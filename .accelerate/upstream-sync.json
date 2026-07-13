@@ -4,6 +4,6 @@
   "upstreamHeadSha": "7c4a7031cf5180f2448237f9377f04854d275a3f",
   "mergeBaseSha": "1d4b687e66fce41dd059e1005501623e021ac27f",
   "upstreamObotVersion": "v0.23.3",
-  "syncBranch": "sync/upstream-20260712-7c4a703",
-  "syncTimestamp": "2026-07-12T03:38:08Z"
+  "syncBranch": "sync/upstream-20260713-7c4a703",
+  "syncTimestamp": "2026-07-13T07:09:38Z"
 }
