@@ -20,26 +20,32 @@ import (
 	ntypes "github.com/obot-platform/nanobot/pkg/types"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/controller/handlers/systemmcpserver"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
+	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/authentication/user"
 )
 
 type Handler struct {
 	mcpSessionManager         *mcp.SessionManager
 	transport                 http.RoundTripper
 	nanobot                   http.Handler
+	mintToken                 func(context.Context, persistent.TokenContext) (string, error)
 	secretBindingAllowedLabel string
 }
 
 var errMCPServerRequiresConfiguration = errors.New("mcp server requires configuration")
 
-func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, auditLogCollector auditlogs.Collector, serverURL, dsn, secretBindingAllowedLabel string) (*Handler, error) {
+const gatewayTokenExpiration = 5 * time.Minute
+
+func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, tokenService *persistent.TokenService, auditLogCollector auditlogs.Collector, serverURL, dsn, secretBindingAllowedLabel string) (*Handler, error) {
 	sessionStore, err := session.NewStoreFromDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session store: %w", err)
@@ -85,9 +91,13 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, audi
 	}
 
 	return &Handler{
-		mcpSessionManager:         mcpSessionManager,
-		transport:                 otelhttp.NewTransport(http.DefaultTransport),
-		nanobot:                   nanobotHTTPServer,
+		mcpSessionManager: mcpSessionManager,
+		transport:         otelhttp.NewTransport(http.DefaultTransport),
+		nanobot:           nanobotHTTPServer,
+		mintToken: func(ctx context.Context, tokenContext persistent.TokenContext) (string, error) {
+			_, token, err := tokenService.NewToken(ctx, tokenContext)
+			return token, err
+		},
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 	}, nil
 }
@@ -107,6 +117,11 @@ func (h *Handler) Proxy(req api.Context) error {
 	}
 
 	if serverConfig.NanobotAgentName != "" {
+		gatewayToken, err := h.mintToken(req.Context(), gatewayTokenContext(req.User, serverConfig, time.Now()))
+		if err != nil {
+			return fmt.Errorf("failed to mint MCP gateway token: %w", err)
+		}
+
 		// We need to just reverse-proxy to the nanobot agent because the UI will make non-MCP requests
 		u, err := url.Parse(serverConfig.URL)
 		if err != nil {
@@ -117,6 +132,7 @@ func (h *Handler) Proxy(req api.Context) error {
 		(&httputil.ReverseProxy{
 			Transport: h.transport,
 			Director: func(r *http.Request) {
+				r.Header.Set("Authorization", "Bearer "+gatewayToken)
 				r.Header.Set("X-Forwarded-Host", r.Host)
 				scheme := "https"
 				if strings.HasPrefix(r.Host, "localhost") || strings.HasPrefix(r.Host, "127.0.0.1") {
@@ -180,6 +196,27 @@ func (h *Handler) Proxy(req api.Context) error {
 
 	h.nanobot.ServeHTTP(req.ResponseWriter, req.WithContext(ctx))
 	return nil
+}
+
+func gatewayTokenContext(authenticatedUser user.Info, server mcp.ServerConfig, now time.Time) persistent.TokenContext {
+	var audience string
+	if len(server.Audiences) > 0 {
+		audience = server.Audiences[0]
+	}
+	extra := authenticatedUser.GetExtra()
+	return persistent.TokenContext{
+		Audience:              audience,
+		IssuedAt:              persistent.NewTime(now),
+		ExpiresAt:             persistent.NewTime(now.Add(gatewayTokenExpiration)),
+		UserID:                authenticatedUser.GetUID(),
+		UserName:              authenticatedUser.GetName(),
+		UserEmail:             auth.FirstExtraValue(extra, "email"),
+		UserGroups:            []string{types.GroupMCP, types.GroupAuthenticated},
+		AuthProviderName:      auth.FirstExtraValue(extra, "auth_provider_name"),
+		AuthProviderNamespace: auth.FirstExtraValue(extra, "auth_provider_namespace"),
+		AuthProviderUserID:    auth.FirstExtraValue(extra, "auth_provider_user_id"),
+		MCPID:                 server.MCPServerName,
+	}
 }
 
 func (h *Handler) ensureServerIsDeployed(req api.Context) (mcp.ServerConfig, error) {
