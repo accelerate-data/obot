@@ -122,14 +122,14 @@ func (h *Handler) Proxy(req api.Context) error {
 		return nil
 	}
 
-	server, err := h.resolveServer(req)
+	resolved, err := h.resolveServer(req)
 	if err != nil {
 		if errors.Is(err, errMCPServerRequiresConfiguration) {
 			return nil
 		}
 		return fmt.Errorf("failed to ensure server is deployed: %v", err)
 	}
-	serverConfig := server.config
+	serverConfig := resolved.config
 
 	var bridgeAuthorizationName, bridgeAuthorizationValue string
 	if serverConfig.TunnelName != "" {
@@ -144,7 +144,7 @@ func (h *Handler) Proxy(req api.Context) error {
 		serverConfig.Headers = append(serverConfig.Headers, fmt.Sprintf("%s=%s", bridgeAuthorizationName, bridgeAuthorizationValue))
 	}
 
-	gatewayToken, err := h.gatewayToken(req.Context(), req.User, server.mcpID, serverConfig)
+	gatewayToken, err := h.gatewayToken(req.Context(), req.User, resolved.mcpID, serverConfig)
 	if err != nil {
 		return fmt.Errorf("failed to mint MCP gateway token: %w", err)
 	}

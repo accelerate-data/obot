@@ -172,17 +172,19 @@ func TestProxyReplacesInboundStudioBearerForNanobotAgent(t *testing.T) {
 func TestProxyReplacesInboundStudioBearerForEmbeddedNanobot(t *testing.T) {
 	receivedAuthorization := make(chan string, 1)
 	receivedToken := make(chan string, 1)
+	var minted persistent.TokenContext
 	handler := Handler{
 		resolveServer: func(api.Context) (resolvedServer, error) {
 			return resolvedServer{
-				mcpID: "ms1server",
+				mcpID: "msi1user-server",
 				config: mcp.ServerConfig{
 					MCPServerName: "ms1server",
 					Audiences:     []string{"https://obot.example.test/mcp-connect/ms1server"},
 				},
 			}, nil
 		},
-		mintToken: func(context.Context, persistent.TokenContext) (string, error) {
+		mintToken: func(_ context.Context, tokenContext persistent.TokenContext) (string, error) {
+			minted = tokenContext
 			return "scoped-gateway-token", nil
 		},
 		nanobot: http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
@@ -199,6 +201,8 @@ func TestProxyReplacesInboundStudioBearerForEmbeddedNanobot(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, response.Code)
 	require.Equal(t, "Bearer scoped-gateway-token", <-receivedAuthorization)
 	require.Equal(t, "scoped-gateway-token", <-receivedToken)
+	require.Equal(t, "msi1user-server", minted.MCPID)
+	require.Equal(t, "https://obot.example.test/mcp-connect/ms1server", minted.Audience)
 }
 
 func TestProxyRemovesInboundStudioBearerWhenAuthenticationIsDisabled(t *testing.T) {

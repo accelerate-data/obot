@@ -144,6 +144,28 @@ func TestTokenExchangeUsesUserSpecificOAuthForMCPServerInstance(t *testing.T) {
 	err = h.doTokenExchange(req, v1.OAuthClient{}, resource, otherSubjectToken, tokenTypeJWT, "")
 	require.Error(t, err)
 	require.Empty(t, otherRecorder.Body.String())
+
+	_, otherUserSubjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
+		Audience:  baseURL + "/mcp-connect/" + serverID,
+		IssuedAt:  persistent.NewTime(now),
+		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
+		UserID:    "43",
+		MCPID:     instanceID,
+	})
+	require.NoError(t, err)
+
+	otherUserRecorder := httptest.NewRecorder()
+	req.ResponseWriter = otherUserRecorder
+	err = h.doTokenExchange(
+		req,
+		v1.OAuthClient{},
+		resource,
+		otherUserSubjectToken,
+		tokenTypeJWT,
+		"",
+	)
+	require.ErrorContains(t, err, "access_denied")
+	require.Empty(t, otherUserRecorder.Body.String())
 }
 
 func TestDoRefreshTokenPreservesScope(t *testing.T) {
