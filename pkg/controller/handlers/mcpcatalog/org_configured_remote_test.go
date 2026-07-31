@@ -87,7 +87,9 @@ remoteConfig:
 
 	github := entries["obot-github"]
 	require.Equal(t, "api.githubcopilot.com", github.RemoteConfig.Hostname)
+	require.Len(t, github.RemoteConfig.Headers, 1)
 	require.Equal(t, "AUTHORIZATION", github.RemoteConfig.Headers[0].Key)
+	require.True(t, github.RemoteConfig.Headers[0].Required)
 	require.True(t, github.RemoteConfig.Headers[0].Sensitive)
 
 	databricks := entries["obot-databricks-genie-spaces"]
@@ -97,6 +99,10 @@ remoteConfig:
 		"${DATABRICKS_WORKSPACE_URL}/api/2.0/mcp/genie/${DATABRICKS_GENIE_SPACE_ID}",
 		databricks.RemoteConfig.URLTemplate,
 	)
+	require.Len(t, databricks.RemoteConfig.Headers, 1)
+	require.Equal(t, "AUTHORIZATION", databricks.RemoteConfig.Headers[0].Key)
+	require.True(t, databricks.RemoteConfig.Headers[0].Required)
+	require.True(t, databricks.RemoteConfig.Headers[0].Sensitive)
 	require.Equal(t, "Bearer ", databricks.RemoteConfig.Headers[0].Prefix)
 	require.Equal(t, "DATABRICKS_WORKSPACE_URL", databricks.Env[0].Key)
 	require.Equal(t, "DATABRICKS_GENIE_SPACE_ID", databricks.Env[1].Key)
@@ -104,5 +110,8 @@ remoteConfig:
 	googleMaps := entries["obot-google-maps-grounding-lite"]
 	require.Equal(t, "true", googleMaps.Metadata["allow-multiple"])
 	require.Equal(t, "https://mapstools.googleapis.com/mcp", googleMaps.RemoteConfig.FixedURL)
+	require.Len(t, googleMaps.RemoteConfig.Headers, 1)
 	require.Equal(t, "X-GOOG-API-KEY", googleMaps.RemoteConfig.Headers[0].Key)
+	require.True(t, googleMaps.RemoteConfig.Headers[0].Required)
+	require.True(t, googleMaps.RemoteConfig.Headers[0].Sensitive)
 }
