@@ -4,6 +4,7 @@ package types
 import (
 	"time"
 
+	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"golang.org/x/oauth2"
 )
 
@@ -57,20 +58,24 @@ type MCPOAuthToken struct {
 }
 
 type MCPOAuthPendingState struct {
-	HashedState        string `gorm:"primaryKey"`
-	State              string
-	Verifier           string
-	UserID             string `gorm:"index:idx_pending_user_mcp"`
-	MCPID              string `gorm:"index:idx_pending_user_mcp"`
-	URL                string
-	OAuthAuthRequestID string
-	ClientID           string
-	ClientSecret       string
-	AuthURL            string
-	TokenURL           string
-	AuthStyle          oauth2.AuthStyle
-	RedirectURL        string
-	Scopes             string
-	Encrypted          bool
-	CreatedAt          time.Time
+	HashedState                    string `gorm:"primaryKey"`
+	State                          string
+	Verifier                       string
+	UserID                         string `gorm:"index:idx_pending_user_mcp"`
+	MCPID                          string `gorm:"index:idx_pending_user_mcp"`
+	URL                            string
+	OAuthAuthRequestID             string
+	ClientID                       string
+	ClientSecret                   string
+	AuthURL                        string
+	TokenURL                       string
+	AuthStyle                      oauth2.AuthStyle
+	RedirectURL                    string
+	Scopes                         string
+	StaticOAuthTest                bool
+	StaticOAuthTestStatus          apitypes.MCPStaticOAuthTestStatus
+	StaticOAuthTestFailureCategory apitypes.MCPStaticOAuthTestFailureCategory
+	StaticOAuthTestCompletedAt     time.Time
+	Encrypted                      bool
+	CreatedAt                      time.Time
 }

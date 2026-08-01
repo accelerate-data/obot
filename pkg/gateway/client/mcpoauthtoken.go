@@ -2,13 +2,16 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
@@ -25,6 +28,8 @@ var mcpOAuthPendingStateGroupResource = schema.GroupResource{
 	Group:    "obot.obot.ai",
 	Resource: "mcpoauthpendingstates",
 }
+
+var ErrMCPStaticOAuthTestInvalid = errors.New("invalid static OAuth test proof")
 
 func (c *Client) GetMCPOAuthToken(ctx context.Context, userID, mcpID, url string) (*types.MCPOAuthToken, error) {
 	var tokens []types.MCPOAuthToken
@@ -114,6 +119,139 @@ func (c *Client) triggerMCPOAuthTokenChange(ctx context.Context, mcpID string) e
 }
 
 // Pending state methods
+
+func (c *Client) CreateMCPStaticOAuthTest(ctx context.Context, userID, mcpID, mcpURL, verifier string, oauthConf *oauth2.Config) (string, error) {
+	state := strings.ToLower(rand.Text())
+	ps := &types.MCPOAuthPendingState{
+		HashedState:           fmt.Sprintf("%x", sha256.Sum256([]byte(state))),
+		State:                 state,
+		Verifier:              verifier,
+		UserID:                userID,
+		MCPID:                 mcpID,
+		URL:                   mcpURL,
+		ClientID:              oauthConf.ClientID,
+		ClientSecret:          oauthConf.ClientSecret,
+		AuthURL:               oauthConf.Endpoint.AuthURL,
+		TokenURL:              oauthConf.Endpoint.TokenURL,
+		AuthStyle:             oauthConf.Endpoint.AuthStyle,
+		RedirectURL:           oauthConf.RedirectURL,
+		Scopes:                strings.Join(oauthConf.Scopes, " "),
+		StaticOAuthTest:       true,
+		StaticOAuthTestStatus: apitypes.MCPStaticOAuthTestStatusPending,
+	}
+
+	if err := c.encryptMCPOAuthPendingState(ctx, ps); err != nil {
+		return "", fmt.Errorf("failed to encrypt static OAuth test: %w", err)
+	}
+	if err := c.db.WithContext(ctx).Create(ps).Error; err != nil {
+		return "", err
+	}
+	return state, nil
+}
+
+func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state string) (apitypes.MCPStaticOAuthTestResult, error) {
+	ps, err := c.GetMCPOAuthPendingState(ctx, state)
+	if err != nil {
+		return apitypes.MCPStaticOAuthTestResult{}, err
+	}
+	if !ps.StaticOAuthTest {
+		return apitypes.MCPStaticOAuthTestResult{}, ErrMCPStaticOAuthTestInvalid
+	}
+	if time.Since(ps.CreatedAt) >= pendingStateTTL {
+		return apitypes.MCPStaticOAuthTestResult{
+			Status:          apitypes.MCPStaticOAuthTestStatusFailed,
+			FailureCategory: apitypes.MCPStaticOAuthTestFailureExpired,
+		}, nil
+	}
+	return apitypes.MCPStaticOAuthTestResult{
+		Status:          ps.StaticOAuthTestStatus,
+		FailureCategory: ps.StaticOAuthTestFailureCategory,
+	}, nil
+}
+
+func (c *Client) CompleteMCPStaticOAuthTest(ctx context.Context, state string, status apitypes.MCPStaticOAuthTestStatus, failureCategory apitypes.MCPStaticOAuthTestFailureCategory) error {
+	if !validMCPStaticOAuthTestCompletion(status, failureCategory) {
+		return ErrMCPStaticOAuthTestInvalid
+	}
+
+	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	completedAt := time.Now()
+	result := c.db.WithContext(ctx).
+		Model(&types.MCPOAuthPendingState{}).
+		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?", hashedState, true, apitypes.MCPStaticOAuthTestStatusPending, completedAt.Add(-pendingStateTTL)).
+		Select("StaticOAuthTestStatus", "StaticOAuthTestFailureCategory", "StaticOAuthTestCompletedAt").
+		Updates(&types.MCPOAuthPendingState{
+			StaticOAuthTestStatus:          status,
+			StaticOAuthTestFailureCategory: failureCategory,
+			StaticOAuthTestCompletedAt:     completedAt,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrMCPStaticOAuthTestInvalid
+	}
+	return nil
+}
+
+func validMCPStaticOAuthTestCompletion(status apitypes.MCPStaticOAuthTestStatus, failureCategory apitypes.MCPStaticOAuthTestFailureCategory) bool {
+	if status == apitypes.MCPStaticOAuthTestStatusSucceeded {
+		return failureCategory == ""
+	}
+	if status != apitypes.MCPStaticOAuthTestStatusFailed {
+		return false
+	}
+	switch failureCategory {
+	case apitypes.MCPStaticOAuthTestFailureAuthorizationDenied,
+		apitypes.MCPStaticOAuthTestFailureInvalidCallback,
+		apitypes.MCPStaticOAuthTestFailureTokenExchange:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) ConsumeMCPStaticOAuthTest(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string) error {
+	ps, err := c.GetMCPOAuthPendingState(ctx, state)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrMCPStaticOAuthTestInvalid
+		}
+		return err
+	}
+	if !ps.StaticOAuthTest ||
+		ps.StaticOAuthTestStatus != apitypes.MCPStaticOAuthTestStatusSucceeded ||
+		time.Since(ps.CreatedAt) >= pendingStateTTL ||
+		!secureStringEqual(ps.UserID, userID) ||
+		!secureStringEqual(ps.MCPID, mcpID) ||
+		!secureStringEqual(ps.URL, mcpURL) ||
+		!secureStringEqual(ps.ClientID, clientID) ||
+		!secureStringEqual(ps.ClientSecret, clientSecret) {
+		return ErrMCPStaticOAuthTestInvalid
+	}
+
+	result := c.db.WithContext(ctx).Delete(
+		&types.MCPOAuthPendingState{},
+		"hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?",
+		ps.HashedState,
+		true,
+		apitypes.MCPStaticOAuthTestStatusSucceeded,
+		time.Now().Add(-pendingStateTTL),
+	)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrMCPStaticOAuthTestInvalid
+	}
+	return nil
+}
+
+func secureStringEqual(a, b string) bool {
+	aHash := sha256.Sum256([]byte(a))
+	bHash := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(aHash[:], bHash[:]) == 1
+}
 
 func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, state, verifier string, oauthConf *oauth2.Config) error {
 	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
@@ -320,32 +458,15 @@ func (c *Client) encryptMCPOAuthPendingState(ctx context.Context, ps *types.MCPO
 		}
 	}
 
-	var (
-		b    []byte
-		err  error
-		errs []error
-
-		dataCtx = mcpOAuthPendingStateCtx(ps)
-	)
-	if b, err = transformer.TransformToStorage(ctx, []byte(ps.State), dataCtx); err != nil {
-		errs = append(errs, err)
-	} else {
-		ps.State = base64.StdEncoding.EncodeToString(b)
-	}
-	if b, err = transformer.TransformToStorage(ctx, []byte(ps.Verifier), dataCtx); err != nil {
-		errs = append(errs, err)
-	} else {
-		ps.Verifier = base64.StdEncoding.EncodeToString(b)
-	}
-	if b, err = transformer.TransformToStorage(ctx, []byte(ps.ClientID), dataCtx); err != nil {
-		errs = append(errs, err)
-	} else {
-		ps.ClientID = base64.StdEncoding.EncodeToString(b)
-	}
-	if b, err = transformer.TransformToStorage(ctx, []byte(ps.ClientSecret), dataCtx); err != nil {
-		errs = append(errs, err)
-	} else {
-		ps.ClientSecret = base64.StdEncoding.EncodeToString(b)
+	var errs []error
+	dataCtx := mcpOAuthPendingStateCtx(ps)
+	for _, field := range mcpOAuthPendingStateEncryptedFields(ps) {
+		b, err := transformer.TransformToStorage(ctx, []byte(*field), dataCtx)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		*field = base64.StdEncoding.EncodeToString(b)
 	}
 
 	ps.Encrypted = true
@@ -366,64 +487,36 @@ func (c *Client) decryptMCPOAuthPendingState(ctx context.Context, ps *types.MCPO
 		}
 	}
 
-	var (
-		out, decoded []byte
-		n            int
-		err          error
-		errs         []error
-
-		dataCtx = mcpOAuthPendingStateCtx(ps)
-	)
-
-	decoded = make([]byte, base64.StdEncoding.DecodedLen(len(ps.State)))
-	n, err = base64.StdEncoding.Decode(decoded, []byte(ps.State))
-	if err == nil {
-		if out, _, err = transformer.TransformFromStorage(ctx, decoded[:n], dataCtx); err != nil {
+	var errs []error
+	dataCtx := mcpOAuthPendingStateCtx(ps)
+	for _, field := range mcpOAuthPendingStateEncryptedFields(ps) {
+		decoded, err := base64.StdEncoding.DecodeString(*field)
+		if err != nil {
 			errs = append(errs, err)
-		} else {
-			ps.State = string(out)
+			continue
 		}
-	} else {
-		errs = append(errs, err)
-	}
-
-	decoded = make([]byte, base64.StdEncoding.DecodedLen(len(ps.Verifier)))
-	n, err = base64.StdEncoding.Decode(decoded, []byte(ps.Verifier))
-	if err == nil {
-		if out, _, err = transformer.TransformFromStorage(ctx, decoded[:n], dataCtx); err != nil {
+		out, _, err := transformer.TransformFromStorage(ctx, decoded, dataCtx)
+		if err != nil {
 			errs = append(errs, err)
-		} else {
-			ps.Verifier = string(out)
+			continue
 		}
-	} else {
-		errs = append(errs, err)
-	}
-
-	decoded = make([]byte, base64.StdEncoding.DecodedLen(len(ps.ClientID)))
-	n, err = base64.StdEncoding.Decode(decoded, []byte(ps.ClientID))
-	if err == nil {
-		if out, _, err = transformer.TransformFromStorage(ctx, decoded[:n], dataCtx); err != nil {
-			errs = append(errs, err)
-		} else {
-			ps.ClientID = string(out)
-		}
-	} else {
-		errs = append(errs, err)
-	}
-
-	decoded = make([]byte, base64.StdEncoding.DecodedLen(len(ps.ClientSecret)))
-	n, err = base64.StdEncoding.Decode(decoded, []byte(ps.ClientSecret))
-	if err == nil {
-		if out, _, err = transformer.TransformFromStorage(ctx, decoded[:n], dataCtx); err != nil {
-			errs = append(errs, err)
-		} else {
-			ps.ClientSecret = string(out)
-		}
-	} else {
-		errs = append(errs, err)
+		*field = string(out)
 	}
 
 	return errors.Join(errs...)
+}
+
+func mcpOAuthPendingStateEncryptedFields(ps *types.MCPOAuthPendingState) []*string {
+	fields := []*string{
+		&ps.State,
+		&ps.Verifier,
+		&ps.ClientID,
+		&ps.ClientSecret,
+	}
+	if ps.StaticOAuthTest {
+		fields = append(fields, &ps.URL, &ps.AuthURL, &ps.TokenURL, &ps.RedirectURL, &ps.Scopes)
+	}
+	return fields
 }
 
 func mcpOAuthPendingStateCtx(ps *types.MCPOAuthPendingState) value.Context {

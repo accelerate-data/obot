@@ -32,6 +32,28 @@ const (
 	ServerUserTypeMultiUser ServerUserType = "multiUser"
 )
 
+type MCPStaticOAuthTestStatus string
+
+const (
+	MCPStaticOAuthTestStatusPending   MCPStaticOAuthTestStatus = "pending"
+	MCPStaticOAuthTestStatusSucceeded MCPStaticOAuthTestStatus = "succeeded"
+	MCPStaticOAuthTestStatusFailed    MCPStaticOAuthTestStatus = "failed"
+)
+
+type MCPStaticOAuthTestFailureCategory string
+
+const (
+	MCPStaticOAuthTestFailureAuthorizationDenied MCPStaticOAuthTestFailureCategory = "authorization_denied"
+	MCPStaticOAuthTestFailureInvalidCallback     MCPStaticOAuthTestFailureCategory = "invalid_callback"
+	MCPStaticOAuthTestFailureTokenExchange       MCPStaticOAuthTestFailureCategory = "token_exchange_failed"
+	MCPStaticOAuthTestFailureExpired             MCPStaticOAuthTestFailureCategory = "expired"
+)
+
+type MCPStaticOAuthTestResult struct {
+	Status          MCPStaticOAuthTestStatus          `json:"status"`
+	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
+}
+
 // IsSingleUser returns true if the type represents a single-user server.
 func (t ServerUserType) IsSingleUser() bool {
 	return t == ServerUserTypeSingleUser
