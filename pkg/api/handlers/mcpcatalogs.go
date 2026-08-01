@@ -1865,27 +1865,14 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 
 	clientID = trimmedClientID
 	clientSecret = trimmedClientSecret
-	if result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), proof, req.User.GetUID(), entry.Name); err != nil || result.Status != types.MCPStaticOAuthTestStatusSucceeded {
-		return types.NewErrBadRequest("invalid or expired OAuth credential test")
-	}
-
-	// Store new credential
-	cred := gatewaytypes.Credential{
-		Context: credName,
-		Name:    "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID":     clientID,
-			"CLIENT_SECRET": clientSecret,
-		},
-	}
-	if err := req.GatewayClient.UpsertCredential(req.Context(), cred); err != nil {
-		return fmt.Errorf("failed to create OAuth credential: %w", err)
-	}
-	if err := h.gatewayClient.ConsumeMCPStaticOAuthTest(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret); err != nil {
-		if _, rollbackErr := req.GatewayClient.DeleteCredential(req.Context(), credName, "oauth"); rollbackErr != nil {
-			return errors.New("failed to roll back unverified OAuth credential")
+	if err := h.gatewayClient.CommitMCPStaticOAuthCredential(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret, false); err != nil {
+		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
+			return types.NewErrBadRequest("invalid or expired OAuth credential test")
 		}
-		return types.NewErrBadRequest("invalid or expired OAuth credential test")
+		if errors.Is(err, gclient.ErrMCPStaticOAuthCredentialExists) {
+			return types.NewErrBadRequest("credentials already exist; delete and recreate credentials to change them")
+		}
+		return fmt.Errorf("failed to create OAuth credential: %w", err)
 	}
 
 	// Trigger reconciliation to update the status
@@ -1944,20 +1931,10 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 		return err
 	}
 
-	if err := h.gatewayClient.ConsumeMCPStaticOAuthTest(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret); err != nil {
+	if err := h.gatewayClient.CommitMCPStaticOAuthCredential(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret, true); err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
 			return types.NewErrBadRequest("invalid or expired OAuth credential test")
 		}
-		return fmt.Errorf("failed to consume OAuth credential test: %w", err)
-	}
-	if err := req.GatewayClient.UpsertCredential(req.Context(), gatewaytypes.Credential{
-		Context: credName,
-		Name:    "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID":     clientID,
-			"CLIENT_SECRET": clientSecret,
-		},
-	}); err != nil {
 		return fmt.Errorf("failed to replace OAuth credential: %w", err)
 	}
 

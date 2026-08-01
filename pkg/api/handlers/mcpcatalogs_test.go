@@ -658,7 +658,7 @@ func TestReplaceOAuthCredentialsListFailureLeavesActiveConfigurationAndProofUsab
 	}
 }
 
-func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndConsumesProof(t *testing.T) {
+func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndProofUsable(t *testing.T) {
 	transformer := &toggleCredentialWriteErrorTransformer{}
 	gateway := newOAuthCredentialTestGatewayClientWithEncryption(t, &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
 		{Group: "obot.obot.ai", Resource: "credentials"}: transformer,
@@ -683,8 +683,8 @@ func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndConsume
 	if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
 		t.Fatalf("active credential changed after upsert failure: %#v", credential.Secrets)
 	}
-	if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); !errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
-		t.Fatalf("upsert failure left proof reusable: %v", err)
+	if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
+		t.Fatalf("upsert failure consumed proof: %v", err)
 	}
 }
 

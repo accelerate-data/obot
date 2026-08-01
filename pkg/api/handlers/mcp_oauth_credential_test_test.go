@@ -326,8 +326,53 @@ func TestGetOAuthCredentialTestProjectsExpiredStatusAtHandlerBoundary(t *testing
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err != nil {
 		t.Fatalf("get expired proof status: %v", err)
 	}
-	if got := strings.TrimSpace(recorder.Body.String()); got != `{"status":"failed","failureCategory":"expired"}` {
-		t.Fatalf("expired status response = %s", got)
+	var result types.MCPStaticOAuthTestResult
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode expired status response: %v", err)
+	}
+	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != types.MCPStaticOAuthTestFailureExpired || result.ExpiresAt.IsZero() || !result.ExpiresAt.Before(time.Now()) {
+		t.Fatalf("expired status response = %+v", result)
+	}
+}
+
+func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		prepare func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string
+	}{
+		{
+			name: "unknown",
+			prepare: func(*testing.T, *gatewayclient.Client, *v1.MCPServerCatalogEntry) string {
+				return "unknown-proof"
+			},
+		},
+		{
+			name: "consumed",
+			prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
+					t.Fatalf("consume proof: %v", err)
+				}
+				return proof
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gateway := newOAuthCredentialTestGatewayClient(t)
+			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+			proof := tt.prepare(t, gateway, entry)
+			req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", httptest.NewRecorder(), gateway,
+				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+			req.SetPathValue("catalog_id", "default")
+			req.SetPathValue("entry_id", entry.Name)
+			req.SetPathValue("state", proof)
+
+			err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req)
+			var httpErr *types.ErrHTTP
+			if !errors.As(err, &httpErr) || httpErr.Code != http.StatusBadRequest || httpErr.Message != "invalid or expired OAuth credential test" {
+				t.Fatalf("unavailable proof error = %#v, want safe HTTP 400", err)
+			}
+		})
 	}
 }
 

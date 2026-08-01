@@ -17,6 +17,7 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/storage/value"
@@ -35,6 +36,7 @@ var mcpOAuthPendingStateGroupResource = schema.GroupResource{
 
 var (
 	ErrMCPStaticOAuthTestInvalid        = errors.New("invalid static OAuth test proof")
+	ErrMCPStaticOAuthCredentialExists   = errors.New("static OAuth credential already exists")
 	ErrMCPOAuthCatalogCredentialChanged = errors.New("catalog OAuth credential changed")
 )
 
@@ -309,15 +311,20 @@ func (c *Client) CreateMCPStaticOAuthTest(ctx context.Context, userID, mcpID, mc
 func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID, mcpID string) (apitypes.MCPStaticOAuthTestResult, error) {
 	ps, err := c.GetMCPOAuthPendingState(ctx, state)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return apitypes.MCPStaticOAuthTestResult{}, ErrMCPStaticOAuthTestInvalid
+		}
 		return apitypes.MCPStaticOAuthTestResult{}, err
 	}
 	if !ps.StaticOAuthTest || !secureStringEqual(ps.UserID, userID) || !secureStringEqual(ps.MCPID, mcpID) {
 		return apitypes.MCPStaticOAuthTestResult{}, ErrMCPStaticOAuthTestInvalid
 	}
+	expiresAt := ps.CreatedAt.Add(pendingStateTTL)
 	if time.Since(ps.CreatedAt) >= pendingStateTTL {
 		return apitypes.MCPStaticOAuthTestResult{
 			Status:          apitypes.MCPStaticOAuthTestStatusFailed,
 			FailureCategory: apitypes.MCPStaticOAuthTestFailureExpired,
+			ExpiresAt:       expiresAt,
 		}, nil
 	}
 	status := ps.StaticOAuthTestStatus
@@ -327,6 +334,7 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID,
 	return apitypes.MCPStaticOAuthTestResult{
 		Status:          status,
 		FailureCategory: ps.StaticOAuthTestFailureCategory,
+		ExpiresAt:       expiresAt,
 	}, nil
 }
 
@@ -423,6 +431,81 @@ func (c *Client) ConsumeMCPStaticOAuthTest(ctx context.Context, state, userID, m
 		return ErrMCPStaticOAuthTestInvalid
 	}
 	return nil
+}
+
+// CommitMCPStaticOAuthCredential validates and consumes an exact successful
+// proof in the same transaction that stores its credential. The caller must
+// hold the catalog entry's credential lock for the complete operation.
+func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string, replace bool) error {
+	credential := types.Credential{
+		Context: system.MCPOAuthCredentialName(mcpID),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     clientID,
+			"CLIENT_SECRET": clientSecret,
+		},
+	}
+	if err := c.encryptCredential(ctx, &credential); err != nil {
+		return fmt.Errorf("failed to encrypt credential: %w", err)
+	}
+
+	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var proof types.MCPOAuthPendingState
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("hashed_state = ?", hashedState).
+			First(&proof).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrMCPStaticOAuthTestInvalid
+			}
+			return err
+		}
+		if err := c.decryptMCPOAuthPendingState(ctx, &proof); err != nil {
+			return fmt.Errorf("failed to decrypt static OAuth test: %w", err)
+		}
+		if !proof.StaticOAuthTest ||
+			proof.StaticOAuthTestStatus != apitypes.MCPStaticOAuthTestStatusSucceeded ||
+			time.Since(proof.CreatedAt) >= pendingStateTTL ||
+			!secureStringEqual(proof.UserID, userID) ||
+			!secureStringEqual(proof.MCPID, mcpID) ||
+			!secureStringEqual(proof.URL, mcpURL) ||
+			!secureStringEqual(proof.ClientID, clientID) ||
+			!secureStringEqual(proof.ClientSecret, clientSecret) {
+			return ErrMCPStaticOAuthTestInvalid
+		}
+
+		upsert := clause.OnConflict{
+			Columns:   []clause.Column{{Name: "context"}, {Name: "name"}},
+			DoUpdates: clause.AssignmentColumns([]string{"secrets", "encrypted"}),
+		}
+		if !replace {
+			upsert.DoNothing = true
+			upsert.DoUpdates = nil
+		}
+		result := tx.Clauses(upsert).Create(&credential)
+		if result.Error != nil {
+			return result.Error
+		}
+		if !replace && result.RowsAffected != 1 {
+			return ErrMCPStaticOAuthCredentialExists
+		}
+
+		result = tx.Delete(
+			&types.MCPOAuthPendingState{},
+			"hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?",
+			proof.HashedState,
+			true,
+			apitypes.MCPStaticOAuthTestStatusSucceeded,
+			time.Now().Add(-pendingStateTTL),
+		)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrMCPStaticOAuthTestInvalid
+		}
+		return nil
+	})
 }
 
 func secureStringEqual(a, b string) bool {

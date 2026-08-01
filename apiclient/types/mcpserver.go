@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Runtime represents the execution runtime type for MCP servers
@@ -52,6 +53,7 @@ const (
 type MCPStaticOAuthTestResult struct {
 	Status          MCPStaticOAuthTestStatus          `json:"status"`
 	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
+	ExpiresAt       time.Time                         `json:"expiresAt,omitzero"`
 }
 
 // IsSingleUser returns true if the type represents a single-user server.

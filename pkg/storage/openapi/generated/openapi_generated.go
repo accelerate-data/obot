@@ -9045,8 +9045,14 @@ func schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref comm
 							Format: "",
 						},
 					},
+					"expiresAt": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "date-time",
+						},
+					},
 				},
-				Required: []string{"status"},
+				Required: []string{"status", "expiresAt"},
 			},
 		},
 	}
