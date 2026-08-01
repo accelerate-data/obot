@@ -16,6 +16,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/handlers"
 	"github.com/obot-platform/obot/pkg/auth"
+	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
@@ -37,6 +38,8 @@ const (
 	ErrServerError             ErrorCode = "server_error"
 	ErrTemporarilyUnavailable  ErrorCode = "temporarily_unavailable"
 	ErrInvalidClientMetadata   ErrorCode = "invalid_client_metadata"
+
+	invalidStaticOAuthCredentialTestMessage = "invalid or expired static OAuth credential test"
 )
 
 // oauthError represents an OAuth 2.0 error response.
@@ -484,6 +487,9 @@ func (h *handler) oauthCallback(req api.Context) error {
 
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+		}
 		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
 	}
 
@@ -546,8 +552,11 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 	} else if !pendingState.StaticOAuthTest {
 		return false, nil
 	}
-	if pendingState.StaticOAuthTestStatus != types.MCPStaticOAuthTestStatusPending {
-		return true, types.NewErrBadRequest("invalid or expired static OAuth credential test")
+	pendingState, err = h.oauthChecker.stateMgr.gatewayClient.ClaimMCPStaticOAuthTest(req.Context(), state)
+	if errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+	} else if err != nil {
+		return true, errors.New("failed to claim static OAuth credential test")
 	}
 
 	code := req.URL.Query().Get("code")
@@ -575,7 +584,9 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 		}
 	}
 
-	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(req.Context(), state, status, failureCategory); err != nil {
+	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(req.Context(), state, status, failureCategory); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+	} else if err != nil {
 		return true, errors.New("failed to complete static OAuth credential test")
 	}
 	http.Redirect(req.ResponseWriter, req.Request, oauthCompletionURL(""), http.StatusFound)

@@ -31,6 +31,8 @@ var mcpOAuthPendingStateGroupResource = schema.GroupResource{
 
 var ErrMCPStaticOAuthTestInvalid = errors.New("invalid static OAuth test proof")
 
+const mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
+
 func (c *Client) GetMCPOAuthToken(ctx context.Context, userID, mcpID, url string) (*types.MCPOAuthToken, error) {
 	var tokens []types.MCPOAuthToken
 	err := c.db.WithContext(ctx).Where("mcp_id = ? AND user_id = ?", mcpID, userID).Find(&tokens).Error
@@ -163,10 +165,31 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID,
 			FailureCategory: apitypes.MCPStaticOAuthTestFailureExpired,
 		}, nil
 	}
+	status := ps.StaticOAuthTestStatus
+	if status == mcpStaticOAuthTestStatusClaimed {
+		status = apitypes.MCPStaticOAuthTestStatusPending
+	}
 	return apitypes.MCPStaticOAuthTestResult{
-		Status:          ps.StaticOAuthTestStatus,
+		Status:          status,
 		FailureCategory: ps.StaticOAuthTestFailureCategory,
 	}, nil
+}
+
+// ClaimMCPStaticOAuthTest atomically admits one unexpired callback for provider exchange.
+func (c *Client) ClaimMCPStaticOAuthTest(ctx context.Context, state string) (*types.MCPOAuthPendingState, error) {
+	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	result := c.db.WithContext(ctx).
+		Model(&types.MCPOAuthPendingState{}).
+		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?", hashedState, true, apitypes.MCPStaticOAuthTestStatusPending, time.Now().Add(-pendingStateTTL)).
+		Update("static_o_auth_test_status", mcpStaticOAuthTestStatusClaimed)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, ErrMCPStaticOAuthTestInvalid
+	}
+
+	return c.GetMCPOAuthPendingState(ctx, state)
 }
 
 func (c *Client) CompleteMCPStaticOAuthTest(ctx context.Context, state string, status apitypes.MCPStaticOAuthTestStatus, failureCategory apitypes.MCPStaticOAuthTestFailureCategory) error {
@@ -178,7 +201,7 @@ func (c *Client) CompleteMCPStaticOAuthTest(ctx context.Context, state string, s
 	completedAt := time.Now()
 	result := c.db.WithContext(ctx).
 		Model(&types.MCPOAuthPendingState{}).
-		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?", hashedState, true, apitypes.MCPStaticOAuthTestStatusPending, completedAt.Add(-pendingStateTTL)).
+		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status IN ? AND created_at >= ?", hashedState, true, []apitypes.MCPStaticOAuthTestStatus{apitypes.MCPStaticOAuthTestStatusPending, mcpStaticOAuthTestStatusClaimed}, completedAt.Add(-pendingStateTTL)).
 		Select("StaticOAuthTestStatus", "StaticOAuthTestFailureCategory", "StaticOAuthTestCompletedAt").
 		Updates(&types.MCPOAuthPendingState{
 			StaticOAuthTestStatus:          status,

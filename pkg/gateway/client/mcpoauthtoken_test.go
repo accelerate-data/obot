@@ -184,6 +184,69 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 	})
 }
 
+func TestClaimMCPStaticOAuthTestEnforcesTTLAndExactlyOnce(t *testing.T) {
+	t.Run("exactly once", func(t *testing.T) {
+		c := newTestClient(t)
+		state, conf := createStaticOAuthTest(t, c)
+
+		const attempts = 8
+		start := make(chan struct{})
+		results := make(chan error, attempts)
+		var wg sync.WaitGroup
+		for range attempts {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				proof, err := c.ClaimMCPStaticOAuthTest(t.Context(), state)
+				if err == nil && (proof.ClientID != conf.ClientID || proof.ClientSecret != conf.ClientSecret) {
+					err = errors.New("claimed proof did not contain the candidate credentials")
+				}
+				results <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		var claimed int
+		for err := range results {
+			if err == nil {
+				claimed++
+			} else if !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+				t.Fatalf("claim proof: %v", err)
+			}
+		}
+		if claimed != 1 {
+			t.Fatalf("successful claims = %d, want exactly 1", claimed)
+		}
+
+		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1")
+		if err != nil {
+			t.Fatalf("read claimed status: %v", err)
+		}
+		assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusPending, "")
+	})
+
+	t.Run("expired row remains unclaimed", func(t *testing.T) {
+		c := newTestClient(t)
+		state, _ := createStaticOAuthTest(t, c)
+		hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+		if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthPendingState{}).
+			Where("hashed_state = ?", hashedState).
+			Update("created_at", time.Now().Add(-pendingStateTTL-time.Second)).Error; err != nil {
+			t.Fatalf("age pending proof: %v", err)
+		}
+
+		if _, err := c.ClaimMCPStaticOAuthTest(t.Context(), state); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+			t.Fatalf("claim expired proof returned %v, want invalid proof", err)
+		}
+		if _, err := c.GetMCPOAuthPendingState(t.Context(), state); err != nil {
+			t.Fatalf("expired proof should remain until cleanup: %v", err)
+		}
+	})
+}
+
 func TestCompleteMCPStaticOAuthTestRejectsUnsafeFailureCategoryWithoutEchoingIt(t *testing.T) {
 	c := newTestClient(t)
 	state, conf := createStaticOAuthTest(t, c)

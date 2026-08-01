@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,16 +69,25 @@ func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
 	})
 
 	t.Run("expired state", func(t *testing.T) {
-		gateway := newStaticOAuthCallbackGateway(t)
+		gateway, db := newStaticOAuthCallbackGatewayWithDB(t)
 		state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
 		if err != nil {
 			t.Fatalf("create static OAuth test: %v", err)
 		}
-		if err := gateway.CleanupExpiredMCPOAuthPendingStates(t.Context(), 0); err != nil {
-			t.Fatalf("expire static OAuth test: %v", err)
+		proof, err := gateway.GetMCPOAuthPendingState(t.Context(), state)
+		if err != nil {
+			t.Fatalf("read pending proof: %v", err)
+		}
+		if err := db.WithContext(t.Context()).Model(&gatewaytypes.MCPOAuthPendingState{}).
+			Where("hashed_state = ?", proof.HashedState).
+			Update("created_at", time.Now().Add(-31*time.Minute)).Error; err != nil {
+			t.Fatalf("age static OAuth test: %v", err)
 		}
 		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
 		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state+"&code=valid-code", http.StatusBadRequest, state)
+		if got := provider.tokenExchangeCount(); got != 0 {
+			t.Fatalf("expired proof provider exchanges = %d, want 0", got)
+		}
 	})
 
 	t.Run("replayed state", func(t *testing.T) {
@@ -93,6 +104,56 @@ func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
 		}
 		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state+"&code=valid-code", http.StatusBadRequest, state)
 	})
+}
+
+func TestStaticOAuthCallbackClaimsProofBeforeProviderExchange(t *testing.T) {
+	provider, tokenExchangeStarted, releaseTokenExchange := newBlockingStaticOAuthCallbackProvider(t)
+	defer releaseTokenExchange()
+	gateway := newStaticOAuthCallbackGateway(t)
+	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+	server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+	path := "/oauth/mcp/callback?state=" + state + "&code=valid-code"
+
+	type callbackResponse struct {
+		status int
+		body   string
+	}
+	responses := make(chan callbackResponse, 2)
+	request := func() {
+		recorder := httptest.NewRecorder()
+		server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		responses <- callbackResponse{status: recorder.Code, body: recorder.Body.String()}
+	}
+
+	go request()
+	select {
+	case <-tokenExchangeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first callback did not reach provider token exchange")
+	}
+	go request()
+
+	select {
+	case loser := <-responses:
+		if loser.status != http.StatusBadRequest || loser.body != "invalid or expired static OAuth credential test\n" {
+			t.Fatalf("concurrent loser = %d body=%q, want generic bad request", loser.status, loser.body)
+		}
+	case <-time.After(2 * time.Second):
+		releaseTokenExchange()
+		t.Fatal("concurrent callback reached provider instead of failing its claim")
+	}
+
+	releaseTokenExchange()
+	winner := <-responses
+	if winner.status != http.StatusFound {
+		t.Fatalf("claim winner = %d body=%q, want completion redirect", winner.status, winner.body)
+	}
+	if got := provider.tokenExchangeCount(); got != 1 {
+		t.Fatalf("provider token exchanges = %d, want exactly 1", got)
+	}
 }
 
 func TestUnauthenticatedStaticOAuthCallbackDoesNotExposeSiblingRoutes(t *testing.T) {
@@ -149,6 +210,9 @@ func assertSafeStaticOAuthCallbackFailure(t *testing.T, server http.Handler, pat
 	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 	if recorder.Code != wantStatus {
 		t.Fatalf("callback response = %d body=%q, want %d", recorder.Code, recorder.Body.String(), wantStatus)
+	}
+	if recorder.Body.String() != "invalid or expired static OAuth credential test\n" {
+		t.Fatalf("callback response body = %q, want generic invalid-or-expired error", recorder.Body.String())
 	}
 	for _, value := range sensitive {
 		if value != "" && strings.Contains(recorder.Body.String(), value) {
@@ -255,10 +319,27 @@ func TestStaticOAuthCallbackClassifiesMismatchedStateAsSafeFailure(t *testing.T)
 
 type staticOAuthCallbackProvider struct {
 	*httptest.Server
+	tokenExchanges *atomic.Int32
 }
 
 func newStaticOAuthCallbackProvider(t *testing.T) staticOAuthCallbackProvider {
 	t.Helper()
+	return newStaticOAuthCallbackProviderWithGate(t, nil, nil)
+}
+
+func newBlockingStaticOAuthCallbackProvider(t *testing.T) (staticOAuthCallbackProvider, <-chan struct{}, func()) {
+	t.Helper()
+	started := make(chan struct{}, 2)
+	proceed := make(chan struct{})
+	var release sync.Once
+	return newStaticOAuthCallbackProviderWithGate(t, started, proceed), started, func() {
+		release.Do(func() { close(proceed) })
+	}
+}
+
+func newStaticOAuthCallbackProviderWithGate(t *testing.T, started chan<- struct{}, proceed <-chan struct{}) staticOAuthCallbackProvider {
+	t.Helper()
+	tokenExchanges := new(atomic.Int32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/authorize" {
 			if req.URL.Query().Get("client_id") != "static-client" ||
@@ -274,6 +355,11 @@ func newStaticOAuthCallbackProvider(t *testing.T) staticOAuthCallbackProvider {
 			http.NotFound(w, req)
 			return
 		}
+		tokenExchanges.Add(1)
+		if started != nil {
+			started <- struct{}{}
+			<-proceed
+		}
 		clientID, clientSecret, ok := req.BasicAuth()
 		if !ok || clientID != "static-client" || clientSecret != "static-secret" || req.FormValue("code_verifier") != "exact-verifier" || req.FormValue("code") != "valid-code" {
 			http.Error(w, "provider body contains secret code and token", http.StatusUnauthorized)
@@ -283,7 +369,11 @@ func newStaticOAuthCallbackProvider(t *testing.T) staticOAuthCallbackProvider {
 		_ = json.NewEncoder(w).Encode(&oauth2.Token{AccessToken: "discard-me", TokenType: "Bearer"})
 	}))
 	t.Cleanup(server.Close)
-	return staticOAuthCallbackProvider{Server: server}
+	return staticOAuthCallbackProvider{Server: server, tokenExchanges: tokenExchanges}
+}
+
+func (p staticOAuthCallbackProvider) tokenExchangeCount() int32 {
+	return p.tokenExchanges.Load()
 }
 
 func (p staticOAuthCallbackProvider) config() *oauth2.Config {
@@ -301,6 +391,12 @@ func (p staticOAuthCallbackProvider) config() *oauth2.Config {
 
 func newStaticOAuthCallbackGateway(t *testing.T) *gatewayclient.Client {
 	t.Helper()
+	client, _ := newStaticOAuthCallbackGatewayWithDB(t)
+	return client
+}
+
+func newStaticOAuthCallbackGatewayWithDB(t *testing.T) (*gatewayclient.Client, *gorm.DB) {
+	t.Helper()
 	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
 	if err != nil {
 		t.Fatalf("create storage services: %v", err)
@@ -312,5 +408,5 @@ func newStaticOAuthCallbackGateway(t *testing.T) *gatewayclient.Client {
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	return gatewayclient.New(t.Context(), database, nil, nil, nil, nil, nil, time.Hour, 10, 0, 0, false), services.DB.DB
 }
