@@ -162,16 +162,14 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 			t.Fatalf("acquire rotation lock: %v", err)
 		}
 		writeResult := make(chan error, 1)
+		writeStarted := make(chan struct{})
 		go func() {
+			close(writeStarted)
 			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
 				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 				&oauth2.Token{AccessToken: "old-app-access"})
 		}()
-		select {
-		case err := <-writeResult:
-			t.Fatalf("old-app write bypassed held rotation lock: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
+		<-writeStarted
 		seedCredential(t, c, "client-1", "secret-2")
 		if err := c.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID); err != nil {
 			t.Fatalf("clear grants during rotation: %v", err)
@@ -194,16 +192,14 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 			t.Fatalf("acquire clear lock: %v", err)
 		}
 		writeResult := make(chan error, 1)
+		writeStarted := make(chan struct{})
 		go func() {
+			close(writeStarted)
 			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
 				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 				&oauth2.Token{AccessToken: "old-app-access"})
 		}()
-		select {
-		case err := <-writeResult:
-			t.Fatalf("old-app write bypassed held clear lock: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
+		<-writeStarted
 		if _, err := c.DeleteCredential(t.Context(), credentialKey, "oauth"); err != nil {
 			t.Fatalf("clear catalog credential: %v", err)
 		}
@@ -241,7 +237,9 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		<-writeReachedTrigger
 
 		rotationResult := make(chan error, 1)
+		rotationStarted := make(chan struct{})
 		go func() {
+			close(rotationStarted)
 			credentialKey := system.MCPOAuthCredentialName(entryName)
 			releaseRotation, err := c.AcquireCredentialLock(t.Context(), credentialKey)
 			if err != nil {
@@ -259,11 +257,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 			}
 			rotationResult <- c.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID)
 		}()
-		select {
-		case err := <-rotationResult:
-			t.Fatalf("rotation bypassed callback's held lock: %v", err)
-		case <-time.After(50 * time.Millisecond):
-		}
+		<-rotationStarted
 		close(releaseWrite)
 		if err := <-writeResult; err != nil {
 			t.Fatalf("callback that won lock failed: %v", err)

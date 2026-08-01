@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	"github.com/obot-platform/obot/pkg/api/handlers/mcpgateway"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -106,6 +108,106 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	wrongCallerReq.SetPathValue("state", started["state"])
 	if err := handler.GetOAuthCredentialTest(wrongCallerReq); err == nil {
 		t.Fatal("wrong caller read static OAuth test status")
+	}
+}
+
+func TestFailedClearLegacyRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
+	const (
+		entryName = "entry-1"
+		mcpID     = "instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	entry := staticOAuthTestEntry(entryName, "default", mcpURL)
+	instance := &v1.MCPServerInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: mcpID, Namespace: system.DefaultNamespace},
+		Spec: v1.MCPServerInstanceSpec{
+			UserID:                    "user-1",
+			MCPServerCatalogEntryName: entryName,
+		},
+	}
+	storageClient := fake.NewClientBuilder().
+		WithScheme(storagescheme.Scheme).
+		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
+		}).
+		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
+		}).
+		WithObjects(
+			&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}},
+			entry,
+			instance,
+		).
+		Build()
+	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
+	if err != nil {
+		t.Fatalf("create storage services: %v", err)
+	}
+	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	if err != nil {
+		t.Fatalf("create gateway database: %v", err)
+	}
+	if err := database.AutoMigrate(); err != nil {
+		t.Fatalf("migrate gateway database: %v", err)
+	}
+	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	t.Cleanup(func() { _ = gateway.Close() })
+	credentialKey := system.MCPOAuthCredentialName(entryName)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: credentialKey, Name: "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+	}); err != nil {
+		t.Fatalf("seed catalog credential: %v", err)
+	}
+	config := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", config,
+		&oauth2.Token{AccessToken: "legacy-access", RefreshToken: "legacy-refresh"}); err != nil {
+		t.Fatalf("seed legacy token: %v", err)
+	}
+
+	newDeleteRequest := func(client storage.Client) api.Context {
+		req := api.Context{
+			Request:        httptest.NewRequest(http.MethodDelete, "/", nil),
+			ResponseWriter: httptest.NewRecorder(),
+			Storage:        client,
+			GatewayClient:  gateway,
+			User:           &user.DefaultInfo{Name: "owner", UID: "user-1"},
+		}
+		req.SetPathValue("catalog_id", "default")
+		req.SetPathValue("entry_id", entryName)
+		return req
+	}
+	handler := &MCPCatalogHandler{gatewayClient: gateway}
+	failedRequest := newDeleteRequest(oauthServerListErrorStorage{Client: storage.Client(storageClient)})
+	if err := handler.DeleteOAuthCredentials(failedRequest); err == nil {
+		t.Fatal("first Clear succeeded despite target list failure")
+	}
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); err != nil {
+		t.Fatalf("failed Clear removed legacy token before retry: %v", err)
+	}
+
+	store := mcpgateway.NewGlobalTokenStore(gateway).ForUserAndMCP("user-1", mcpID)
+	if _, _, err := store.GetTokenConfig(t.Context(), mcpURL); !errors.Is(err, gatewayclient.ErrMCPOAuthCatalogCredentialChanged) {
+		t.Fatalf("legacy refresh after failed Clear error = %v, want credential changed", err)
+	}
+	refreshStarted := make(chan struct{})
+	writeRefresh := make(chan struct{})
+	refreshResult := make(chan error, 1)
+	go func() {
+		close(refreshStarted)
+		<-writeRefresh
+		refreshResult <- store.SetTokenConfig(t.Context(), mcpURL, config, &oauth2.Token{AccessToken: "resurrected-access"})
+	}()
+	<-refreshStarted
+	if err := handler.DeleteOAuthCredentials(newDeleteRequest(storage.Client(storageClient))); err != nil {
+		t.Fatalf("Clear retry failed: %v", err)
+	}
+	close(writeRefresh)
+	if err := <-refreshResult; !errors.Is(err, gatewayclient.ErrMCPOAuthCatalogCredentialChanged) {
+		t.Fatalf("in-flight refresh write error = %v, want credential changed", err)
+	}
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("legacy token resurrected after successful Clear retry: %v", err)
 	}
 }
 

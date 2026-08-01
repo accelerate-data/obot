@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	apitypes "github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/api"
+	apihandlers "github.com/obot-platform/obot/pkg/api/handlers"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -21,6 +25,8 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/user"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -112,6 +118,204 @@ func TestStateManagerFencesCallbackWriteAfterProviderExchange(t *testing.T) {
 	}
 }
 
+func TestStateManagerInfersFenceForLegacyStaticPendingState(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	for _, tc := range []struct {
+		name      string
+		changeApp func(*testing.T, *gateway.Client)
+	}{
+		{
+			name: "rotation wins before legacy callback write",
+			changeApp: func(t *testing.T, client *gateway.Client) {
+				t.Helper()
+				require.NoError(t, changeStaticCatalogApp(t, client, entryName, mcpID, mcpURL, false))
+			},
+		},
+		{
+			name: "clear wins before legacy callback write",
+			changeApp: func(t *testing.T, client *gateway.Client) {
+				t.Helper()
+				require.NoError(t, changeStaticCatalogApp(t, client, entryName, mcpID, mcpURL, true))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newStateManagerTestClient(t, entryName, mcpID)
+			require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+				Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
+				Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+			}))
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				tc.changeApp(t, client)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"access_token":"legacy-access","refresh_token":"legacy-refresh","token_type":"Bearer"}`)
+			}))
+			t.Cleanup(provider.Close)
+			config := &oauth2.Config{
+				ClientID: "client-1", ClientSecret: "secret-1",
+				Endpoint: oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL},
+			}
+			manager := newStateManager(client)
+			// An empty catalog entry models a pending row created before the fence column existed.
+			require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "legacy-state", "verifier-1", config))
+
+			_, _, err := manager.createToken(t.Context(), "legacy-state", "code-1", "", "")
+			require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
+			_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+			require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+			_, err = client.GetMCPOAuthPendingState(t.Context(), "legacy-state")
+			require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		})
+	}
+}
+
+func TestStateManagerLegacyCallbackWinningBeforeAppChangeIsCleaned(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	for _, tc := range []struct {
+		name      string
+		changeApp func(*testing.T, *gateway.Client)
+	}{
+		{
+			name: "rotation cleans completed legacy callback",
+			changeApp: func(t *testing.T, client *gateway.Client) {
+				t.Helper()
+				require.NoError(t, changeStaticCatalogApp(t, client, entryName, mcpID, mcpURL, false))
+			},
+		},
+		{
+			name: "clear cleans completed legacy callback",
+			changeApp: func(t *testing.T, client *gateway.Client) {
+				t.Helper()
+				require.NoError(t, changeStaticCatalogApp(t, client, entryName, mcpID, mcpURL, true))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newStateManagerTestClient(t, entryName, mcpID)
+			require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+				Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
+				Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+			}))
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"access_token":"legacy-access","token_type":"Bearer"}`)
+			}))
+			t.Cleanup(provider.Close)
+			config := &oauth2.Config{
+				ClientID: "client-1", ClientSecret: "secret-1",
+				Endpoint: oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL},
+			}
+			manager := newStateManager(client)
+			require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "legacy-state", "verifier-1", config))
+			_, _, err := manager.createToken(t.Context(), "legacy-state", "code-1", "", "")
+			require.NoError(t, err)
+			stored, err := client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+			require.NoError(t, err)
+			require.Equal(t, entryName, stored.CatalogEntryName)
+
+			tc.changeApp(t, client)
+			_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+			require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+		})
+	}
+}
+
+func TestStateManagerPreservesLegacyDynamicPendingState(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"access_token":"dynamic-access","token_type":"Bearer"}`)
+	}))
+	t.Cleanup(provider.Close)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL},
+	}
+	manager := newStateManager(client)
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "legacy-dynamic", "verifier-1", config))
+	_, _, err := manager.createToken(t.Context(), "legacy-dynamic", "code-1", "", "")
+	require.NoError(t, err)
+	stored, err := client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.NoError(t, err)
+	require.Equal(t, "dynamic-access", stored.AccessToken)
+	require.Empty(t, stored.CatalogEntryName)
+}
+
+func changeStaticCatalogApp(t *testing.T, gatewayClient *gateway.Client, entryName, mcpID, mcpURL string, clearCredential bool) error {
+	t.Helper()
+	entry := &v1.MCPServerCatalogEntry{
+		ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
+		Spec: v1.MCPServerCatalogEntrySpec{
+			MCPCatalogName: "default",
+			Manifest: apitypes.MCPServerCatalogEntryManifest{
+				RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL, StaticOAuthRequired: true},
+			},
+		},
+	}
+	instance := &v1.MCPServerInstance{
+		ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
+		Spec: v1.MCPServerInstanceSpec{
+			UserID:                    "user-1",
+			MCPServerCatalogEntryName: entryName,
+		},
+	}
+	storageClient := clientfake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object kclient.Object) []string {
+			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
+		}).
+		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object kclient.Object) []string {
+			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
+		}).
+		WithObjects(
+			&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: "default"}},
+			entry,
+			instance,
+		).
+		Build()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodDelete, "/", nil)
+	if !clearCredential {
+		proof, err := gatewayClient.CreateMCPStaticOAuthTest(t.Context(), "user-1", entryName, mcpURL, "verifier", &oauth2.Config{
+			ClientID: "client-1", ClientSecret: "secret-2",
+		})
+		if err != nil {
+			return err
+		}
+		if err := gatewayClient.CompleteMCPStaticOAuthTest(t.Context(), proof, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
+			return err
+		}
+		request = httptest.NewRequest(http.MethodPut, "/", strings.NewReader(fmt.Sprintf(`{"clientID":"client-1","clientSecret":"secret-2","proof":%q}`, proof)))
+	}
+	req := api.Context{
+		Request:        request,
+		ResponseWriter: recorder,
+		Storage:        storage.Client(storageClient),
+		GatewayClient:  gatewayClient,
+		User:           &user.DefaultInfo{Name: "owner", UID: "user-1"},
+	}
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entryName)
+	handler := apihandlers.NewMCPCatalogHandler("", "https://obot.example", "", nil, nil, gatewayClient, nil, "")
+	if clearCredential {
+		return handler.DeleteOAuthCredentials(req)
+	}
+	return handler.ReplaceOAuthCredentials(req)
+}
+
 func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.T) {
 	const (
 		entryName = "catalog-entry-1"
@@ -129,7 +333,7 @@ func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.
 			&v1.MCPServerCatalogEntry{
 				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
-					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL},
+					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL, StaticOAuthRequired: true},
 				}},
 			},
 		).
@@ -170,6 +374,11 @@ func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.
 
 func newStateManagerTestClient(t *testing.T, entryName, mcpID string) *gateway.Client {
 	t.Helper()
+	return newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, true)
+}
+
+func newStateManagerTestClientWithStaticRequirement(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) *gateway.Client {
+	t.Helper()
 	storage := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(
@@ -180,7 +389,7 @@ func newStateManagerTestClient(t *testing.T, entryName, mcpID string) *gateway.C
 			&v1.MCPServerCatalogEntry{
 				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
-					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api"},
+					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api", StaticOAuthRequired: staticOAuthRequired},
 				}},
 			},
 		).

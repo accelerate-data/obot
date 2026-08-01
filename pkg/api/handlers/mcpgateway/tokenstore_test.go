@@ -52,7 +52,7 @@ func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client := newCatalogTokenStoreTestClient(t, entryName, mcpID)
+			client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)
 			require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
 				Context: system.MCPOAuthCredentialName(entryName),
 				Name:    "oauth",
@@ -88,7 +88,7 @@ func TestTokenStoreInfersFenceForLegacyCatalogGrant(t *testing.T) {
 		mcpID     = "mcp-instance-1"
 		mcpURL    = "https://mcp.example/api"
 	)
-	client := newCatalogTokenStoreTestClient(t, entryName, mcpID)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)
 	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: system.MCPOAuthCredentialName(entryName),
 		Name:    "oauth",
@@ -114,7 +114,58 @@ func TestTokenStoreInfersFenceForLegacyCatalogGrant(t *testing.T) {
 	require.True(t, errors.Is(err, gorm.ErrRecordNotFound))
 }
 
-func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string) *gateway.Client {
+func TestTokenStoreRejectsLegacyStaticGrantLeftByFailedClear(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)
+	config := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+	}))
+	require.NoError(t, client.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", config,
+		&oauth2.Token{AccessToken: "legacy-access", RefreshToken: "legacy-refresh"}))
+
+	// Clear removed the shared app, then target discovery failed before it could delete this legacy token.
+	deleted, err := client.DeleteCredential(t.Context(), system.MCPOAuthCredentialName(entryName), "oauth")
+	require.NoError(t, err)
+	require.True(t, deleted)
+	store := &tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}
+	_, _, err = store.GetTokenConfig(t.Context(), mcpURL)
+	require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
+
+	// A successful Clear retry deletes the leftover row while a stale refresh result is ready to write.
+	require.NoError(t, client.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID))
+	err = store.SetTokenConfig(t.Context(), mcpURL, config, &oauth2.Token{AccessToken: "resurrected-access"})
+	require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
+	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestTokenStorePreservesLegacyDynamicGrantRefresh(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, false)
+	config := &oauth2.Config{ClientID: "dynamic-client", ClientSecret: "dynamic-secret"}
+	require.NoError(t, client.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", config,
+		&oauth2.Token{AccessToken: "old-dynamic", RefreshToken: "dynamic-refresh"}))
+	store := &tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}
+	loadedConfig, _, err := store.GetTokenConfig(t.Context(), mcpURL)
+	require.NoError(t, err)
+	require.NoError(t, store.SetTokenConfig(t.Context(), mcpURL, loadedConfig,
+		&oauth2.Token{AccessToken: "new-dynamic", RefreshToken: "dynamic-refresh"}))
+	stored, err := client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.NoError(t, err)
+	require.Equal(t, "new-dynamic", stored.AccessToken)
+}
+
+func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) *gateway.Client {
 	t.Helper()
 	storage := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
@@ -126,7 +177,7 @@ func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string) *gate
 			&v1.MCPServerCatalogEntry{
 				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
-					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api"},
+					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api", StaticOAuthRequired: staticOAuthRequired},
 				}},
 			},
 		).

@@ -109,9 +109,29 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx context.Cont
 	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, oauthConf, token)
 }
 
+// CatalogEntryForStaticOAuthMCP recovers the fence identity for OAuth state
+// rows created before catalog entry identity was persisted.
+func (c *Client) CatalogEntryForStaticOAuthMCP(ctx context.Context, mcpID, url string) (string, error) {
+	entryName, err := c.mcpCatalogEntryName(ctx, mcpID)
+	if err != nil {
+		return "", ErrMCPOAuthCatalogCredentialChanged
+	}
+	entry, err := c.mcpCatalogEntry(ctx, entryName)
+	if err != nil || entry.Spec.Manifest.RemoteConfig == nil {
+		return "", ErrMCPOAuthCatalogCredentialChanged
+	}
+	if !entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+		return "", nil
+	}
+	if !secureStringEqual(entry.Spec.Manifest.RemoteConfig.FixedURL, url) {
+		return "", ErrMCPOAuthCatalogCredentialChanged
+	}
+	return entryName, nil
+}
+
 // CatalogEntryForCurrentOAuthCredential identifies a legacy grant that uses
-// the static app which is active for its MCP. A present but different app makes
-// the grant stale; no configured static app means the grant is dynamic.
+// the static app which is active for its MCP. Static-required entries fail
+// closed; optional entries without an app preserve dynamic registration.
 func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, userID, mcpID, url string, oauthConf *oauth2.Config) (string, error) {
 	entryName, err := c.mcpCatalogEntryName(ctx, mcpID)
 	if err != nil {
@@ -126,8 +146,8 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 		return "", fmt.Errorf("failed to coordinate catalog OAuth token read: %w", err)
 	}
 	defer release()
-	currentURL, err := c.mcpCatalogEntryURL(ctx, entryName)
-	if err != nil || !secureStringEqual(currentURL, url) {
+	entry, err := c.mcpCatalogEntry(ctx, entryName)
+	if err != nil || entry.Spec.Manifest.RemoteConfig == nil || !secureStringEqual(entry.Spec.Manifest.RemoteConfig.FixedURL, url) {
 		return "", ErrMCPOAuthCatalogCredentialChanged
 	}
 	if _, err := c.GetMCPOAuthToken(ctx, userID, mcpID, url); err != nil {
@@ -140,6 +160,9 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 	if err != nil {
 		var notFound CredentialNotFoundError
 		if errors.As(err, &notFound) {
+			if entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+				return "", ErrMCPOAuthCatalogCredentialChanged
+			}
 			return "", nil
 		}
 		return "", err
@@ -203,14 +226,22 @@ func (c *Client) mcpCatalogEntryName(ctx context.Context, mcpID string) (string,
 }
 
 func (c *Client) mcpCatalogEntryURL(ctx context.Context, entryName string) (string, error) {
-	var entry v1.MCPServerCatalogEntry
-	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: entryName}, &entry); err != nil {
+	entry, err := c.mcpCatalogEntry(ctx, entryName)
+	if err != nil {
 		return "", err
 	}
 	if entry.Spec.Manifest.RemoteConfig == nil {
 		return "", fmt.Errorf("catalog entry has no remote configuration")
 	}
 	return entry.Spec.Manifest.RemoteConfig.FixedURL, nil
+}
+
+func (c *Client) mcpCatalogEntry(ctx context.Context, entryName string) (*v1.MCPServerCatalogEntry, error) {
+	var entry v1.MCPServerCatalogEntry
+	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: entryName}, &entry); err != nil {
+		return nil, err
+	}
+	return &entry, nil
 }
 
 func (c *Client) DeleteMCPOAuthTokenForURL(ctx context.Context, userID, mcpID, mcpURL string) error {

@@ -172,7 +172,17 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return fmt.Errorf("failed to exchange OAuth code: %w", err)
 	}
 
-	if err := req.GatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", pendingState.CatalogEntryName, conf, token); err != nil {
+	catalogEntryName := pendingState.CatalogEntryName
+	if catalogEntryName == "" {
+		catalogEntryName, err = req.GatewayClient.CatalogEntryForStaticOAuthMCP(req.Context(), server.Name, serverConfig.URL)
+		if err != nil {
+			if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
+				_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
+			}
+			return err
+		}
+	}
+	if err := req.GatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", catalogEntryName, conf, token); err != nil {
 		if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
 			_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
 		}

@@ -85,8 +85,15 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2
 
 func (t *tokenStore) SetTokenConfig(ctx context.Context, mcpURL string, config *oauth2.Config, token *oauth2.Token) error {
 	t.mu.Lock()
-	catalogEntryName := t.catalogEntry[mcpURL]
+	catalogEntryName, captured := t.catalogEntry[mcpURL]
 	t.mu.Unlock()
+	if !captured {
+		var err error
+		catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, config)
+		if err != nil {
+			return err
+		}
+	}
 	return t.gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, t.userID, t.mcpID, mcpURL, "", catalogEntryName, config, token)
 }
 
