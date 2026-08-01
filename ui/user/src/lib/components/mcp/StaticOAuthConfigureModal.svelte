@@ -29,7 +29,7 @@
 		onStartTest: (
 			credentials: MCPServerOAuthCredentialTestRequest
 		) => Promise<MCPServerOAuthCredentialTestStart>;
-		onGetTest: (state: string) => Promise<MCPServerOAuthCredentialTestResult>;
+		onGetTest: (testState: string) => Promise<MCPServerOAuthCredentialTestResult>;
 		onSave: (credentials: {
 			clientID: string;
 			clientSecret: string;
@@ -154,7 +154,7 @@
 			await poll(
 				async () => {
 					if (generation !== testGeneration) return true;
-					const result = await onGetTest(started.state);
+					const result = await onGetTest(started.testState);
 					if (result.status === 'pending') {
 						if (!popup.closed) return false;
 						credentialTest = failStaticOAuthCredentialTest(credentialTest, 'popup_closed');
@@ -162,9 +162,14 @@
 						return true;
 					}
 					if (result.status === 'succeeded') {
+						if (!result.proof) {
+							credentialTest = failStaticOAuthCredentialTest(credentialTest, 'invalid_test_result');
+							error = credentialTestFailureMessage('invalid_test_result');
+							return true;
+						}
 						credentialTest = succeedStaticOAuthCredentialTest(
 							credentialTest,
-							started.state,
+							result.proof,
 							result.expiresAt
 						);
 						if (credentialTest.status !== 'succeeded') {
@@ -218,13 +223,6 @@
 		showRequired = false;
 		error = undefined;
 
-		// Credentials cannot be updated once configured - must delete and recreate
-		if (oauthStatus?.configured) {
-			error = 'Credentials already configured. Clear credentials first to change them.';
-			return;
-		}
-
-		// Initial setup: Validate all required fields
 		if (!form.clientID.trim()) {
 			showRequired = true;
 			return;
@@ -303,8 +301,8 @@
 
 		{#if oauthStatus?.configured}
 			<p class="text-muted-content text-sm font-light">
-				OAuth credentials are configured. To change the client ID or secret, clear the credentials
-				and re-enter all values.
+				Test replacement credentials before saving. The active app and user grants remain usable
+				unless the tested replacement is saved successfully.
 			</p>
 		{:else}
 			<p class="text-muted-content text-sm font-light">
@@ -322,9 +320,7 @@
 					bind:value={form.clientID}
 					class="text-input-filled"
 					class:error={showRequired && !form.clientID}
-					class:opacity-60={oauthStatus?.configured}
 					placeholder="your-client-id"
-					readonly={oauthStatus?.configured}
 					oninput={handleCredentialInput}
 				/>
 			</div>
@@ -337,10 +333,8 @@
 					name="clientSecret"
 					bind:value={form.clientSecret}
 					error={showRequired && !form.clientSecret}
-					placeholder={oauthStatus?.configured ? '••••••••' : 'your-client-secret'}
-					readonly={oauthStatus?.configured}
+					placeholder="your-client-secret"
 					oninput={handleCredentialInput}
-					classes={{ input: oauthStatus?.configured ? 'opacity-60' : '' }}
 				/>
 			</div>
 
@@ -380,45 +374,43 @@
 			<div></div>
 		{/if}
 
-		{#if !oauthStatus?.configured}
-			<div class="flex flex-wrap gap-2">
-				{#if showSkip}
-					<button type="button" class="btn btn-secondary" onclick={handleSkip} disabled={loading}>
-						Skip
-					</button>
+		<div class="flex flex-wrap gap-2">
+			{#if showSkip && !oauthStatus?.configured}
+				<button type="button" class="btn btn-secondary" onclick={handleSkip} disabled={loading}>
+					Skip
+				</button>
+			{/if}
+			<button type="button" class="btn btn-secondary" onclick={handleCancel} disabled={loading}>
+				Cancel
+			</button>
+			<button
+				type="button"
+				class="btn btn-secondary"
+				onclick={handleTest}
+				disabled={loading || testing}
+			>
+				{#if testing}
+					<Loading class="size-4" />
+				{:else}
+					<ExternalLink class="size-4" />
+					Test Credentials
 				{/if}
-				<button type="button" class="btn btn-secondary" onclick={handleCancel} disabled={loading}>
-					Cancel
-				</button>
-				<button
-					type="button"
-					class="btn btn-secondary"
-					onclick={handleTest}
-					disabled={loading || testing}
-				>
-					{#if testing}
-						<Loading class="size-4" />
-					{:else}
-						<ExternalLink class="size-4" />
-						Test Credentials
-					{/if}
-				</button>
-				<button
-					type="button"
-					class="btn btn-primary"
-					onclick={handleSave}
-					disabled={loading ||
-						testing ||
-						!canSaveStaticOAuthCredentials(credentialTest, form.clientID, form.clientSecret)}
-				>
-					{#if loading}
-						<Loading class="size-4" />
-					{:else}
-						Save
-					{/if}
-				</button>
-			</div>
-		{/if}
+			</button>
+			<button
+				type="button"
+				class="btn btn-primary"
+				onclick={handleSave}
+				disabled={loading ||
+					testing ||
+					!canSaveStaticOAuthCredentials(credentialTest, form.clientID, form.clientSecret)}
+			>
+				{#if loading}
+					<Loading class="size-4" />
+				{:else}
+					{oauthStatus?.configured ? 'Replace Credentials' : 'Save'}
+				{/if}
+			</button>
+		</div>
 	</div>
 </ResponsiveDialog>
 

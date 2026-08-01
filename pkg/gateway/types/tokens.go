@@ -47,7 +47,7 @@ type MCPOAuthToken struct {
 	MCPID              string `gorm:"primaryKey"`
 	UserID             string `gorm:"primaryKey"`
 	URL                string
-	CatalogEntryName   string
+	CatalogEntryName   string `gorm:"index:idx_mcp_oauth_token_catalog_entry"`
 	OAuthAuthRequestID string `gorm:"index"`
 	AccessToken        string
 	TokenType          string
@@ -63,7 +63,7 @@ type MCPOAuthPendingState struct {
 	State                          string
 	Verifier                       string
 	UserID                         string `gorm:"index:idx_pending_user_mcp"`
-	MCPID                          string `gorm:"index:idx_pending_user_mcp"`
+	MCPID                          string `gorm:"index:idx_pending_user_mcp;index:idx_pending_mcp_static_test,priority:1"`
 	URL                            string
 	CatalogEntryName               string
 	OAuthAuthRequestID             string
@@ -74,10 +74,13 @@ type MCPOAuthPendingState struct {
 	AuthStyle                      oauth2.AuthStyle
 	RedirectURL                    string
 	Scopes                         string
-	StaticOAuthTest                bool
+	StaticOAuthTest                bool   `gorm:"index:idx_pending_mcp_static_test,priority:2"`
+	StaticOAuthTestStateHash       string `gorm:"index"`
 	StaticOAuthTestStatus          apitypes.MCPStaticOAuthTestStatus
 	StaticOAuthTestFailureCategory apitypes.MCPStaticOAuthTestFailureCategory
 	StaticOAuthTestCompletedAt     time.Time
+	StaticOAuthSaveProofHash       string `gorm:"index"`
+	StaticOAuthSaveProof           string
 	Encrypted                      bool
 	CreatedAt                      time.Time
 }

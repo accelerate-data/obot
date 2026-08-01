@@ -84,15 +84,15 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	}
 
 	verifier := oauth2.GenerateVerifier()
-	state, err := h.gatewayClient.CreateMCPStaticOAuthTest(req.Context(), req.User.GetUID(), entry.Name, fixedURL, verifier, conf)
+	started, err := h.gatewayClient.CreateMCPStaticOAuthTest(req.Context(), req.User.GetUID(), entry.Name, fixedURL, verifier, conf)
 	if err != nil {
 		return errors.New("failed to create static OAuth credential test")
 	}
-	oauthURL, err := nmcp.AuthCodeURL(conf, authorizationServer.AuthorizationEndpoint, fixedURL, state, verifier)
+	oauthURL, err := nmcp.AuthCodeURL(conf, authorizationServer.AuthorizationEndpoint, fixedURL, started.CallbackState, verifier)
 	if err != nil {
 		return errors.New("failed to create static OAuth authorization URL")
 	}
-	return req.Write(types.MCPServerOAuthCredentialTestStart{State: state, OAuthURL: oauthURL})
+	return req.Write(types.MCPServerOAuthCredentialTestStart{TestState: started.TestState, OAuthURL: oauthURL})
 }
 
 // GetOAuthCredentialTest returns only the caller- and entry-bound safe verification status.
@@ -105,11 +105,11 @@ func (h *MCPCatalogHandler) GetOAuthCredentialTest(req api.Context) error {
 	if err := req.Read(&statusRequest); err != nil {
 		return err
 	}
-	statusRequest.State = strings.TrimSpace(statusRequest.State)
-	if statusRequest.State == "" {
-		return types.NewErrBadRequest("state is required")
+	statusRequest.TestState = strings.TrimSpace(statusRequest.TestState)
+	if statusRequest.TestState == "" {
+		return types.NewErrBadRequest("testState is required")
 	}
-	result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), statusRequest.State, req.User.GetUID(), entry.Name)
+	result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), statusRequest.TestState, req.User.GetUID(), entry.Name)
 	if errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
 		return types.NewErrBadRequest("invalid or expired OAuth credential test")
 	} else if err != nil {

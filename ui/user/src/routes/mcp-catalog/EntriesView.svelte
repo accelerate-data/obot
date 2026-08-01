@@ -223,18 +223,17 @@
 		proof: string;
 	}) {
 		if (!oauthConfigEntry) return;
+		const replacing = oauthStatus?.configured === true;
 		if (oauthConfigEntry.powerUserWorkspaceID) {
-			await UserService.setWorkspaceMCPCatalogEntryOAuthCredentials(
-				oauthConfigEntry.powerUserWorkspaceID,
-				oauthConfigEntry.id,
-				credentials
-			);
+			const save = replacing
+				? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
+				: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
+			await save(oauthConfigEntry.powerUserWorkspaceID, oauthConfigEntry.id, credentials);
 		} else {
-			await AdminService.setMCPCatalogEntryOAuthCredentials(
-				'default',
-				oauthConfigEntry.id,
-				credentials
-			);
+			const save = replacing
+				? AdminService.replaceMCPCatalogEntryOAuthCredentials
+				: AdminService.setMCPCatalogEntryOAuthCredentials;
+			await save('default', oauthConfigEntry.id, credentials);
 		}
 		// Refresh the table to update status
 		mcpServersAndEntries.refreshAll();

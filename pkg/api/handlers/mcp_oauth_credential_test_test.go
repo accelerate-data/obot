@@ -61,8 +61,8 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	if err := json.Unmarshal(startRecorder.Body.Bytes(), &started); err != nil {
 		t.Fatalf("decode start response: %v", err)
 	}
-	if len(started) != 2 || started["state"] == "" || started["oauthURL"] == "" {
-		t.Fatalf("start response = %#v, want only state and oauthURL", started)
+	if len(started) != 2 || started["testState"] == "" || started["oauthURL"] == "" {
+		t.Fatalf("start response = %#v, want only testState and oauthURL", started)
 	}
 	for _, sensitive := range []string{"static-secret", provider.URL + "/token"} {
 		if strings.Contains(startRecorder.Body.String(), sensitive) {
@@ -80,6 +80,9 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	if authURL.Query().Get("code_challenge") == "" || authURL.Query().Get("code_challenge_method") != "S256" {
 		t.Fatalf("OAuth URL does not require PKCE: %s", authURL.RawQuery)
 	}
+	if authURL.Query().Get("state") == "" || authURL.Query().Get("state") == started["testState"] {
+		t.Fatalf("callback state was missing or reused the body-only test state: %s", authURL.RawQuery)
+	}
 	authResponse, err := http.Get(started["oauthURL"])
 	if err != nil {
 		t.Fatalf("open provider authorization URL: %v", err)
@@ -90,7 +93,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	}
 
 	statusRecorder := httptest.NewRecorder()
-	statusReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["state"]), statusRecorder, gateway,
+	statusReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["testState"]), statusRecorder, gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 	statusReq.SetPathValue("catalog_id", "default")
 	statusReq.SetPathValue("entry_id", entry.Name)
@@ -110,7 +113,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 		}
 	}
 
-	wrongCallerReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["state"]), httptest.NewRecorder(), gateway,
+	wrongCallerReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["testState"]), httptest.NewRecorder(), gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 	wrongCallerReq.User = &user.DefaultInfo{Name: "other", UID: "user-2"}
 	wrongCallerReq.SetPathValue("catalog_id", "default")
@@ -275,11 +278,11 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 			gateway := newOAuthCredentialTestGatewayClient(t)
 			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 			state := pendingStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
-			if err := gateway.CompleteMCPStaticOAuthTest(t.Context(), state, tt.status, tt.failure); err != nil {
+			if err := gateway.CompleteMCPStaticOAuthTest(t.Context(), state.CallbackState, tt.status, tt.failure); err != nil {
 				t.Fatalf("complete proof: %v", err)
 			}
 			recorder := httptest.NewRecorder()
-			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state), recorder, gateway,
+			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state.TestState), recorder, gateway,
 				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
@@ -305,7 +308,7 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 	entryOne := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	entryTwo := staticOAuthTestEntry("entry-2", "default", "https://mcp.example/api")
 	state := pendingStaticOAuthCredentialProof(t, gateway, entryOne.Name, entryOne.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
-	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state), httptest.NewRecorder(), gateway,
+	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state.TestState), httptest.NewRecorder(), gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entryTwo)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entryTwo.Name)
@@ -325,7 +328,7 @@ func TestGetOAuthCredentialTestProjectsExpiredStatusAtHandlerBoundary(t *testing
 	}
 
 	recorder := httptest.NewRecorder()
-	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state), recorder, gateway,
+	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state.TestState), recorder, gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
@@ -356,11 +359,18 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 			name: "consumed",
 			prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
 				t.Helper()
-				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
-				if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
-					t.Fatalf("consume proof: %v", err)
+				started := pendingStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				if err := gateway.CompleteMCPStaticOAuthTest(t.Context(), started.CallbackState, types.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
+					t.Fatalf("complete proof: %v", err)
 				}
-				return proof
+				result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), started.TestState, "user-1", entry.Name)
+				if err != nil {
+					t.Fatalf("read proof: %v", err)
+				}
+				if err := gateway.CommitMCPStaticOAuthCredential(t.Context(), result.Proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", false); err != nil {
+					t.Fatalf("consume proof through commit: %v", err)
+				}
+				return started.TestState
 			},
 		},
 	} {
@@ -416,7 +426,7 @@ func newStaticOAuthTestRequest(t *testing.T, method, target, body string, record
 
 func staticOAuthStatusBody(t *testing.T, state string) string {
 	t.Helper()
-	body, err := json.Marshal(types.MCPServerOAuthCredentialTestStatusRequest{State: state})
+	body, err := json.Marshal(types.MCPServerOAuthCredentialTestStatusRequest{TestState: state})
 	if err != nil {
 		t.Fatalf("marshal status request: %v", err)
 	}

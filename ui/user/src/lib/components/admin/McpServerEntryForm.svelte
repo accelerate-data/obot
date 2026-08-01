@@ -1510,10 +1510,17 @@
 	}}
 	onSave={async (credentials) => {
 		if (!entry || !id) return;
+		const replacing = staticOauthStatus?.configured === true;
 		if (entity === 'workspace') {
-			await UserService.setWorkspaceMCPCatalogEntryOAuthCredentials(id, entry.id, credentials);
+			const save = replacing
+				? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
+				: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
+			await save(id, entry.id, credentials);
 		} else {
-			await AdminService.setMCPCatalogEntryOAuthCredentials(id, entry.id, credentials);
+			const save = replacing
+				? AdminService.replaceMCPCatalogEntryOAuthCredentials
+				: AdminService.setMCPCatalogEntryOAuthCredentials;
+			await save(id, entry.id, credentials);
 		}
 		staticOauthStatus = {
 			...staticOauthStatus,

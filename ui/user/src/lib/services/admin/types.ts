@@ -885,12 +885,13 @@ export interface MCPServerOAuthCredentialRequest {
 }
 export type MCPServerOAuthCredentialTestRequest = Omit<MCPServerOAuthCredentialRequest, 'proof'>;
 export interface MCPServerOAuthCredentialTestStart {
-	state: string;
+	testState: string;
 	oauthURL: string;
 }
 export interface MCPServerOAuthCredentialTestResult {
 	status: 'pending' | 'succeeded' | 'failed';
 	expiresAt: string;
+	proof?: string;
 	failureCategory?:
 		| 'authorization_denied'
 		| 'invalid_callback'

@@ -44,6 +44,11 @@ var (
 
 const mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
 
+type MCPStaticOAuthTestStart struct {
+	CallbackState string
+	TestState     string
+}
+
 func (c *Client) GetMCPOAuthToken(ctx context.Context, userID, mcpID, url string) (*types.MCPOAuthToken, error) {
 	var tokens []types.MCPOAuthToken
 	err := c.db.WithContext(ctx).Where("mcp_id = ? AND user_id = ?", mcpID, userID).Find(&tokens).Error
@@ -311,42 +316,51 @@ func (c *Client) triggerMCPOAuthTokenChange(ctx context.Context, mcpID string) e
 
 // Pending state methods
 
-func (c *Client) CreateMCPStaticOAuthTest(ctx context.Context, userID, mcpID, mcpURL, verifier string, oauthConf *oauth2.Config) (string, error) {
-	state := strings.ToLower(rand.Text())
+func (c *Client) CreateMCPStaticOAuthTest(ctx context.Context, userID, mcpID, mcpURL, verifier string, oauthConf *oauth2.Config) (MCPStaticOAuthTestStart, error) {
+	start := MCPStaticOAuthTestStart{
+		CallbackState: strings.ToLower(rand.Text()),
+		TestState:     strings.ToLower(rand.Text()),
+	}
 	ps := &types.MCPOAuthPendingState{
-		HashedState:           fmt.Sprintf("%x", sha256.Sum256([]byte(state))),
-		State:                 state,
-		Verifier:              verifier,
-		UserID:                userID,
-		MCPID:                 mcpID,
-		URL:                   mcpURL,
-		ClientID:              oauthConf.ClientID,
-		ClientSecret:          oauthConf.ClientSecret,
-		AuthURL:               oauthConf.Endpoint.AuthURL,
-		TokenURL:              oauthConf.Endpoint.TokenURL,
-		AuthStyle:             oauthConf.Endpoint.AuthStyle,
-		RedirectURL:           oauthConf.RedirectURL,
-		Scopes:                strings.Join(oauthConf.Scopes, " "),
-		StaticOAuthTest:       true,
-		StaticOAuthTestStatus: apitypes.MCPStaticOAuthTestStatusPending,
+		HashedState:              hashMCPStaticOAuthValue(start.CallbackState),
+		State:                    start.CallbackState,
+		StaticOAuthTestStateHash: hashMCPStaticOAuthValue(start.TestState),
+		Verifier:                 verifier,
+		UserID:                   userID,
+		MCPID:                    mcpID,
+		URL:                      mcpURL,
+		ClientID:                 oauthConf.ClientID,
+		ClientSecret:             oauthConf.ClientSecret,
+		AuthURL:                  oauthConf.Endpoint.AuthURL,
+		TokenURL:                 oauthConf.Endpoint.TokenURL,
+		AuthStyle:                oauthConf.Endpoint.AuthStyle,
+		RedirectURL:              oauthConf.RedirectURL,
+		Scopes:                   strings.Join(oauthConf.Scopes, " "),
+		StaticOAuthTest:          true,
+		StaticOAuthTestStatus:    apitypes.MCPStaticOAuthTestStatusPending,
 	}
 
 	if err := c.encryptMCPOAuthPendingState(ctx, ps); err != nil {
-		return "", fmt.Errorf("failed to encrypt static OAuth test: %w", err)
+		return MCPStaticOAuthTestStart{}, fmt.Errorf("failed to encrypt static OAuth test: %w", err)
 	}
 	if err := c.db.WithContext(ctx).Create(ps).Error; err != nil {
-		return "", err
+		return MCPStaticOAuthTestStart{}, err
 	}
-	return state, nil
+	return start, nil
 }
 
-func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID, mcpID string) (apitypes.MCPStaticOAuthTestResult, error) {
-	ps, err := c.GetMCPOAuthPendingState(ctx, state)
-	if err != nil {
+func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, testState, userID, mcpID string) (apitypes.MCPStaticOAuthTestResult, error) {
+	var ps types.MCPOAuthPendingState
+	if err := c.db.WithContext(ctx).
+		Where("static_o_auth_test_state_hash = ?", hashMCPStaticOAuthValue(testState)).
+		First(&ps).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return apitypes.MCPStaticOAuthTestResult{}, ErrMCPStaticOAuthTestInvalid
 		}
 		return apitypes.MCPStaticOAuthTestResult{}, err
+	}
+	if err := c.decryptMCPOAuthPendingState(ctx, &ps); err != nil {
+		return apitypes.MCPStaticOAuthTestResult{}, fmt.Errorf("failed to decrypt static OAuth test: %w", err)
 	}
 	if !ps.StaticOAuthTest || !secureStringEqual(ps.UserID, userID) || !secureStringEqual(ps.MCPID, mcpID) {
 		return apitypes.MCPStaticOAuthTestResult{}, ErrMCPStaticOAuthTestInvalid
@@ -366,6 +380,7 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID,
 	return apitypes.MCPStaticOAuthTestResult{
 		Status:          status,
 		FailureCategory: ps.StaticOAuthTestFailureCategory,
+		Proof:           ps.StaticOAuthSaveProof,
 		ExpiresAt:       apitypes.Time{Time: expiresAt},
 	}, nil
 }
@@ -392,24 +407,37 @@ func (c *Client) CompleteMCPStaticOAuthTest(ctx context.Context, state string, s
 		return ErrMCPStaticOAuthTestInvalid
 	}
 
-	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	hashedState := hashMCPStaticOAuthValue(state)
 	completedAt := time.Now()
-	result := c.db.WithContext(ctx).
-		Model(&types.MCPOAuthPendingState{}).
-		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status IN ? AND created_at >= ?", hashedState, true, []apitypes.MCPStaticOAuthTestStatus{apitypes.MCPStaticOAuthTestStatusPending, mcpStaticOAuthTestStatusClaimed}, completedAt.Add(-pendingStateTTL)).
-		Select("StaticOAuthTestStatus", "StaticOAuthTestFailureCategory", "StaticOAuthTestCompletedAt").
-		Updates(&types.MCPOAuthPendingState{
-			StaticOAuthTestStatus:          status,
-			StaticOAuthTestFailureCategory: failureCategory,
-			StaticOAuthTestCompletedAt:     completedAt,
-		})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
-		return ErrMCPStaticOAuthTestInvalid
-	}
-	return nil
+	return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var pending types.MCPOAuthPendingState
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status IN ? AND created_at >= ?", hashedState, true, []apitypes.MCPStaticOAuthTestStatus{apitypes.MCPStaticOAuthTestStatusPending, mcpStaticOAuthTestStatusClaimed}, completedAt.Add(-pendingStateTTL)).
+			First(&pending).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrMCPStaticOAuthTestInvalid
+			}
+			return err
+		}
+
+		updates := map[string]any{
+			"static_o_auth_test_status":           status,
+			"static_o_auth_test_failure_category": failureCategory,
+			"static_o_auth_test_completed_at":     completedAt,
+			"static_o_auth_save_proof":            "",
+			"static_o_auth_save_proof_hash":       "",
+		}
+		if status == apitypes.MCPStaticOAuthTestStatusSucceeded {
+			saveProof := strings.ToLower(rand.Text())
+			encryptedProof, err := c.encryptMCPStaticOAuthSaveProof(ctx, &pending, saveProof)
+			if err != nil {
+				return fmt.Errorf("failed to encrypt static OAuth save proof: %w", err)
+			}
+			updates["static_o_auth_save_proof"] = encryptedProof
+			updates["static_o_auth_save_proof_hash"] = hashMCPStaticOAuthValue(saveProof)
+		}
+		return tx.Model(&pending).Updates(updates).Error
+	})
 }
 
 func validMCPStaticOAuthTestCompletion(status apitypes.MCPStaticOAuthTestStatus, failureCategory apitypes.MCPStaticOAuthTestFailureCategory) bool {
@@ -427,42 +455,6 @@ func validMCPStaticOAuthTestCompletion(status apitypes.MCPStaticOAuthTestStatus,
 	default:
 		return false
 	}
-}
-
-func (c *Client) ConsumeMCPStaticOAuthTest(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string) error {
-	ps, err := c.GetMCPOAuthPendingState(ctx, state)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return ErrMCPStaticOAuthTestInvalid
-		}
-		return err
-	}
-	if !ps.StaticOAuthTest ||
-		ps.StaticOAuthTestStatus != apitypes.MCPStaticOAuthTestStatusSucceeded ||
-		time.Since(ps.CreatedAt) >= pendingStateTTL ||
-		!secureStringEqual(ps.UserID, userID) ||
-		!secureStringEqual(ps.MCPID, mcpID) ||
-		!secureStringEqual(ps.URL, mcpURL) ||
-		!secureStringEqual(ps.ClientID, clientID) ||
-		!secureStringEqual(ps.ClientSecret, clientSecret) {
-		return ErrMCPStaticOAuthTestInvalid
-	}
-
-	result := c.db.WithContext(ctx).Delete(
-		&types.MCPOAuthPendingState{},
-		"hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?",
-		ps.HashedState,
-		true,
-		apitypes.MCPStaticOAuthTestStatusSucceeded,
-		time.Now().Add(-pendingStateTTL),
-	)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected != 1 {
-		return ErrMCPStaticOAuthTestInvalid
-	}
-	return nil
 }
 
 // CommitMCPStaticOAuthCredential validates and consumes an exact successful
@@ -484,12 +476,12 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 		return fmt.Errorf("failed to encrypt credential: %w", err)
 	}
 
-	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	hashedProof := hashMCPStaticOAuthValue(state)
 	var changedMCPIDs []string
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var proof types.MCPOAuthPendingState
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("hashed_state = ?", hashedState).
+			Where("static_o_auth_save_proof_hash = ?", hashedProof).
 			First(&proof).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrMCPStaticOAuthTestInvalid
@@ -506,7 +498,8 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 			!secureStringEqual(proof.MCPID, mcpID) ||
 			!secureStringEqual(proof.URL, mcpURL) ||
 			!secureStringEqual(proof.ClientID, clientID) ||
-			!secureStringEqual(proof.ClientSecret, clientSecret) {
+			!secureStringEqual(proof.ClientSecret, clientSecret) ||
+			!secureStringEqual(proof.StaticOAuthSaveProof, state) {
 			return ErrMCPStaticOAuthTestInvalid
 		}
 		if replace {
@@ -858,15 +851,18 @@ func (c *Client) encryptMCPOAuthPendingState(ctx context.Context, ps *types.MCPO
 }
 
 func (c *Client) decryptMCPOAuthPendingState(ctx context.Context, ps *types.MCPOAuthPendingState) error {
-	if !ps.Encrypted || c.encryptionConfig == nil {
+	if !ps.Encrypted {
 		return nil
+	}
+	if c.encryptionConfig == nil {
+		return ErrMCPStaticOAuthEncryptionRequired
 	}
 
 	transformer := c.encryptionConfig.Transformers[mcpOAuthPendingStateGroupResource]
 	if transformer == nil {
 		transformer = c.encryptionConfig.Transformers[mcpOAuthTokenGroupResource]
 		if transformer == nil {
-			return nil
+			return ErrMCPStaticOAuthEncryptionRequired
 		}
 	}
 
@@ -889,6 +885,24 @@ func (c *Client) decryptMCPOAuthPendingState(ctx context.Context, ps *types.MCPO
 	return errors.Join(errs...)
 }
 
+func (c *Client) encryptMCPStaticOAuthSaveProof(ctx context.Context, ps *types.MCPOAuthPendingState, proof string) (string, error) {
+	if c.encryptionConfig == nil {
+		return "", ErrMCPStaticOAuthEncryptionRequired
+	}
+	transformer := c.encryptionConfig.Transformers[mcpOAuthPendingStateGroupResource]
+	if transformer == nil {
+		transformer = c.encryptionConfig.Transformers[mcpOAuthTokenGroupResource]
+	}
+	if transformer == nil {
+		return "", ErrMCPStaticOAuthEncryptionRequired
+	}
+	b, err := transformer.TransformToStorage(ctx, []byte(proof), mcpOAuthPendingStateCtx(ps))
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
 func mcpOAuthPendingStateEncryptedFields(ps *types.MCPOAuthPendingState) []*string {
 	fields := []*string{
 		&ps.State,
@@ -898,8 +912,15 @@ func mcpOAuthPendingStateEncryptedFields(ps *types.MCPOAuthPendingState) []*stri
 	}
 	if ps.StaticOAuthTest {
 		fields = append(fields, &ps.URL, &ps.AuthURL, &ps.TokenURL, &ps.RedirectURL, &ps.Scopes)
+		if ps.StaticOAuthSaveProof != "" {
+			fields = append(fields, &ps.StaticOAuthSaveProof)
+		}
 	}
 	return fields
+}
+
+func hashMCPStaticOAuthValue(value string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
 }
 
 func mcpOAuthPendingStateCtx(ps *types.MCPOAuthPendingState) value.Context {

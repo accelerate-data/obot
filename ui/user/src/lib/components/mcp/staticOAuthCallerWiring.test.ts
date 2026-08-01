@@ -33,7 +33,9 @@ for (const caller of callers) {
 			'UserService.getWorkspaceMCPCatalogEntryOAuthCredentialTest',
 			'AdminService.getMCPCatalogEntryOAuthCredentialTest',
 			'UserService.setWorkspaceMCPCatalogEntryOAuthCredentials',
-			'AdminService.setMCPCatalogEntryOAuthCredentials'
+			'AdminService.setMCPCatalogEntryOAuthCredentials',
+			'UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials',
+			'AdminService.replaceMCPCatalogEntryOAuthCredentials'
 		];
 
 		for (const operation of expectedOperations) {

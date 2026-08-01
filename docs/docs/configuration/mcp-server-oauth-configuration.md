@@ -51,7 +51,7 @@ After saving the remote MCP server with static OAuth enabled:
 4. Click **Test Credentials** and finish the provider authorization in the window that opens
 5. After Obot reports a successful test, click **Save**
 
-Obot enables **Save** only for the exact client ID and secret that passed the test. The server returns the proof's authoritative expiration time, and the dialog disables **Save** when that time is reached. Editing either field, closing the dialog, a denied authorization, a failed token exchange, or an expired test requires a new successful test.
+Obot enables **Save** only for the exact client ID and secret that passed the test. The provider callback state, status-polling token, and one-use Save proof are independent values; the proof is returned only after successful authorization. The server returns its authoritative expiration time, and the dialog disables **Save** when that time is reached. Editing either field, closing the dialog, a denied authorization, a failed token exchange, or an expired test requires a new successful test.
 
 Once configured, matching MCP server deployments become available to users. Each user still creates a separate OAuth grant for each deployment.
 
@@ -66,20 +66,11 @@ The remote MCP server shows whether OAuth credentials are configured. When viewi
 
 ### Replacing client credentials without interrupting the active app
 
-API clients can rotate an existing application with one replacement request. Replacement requires the same successful exact-value test used for initial Save. Obot validates the proof, replaces the saved application, and consumes the proof in one database transaction. It then removes local user grants for every matching server and server instance while retaining the cross-process credential lock.
+The Obot admin interface and API clients rotate an existing application with one replacement request. Enter and test the full replacement client ID and secret while the active application and user grants remain usable, then select **Replace Credentials**. Replacement requires the same successful exact-value test used for initial Save. Obot validates the proof, replaces the saved application, and consumes the proof in one database transaction. It then removes local user grants for every matching server and server instance while retaining the cross-process credential lock.
 
 An invalid or expired proof leaves the active application and grants unchanged. A successful replacement retains catalog servers and access rules, but each user must authorize each deployment again. Obot does not revoke grants at the provider.
 
-The Obot admin interface retains its explicit clear workflow:
-
-1. Click **Configure OAuth Credentials**.
-2. Click **Clear Credentials**.
-3. Confirm the deletion.
-4. Reopen **Configure OAuth Credentials**.
-5. Enter and test the new values.
-6. Click **Save** only after **Test Credentials** succeeds.
-
-This clear-then-save workflow intentionally creates an unconfigured interval. Matching deployments remain present but unavailable until the new application is saved.
+**Clear Credentials** remains a separate destructive action. Use it only when the entry should become unconfigured; matching deployments remain present but unavailable until a new tested application is saved.
 
 ### Credential API lifecycle
 

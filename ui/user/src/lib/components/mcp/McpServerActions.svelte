@@ -842,14 +842,17 @@
 	}}
 	onSave={async (credentials) => {
 		if (!entry) return;
+		const replacing = oauthStatus?.configured === true;
 		if (entry.powerUserWorkspaceID) {
-			await UserService.setWorkspaceMCPCatalogEntryOAuthCredentials(
-				entry.powerUserWorkspaceID,
-				entry.id,
-				credentials
-			);
+			const save = replacing
+				? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
+				: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
+			await save(entry.powerUserWorkspaceID, entry.id, credentials);
 		} else {
-			await AdminService.setMCPCatalogEntryOAuthCredentials('default', entry.id, credentials);
+			const save = replacing
+				? AdminService.replaceMCPCatalogEntryOAuthCredentials
+				: AdminService.setMCPCatalogEntryOAuthCredentials;
+			await save('default', entry.id, credentials);
 		}
 		oauthConfiguredOverride = true;
 		onOAuthConfigured?.();

@@ -53,6 +53,8 @@ const (
 type MCPStaticOAuthTestResult struct {
 	Status          MCPStaticOAuthTestStatus          `json:"status"`
 	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
+	// Proof is returned only after a successful provider exchange and is consumed by Save.
+	Proof string `json:"proof,omitempty"`
 	// ExpiresAt is the server-authoritative time after which the proof cannot be saved.
 	ExpiresAt Time `json:"expiresAt"`
 }
@@ -790,11 +792,11 @@ type MCPServerOAuthCredentialTestRequest struct {
 // MCPServerOAuthCredentialTestStatusRequest carries an opaque proof outside
 // the URL so access and audit logs cannot persist it.
 type MCPServerOAuthCredentialTestStatusRequest struct {
-	State string `json:"state"`
+	TestState string `json:"testState"`
 }
 
 // MCPServerOAuthCredentialTestStart identifies a pending static OAuth verification.
 type MCPServerOAuthCredentialTestStart struct {
-	State    string `json:"state"`
-	OAuthURL string `json:"oauthURL"`
+	TestState string `json:"testState"`
+	OAuthURL  string `json:"oauthURL"`
 }

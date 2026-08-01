@@ -23,9 +23,17 @@ const (
 )
 
 var (
-	tunnelResources       = newPathMatcher("GET /tunnel/connect")
-	tunnelBridgeResources = newPathMatcher("/tunnel/bridge/{target}")
-	tunnelPeerResources   = newPathMatcher("GET /tunnel/peer")
+	tunnelResources                = newPathMatcher("GET /tunnel/connect")
+	tunnelBridgeResources          = newPathMatcher("/tunnel/bridge/{target}")
+	tunnelPeerResources            = newPathMatcher("GET /tunnel/peer")
+	ownerOnlyCatalogOAuthResources = newPathMatcher(
+		"POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credential-tests",
+		"POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credential-tests/status",
+		"GET /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+		"POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+		"PUT /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+		"DELETE /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+	)
 
 	adminAndOwnerRules = []string{
 		"/api/mcp-tunnels",
@@ -413,6 +421,9 @@ func NewAuthorizer(gatewayClient *client.Client, cache, uncached kclient.Client,
 }
 
 func (a *Authorizer) Authorize(req *http.Request, userInfo user.Info) bool {
+	if _, restricted := ownerOnlyCatalogOAuthResources.Match(req); restricted && !slices.Contains(userInfo.GetGroups(), types.GroupOwner) {
+		return false
+	}
 	// Tunnel credentials are deliberately non-user principals. Keep this check
 	// ahead of anyGroup and UI authorization so the credential cannot inherit
 	// baseline routes intended for ordinary users.

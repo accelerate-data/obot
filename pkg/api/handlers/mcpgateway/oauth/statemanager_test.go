@@ -338,16 +338,20 @@ func changeStaticCatalogApp(t *testing.T, gatewayClient *gateway.Client, entryNa
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodDelete, "/", nil)
 	if !clearCredential {
-		proof, err := gatewayClient.CreateMCPStaticOAuthTest(t.Context(), "user-1", entryName, mcpURL, "verifier", &oauth2.Config{
+		started, err := gatewayClient.CreateMCPStaticOAuthTest(t.Context(), "user-1", entryName, mcpURL, "verifier", &oauth2.Config{
 			ClientID: "client-1", ClientSecret: "secret-2",
 		})
 		if err != nil {
 			return err
 		}
-		if err := gatewayClient.CompleteMCPStaticOAuthTest(t.Context(), proof, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
+		if err := gatewayClient.CompleteMCPStaticOAuthTest(t.Context(), started.CallbackState, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
 			return err
 		}
-		request = httptest.NewRequest(http.MethodPut, "/", strings.NewReader(fmt.Sprintf(`{"clientID":"client-1","clientSecret":"secret-2","proof":%q}`, proof)))
+		result, err := gatewayClient.GetMCPStaticOAuthTestStatus(t.Context(), started.TestState, "user-1", entryName)
+		if err != nil {
+			return err
+		}
+		request = httptest.NewRequest(http.MethodPut, "/", strings.NewReader(fmt.Sprintf(`{"clientID":"client-1","clientSecret":"secret-2","proof":%q}`, result.Proof)))
 	}
 	req := api.Context{
 		Request:        request,
@@ -448,7 +452,7 @@ func newStateManagerTestClientWithStaticRequirement(t *testing.T, entryName, mcp
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	client := gateway.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, true)
+	client := gateway.New(t.Context(), db, storage, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	return client
 }

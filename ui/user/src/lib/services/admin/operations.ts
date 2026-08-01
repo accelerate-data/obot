@@ -889,12 +889,12 @@ export async function startMCPCatalogEntryOAuthCredentialTest(
 export async function getMCPCatalogEntryOAuthCredentialTest(
 	catalogID: string,
 	entryID: string,
-	state: string,
+	testState: string,
 	opts?: { fetch?: Fetcher }
 ): Promise<MCPServerOAuthCredentialTestResult> {
 	return (await doPost(
 		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credential-tests/status`,
-		{ state },
+		{ testState },
 		opts
 	)) as MCPServerOAuthCredentialTestResult;
 }
@@ -911,6 +911,19 @@ export async function setMCPCatalogEntryOAuthCredentials(
 		opts
 	)) as MCPServerOAuthCredentialStatus;
 	return response;
+}
+
+export async function replaceMCPCatalogEntryOAuthCredentials(
+	catalogID: string,
+	entryID: string,
+	credentials: MCPServerOAuthCredentialRequest,
+	opts?: { fetch?: Fetcher }
+): Promise<MCPServerOAuthCredentialStatus> {
+	return (await doPut(
+		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credentials`,
+		credentials,
+		opts
+	)) as MCPServerOAuthCredentialStatus;
 }
 
 export async function deleteMCPCatalogEntryOAuthCredentials(

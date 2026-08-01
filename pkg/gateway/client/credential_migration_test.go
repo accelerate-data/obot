@@ -1,10 +1,57 @@
 package client
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
+	"k8s.io/apiserver/pkg/storage/value"
 )
+
+func TestMigrateUnencryptedCredentialsPreservesAndEncryptsLegacyRows(t *testing.T) {
+	c := newTestClient(t)
+	c.encryptionConfig = &encryptionconfig.EncryptionConfiguration{
+		Transformers: map[schema.GroupResource]value.Transformer{
+			credentialGroupResource: staticOAuthTestTransformer{},
+		},
+	}
+	legacy := gatewaytypes.Credential{
+		Context: "mcp-oauth-entry-1",
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "legacy-client", "CLIENT_SECRET": "legacy-secret"},
+	}
+	if err := c.db.WithContext(t.Context()).Create(&legacy).Error; err != nil {
+		t.Fatalf("seed plaintext credential: %v", err)
+	}
+
+	if err := c.MigrateUnencryptedCredentials(t.Context()); err != nil {
+		t.Fatalf("migrate plaintext credentials: %v", err)
+	}
+	var stored gatewaytypes.Credential
+	if err := c.db.WithContext(t.Context()).First(&stored, legacy.ID).Error; err != nil {
+		t.Fatalf("read migrated credential: %v", err)
+	}
+	encoded, err := json.Marshal(stored.Secrets)
+	if err != nil {
+		t.Fatalf("marshal stored secrets: %v", err)
+	}
+	if !stored.Encrypted || strings.Contains(string(encoded), "legacy-client") || strings.Contains(string(encoded), "legacy-secret") {
+		t.Fatalf("legacy credential remained plaintext: encrypted=%v secrets=%s", stored.Encrypted, encoded)
+	}
+	revealed, err := c.RevealCredential(t.Context(), []string{legacy.Context}, legacy.Name)
+	if err != nil {
+		t.Fatalf("reveal migrated credential: %v", err)
+	}
+	if revealed.Secrets["CLIENT_ID"] != "legacy-client" || revealed.Secrets["CLIENT_SECRET"] != "legacy-secret" {
+		t.Fatalf("migrated credential changed: %#v", revealed.Secrets)
+	}
+	if err := c.MigrateUnencryptedCredentials(t.Context()); err != nil {
+		t.Fatalf("migration was not idempotent: %v", err)
+	}
+}
 
 func TestMigrateToolReferenceCredentialContexts(t *testing.T) {
 	c := newTestClient(t)

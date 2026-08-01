@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -26,6 +27,9 @@ import (
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
+	"k8s.io/apiserver/pkg/storage/value"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -39,12 +43,12 @@ func TestUnauthenticatedStaticOAuthCallbackPassesServerMiddleware(t *testing.T) 
 
 	server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
 	recorder := httptest.NewRecorder()
-	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state+"&code=valid-code", nil))
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil))
 
 	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/auth/oauth/complete" {
 		t.Fatalf("callback response = %d Location=%q body=%q, want handler completion redirect", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
 	}
-	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "entry-1")
+	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
 	if err != nil {
 		t.Fatalf("get completed static OAuth test: %v", err)
 	}
@@ -74,7 +78,7 @@ func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create static OAuth test: %v", err)
 		}
-		proof, err := gateway.GetMCPOAuthPendingState(t.Context(), state)
+		proof, err := gateway.GetMCPOAuthPendingState(t.Context(), state.CallbackState)
 		if err != nil {
 			t.Fatalf("read pending proof: %v", err)
 		}
@@ -84,7 +88,7 @@ func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
 			t.Fatalf("age static OAuth test: %v", err)
 		}
 		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
-		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state+"&code=valid-code", http.StatusBadRequest, state)
+		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", http.StatusBadRequest, state.CallbackState)
 		if got := provider.tokenExchangeCount(); got != 0 {
 			t.Fatalf("expired proof provider exchanges = %d, want 0", got)
 		}
@@ -98,11 +102,11 @@ func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
 		}
 		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
 		first := httptest.NewRecorder()
-		server.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state+"&code=valid-code", nil))
+		server.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil))
 		if first.Code != http.StatusFound {
 			t.Fatalf("first callback response = %d body=%q, want completion redirect", first.Code, first.Body.String())
 		}
-		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state+"&code=valid-code", http.StatusBadRequest, state)
+		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", http.StatusBadRequest, state.CallbackState)
 	})
 }
 
@@ -115,7 +119,7 @@ func TestStaticOAuthCallbackClaimsProofBeforeProviderExchange(t *testing.T) {
 		t.Fatalf("create static OAuth test: %v", err)
 	}
 	server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
-	path := "/oauth/mcp/callback?state=" + state + "&code=valid-code"
+	path := "/oauth/mcp/callback?state=" + state.CallbackState + "&code=valid-code"
 
 	type callbackResponse struct {
 		status int
@@ -229,7 +233,7 @@ func TestStaticOAuthCallbackExchangesAndDiscardsTokenBeforeNormalOAuth(t *testin
 	if err != nil {
 		t.Fatalf("create static OAuth test: %v", err)
 	}
-	authorizationResponse, err := http.Get(conf.AuthCodeURL(state, oauth2.S256ChallengeOption("exact-verifier")))
+	authorizationResponse, err := http.Get(conf.AuthCodeURL(state.CallbackState, oauth2.S256ChallengeOption("exact-verifier")))
 	if err != nil {
 		t.Fatalf("authorize static OAuth test: %v", err)
 	}
@@ -240,7 +244,7 @@ func TestStaticOAuthCallbackExchangesAndDiscardsTokenBeforeNormalOAuth(t *testin
 
 	recorder := httptest.NewRecorder()
 	req := api.Context{
-		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state+"&code=valid-code", nil),
+		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil),
 		ResponseWriter: recorder,
 	}
 	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
@@ -248,7 +252,7 @@ func TestStaticOAuthCallbackExchangesAndDiscardsTokenBeforeNormalOAuth(t *testin
 		t.Fatalf("handle static OAuth callback: %v", err)
 	}
 
-	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "entry-1")
+	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
 	if err != nil {
 		t.Fatalf("get completed static OAuth test: %v", err)
 	}
@@ -282,7 +286,7 @@ func TestStaticOAuthCallbackRecordsOnlySafeFailures(t *testing.T) {
 			}
 			recorder := httptest.NewRecorder()
 			req := api.Context{
-				Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state+tt.query, nil),
+				Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+tt.query, nil),
 				ResponseWriter: recorder,
 			}
 			h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
@@ -290,7 +294,7 @@ func TestStaticOAuthCallbackRecordsOnlySafeFailures(t *testing.T) {
 				t.Fatalf("handle failed static OAuth callback: %v", err)
 			}
 
-			result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "entry-1")
+			result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
 			if err != nil {
 				t.Fatalf("get failed static OAuth test: %v", err)
 			}
@@ -408,5 +412,24 @@ func newStaticOAuthCallbackGatewayWithDB(t *testing.T) (*gatewayclient.Client, *
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, nil, nil, nil, nil, time.Hour, 10, 0, 0, false), services.DB.DB
+	return gatewayclient.New(t.Context(), database, nil, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 0, 0, false), services.DB.DB
+}
+
+func staticOAuthTestEncryptionConfig() *encryptionconfig.EncryptionConfiguration {
+	transformer := staticOAuthTestTransformer{}
+	return &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
+		{Group: "obot.obot.ai", Resource: "credentials"}:           transformer,
+		{Group: "obot.obot.ai", Resource: "mcpoauthpendingstates"}: transformer,
+		{Group: "obot.obot.ai", Resource: "mcpoauthtokens"}:        transformer,
+	}}
+}
+
+type staticOAuthTestTransformer struct{}
+
+func (staticOAuthTestTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
+	return append([]byte("encrypted:"), data...), nil
+}
+
+func (staticOAuthTestTransformer) TransformFromStorage(_ context.Context, data []byte, _ value.Context) ([]byte, bool, error) {
+	return []byte(strings.TrimPrefix(string(data), "encrypted:")), false, nil
 }
