@@ -452,18 +452,23 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 	}{
 		{name: "wrong proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(*testing.T, *gatewayclient.Client, *v1.MCPServerCatalogEntry) string { return "wrong-proof" }},
 		{name: "wrong caller", userID: "user-2", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			return successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 		}},
 		{name: "changed client ID", userID: "user-1", requestClient: "changed-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			return successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 		}},
 		{name: "changed client secret", userID: "user-1", requestClient: "candidate-client", requestSecret: "changed-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			return successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 		}},
 		{name: "pending proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			return pendingStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 		}},
 		{name: "failed proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			proof := pendingStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 			if err := gateway.CompleteMCPStaticOAuthTest(t.Context(), proof, types.MCPStaticOAuthTestStatusFailed, types.MCPStaticOAuthTestFailureTokenExchange); err != nil {
 				t.Fatalf("fail static OAuth test: %v", err)
@@ -471,6 +476,7 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 			return proof
 		}},
 		{name: "consumed proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 			if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
 				t.Fatalf("consume proof: %v", err)
@@ -478,6 +484,7 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 			return proof
 		}},
 		{name: "stale proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
 			proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 			if err := gateway.CleanupExpiredMCPOAuthPendingStates(t.Context(), 0); err != nil {
 				t.Fatalf("expire proof: %v", err)
@@ -722,7 +729,7 @@ func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
 			callbackName := "test:transient_oauth_credential_read_" + strings.ToLower(method)
 			if err := rawDB.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
 				if failCredentialRead && tx.Statement.Table == "credentials" {
-					tx.AddError(errors.New("transient credential database failure"))
+					_ = tx.AddError(errors.New("transient credential database failure"))
 				}
 			}); err != nil {
 				t.Fatalf("register transient credential read failure: %v", err)

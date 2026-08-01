@@ -262,14 +262,17 @@ func newStaticOAuthTestRequest(t *testing.T, method, target, body string, record
 }
 
 func newOAuthCredentialTestGatewayClient(t *testing.T) *gatewayclient.Client {
+	t.Helper()
 	return newOAuthCredentialTestGatewayClientWithOptions(t, nil, nil)
 }
 
 func newOAuthCredentialTestGatewayClientWithEncryption(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration) *gatewayclient.Client {
+	t.Helper()
 	return newOAuthCredentialTestGatewayClientWithOptions(t, encryptionConfig, nil)
 }
 
 func newOAuthCredentialTestGatewayClientWithTrigger(t *testing.T, trigger func(context.Context, string) error) *gatewayclient.Client {
+	t.Helper()
 	return newOAuthCredentialTestGatewayClientWithOptions(t, nil, trigger)
 }
 
