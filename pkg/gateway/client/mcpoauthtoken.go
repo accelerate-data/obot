@@ -134,6 +134,36 @@ func (c *Client) CatalogEntryForStaticOAuthMCP(ctx context.Context, mcpID, url s
 	return entryName, nil
 }
 
+// CommitMCPOAuthPendingStateToken persists the exchanged token using the
+// catalog credential identity captured by the pending state. The explicit
+// OAuth auth request ID lets callers choose the completion notification that
+// belongs to their flow rather than trusting a legacy state value.
+func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pendingState *types.MCPOAuthPendingState, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	catalogEntryName := pendingState.CatalogEntryName
+	if catalogEntryName == "" {
+		var err error
+		catalogEntryName, err = c.CatalogEntryForStaticOAuthMCP(ctx, pendingState.MCPID, pendingState.URL)
+		if err != nil {
+			c.deleteChangedMCPOAuthPendingState(ctx, pendingState.HashedState, err)
+			return err
+		}
+	}
+
+	if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, pendingState.UserID, pendingState.MCPID, pendingState.URL, oauthAuthRequestID, catalogEntryName, oauthConf, token); err != nil {
+		c.deleteChangedMCPOAuthPendingState(ctx, pendingState.HashedState, err)
+		return err
+	}
+
+	_ = c.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
+	return nil
+}
+
+func (c *Client) deleteChangedMCPOAuthPendingState(ctx context.Context, hashedState string, err error) {
+	if errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+		_ = c.DeleteMCPOAuthPendingState(ctx, hashedState)
+	}
+}
+
 // CatalogEntryForCurrentOAuthCredential identifies a legacy grant that uses
 // the static app which is active for its MCP. Static-required entries fail
 // closed; optional entries without an app preserve dynamic registration.

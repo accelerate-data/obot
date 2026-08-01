@@ -2,7 +2,6 @@ package oauth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -56,27 +55,9 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 		return "", "", fmt.Errorf("failed to exchange code: %w", err)
 	}
 
-	catalogEntryName := ps.CatalogEntryName
-	if catalogEntryName == "" {
-		catalogEntryName, err = sm.gatewayClient.CatalogEntryForStaticOAuthMCP(ctx, ps.MCPID, ps.URL)
-		if err != nil {
-			if errors.Is(err, client.ErrMCPOAuthCatalogCredentialChanged) {
-				_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-			}
-			return "", "", err
-		}
-	}
-
-	// Save the completed token
-	if err := sm.gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, ps.UserID, ps.MCPID, ps.URL, ps.OAuthAuthRequestID, catalogEntryName, conf, token); err != nil {
-		if errors.Is(err, client.ErrMCPOAuthCatalogCredentialChanged) {
-			_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		}
+	if err := sm.gatewayClient.CommitMCPOAuthPendingStateToken(ctx, ps, ps.OAuthAuthRequestID, conf, token); err != nil {
 		return "", "", err
 	}
-
-	// Delete the pending state
-	_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
 
 	return ps.OAuthAuthRequestID, ps.MCPID, nil
 }

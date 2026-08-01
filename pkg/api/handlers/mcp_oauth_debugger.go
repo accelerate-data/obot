@@ -190,23 +190,9 @@ func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *ga
 		return nil, fmt.Errorf("failed to exchange OAuth code: %w", err)
 	}
 
-	catalogEntryName := pendingState.CatalogEntryName
-	if catalogEntryName == "" {
-		catalogEntryName, err = gatewayClient.CatalogEntryForStaticOAuthMCP(ctx, pendingState.MCPID, pendingState.URL)
-		if err != nil {
-			if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
-				_ = gatewayClient.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
-			}
-			return nil, err
-		}
-	}
-	if err := gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, pendingState.UserID, pendingState.MCPID, pendingState.URL, "", catalogEntryName, conf, token); err != nil {
-		if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
-			_ = gatewayClient.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
-		}
+	if err := gatewayClient.CommitMCPOAuthPendingStateToken(ctx, pendingState, "", conf, token); err != nil {
 		return nil, err
 	}
-	_ = gatewayClient.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
 	return token, nil
 }
 

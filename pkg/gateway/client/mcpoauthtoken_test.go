@@ -47,7 +47,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 				&v1.MCPServerCatalogEntry{
 					ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
 					Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
-						RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL},
+						RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL, StaticOAuthRequired: true},
 					}},
 				},
 			).
@@ -308,6 +308,54 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 			&oauth2.Config{ClientID: "other-client", ClientSecret: "other-secret"},
 			&oauth2.Token{AccessToken: "other-access"}); err != nil {
 			t.Fatalf("unrelated entry write was blocked: %v", err)
+		}
+	})
+
+	t.Run("pending state commit recovers legacy fence and uses explicit auth request", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+		conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+		if err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, "stored-request", "", "legacy-state", "verifier", conf); err != nil {
+			t.Fatalf("create legacy pending state: %v", err)
+		}
+		pending, err := c.GetMCPOAuthPendingState(t.Context(), "legacy-state")
+		if err != nil {
+			t.Fatalf("load legacy pending state: %v", err)
+		}
+
+		if err := c.CommitMCPOAuthPendingStateToken(t.Context(), pending, "explicit-request", conf, &oauth2.Token{AccessToken: "access-1"}); err != nil {
+			t.Fatalf("commit pending state token: %v", err)
+		}
+		stored, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+		if err != nil {
+			t.Fatalf("load committed token: %v", err)
+		}
+		if stored.CatalogEntryName != entryName || stored.OAuthAuthRequestID != "explicit-request" {
+			t.Fatalf("committed token = entry %q request %q", stored.CatalogEntryName, stored.OAuthAuthRequestID)
+		}
+		if _, err := c.GetMCPOAuthPendingState(t.Context(), "legacy-state"); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("committed pending state remains: %v", err)
+		}
+	})
+
+	t.Run("pending state commit deletes stale legacy state after fence rejection", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "rotated-secret")
+		conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "old-secret"}
+		if err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "stale-state", "verifier", conf); err != nil {
+			t.Fatalf("create stale pending state: %v", err)
+		}
+		pending, err := c.GetMCPOAuthPendingState(t.Context(), "stale-state")
+		if err != nil {
+			t.Fatalf("load stale pending state: %v", err)
+		}
+
+		err = c.CommitMCPOAuthPendingStateToken(t.Context(), pending, pending.OAuthAuthRequestID, conf, &oauth2.Token{AccessToken: "stale-access"})
+		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("stale commit error = %v, want catalog credential changed", err)
+		}
+		if _, err := c.GetMCPOAuthPendingState(t.Context(), "stale-state"); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("stale pending state remains: %v", err)
 		}
 	})
 }
