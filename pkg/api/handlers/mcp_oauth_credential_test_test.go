@@ -358,6 +358,7 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 		{
 			name: "consumed",
 			prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+				t.Helper()
 				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 				if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
 					t.Fatalf("consume proof: %v", err)

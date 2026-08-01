@@ -558,6 +558,7 @@ func TestGetMCPStaticOAuthTestStatusTreatsUnknownConsumedAndCleanedProofsAsInval
 		{
 			name: "consumed",
 			prepare: func(t *testing.T, c *Client) string {
+				t.Helper()
 				state, conf := createStaticOAuthTest(t, c)
 				completeSuccessfulStaticOAuthTest(t, c, state)
 				if err := c.ConsumeMCPStaticOAuthTest(t.Context(), state, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret); err != nil {
@@ -569,6 +570,7 @@ func TestGetMCPStaticOAuthTestStatusTreatsUnknownConsumedAndCleanedProofsAsInval
 		{
 			name: "cleaned",
 			prepare: func(t *testing.T, c *Client) string {
+				t.Helper()
 				state, _ := createStaticOAuthTest(t, c)
 				if err := c.CleanupExpiredMCPOAuthPendingStates(t.Context(), 0); err != nil {
 					t.Fatalf("clean proof: %v", err)
