@@ -664,7 +664,7 @@
 					? await UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(id, entry.id)
 					: await AdminService.getMCPCatalogEntryOAuthCredentials(id, entry.id);
 		} catch {
-			staticOauthStatus = { configured: false };
+			staticOauthStatus = { configured: false, callbackURL: '' };
 		}
 		staticOauthConfigModal?.open();
 	}
@@ -1496,6 +1496,18 @@
 <StaticOAuthConfigureModal
 	bind:this={staticOauthConfigModal}
 	oauthStatus={staticOauthStatus}
+	onStartTest={async (credentials) => {
+		if (!entry || !id) throw new Error('No MCP catalog entry selected');
+		return entity === 'workspace'
+			? UserService.startWorkspaceMCPCatalogEntryOAuthCredentialTest(id, entry.id, credentials)
+			: AdminService.startMCPCatalogEntryOAuthCredentialTest(id, entry.id, credentials);
+	}}
+	onGetTest={async (state) => {
+		if (!entry || !id) throw new Error('No MCP catalog entry selected');
+		return entity === 'workspace'
+			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentialTest(id, entry.id, state)
+			: AdminService.getMCPCatalogEntryOAuthCredentialTest(id, entry.id, state);
+	}}
 	onSave={async (credentials) => {
 		if (!entry || !id) return;
 		if (entity === 'workspace') {
@@ -1505,6 +1517,7 @@
 		}
 		staticOauthStatus = {
 			...staticOauthStatus,
+			callbackURL: staticOauthStatus?.callbackURL ?? '',
 			configured: true
 		};
 	}}
@@ -1517,6 +1530,7 @@
 		}
 		staticOauthStatus = {
 			...staticOauthStatus,
+			callbackURL: staticOauthStatus?.callbackURL ?? '',
 			configured: false
 		};
 	}}

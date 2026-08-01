@@ -349,6 +349,30 @@ func TestCleanupExpiredMCPOAuthPendingStatesRemovesPendingAndCompletedStaticOAut
 	}
 }
 
+func TestDeleteMCPOAuthTokenForAllUsersTriggersServerReconciliation(t *testing.T) {
+	c := newTestClient(t)
+	triggered := 0
+	c.mcpOAuthTokenTrigger = func(context.Context, string) error {
+		triggered++
+		return nil
+	}
+	conf := &oauth2.Config{ClientID: "client", ClientSecret: "secret"}
+	if err := c.ReplaceMCPOAuthToken(t.Context(), "user-1", "server-1", "https://mcp.example/api", "", conf, &oauth2.Token{AccessToken: "token"}); err != nil {
+		t.Fatalf("seed OAuth token: %v", err)
+	}
+	if triggered != 1 {
+		t.Fatalf("Replace trigger count = %d, want 1", triggered)
+	}
+	triggered = 0
+
+	if err := c.DeleteMCPOAuthTokenForAllUsers(t.Context(), "server-1"); err != nil {
+		t.Fatalf("delete OAuth tokens: %v", err)
+	}
+	if triggered != 1 {
+		t.Fatalf("Delete trigger count = %d, want 1", triggered)
+	}
+}
+
 func completeSuccessfulStaticOAuthTest(t *testing.T, c *Client, state string) {
 	t.Helper()
 	if err := c.CompleteMCPStaticOAuthTest(t.Context(), state, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {

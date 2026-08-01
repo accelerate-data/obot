@@ -763,6 +763,7 @@ func ValidateURLHostname(u string, hostname string) error {
 type MCPServerOAuthCredentialRequest struct {
 	ClientID     string `json:"clientID"`
 	ClientSecret string `json:"clientSecret"`
+	Proof        string `json:"proof"`
 }
 
 // MCPServerOAuthCredentialStatus represents the status of OAuth credentials for an MCP server
@@ -771,4 +772,18 @@ type MCPServerOAuthCredentialStatus struct {
 	Configured bool `json:"configured"`
 	// ClientID is the configured client ID (never includes secret)
 	ClientID string `json:"clientID,omitempty"`
+	// CallbackURL is the redirect URL to register with the OAuth provider.
+	CallbackURL string `json:"callbackURL"`
+}
+
+// MCPServerOAuthCredentialTestRequest contains candidate static OAuth credentials to verify.
+type MCPServerOAuthCredentialTestRequest struct {
+	ClientID     string `json:"clientID"`
+	ClientSecret string `json:"clientSecret"`
+}
+
+// MCPServerOAuthCredentialTestStart identifies a pending static OAuth verification.
+type MCPServerOAuthCredentialTestStart struct {
+	State    string `json:"state"`
+	OAuthURL string `json:"oauthURL"`
 }

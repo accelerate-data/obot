@@ -212,7 +212,7 @@
 					)
 				: await AdminService.getMCPCatalogEntryOAuthCredentials(catalogId!, entry.id);
 		} catch {
-			oauthStatus = { configured: false };
+			oauthStatus = { configured: false, callbackURL: '' };
 		}
 		oauthConfigModal?.open();
 	}
@@ -220,7 +220,7 @@
 	async function handleSaveOAuth(credentials: {
 		clientID: string;
 		clientSecret: string;
-		authorizationServerURL?: string;
+		proof: string;
 	}) {
 		if (!oauthConfigEntry) return;
 		if (oauthConfigEntry.powerUserWorkspaceID) {
@@ -599,6 +599,30 @@
 	bind:this={oauthConfigModal}
 	{oauthStatus}
 	deprecated={isDeprecatedMCPServer(oauthConfigEntry)}
+	onStartTest={async (credentials) => {
+		if (!oauthConfigEntry) throw new Error('No MCP catalog entry selected');
+		return oauthConfigEntry.powerUserWorkspaceID
+			? UserService.startWorkspaceMCPCatalogEntryOAuthCredentialTest(
+					oauthConfigEntry.powerUserWorkspaceID,
+					oauthConfigEntry.id,
+					credentials
+				)
+			: AdminService.startMCPCatalogEntryOAuthCredentialTest(
+					'default',
+					oauthConfigEntry.id,
+					credentials
+				);
+	}}
+	onGetTest={async (state) => {
+		if (!oauthConfigEntry) throw new Error('No MCP catalog entry selected');
+		return oauthConfigEntry.powerUserWorkspaceID
+			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentialTest(
+					oauthConfigEntry.powerUserWorkspaceID,
+					oauthConfigEntry.id,
+					state
+				)
+			: AdminService.getMCPCatalogEntryOAuthCredentialTest('default', oauthConfigEntry.id, state);
+	}}
 	onSave={handleSaveOAuth}
 	onDelete={handleDeleteOAuth}
 />

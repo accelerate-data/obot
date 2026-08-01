@@ -44,10 +44,14 @@ Before configuring Obot, you need to register an OAuth application with the serv
 After saving the remote MCP server with static OAuth enabled:
 
 1. Click **Configure OAuth Credentials** in the Static OAuth section
-2. Enter the following information:
+2. Copy the displayed **OAuth callback URL** into the provider's allowed redirect URLs if it is not already registered
+3. Enter the following information:
    - **Client ID**: The client ID from your registered OAuth application
    - **Client Secret**: The client secret from your registered OAuth application
-3. Click **Save**
+4. Click **Test Credentials** and finish the provider authorization in the window that opens
+5. After Obot reports a successful test, click **Save**
+
+Obot enables **Save** only for the exact client ID and secret that passed the test. Editing either field, closing the dialog, a denied authorization, a failed token exchange, or an expired test requires a new successful test.
 
 Once configured, the MCP server becomes available to users.
 
@@ -68,6 +72,7 @@ To change the Client ID and Client Secret:
 2. Click **Clear Credentials**
 3. Confirm the deletion
 4. Re-enter OAuth credentials with the new values
+5. Test the new credentials and save them
 
 Clearing credentials temporarily makes the MCP server unavailable to users until new credentials are configured.
 
@@ -102,10 +107,12 @@ This example demonstrates configuring the GitHub remote MCP server.
 ### Add OAuth credentials
 
 1. Click **Configure OAuth Credentials**
-2. Enter:
+2. Confirm the displayed OAuth callback URL is registered in the GitHub OAuth app
+3. Enter:
    - **Client ID**: Your GitHub OAuth app client ID
    - **Client Secret**: Your GitHub OAuth app client secret
-3. Click **Save**
+4. Click **Test Credentials** and authorize the app in the window that opens
+5. After the test succeeds, click **Save**
 
 Users can now add the GitHub MCP server to their projects and authenticate with their GitHub accounts.
 

@@ -68,6 +68,9 @@ import type {
 	MCPCapacityInfo,
 	MCPServerOAuthCredentialRequest,
 	MCPServerOAuthCredentialStatus,
+	MCPServerOAuthCredentialTestRequest,
+	MCPServerOAuthCredentialTestResult,
+	MCPServerOAuthCredentialTestStart,
 	TokenUsageTimeRange,
 	TotalTokenUsage,
 	TokenUsage,
@@ -868,6 +871,31 @@ export async function getMCPCatalogEntryOAuthCredentials(
 		dontLogErrors: true
 	})) as MCPServerOAuthCredentialStatus;
 	return response;
+}
+
+export async function startMCPCatalogEntryOAuthCredentialTest(
+	catalogID: string,
+	entryID: string,
+	credentials: MCPServerOAuthCredentialTestRequest,
+	opts?: { fetch?: Fetcher }
+): Promise<MCPServerOAuthCredentialTestStart> {
+	return (await doPost(
+		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credential-tests`,
+		credentials,
+		opts
+	)) as MCPServerOAuthCredentialTestStart;
+}
+
+export async function getMCPCatalogEntryOAuthCredentialTest(
+	catalogID: string,
+	entryID: string,
+	state: string,
+	opts?: { fetch?: Fetcher }
+): Promise<MCPServerOAuthCredentialTestResult> {
+	return (await doGet(
+		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credential-tests/${encodeURIComponent(state)}`,
+		opts
+	)) as MCPServerOAuthCredentialTestResult;
 }
 
 export async function setMCPCatalogEntryOAuthCredentials(

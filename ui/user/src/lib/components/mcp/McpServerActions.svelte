@@ -8,7 +8,8 @@
 		AdminService,
 		type MCPCatalogEntry,
 		type MCPCatalogServer,
-		type MCPServerInstance
+		type MCPServerInstance,
+		type MCPServerOAuthCredentialStatus
 	} from '$lib/services';
 	import { MCP_CONNECTION_INVALID_LICENSE_MESSAGE } from '$lib/services/user/constants';
 	import {
@@ -98,6 +99,7 @@
 	let oauthConfigPromptHandled = $state(false);
 	let isInitialOAuthConfig = $state(false);
 	let oauthConfiguredOverride = $state<boolean | undefined>(undefined);
+	let oauthStatus = $state<MCPServerOAuthCredentialStatus>();
 	let debugOauthDialog = $state<ReturnType<typeof DebugOauthDialog>>();
 
 	let disconnecting = $state(false);
@@ -281,7 +283,7 @@
 		if (promptOAuthConfig && !oauthConfigPromptHandled) {
 			oauthConfigPromptHandled = true;
 			isInitialOAuthConfig = true;
-			oauthConfigModal?.open();
+			void openStaticOAuthConfig();
 
 			// clear out the configure-oauth param
 			const url = new URL(page.url);
@@ -289,6 +291,21 @@
 			goto(url, { replaceState: true });
 		}
 	});
+
+	async function openStaticOAuthConfig() {
+		if (!entry) return;
+		try {
+			oauthStatus = entry.powerUserWorkspaceID
+				? await UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(
+						entry.powerUserWorkspaceID,
+						entry.id
+					)
+				: await AdminService.getMCPCatalogEntryOAuthCredentials('default', entry.id);
+		} catch {
+			oauthStatus = { configured: false, callbackURL: '' };
+		}
+		oauthConfigModal?.open();
+	}
 
 	function handleShowSelectServerDialog(
 		mode: ServerSelectMode = 'connect',
@@ -801,7 +818,28 @@
 
 <StaticOAuthConfigureModal
 	bind:this={oauthConfigModal}
+	{oauthStatus}
 	{deprecated}
+	onStartTest={async (credentials) => {
+		if (!entry) throw new Error('No MCP catalog entry selected');
+		return entry.powerUserWorkspaceID
+			? UserService.startWorkspaceMCPCatalogEntryOAuthCredentialTest(
+					entry.powerUserWorkspaceID,
+					entry.id,
+					credentials
+				)
+			: AdminService.startMCPCatalogEntryOAuthCredentialTest('default', entry.id, credentials);
+	}}
+	onGetTest={async (state) => {
+		if (!entry) throw new Error('No MCP catalog entry selected');
+		return entry.powerUserWorkspaceID
+			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentialTest(
+					entry.powerUserWorkspaceID,
+					entry.id,
+					state
+				)
+			: AdminService.getMCPCatalogEntryOAuthCredentialTest('default', entry.id, state);
+	}}
 	onSave={async (credentials) => {
 		if (!entry) return;
 		if (entry.powerUserWorkspaceID) {

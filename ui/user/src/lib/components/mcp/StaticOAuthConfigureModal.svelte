@@ -1,15 +1,39 @@
 <script lang="ts">
 	import Loading from '$lib/icons/Loading.svelte';
-	import type { MCPServerOAuthCredentialStatus } from '$lib/services/admin/types';
+	import type {
+		MCPServerOAuthCredentialStatus,
+		MCPServerOAuthCredentialTestRequest,
+		MCPServerOAuthCredentialTestResult,
+		MCPServerOAuthCredentialTestStart
+	} from '$lib/services/admin/types';
+	import { poll } from '$lib/utils';
 	import Confirm from '../Confirm.svelte';
+	import CopyField from '../CopyField.svelte';
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
 	import SensitiveInput from '../SensitiveInput.svelte';
 	import McpDeprecatedNotice from './McpDeprecatedNotice.svelte';
-	import { CircleAlert, Trash2 } from '@lucide/svelte';
+	import {
+		beginStaticOAuthCredentialTest,
+		canSaveStaticOAuthCredentials,
+		failStaticOAuthCredentialTest,
+		idleStaticOAuthCredentialTest,
+		invalidateStaticOAuthCredentialTest,
+		succeedStaticOAuthCredentialTest
+	} from './staticOAuthCredentialTestState';
+	import { CircleAlert, CircleCheckBig, ExternalLink, Trash2 } from '@lucide/svelte';
+	import { onDestroy } from 'svelte';
 
 	interface Props {
 		oauthStatus?: MCPServerOAuthCredentialStatus;
-		onSave: (credentials: { clientID: string; clientSecret: string }) => Promise<void>;
+		onStartTest: (
+			credentials: MCPServerOAuthCredentialTestRequest
+		) => Promise<MCPServerOAuthCredentialTestStart>;
+		onGetTest: (state: string) => Promise<MCPServerOAuthCredentialTestResult>;
+		onSave: (credentials: {
+			clientID: string;
+			clientSecret: string;
+			proof: string;
+		}) => Promise<void>;
 		onDelete?: () => Promise<void>;
 		onSkip?: () => void;
 		onCancel?: () => void;
@@ -19,6 +43,8 @@
 
 	let {
 		oauthStatus,
+		onStartTest,
+		onGetTest,
 		onSave,
 		onDelete,
 		onSkip,
@@ -29,9 +55,13 @@
 
 	let dialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let loading = $state(false);
+	let testing = $state(false);
 	let error = $state<string>();
 	let showDeleteConfirm = $state(false);
 	let showRequired = $state(false);
+	let credentialTest = $state(idleStaticOAuthCredentialTest());
+	let testGeneration = 0;
+	let testPopup: Window | null = null;
 
 	let form = $state({
 		clientID: '',
@@ -45,13 +75,114 @@
 		};
 		showRequired = false;
 		error = undefined;
+		credentialTest = idleStaticOAuthCredentialTest();
 	}
 
 	function onClose() {
+		resetCredentialTest();
 		form = { clientID: '', clientSecret: '' };
 		showRequired = false;
 		error = undefined;
 	}
+
+	function closeTestPopup() {
+		if (testPopup && !testPopup.closed) {
+			testPopup.close();
+		}
+		testPopup = null;
+	}
+
+	function resetCredentialTest() {
+		testGeneration += 1;
+		testing = false;
+		credentialTest = invalidateStaticOAuthCredentialTest(credentialTest);
+		closeTestPopup();
+	}
+
+	function handleCredentialInput() {
+		showRequired = false;
+		error = undefined;
+		resetCredentialTest();
+	}
+
+	function credentialTestFailureMessage(category?: string): string {
+		switch (category) {
+			case 'authorization_denied':
+				return 'Authorization was denied. Test the credentials again to continue.';
+			case 'invalid_callback':
+				return 'The OAuth callback was invalid. Check the provider callback URL and test again.';
+			case 'token_exchange_failed':
+				return 'The provider rejected the client credentials. Check them and test again.';
+			case 'expired':
+				return 'The credential test expired. Test the credentials again to continue.';
+			default:
+				return 'The OAuth credential test failed. Test the credentials again to continue.';
+		}
+	}
+
+	async function handleTest() {
+		showRequired = false;
+		error = undefined;
+		if (!form.clientID.trim() || !form.clientSecret.trim()) {
+			showRequired = true;
+			return;
+		}
+
+		const popup = window.open('', '_blank');
+		if (!popup) {
+			error = 'Allow pop-ups for Obot to test the OAuth credentials.';
+			return;
+		}
+		popup.opener = null;
+		testPopup = popup;
+
+		const generation = ++testGeneration;
+		testing = true;
+		credentialTest = beginStaticOAuthCredentialTest(form.clientID, form.clientSecret);
+		try {
+			const started = await onStartTest({
+				clientID: form.clientID.trim(),
+				clientSecret: form.clientSecret.trim()
+			});
+			if (generation !== testGeneration) return;
+			popup.location.href = started.oauthURL;
+
+			await poll(
+				async () => {
+					if (generation !== testGeneration) return true;
+					const result = await onGetTest(started.state);
+					if (result.status === 'pending') {
+						if (!popup.closed) return false;
+						credentialTest = failStaticOAuthCredentialTest(credentialTest, 'popup_closed');
+						error = 'The authorization window was closed before the test finished.';
+						return true;
+					}
+					if (result.status === 'succeeded') {
+						credentialTest = succeedStaticOAuthCredentialTest(credentialTest, started.state);
+					} else {
+						credentialTest = failStaticOAuthCredentialTest(
+							credentialTest,
+							result.failureCategory ?? 'invalid_test_result'
+						);
+						error = credentialTestFailureMessage(result.failureCategory);
+					}
+					return true;
+				},
+				{ interval: 1000, maxTimeout: 5 * 60 * 1000 }
+			);
+		} catch (err) {
+			if (generation !== testGeneration) return;
+			credentialTest = failStaticOAuthCredentialTest(credentialTest, 'test_failed');
+			error = err instanceof Error ? err.message : credentialTestFailureMessage();
+		} finally {
+			if (generation === testGeneration) {
+				testing = false;
+				closeTestPopup();
+			}
+		}
+	}
+
+	onDestroy(resetCredentialTest);
 
 	export function open() {
 		dialog?.open();
@@ -80,12 +211,17 @@
 			showRequired = true;
 			return;
 		}
+		if (!canSaveStaticOAuthCredentials(credentialTest, form.clientID, form.clientSecret)) {
+			error = 'Test these OAuth credentials successfully before saving.';
+			return;
+		}
 
 		loading = true;
 		try {
 			await onSave({
 				clientID: form.clientID.trim(),
-				clientSecret: form.clientSecret.trim()
+				clientSecret: form.clientSecret.trim(),
+				proof: credentialTest.proof
 			});
 			dialog?.close();
 		} catch (err) {
@@ -151,7 +287,7 @@
 		{:else}
 			<p class="text-muted-content text-sm font-light">
 				This remote MCP server requires OAuth configuration. Provide the client credentials from
-				your OAuth provider.
+				your OAuth provider, then test them before saving.
 			</p>
 		{/if}
 
@@ -167,6 +303,7 @@
 					class:opacity-60={oauthStatus?.configured}
 					placeholder="your-client-id"
 					readonly={oauthStatus?.configured}
+					oninput={handleCredentialInput}
 				/>
 			</div>
 
@@ -180,9 +317,26 @@
 					error={showRequired && !form.clientSecret}
 					placeholder={oauthStatus?.configured ? '••••••••' : 'your-client-secret'}
 					readonly={oauthStatus?.configured}
+					oninput={handleCredentialInput}
 					classes={{ input: oauthStatus?.configured ? 'opacity-60' : '' }}
 				/>
 			</div>
+
+			{#if oauthStatus?.callbackURL}
+				<CopyField
+					id="static-oauth-callback-url"
+					label="OAuth callback URL"
+					value={oauthStatus.callbackURL}
+					variant="code"
+				/>
+			{/if}
+
+			{#if credentialTest.status === 'succeeded'}
+				<div class="bg-success/10 text-success flex items-center gap-2 rounded-md p-3 text-sm">
+					<CircleCheckBig class="size-5 shrink-0" />
+					Credentials tested successfully. You can save them.
+				</div>
+			{/if}
 		</div>
 	</form>
 
@@ -205,7 +359,7 @@
 		{/if}
 
 		{#if !oauthStatus?.configured}
-			<div class="flex gap-2">
+			<div class="flex flex-wrap gap-2">
 				{#if showSkip}
 					<button type="button" class="btn btn-secondary" onclick={handleSkip} disabled={loading}>
 						Skip
@@ -214,7 +368,27 @@
 				<button type="button" class="btn btn-secondary" onclick={handleCancel} disabled={loading}>
 					Cancel
 				</button>
-				<button type="button" class="btn btn-primary" onclick={handleSave} disabled={loading}>
+				<button
+					type="button"
+					class="btn btn-secondary"
+					onclick={handleTest}
+					disabled={loading || testing}
+				>
+					{#if testing}
+						<Loading class="size-4" />
+					{:else}
+						<ExternalLink class="size-4" />
+						Test Credentials
+					{/if}
+				</button>
+				<button
+					type="button"
+					class="btn btn-primary"
+					onclick={handleSave}
+					disabled={loading ||
+						testing ||
+						!canSaveStaticOAuthCredentials(credentialTest, form.clientID, form.clientSecret)}
+				>
 					{#if loading}
 						<Loading class="size-4" />
 					{:else}

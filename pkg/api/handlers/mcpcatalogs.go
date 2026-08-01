@@ -39,9 +39,14 @@ type MCPCatalogHandler struct {
 	gatewayClient             *gclient.Client
 	acrHelper                 *accesscontrolrule.Helper
 	secretBindingAllowedLabel string
+	remoteURLValidationConfig mcp.RemoteMCPURLValidationConfig
 }
 
 func NewMCPCatalogHandler(defaultCatalogPath string, serverURL string, mcpBackend string, sessionManager *mcp.SessionManager, oauthChecker MCPOAuthChecker, gatewayClient *gclient.Client, acrHelper *accesscontrolrule.Helper, secretBindingAllowedLabel string) *MCPCatalogHandler {
+	remoteURLValidationConfig := mcp.RemoteMCPURLValidationConfig{}
+	if sessionManager != nil {
+		remoteURLValidationConfig = sessionManager.RemoteMCPURLValidationConfig()
+	}
 	return &MCPCatalogHandler{
 		defaultCatalogPath:        defaultCatalogPath,
 		serverURL:                 serverURL,
@@ -51,6 +56,7 @@ func NewMCPCatalogHandler(defaultCatalogPath string, serverURL string, mcpBacken
 		gatewayClient:             gatewayClient,
 		acrHelper:                 acrHelper,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
+		remoteURLValidationConfig: remoteURLValidationConfig,
 	}
 }
 
@@ -1800,8 +1806,9 @@ func (h *MCPCatalogHandler) GetOAuthCredentials(req api.Context) error {
 	}
 
 	return req.Write(types.MCPServerOAuthCredentialStatus{
-		Configured: configured,
-		ClientID:   clientID,
+		Configured:  configured,
+		ClientID:    clientID,
+		CallbackURL: system.MCPOAuthCallbackURL(h.serverURL),
 	})
 }
 
@@ -1839,12 +1846,16 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	// Trim whitespace before validation
 	trimmedClientID := strings.TrimSpace(credReq.ClientID)
 	trimmedClientSecret := strings.TrimSpace(credReq.ClientSecret)
-	if trimmedClientID == "" || trimmedClientSecret == "" {
-		return types.NewErrBadRequest("clientID and clientSecret are required")
+	proof := strings.TrimSpace(credReq.Proof)
+	if trimmedClientID == "" || trimmedClientSecret == "" || proof == "" {
+		return types.NewErrBadRequest("clientID, clientSecret, and proof are required")
 	}
 
 	clientID = trimmedClientID
 	clientSecret = trimmedClientSecret
+	if result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), proof, req.User.GetUID(), entry.Name); err != nil || result.Status != types.MCPStaticOAuthTestStatusSucceeded {
+		return types.NewErrBadRequest("invalid or expired OAuth credential test")
+	}
 
 	// Store new credential
 	cred := gatewaytypes.Credential{
@@ -1858,6 +1869,12 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	if err := req.GatewayClient.UpsertCredential(req.Context(), cred); err != nil {
 		return fmt.Errorf("failed to create OAuth credential: %w", err)
 	}
+	if err := h.gatewayClient.ConsumeMCPStaticOAuthTest(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret); err != nil {
+		if _, rollbackErr := req.GatewayClient.DeleteCredential(req.Context(), credName, "oauth"); rollbackErr != nil {
+			return errors.New("failed to roll back unverified OAuth credential")
+		}
+		return types.NewErrBadRequest("invalid or expired OAuth credential test")
+	}
 
 	// Trigger reconciliation to update the status
 	if entry.Annotations == nil {
@@ -1869,8 +1886,9 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	}
 
 	return req.Write(types.MCPServerOAuthCredentialStatus{
-		Configured: true,
-		ClientID:   clientID,
+		Configured:  true,
+		ClientID:    clientID,
+		CallbackURL: system.MCPOAuthCallbackURL(h.serverURL),
 	})
 }
 

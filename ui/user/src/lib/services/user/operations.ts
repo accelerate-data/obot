@@ -12,7 +12,10 @@ import type {
 	TunnelConnection,
 	ServerK8sSettings,
 	MCPServerOAuthCredentialRequest,
-	MCPServerOAuthCredentialStatus
+	MCPServerOAuthCredentialStatus,
+	MCPServerOAuthCredentialTestRequest,
+	MCPServerOAuthCredentialTestResult,
+	MCPServerOAuthCredentialTestStart
 } from '../admin/types';
 import {
 	baseURL,
@@ -843,6 +846,31 @@ export async function getWorkspaceMCPCatalogEntryOAuthCredentials(
 		dontLogErrors: true
 	})) as MCPServerOAuthCredentialStatus;
 	return response;
+}
+
+export async function startWorkspaceMCPCatalogEntryOAuthCredentialTest(
+	workspaceID: string,
+	entryID: string,
+	credentials: MCPServerOAuthCredentialTestRequest,
+	opts?: { fetch?: Fetcher }
+): Promise<MCPServerOAuthCredentialTestStart> {
+	return (await doPost(
+		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credential-tests`,
+		credentials,
+		opts
+	)) as MCPServerOAuthCredentialTestStart;
+}
+
+export async function getWorkspaceMCPCatalogEntryOAuthCredentialTest(
+	workspaceID: string,
+	entryID: string,
+	state: string,
+	opts?: { fetch?: Fetcher }
+): Promise<MCPServerOAuthCredentialTestResult> {
+	return (await doGet(
+		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credential-tests/${encodeURIComponent(state)}`,
+		opts
+	)) as MCPServerOAuthCredentialTestResult;
 }
 
 export async function setWorkspaceMCPCatalogEntryOAuthCredentials(
