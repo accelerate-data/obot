@@ -8,6 +8,7 @@
 	import McpMultiDeleteBlockedDialog from '$lib/components/mcp/McpMultiDeleteBlockedDialog.svelte';
 	import McpTunnelDisconnectedStatus from '$lib/components/mcp/McpTunnelDisconnectedStatus.svelte';
 	import StaticOAuthConfigureModal from '$lib/components/mcp/StaticOAuthConfigureModal.svelte';
+	import { staticOAuthReplacementWasCommitted } from '$lib/components/mcp/staticOAuthCredentialTestState';
 	import Table, { type InitSort, type InitSortFn } from '$lib/components/table/Table.svelte';
 	import {
 		AdminService,
@@ -226,26 +227,35 @@
 		proof: string;
 	}) {
 		if (!oauthConfigEntry) return;
-		const replacing = oauthStatus?.configured === true;
+		const statusBeforeSave = oauthStatus;
+		const replacing = statusBeforeSave?.configured === true;
 		try {
+			let savedStatus: MCPServerOAuthCredentialStatus;
 			if (oauthConfigEntry.powerUserWorkspaceID) {
 				const save = replacing
 					? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
 					: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
-				await save(oauthConfigEntry.powerUserWorkspaceID, oauthConfigEntry.id, credentials);
+				savedStatus = await save(
+					oauthConfigEntry.powerUserWorkspaceID,
+					oauthConfigEntry.id,
+					credentials
+				);
 			} else {
 				const save = replacing
 					? AdminService.replaceMCPCatalogEntryOAuthCredentials
 					: AdminService.setMCPCatalogEntryOAuthCredentials;
-				await save('default', oauthConfigEntry.id, credentials);
+				savedStatus = await save('default', oauthConfigEntry.id, credentials);
 			}
+			oauthStatus = savedStatus;
 		} catch (error) {
 			try {
 				oauthStatus = await loadOAuthStatus(oauthConfigEntry);
 			} catch {
 				// The request layer reports the status-refresh failure separately.
 			}
-			throw error;
+			if (!staticOAuthReplacementWasCommitted(statusBeforeSave, oauthStatus)) {
+				throw error;
+			}
 		}
 		// Refresh the table to update status
 		mcpServersAndEntries.refreshAll();

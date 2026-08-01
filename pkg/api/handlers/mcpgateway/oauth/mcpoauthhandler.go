@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
+	"github.com/obot-platform/nanobot/pkg/safehttp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
@@ -28,11 +29,16 @@ type MCPOAuthHandlerFactory struct {
 }
 
 func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManager, client kclient.Client, gatewayClient *client.Client, globalTokenStore mcp.GlobalTokenStore, secretBindingAllowedLabel string) *MCPOAuthHandlerFactory {
+	remoteURLValidationConfig := sessionManager.RemoteMCPURLValidationConfig()
 	return &MCPOAuthHandlerFactory{
-		baseURL:                   baseURL,
-		mcpSessionManager:         sessionManager,
-		client:                    client,
-		stateMgr:                  newStateManager(gatewayClient),
+		baseURL:           baseURL,
+		mcpSessionManager: sessionManager,
+		client:            client,
+		stateMgr: newStateManager(gatewayClient, safehttp.NewClient(
+			!remoteURLValidationConfig.AllowLocalhostMCP,
+			!remoteURLValidationConfig.AllowPrivateIPMCP,
+			!remoteURLValidationConfig.AllowLinkLocalMCP,
+		)),
 		tokenStore:                globalTokenStore,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 	}

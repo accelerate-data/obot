@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/obot-platform/obot/pkg/gateway/client"
@@ -10,13 +11,16 @@ import (
 )
 
 type stateManager struct {
-	gatewayClient *client.Client
+	gatewayClient         *client.Client
+	staticOAuthHTTPClient *http.Client
 }
 
-func newStateManager(gatewayClient *client.Client) *stateManager {
-	return &stateManager{
-		gatewayClient: gatewayClient,
+func newStateManager(gatewayClient *client.Client, staticOAuthHTTPClient ...*http.Client) *stateManager {
+	manager := &stateManager{gatewayClient: gatewayClient}
+	if len(staticOAuthHTTPClient) > 0 {
+		manager.staticOAuthHTTPClient = staticOAuthHTTPClient[0]
 	}
+	return manager
 }
 
 func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier string, conf *oauth2.Config) error {
@@ -49,7 +53,11 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 		conf.Scopes = strings.Split(ps.Scopes, " ")
 	}
 
-	token, err := conf.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", ps.Verifier))
+	exchangeContext := ctx
+	if ps.CatalogEntryName != "" && sm.staticOAuthHTTPClient != nil {
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, sm.staticOAuthHTTPClient)
+	}
+	token, err := conf.Exchange(exchangeContext, code, oauth2.SetAuthURLParam("code_verifier", ps.Verifier))
 	if err != nil {
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
 		return "", "", fmt.Errorf("failed to exchange code: %w", err)

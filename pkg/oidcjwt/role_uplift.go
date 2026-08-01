@@ -12,6 +12,7 @@ import (
 type RoleUplift struct {
 	next       authenticator.Request
 	adminRoles map[string]struct{}
+	ownerRoles map[string]struct{}
 }
 
 func NewRoleUplift(next authenticator.Request, cfg Config) *RoleUplift {
@@ -19,7 +20,11 @@ func NewRoleUplift(next authenticator.Request, cfg Config) *RoleUplift {
 	for _, role := range cfg.AdminRoles {
 		adminRoles[role] = struct{}{}
 	}
-	return &RoleUplift{next: next, adminRoles: adminRoles}
+	ownerRoles := make(map[string]struct{}, len(cfg.OwnerRoles))
+	for _, role := range cfg.OwnerRoles {
+		ownerRoles[role] = struct{}{}
+	}
+	return &RoleUplift{next: next, adminRoles: adminRoles, ownerRoles: ownerRoles}
 }
 
 func (r *RoleUplift) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
@@ -27,13 +32,17 @@ func (r *RoleUplift) AuthenticateRequest(req *http.Request) (*authenticator.Resp
 	if err != nil || !ok || resp == nil || resp.User == nil {
 		return resp, ok, err
 	}
-	if !r.hasAdminRole(resp.User.GetExtra()[jwtRolesExtraKey]) {
+	jwtRoles := resp.User.GetExtra()[jwtRolesExtraKey]
+	role := types.RoleAdmin
+	if r.hasRole(jwtRoles, r.ownerRoles) {
+		role = types.RoleOwner
+	} else if !r.hasRole(jwtRoles, r.adminRoles) {
 		return resp, ok, nil
 	}
 
 	groups := append([]string{}, resp.User.GetGroups()...)
-	for _, group := range types.RoleAdmin.Groups() {
-		if group == types.GroupOwner || slices.Contains(groups, group) {
+	for _, group := range role.Groups() {
+		if (role != types.RoleOwner && group == types.GroupOwner) || slices.Contains(groups, group) {
 			continue
 		}
 		groups = append(groups, group)
@@ -48,9 +57,9 @@ func (r *RoleUplift) AuthenticateRequest(req *http.Request) (*authenticator.Resp
 	return resp, ok, nil
 }
 
-func (r *RoleUplift) hasAdminRole(jwtRoles []string) bool {
+func (r *RoleUplift) hasRole(jwtRoles []string, configured map[string]struct{}) bool {
 	for _, role := range jwtRoles {
-		if _, ok := r.adminRoles[role]; ok {
+		if _, ok := configured[role]; ok {
 			return true
 		}
 	}

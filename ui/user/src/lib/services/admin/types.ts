@@ -901,6 +901,7 @@ export interface MCPServerOAuthCredentialTestResult {
 export interface MCPServerOAuthCredentialStatus {
 	configured: boolean;
 	clientID?: string;
+	generation?: string;
 	callbackURL: string;
 }
 

@@ -1824,6 +1824,36 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 	}
 }
 
+func TestStaticOAuthCredentialReadyUsesCredentialStoreInsteadOfCachedStatus(t *testing.T) {
+	const entryName = "entry-1"
+	entry := v1.MCPServerCatalogEntry{
+		ObjectMeta: metav1.ObjectMeta{Name: entryName},
+		Spec: v1.MCPServerCatalogEntrySpec{Manifest: types.MCPServerCatalogEntryManifest{
+			Runtime: types.RuntimeRemote,
+			RemoteConfig: &types.RemoteCatalogConfig{
+				FixedURL: "https://mcp.example/api", StaticOAuthRequired: true,
+			},
+		}},
+		Status: v1.MCPServerCatalogEntryStatus{OAuthCredentialConfigured: true},
+	}
+	gatewayClient := newOAuthCredentialTestGatewayClient(t)
+
+	release, ready, err := lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, entry)
+	require.NoError(t, err)
+	release()
+	assert.False(t, ready, "stale configured status must not authorize creation after clear")
+
+	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+	}))
+	entry.Status.OAuthCredentialConfigured = false
+	release, ready, err = lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, entry)
+	require.NoError(t, err)
+	release()
+	assert.True(t, ready, "stale unconfigured status must not block creation after save")
+}
+
 // composite builds a composite catalog entry manifest from the given components.
 func composite(components ...types.CatalogComponentServer) types.MCPServerCatalogEntryManifest {
 	return types.MCPServerCatalogEntryManifest{

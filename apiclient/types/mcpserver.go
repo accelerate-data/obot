@@ -779,6 +779,8 @@ type MCPServerOAuthCredentialStatus struct {
 	Configured bool `json:"configured"`
 	// ClientID is the configured client ID (never includes secret)
 	ClientID string `json:"clientID,omitempty"`
+	// Generation changes for every committed save, including same-value replacement.
+	Generation string `json:"generation,omitempty"`
 	// CallbackURL is the redirect URL to register with the OAuth provider.
 	CallbackURL string `json:"callbackURL"`
 }

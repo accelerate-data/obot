@@ -76,6 +76,24 @@ export function canSaveStaticOAuthCredentials(
 	);
 }
 
+type StaticOAuthCredentialGeneration = {
+	configured: boolean;
+	generation?: string;
+};
+
+export function staticOAuthReplacementWasCommitted(
+	previous: StaticOAuthCredentialGeneration | undefined,
+	current: StaticOAuthCredentialGeneration | undefined
+): boolean {
+	return Boolean(
+		previous?.configured &&
+		previous.generation &&
+		current?.configured &&
+		current.generation &&
+		current.generation !== previous.generation
+	);
+}
+
 export function scheduleStaticOAuthCredentialTestExpiry(
 	expiresAt: string,
 	onExpire: () => void,

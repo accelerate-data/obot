@@ -177,6 +177,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialStatus":            schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialStatus(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestRequest":       schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestStart":         schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStart(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestStatusRequest": schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStatusRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerTool":                             schema_obot_platform_obot_apiclient_types_MCPServerTool(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServersNeedingK8sUpdateList":            schema_obot_platform_obot_apiclient_types_MCPServersNeedingK8sUpdateList(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPStaticOAuthTestResult":                  schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref),
@@ -8856,6 +8857,13 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialStatus(re
 							Format:      "",
 						},
 					},
+					"generation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Generation changes for every committed save, including same-value replacement.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"callbackURL": {
 						SchemaProps: spec.SchemaProps{
 							Description: "CallbackURL is the redirect URL to register with the OAuth provider.",
@@ -8906,7 +8914,7 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStart
 				Description: "MCPServerOAuthCredentialTestStart identifies a pending static OAuth verification.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
-					"state": {
+					"testState": {
 						SchemaProps: spec.SchemaProps{
 							Default: "",
 							Type:    []string{"string"},
@@ -8921,7 +8929,28 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStart
 						},
 					},
 				},
-				Required: []string{"state", "oauthURL"},
+				Required: []string{"testState", "oauthURL"},
+			},
+		},
+	}
+}
+
+func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStatusRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "MCPServerOAuthCredentialTestStatusRequest carries an opaque proof outside the URL so access and audit logs cannot persist it.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"testState": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+				},
+				Required: []string{"testState"},
 			},
 		},
 	}
@@ -9045,6 +9074,13 @@ func schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref comm
 						SchemaProps: spec.SchemaProps{
 							Type:   []string{"string"},
 							Format: "",
+						},
+					},
+					"proof": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Proof is returned only after a successful provider exchange and is consumed by Save.",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 					"expiresAt": {

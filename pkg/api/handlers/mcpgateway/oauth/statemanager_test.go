@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/obot-platform/nanobot/pkg/safehttp"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	apihandlers "github.com/obot-platform/obot/pkg/api/handlers"
@@ -29,6 +30,34 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestStateManagerBlocksStaticCatalogTokenExchangeToPrivateAddress(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClient(t, entryName, mcpID)
+	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+	}))
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("restricted client reached the private token endpoint")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(provider.Close)
+	manager := newStateManager(client, safehttp.NewClient(true, true, true))
+	config := &oauth2.Config{
+		ClientID: "client-1", ClientSecret: "secret-1",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", entryName, "state-private-token", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-private-token", "code-1", "", "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to exchange code")
+}
 
 func TestStateManagerFencesCallbackWriteAfterProviderExchange(t *testing.T) {
 	const (

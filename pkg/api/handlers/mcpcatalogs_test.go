@@ -878,7 +878,7 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: system.MCPOAuthCredentialName(entry.Name),
 		Name:    "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"},
+		Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": "safe-generation"},
 	}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
@@ -895,7 +895,7 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode credential status: %v", err)
 	}
-	if len(got) != 3 || got["configured"] != true || got["clientID"] != "saved-client" || got["callbackURL"] != "https://obot.example/oauth/mcp/callback" {
+	if len(got) != 4 || got["configured"] != true || got["clientID"] != "saved-client" || got["generation"] != "safe-generation" || got["callbackURL"] != "https://obot.example/oauth/mcp/callback" {
 		t.Fatalf("credential status = %#v", got)
 	}
 	if strings.Contains(recorder.Body.String(), "saved-secret") {

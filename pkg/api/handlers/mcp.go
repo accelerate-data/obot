@@ -1615,8 +1615,14 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 			}
 		}
 
-		// Block server creation if OAuth is required but not configured
-		if entryRequiresStaticOAuthCreds(catalogEntry) {
+		// Keep credential mutation serialized through creation so a concurrent clear
+		// cannot pass a stale controller status check and leave a new unusable server.
+		releaseOAuthCredential, oauthCredentialReady, err := lockStaticOAuthCredentialForCreate(req.Context(), req.GatewayClient, catalogEntry)
+		if err != nil {
+			return fmt.Errorf("failed to check static OAuth credential: %w", err)
+		}
+		defer releaseOAuthCredential()
+		if !oauthCredentialReady {
 			return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
 		}
 
@@ -1701,6 +1707,25 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 	}
 
 	return req.WriteCreated(ConvertMCPServer(server, mergedEnv, m.serverURL, slug))
+}
+
+func lockStaticOAuthCredentialForCreate(ctx context.Context, gatewayClient *gateway.Client, entry v1.MCPServerCatalogEntry) (func(), bool, error) {
+	if entry.Spec.Manifest.RemoteConfig == nil || !entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+		return func() {}, true, nil
+	}
+	credentialName := system.MCPOAuthCredentialName(entry.Name)
+	release, err := gatewayClient.AcquireCredentialLock(ctx, credentialName)
+	if err != nil {
+		return func() {}, false, err
+	}
+	if _, err := gatewayClient.RevealCredential(ctx, []string{credentialName}, "oauth"); err != nil {
+		if errors.As(err, &gateway.CredentialNotFoundError{}) {
+			return release, false, nil
+		}
+		release()
+		return func() {}, false, err
+	}
+	return release, true, nil
 }
 
 // UpdateServer updates the manifest of an MCPServer.

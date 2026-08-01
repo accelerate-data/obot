@@ -13,6 +13,7 @@ import (
 	"time"
 
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
+	"github.com/obot-platform/nanobot/pkg/safehttp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
@@ -165,7 +166,16 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return types.NewErrNotFound("OAuth debugger authorization state not found")
 	}
 
-	token, err := exchangeAndPersistOAuthDebuggerToken(req.Context(), req.GatewayClient, pendingState, input.Code)
+	var staticOAuthHTTPClient *http.Client
+	if pendingState.CatalogEntryName != "" {
+		validation := m.mcpSessionManager.RemoteMCPURLValidationConfig()
+		staticOAuthHTTPClient = safehttp.NewClient(
+			!validation.AllowLocalhostMCP,
+			!validation.AllowPrivateIPMCP,
+			!validation.AllowLinkLocalMCP,
+		)
+	}
+	token, err := exchangeAndPersistOAuthDebuggerToken(req.Context(), req.GatewayClient, pendingState, input.Code, staticOAuthHTTPClient)
 	if err != nil {
 		return err
 	}
@@ -183,9 +193,13 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 	})
 }
 
-func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, pendingState *gwtypes.MCPOAuthPendingState, code string) (*oauth2.Token, error) {
+func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, pendingState *gwtypes.MCPOAuthPendingState, code string, httpClients ...*http.Client) (*oauth2.Token, error) {
 	conf := oauthDebuggerConfigFromPendingState(pendingState)
-	token, err := conf.Exchange(ctx, code, oauth2.VerifierOption(pendingState.Verifier))
+	exchangeContext := ctx
+	if len(httpClients) > 0 && httpClients[0] != nil {
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, httpClients[0])
+	}
+	token, err := conf.Exchange(exchangeContext, code, oauth2.VerifierOption(pendingState.Verifier))
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange OAuth code: %w", err)
 	}

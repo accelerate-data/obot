@@ -10,6 +10,7 @@ const {
 	invalidateStaticOAuthCredentialTest,
 	safeStaticOAuthAuthorizationURL,
 	scheduleStaticOAuthCredentialTestExpiry,
+	staticOAuthReplacementWasCommitted,
 	succeedStaticOAuthCredentialTest
 } = staticOAuthCredentialTestState;
 
@@ -18,7 +19,10 @@ test('authorization navigation accepts only HTTP URLs with a hostname', () => {
 		safeStaticOAuthAuthorizationURL('https://provider.example/authorize?client_id=client'),
 		'https://provider.example/authorize?client_id=client'
 	);
-	assert.equal(safeStaticOAuthAuthorizationURL('http://127.0.0.1:8080/authorize'), 'http://127.0.0.1:8080/authorize');
+	assert.equal(
+		safeStaticOAuthAuthorizationURL('http://127.0.0.1:8080/authorize'),
+		'http://127.0.0.1:8080/authorize'
+	);
 	assert.equal(safeStaticOAuthAuthorizationURL('javascript:alert(document.domain)'), undefined);
 	assert.equal(safeStaticOAuthAuthorizationURL('not a URL'), undefined);
 });
@@ -85,6 +89,37 @@ test('a failed test and a new test cannot reuse an earlier proof', () => {
 
 	assert.equal(canSaveStaticOAuthCredentials(failed, 'client-id', 'client-secret'), false);
 	assert.equal(canSaveStaticOAuthCredentials(restarted, 'client-id', 'client-secret'), false);
+});
+
+test('only an advanced generation confirms an ambiguous replacement', () => {
+	assert.equal(
+		staticOAuthReplacementWasCommitted(
+			{ configured: true, generation: 'generation-1' },
+			{ configured: true, generation: 'generation-2' }
+		),
+		true
+	);
+	assert.equal(
+		staticOAuthReplacementWasCommitted(
+			{ configured: true, generation: 'generation-1' },
+			{ configured: true, generation: 'generation-1' }
+		),
+		false
+	);
+	assert.equal(
+		staticOAuthReplacementWasCommitted(
+			{ configured: true },
+			{ configured: true, generation: 'generation-2' }
+		),
+		false
+	);
+	assert.equal(
+		staticOAuthReplacementWasCommitted(
+			{ configured: false, generation: 'generation-1' },
+			{ configured: true, generation: 'generation-2' }
+		),
+		false
+	);
 });
 
 test('server expiry invalidates the proof at the authoritative time', (t) => {

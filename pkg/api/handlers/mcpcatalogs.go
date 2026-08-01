@@ -1804,13 +1804,16 @@ func (h *MCPCatalogHandler) GetOAuthCredentials(req api.Context) error {
 	configured := err == nil
 
 	var clientID string
+	var generation string
 	if configured {
 		clientID = cred.Secrets["CLIENT_ID"]
+		generation = cred.Secrets["GENERATION"]
 	}
 
 	return req.Write(types.MCPServerOAuthCredentialStatus{
 		Configured:  configured,
 		ClientID:    clientID,
+		Generation:  generation,
 		CallbackURL: system.MCPOAuthCallbackURL(h.serverURL),
 	})
 }
@@ -1873,6 +1876,10 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 		}
 		return fmt.Errorf("failed to create OAuth credential: %w", err)
 	}
+	committedCredential, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
+	if err != nil {
+		return fmt.Errorf("failed to read committed OAuth credential: %w", err)
+	}
 
 	// Trigger reconciliation to update the status
 	if entry.Annotations == nil {
@@ -1886,6 +1893,7 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	return req.Write(types.MCPServerOAuthCredentialStatus{
 		Configured:  true,
 		ClientID:    clientID,
+		Generation:  committedCredential.Secrets["GENERATION"],
 		CallbackURL: system.MCPOAuthCallbackURL(h.serverURL),
 	})
 }
@@ -1942,6 +1950,10 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 		}
 		return fmt.Errorf("failed to replace OAuth credential: %w", err)
 	}
+	committedCredential, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
+	if err != nil {
+		return fmt.Errorf("failed to read committed OAuth credential: %w", err)
+	}
 
 	if entry.Annotations == nil {
 		entry.Annotations = make(map[string]string, 1)
@@ -1954,6 +1966,7 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 	return req.Write(types.MCPServerOAuthCredentialStatus{
 		Configured:  true,
 		ClientID:    clientID,
+		Generation:  committedCredential.Secrets["GENERATION"],
 		CallbackURL: system.MCPOAuthCallbackURL(h.serverURL),
 	})
 }

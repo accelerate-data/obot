@@ -34,6 +34,7 @@
 	import McpSelectServerDeployment from './McpSelectServerDeployment.svelte';
 	import StaticOAuthConfigureModal from './StaticOAuthConfigureModal.svelte';
 	import DebugOauthDialog from './oauth/DebugOauthDialog.svelte';
+	import { staticOAuthReplacementWasCommitted } from './staticOAuthCredentialTestState';
 	import {
 		KeyRound,
 		PencilLine,
@@ -846,26 +847,31 @@
 	}}
 	onSave={async (credentials) => {
 		if (!entry) return;
-		const replacing = oauthStatus?.configured === true;
+		const statusBeforeSave = oauthStatus;
+		const replacing = statusBeforeSave?.configured === true;
 		try {
+			let savedStatus: MCPServerOAuthCredentialStatus;
 			if (entry.powerUserWorkspaceID) {
 				const save = replacing
 					? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
 					: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
-				await save(entry.powerUserWorkspaceID, entry.id, credentials);
+				savedStatus = await save(entry.powerUserWorkspaceID, entry.id, credentials);
 			} else {
 				const save = replacing
 					? AdminService.replaceMCPCatalogEntryOAuthCredentials
 					: AdminService.setMCPCatalogEntryOAuthCredentials;
-				await save('default', entry.id, credentials);
+				savedStatus = await save('default', entry.id, credentials);
 			}
+			oauthStatus = savedStatus;
 		} catch (error) {
 			try {
 				oauthStatus = await loadOAuthStatus(entry);
 			} catch {
 				// The request layer reports the status-refresh failure separately.
 			}
-			throw error;
+			if (!staticOAuthReplacementWasCommitted(statusBeforeSave, oauthStatus)) {
+				throw error;
+			}
 		}
 		oauthConfiguredOverride = true;
 		onOAuthConfigured?.();

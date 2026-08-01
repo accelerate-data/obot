@@ -44,6 +44,7 @@
 	import McpServerInfo from '../mcp/McpServerInfo.svelte';
 	import McpServerTools from '../mcp/McpServerTools.svelte';
 	import StaticOAuthConfigureModal from '../mcp/StaticOAuthConfigureModal.svelte';
+	import { staticOAuthReplacementWasCommitted } from '../mcp/staticOAuthCredentialTestState';
 	import IconButton from '../primitives/IconButton.svelte';
 	import Table from '../table/Table.svelte';
 	import { setVirtualPageDisabled } from '../ui/virtual-page/context';
@@ -666,7 +667,10 @@
 		staticOauthConfigModal?.open();
 	}
 
-	function loadOAuthStatus(target: MCPCatalogEntry | MCPCatalogServer, catalogOrWorkspaceID: string) {
+	function loadOAuthStatus(
+		target: MCPCatalogEntry | MCPCatalogServer,
+		catalogOrWorkspaceID: string
+	) {
 		return entity === 'workspace'
 			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(catalogOrWorkspaceID, target.id)
 			: AdminService.getMCPCatalogEntryOAuthCredentials(catalogOrWorkspaceID, target.id);
@@ -1513,18 +1517,20 @@
 	}}
 	onSave={async (credentials) => {
 		if (!entry || !id) return;
-		const replacing = staticOauthStatus?.configured === true;
+		const statusBeforeSave = staticOauthStatus;
+		const replacing = statusBeforeSave?.configured === true;
+		let savedStatus: MCPServerOAuthCredentialStatus | undefined;
 		try {
 			if (entity === 'workspace') {
 				const save = replacing
 					? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
 					: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
-				await save(id, entry.id, credentials);
+				savedStatus = await save(id, entry.id, credentials);
 			} else {
 				const save = replacing
 					? AdminService.replaceMCPCatalogEntryOAuthCredentials
 					: AdminService.setMCPCatalogEntryOAuthCredentials;
-				await save(id, entry.id, credentials);
+				savedStatus = await save(id, entry.id, credentials);
 			}
 		} catch (error) {
 			try {
@@ -1532,13 +1538,12 @@
 			} catch {
 				// The request layer reports the status-refresh failure separately.
 			}
-			throw error;
+			if (!staticOAuthReplacementWasCommitted(statusBeforeSave, staticOauthStatus)) {
+				throw error;
+			}
+			savedStatus = staticOauthStatus;
 		}
-		staticOauthStatus = {
-			...staticOauthStatus,
-			callbackURL: staticOauthStatus?.callbackURL ?? '',
-			configured: true
-		};
+		staticOauthStatus = savedStatus;
 	}}
 	onDelete={async () => {
 		if (!entry || !id) return;

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
+	"github.com/obot-platform/nanobot/pkg/safehttp"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -82,6 +83,32 @@ func TestExchangeAndPersistOAuthDebuggerTokenForDirectDynamicAndCIMD(t *testing.
 				t.Fatalf("stored debugger token = access %q entry %q", stored.AccessToken, stored.CatalogEntryName)
 			}
 		})
+	}
+}
+
+func TestExchangeOAuthDebuggerTokenBlocksStaticCatalogPrivateTokenEndpoint(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatal("restricted client reached the private token endpoint")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(provider.Close)
+	pending := &gatewaytypes.MCPOAuthPendingState{
+		UserID: "user-1", MCPID: "mcp-1", URL: "https://mcp.example/api",
+		OAuthAuthRequestID: OAuthDebuggerPendingStateMarker,
+		CatalogEntryName:   "entry-1",
+		ClientID:           "client-1", ClientSecret: "secret-1",
+		AuthURL: "https://provider.example/authorize", TokenURL: provider.URL,
+	}
+
+	_, err := exchangeAndPersistOAuthDebuggerToken(
+		t.Context(),
+		newDirectOAuthDebuggerTestClient(t, "mcp-1"),
+		pending,
+		"code-1",
+		safehttp.NewClient(true, true, true),
+	)
+	if err == nil || !strings.Contains(err.Error(), "failed to exchange OAuth code") {
+		t.Fatalf("expected blocked private token exchange, got %v", err)
 	}
 }
 

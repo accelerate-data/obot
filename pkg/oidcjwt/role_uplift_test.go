@@ -61,6 +61,28 @@ func TestRoleUpliftPreservesDecoratedOwnerRole(t *testing.T) {
 	assert.Contains(t, resp.User.GetGroups(), types.GroupAdmin)
 }
 
+func TestRoleUpliftAddsRequestTimeOwnerForConfiguredOwnerClaim(t *testing.T) {
+	wrapped := NewRoleUplift(staticAuthenticator{
+		response: &authenticator.Response{
+			User: &user.DefaultInfo{
+				Name:   "owner",
+				UID:    "1",
+				Groups: types.RoleBasic.Groups(),
+				Extra: map[string][]string{
+					jwtRolesExtraKey: {"owner"},
+				},
+			},
+		},
+	}, Config{AdminRoles: []string{"admin"}, OwnerRoles: []string{"owner"}})
+
+	resp, ok, err := wrapped.AuthenticateRequest(&http.Request{})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	assert.Contains(t, resp.User.GetGroups(), types.GroupOwner)
+	assert.Contains(t, resp.User.GetGroups(), types.GroupAdmin)
+}
+
 func TestRoleUpliftDoesNotPromoteNonAdminJWT(t *testing.T) {
 	wrapped := NewRoleUplift(staticAuthenticator{
 		response: &authenticator.Response{
