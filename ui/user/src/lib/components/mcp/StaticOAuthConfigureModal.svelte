@@ -328,6 +328,7 @@
 					class="text-input-filled"
 					class:error={showRequired && !form.clientID}
 					placeholder="your-client-id"
+					disabled={loading}
 					oninput={handleCredentialInput}
 				/>
 			</div>
@@ -341,6 +342,7 @@
 					bind:value={form.clientSecret}
 					error={showRequired && !form.clientSecret}
 					placeholder="your-client-secret"
+					disabled={loading}
 					oninput={handleCredentialInput}
 				/>
 			</div>
@@ -423,7 +425,7 @@
 
 <Confirm
 	show={showDeleteConfirm}
-	msg="Are you sure you want to clear the OAuth credentials? Users will not be able to connect to this server until new credentials are configured."
+	msg="Are you sure you want to clear the OAuth credentials? All deployments remain, but all Users must reconnect after new credentials are configured."
 	onsuccess={handleDelete}
 	oncancel={() => {
 		showDeleteConfirm = false;

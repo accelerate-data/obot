@@ -790,8 +790,42 @@ func TestCommitMCPStaticOAuthCredentialAtomicallyStoresAndConsumesExactProof(t *
 	if credential.Secrets["CLIENT_ID"] != conf.ClientID || credential.Secrets["CLIENT_SECRET"] != conf.ClientSecret {
 		t.Fatalf("committed credential = %#v", credential.Secrets)
 	}
+	if credential.Secrets["MCP_URL"] != "https://mcp.example/api" {
+		t.Fatalf("committed credential URL = %q", credential.Secrets["MCP_URL"])
+	}
+	if credential.Secrets["GENERATION"] != hashMCPStaticOAuthValue(proof) {
+		t.Fatalf("committed credential generation = %q, want proof receipt", credential.Secrets["GENERATION"])
+	}
 	if _, err := c.GetMCPOAuthPendingState(t.Context(), state.CallbackState); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("committed proof remained usable: %v", err)
+	}
+}
+
+func TestCreateMCPOAuthPendingStateRejectsCredentialBoundToAnotherCatalogURL(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "server-1"
+		oldURL    = "https://old-mcp.example/api"
+		newURL    = "https://new-mcp.example/api"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "client-1",
+			"CLIENT_SECRET": "secret-1",
+			"MCP_URL":       oldURL,
+			"GENERATION":    "generation-1",
+		},
+	}); err != nil {
+		t.Fatalf("seed catalog credential: %v", err)
+	}
+	conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+
+	err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, newURL, "request-1", entryName, "state-1", "verifier-1", conf)
+	if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+		t.Fatalf("changed catalog URL error = %v, want catalog credential changed", err)
 	}
 }
 

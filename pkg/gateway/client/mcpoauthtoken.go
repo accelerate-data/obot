@@ -121,6 +121,9 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx co
 		!secureStringEqual(credential.Secrets["GENERATION"], catalogCredentialGeneration) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
+	if credentialURL := credential.Secrets["MCP_URL"]; credentialURL != "" && !secureStringEqual(credentialURL, url) {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
 
 	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration, oauthConf, token)
 }
@@ -467,8 +470,10 @@ func validMCPStaticOAuthTestCompletion(status apitypes.MCPStaticOAuthTestStatus,
 
 type MCPStaticOAuthCredentialClaim struct {
 	mcpID        string
+	mcpURL       string
 	clientID     string
 	clientSecret string
+	generation   string
 }
 
 // ClaimMCPStaticOAuthCredentialProof validates and durably consumes one proof.
@@ -512,7 +517,13 @@ func (c *Client) ClaimMCPStaticOAuthCredentialProof(ctx context.Context, state, 
 	if rejectedErr != nil {
 		return nil, rejectedErr
 	}
-	return &MCPStaticOAuthCredentialClaim{mcpID: mcpID, clientID: clientID, clientSecret: clientSecret}, nil
+	return &MCPStaticOAuthCredentialClaim{
+		mcpID:        mcpID,
+		mcpURL:       mcpURL,
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		generation:   hashedProof,
+	}, nil
 }
 
 // CommitClaimedMCPStaticOAuthCredential applies a previously claimed Save.
@@ -531,7 +542,8 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 		Secrets: map[string]string{
 			"CLIENT_ID":     claim.clientID,
 			"CLIENT_SECRET": claim.clientSecret,
-			"GENERATION":    strings.ToLower(rand.Text()),
+			"MCP_URL":       claim.mcpURL,
+			"GENERATION":    claim.generation,
 		},
 	}
 	if err := c.encryptCredential(ctx, &credential); err != nil {
@@ -676,6 +688,9 @@ func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, 
 	if catalogEntryName != "" {
 		credential, err := c.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(catalogEntryName)}, "oauth")
 		if err != nil || !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) || !secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
+			return ErrMCPOAuthCatalogCredentialChanged
+		}
+		if credentialURL := credential.Secrets["MCP_URL"]; credentialURL != "" && !secureStringEqual(credentialURL, mcpURL) {
 			return ErrMCPOAuthCatalogCredentialChanged
 		}
 		catalogCredentialGeneration = credential.Secrets["GENERATION"]

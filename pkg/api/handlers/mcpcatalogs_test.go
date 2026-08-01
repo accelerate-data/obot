@@ -510,6 +510,46 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 	}
 }
 
+func TestSetOAuthCredentialsReplacesCredentialBoundToPreviousCatalogURL(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://new-mcp.example/api")
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "old-client",
+			"CLIENT_SECRET": "old-secret",
+			"MCP_URL":       "https://old-mcp.example/api",
+			"GENERATION":    "old-generation",
+		},
+	}); err != nil {
+		t.Fatalf("seed old-provider credential: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProofFor(
+		t,
+		gateway,
+		entry.Name,
+		entry.Spec.Manifest.RemoteConfig.FixedURL,
+		"user-1",
+		"new-client",
+		"new-secret",
+	)
+	req, _ := newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "new-client", "new-secret", proof)
+
+	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).SetOAuthCredentials(req); err != nil {
+		t.Fatalf("save new-provider credential: %v", err)
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(entry.Name)}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal new-provider credential: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "new-client" ||
+		credential.Secrets["CLIENT_SECRET"] != "new-secret" ||
+		credential.Secrets["MCP_URL"] != entry.Spec.Manifest.RemoteConfig.FixedURL {
+		t.Fatalf("new-provider credential = %#v", credential.Secrets)
+	}
+}
+
 func TestSetOAuthCredentialsProofConsumptionOnRejectedSave(t *testing.T) {
 	t.Run("storage failure", func(t *testing.T) {
 		transformer := &toggleCredentialWriteErrorTransformer{failWrite: true}
@@ -900,6 +940,39 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "saved-secret") {
 		t.Fatalf("credential status exposed secret: %s", recorder.Body.String())
+	}
+}
+
+func TestGetOAuthCredentialsFailsClosedAfterCatalogURLChanges(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://new-mcp.example/api")
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "saved-client",
+			"CLIENT_SECRET": "saved-secret",
+			"MCP_URL":       "https://old-mcp.example/api",
+			"GENERATION":    "safe-generation",
+		},
+	}); err != nil {
+		t.Fatalf("seed OAuth credential: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+
+	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).GetOAuthCredentials(req); err != nil {
+		t.Fatalf("get OAuth credential status: %v", err)
+	}
+	var got types.MCPServerOAuthCredentialStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode credential status: %v", err)
+	}
+	if got.Configured || got.ClientID != "" || got.Generation != "" {
+		t.Fatalf("changed provider reported stale credential configured: %#v", got)
 	}
 }
 
@@ -1405,8 +1478,9 @@ func newSetOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client, e
 	t.Helper()
 	recorder := httptest.NewRecorder()
 	body := fmt.Sprintf(`{"clientID":%q,"clientSecret":%q,"proof":%q}`, clientID, clientSecret, proof)
-	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", body, recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry)
+	req.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.ResponseWriter = recorder
 	req.User = &user.DefaultInfo{Name: "owner", UID: userID}
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)

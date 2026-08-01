@@ -58,3 +58,14 @@ for (const caller of callers) {
 		}
 	});
 }
+
+test('shared static OAuth modal keeps submitted values immutable and explains entry-wide clear', async () => {
+	const modal = await readFile(
+		new URL('./StaticOAuthConfigureModal.svelte', import.meta.url),
+		'utf8'
+	);
+
+	assert.match(modal, /id="clientID"[\s\S]*?disabled=\{loading\}/);
+	assert.match(modal, /name="clientSecret"[\s\S]*?disabled=\{loading\}/);
+	assert.match(modal, /all deployments remain[\s\S]*?all Users must reconnect/i);
+});

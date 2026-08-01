@@ -51,7 +51,7 @@ After saving the remote MCP server with static OAuth enabled:
 4. Click **Test Credentials** and finish the provider authorization in the window that opens
 5. After Obot reports a successful test, click **Save**
 
-Obot enables **Save** only for the exact client ID and secret that passed the test. Client IDs and secrets are opaque: blank validation never trims or transforms the values tested, proof-bound, or saved. The provider callback state, status-polling token, and one-use Save proof are independent values; the proof is returned only after successful authorization. The server validates discovered authorization and token endpoints before opening the provider and keeps token exchange on the same restricted network policy. The server returns its authoritative expiration time, and the dialog disables **Save** when that time is reached. Editing either field, closing the dialog, a denied authorization, a failed token exchange, an expired test, or any Save attempt requires a new successful test before Save can be enabled again.
+Obot enables **Save** only for the exact client ID and secret that passed the test. Client IDs and secrets are opaque: blank validation never trims or transforms the values tested, proof-bound, or saved. The provider callback state, status-polling token, and one-use Save proof are independent values; the proof is returned only after successful authorization. The server validates discovered authorization and token endpoints before opening the provider and keeps token exchange on the same restricted network policy. The server returns its authoritative expiration time, and the dialog disables **Save** when that time is reached. Editing either field, closing the dialog, a denied authorization, a failed token exchange, an expired test, or any Save attempt requires a new successful test before Save can be enabled again. While Save is in flight, both credential fields are read-only so the displayed pair remains the submitted pair.
 
 Once configured, matching MCP server deployments become available to users. Each user still creates a separate OAuth grant for each deployment.
 
@@ -70,15 +70,15 @@ The Obot admin interface and API clients rotate an existing application with one
 
 An invalid or expired proof leaves the active application and grants unchanged. A successful replacement retains catalog servers and access rules, but each user must authorize each deployment again. Obot does not revoke grants at the provider.
 
-**Clear Credentials** remains a separate destructive action. Use it only when the entry should become unconfigured; matching deployments remain present but unavailable until a new tested application is saved.
+**Clear Credentials** remains a separate destructive action. Use it only when the entry should become unconfigured; all matching deployments remain present but unavailable, and all Users must reconnect after a new tested application is saved.
 
 ### Credential API lifecycle
 
-- Initial configuration uses `POST` on the catalog-entry or workspace credential resource. Existing credentials are not overwritten. Exact-value proof validation and durable claim happen first; credential creation failure leaves the active state unchanged and requires a new Test.
+- Initial configuration uses `POST` on the catalog-entry or workspace credential resource. An existing credential for the same provider is not overwritten. A credential bound to a previous fixed URL may be atomically replaced after the new provider succeeds, with the same local-grant cleanup as rotation. Exact-value proof validation and durable claim happen first; credential creation failure leaves the active state unchanged and requires a new Test. The saved credential retains the tested fixed URL and uses a proof-derived safe generation receipt, allowing API clients to reconcile a lost success response without retrying the mutation.
 - Replacement uses `PUT` on that same resource. Exact-value proof validation and durable claim happen before cleanup discovery and mutation. Credential replacement, application-generation advancement, sibling-proof invalidation, and local grant cleanup then commit or roll back together while the same cross-process credential lock is held.
 - Clear uses `DELETE`. It retains catalog servers and access rules but removes the shared application and matching local grants.
 
-For static-required catalog entries, token writes verify the current catalog entry, server URL, client ID, client secret, and application generation under the same lock. A callback or refresh that began with an older static application cannot recreate its grant after replacement or clear. Direct non-catalog dynamic registration, including CIMD, and optional-catalog dynamic registration do not use this static-application fence.
+For static-required catalog entries, token writes verify the current catalog entry, server URL, client ID, client secret, and application generation under the same lock. A callback or refresh that began with an older static application cannot recreate its grant after replacement or clear. If the catalog entry's fixed URL changes, the saved application is reported unconfigured and cannot be used for the new provider. Direct non-catalog dynamic registration, including CIMD, and optional-catalog dynamic registration do not use this static-application fence.
 
 ## Example: GitHub MCP Server
 

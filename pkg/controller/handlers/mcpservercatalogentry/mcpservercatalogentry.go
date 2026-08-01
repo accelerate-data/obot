@@ -301,11 +301,12 @@ func (h *Handler) EnsureOAuthCredentialStatus(req router.Request, _ router.Respo
 
 	// Check if credentials exist
 	credName := system.MCPOAuthCredentialName(entry.Name)
-	_, err := h.gatewayClient.RevealCredential(req.Ctx, []string{credName}, "oauth")
+	credential, err := h.gatewayClient.RevealCredential(req.Ctx, []string{credName}, "oauth")
 
 	var configured bool
 	if err == nil {
-		configured = true
+		credentialURL := credential.Secrets["MCP_URL"]
+		configured = credentialURL == "" || credentialURL == entry.Spec.Manifest.RemoteConfig.FixedURL
 	} else if !errors.As(err, &gclient.CredentialNotFoundError{}) {
 		return fmt.Errorf("failed to check credential status: %w", err)
 	}
