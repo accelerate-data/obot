@@ -1,7 +1,6 @@
 package mcpgateway
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -55,6 +54,80 @@ func TestTokenStoreRejectsCatalogGrantAfterProviderURLChanges(t *testing.T) {
 	require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
 }
 
+func TestTokenStoreRejectsLegacyGrantWithoutCatalogFence(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)
+	config := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     config.ClientID,
+			"CLIENT_SECRET": config.ClientSecret,
+			"MCP_URL":       mcpURL,
+			"GENERATION":    "generation-1",
+		},
+	}))
+	require.NoError(t, client.ReplaceMCPOAuthToken(
+		t.Context(), "user-1", mcpID, mcpURL, "", config,
+		&oauth2.Token{AccessToken: "legacy-access"},
+	))
+
+	store := &tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}
+	_, _, err := store.GetTokenConfig(t.Context(), mcpURL)
+	require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
+}
+
+func TestTokenStoreReadWaitsForCatalogMutationFence(t *testing.T) {
+	const (
+		entryName          = "catalog-entry-1"
+		mcpID              = "mcp-instance-1"
+		mcpURL             = "https://mcp.example/api"
+		catalogMutationKey = "mcp-static-oauth-catalog-mutation"
+	)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)
+	config := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     config.ClientID,
+			"CLIENT_SECRET": config.ClientSecret,
+			"MCP_URL":       mcpURL,
+			"GENERATION":    "generation-1",
+		},
+	}))
+	require.NoError(t, client.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(
+		t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1", config,
+		&oauth2.Token{AccessToken: "active-access"},
+	))
+
+	release, err := client.AcquireCredentialLock(t.Context(), catalogMutationKey)
+	require.NoError(t, err)
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := (&tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}).GetTokenConfig(t.Context(), mcpURL)
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		release()
+		t.Fatalf("token read bypassed catalog mutation fence: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	release()
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fenced token read")
+	}
+}
+
 func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T) {
 	const (
 		entryName = "catalog-entry-1"
@@ -72,7 +145,7 @@ func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T
 				require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
 					Context: system.MCPOAuthCredentialName(entryName),
 					Name:    "oauth",
-					Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-2"},
+					Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-2", "MCP_URL": mcpURL, "GENERATION": "generation-2"},
 				}))
 			},
 		},
@@ -92,7 +165,7 @@ func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T
 				require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
 					Context: system.MCPOAuthCredentialName(entryName),
 					Name:    "oauth",
-					Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "GENERATION": "generation-2"},
+					Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "MCP_URL": mcpURL, "GENERATION": "generation-2"},
 				}))
 			},
 		},
@@ -102,10 +175,10 @@ func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T
 			require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
 				Context: system.MCPOAuthCredentialName(entryName),
 				Name:    "oauth",
-				Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+				Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "MCP_URL": mcpURL, "GENERATION": "generation-1"},
 			}))
 			oldConfig := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
-			require.NoError(t, client.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, oldConfig,
+			require.NoError(t, client.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1", oldConfig,
 				&oauth2.Token{AccessToken: "old-access", RefreshToken: "refresh-1", Expiry: time.Now().Add(-time.Minute)}))
 
 			store := &tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}
@@ -126,38 +199,6 @@ func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T
 			require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 		})
 	}
-}
-
-func TestTokenStoreInfersFenceForLegacyCatalogGrant(t *testing.T) {
-	const (
-		entryName = "catalog-entry-1"
-		mcpID     = "mcp-instance-1"
-		mcpURL    = "https://mcp.example/api"
-	)
-	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)
-	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entryName),
-		Name:    "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
-	}))
-	oldConfig := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
-	require.NoError(t, client.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", oldConfig,
-		&oauth2.Token{AccessToken: "old-access", RefreshToken: "refresh-1"}))
-
-	store := &tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}
-	config, _, err := store.GetTokenConfig(t.Context(), mcpURL)
-	require.NoError(t, err)
-	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entryName),
-		Name:    "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-2"},
-	}))
-	require.NoError(t, client.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID))
-
-	err = store.SetTokenConfig(t.Context(), mcpURL, config, &oauth2.Token{AccessToken: "refreshed-access"})
-	require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
-	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
-	require.True(t, errors.Is(err, gorm.ErrRecordNotFound))
 }
 
 func TestTokenStoreRejectsLegacyStaticGrantLeftByFailedClear(t *testing.T) {

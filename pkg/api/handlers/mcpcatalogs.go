@@ -437,6 +437,11 @@ func (h *MCPCatalogHandler) UpdateEntry(req api.Context) error {
 	// Update the manifest
 	entry.Spec.Manifest = manifest
 
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog entry update with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	if err := req.Update(&entry); err != nil {
 		return fmt.Errorf("failed to update entry: %w", err)
 	}
@@ -475,6 +480,11 @@ func (h *MCPCatalogHandler) DeleteEntry(req api.Context) error {
 		return types.NewErrBadRequest("entry is not editable and cannot be manually deleted")
 	}
 
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog entry deletion with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	if err := req.Delete(&entry); err != nil {
 		return fmt.Errorf("failed to delete entry: %w", err)
 	}
@@ -1812,13 +1822,9 @@ func (h *MCPCatalogHandler) GetOAuthCredentials(req api.Context) error {
 	if err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
 		return fmt.Errorf("failed to read OAuth credential: %w", err)
 	}
-	configured := err == nil
-	if configured {
-		credentialURL := cred.Secrets["MCP_URL"]
-		if credentialURL != "" && credentialURL != entry.Spec.Manifest.RemoteConfig.FixedURL {
-			configured = false
-		}
-	}
+	configured := err == nil &&
+		cred.Secrets["MCP_URL"] == entry.Spec.Manifest.RemoteConfig.FixedURL &&
+		cred.Secrets["GENERATION"] != ""
 
 	var clientID string
 	var generation string
@@ -1855,6 +1861,11 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 
 	// Check if credentials already exist
 	credName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate OAuth credential with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credName)
 	if err != nil {
 		return fmt.Errorf("failed to lock OAuth credential: %w", err)
@@ -1862,8 +1873,8 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	defer releaseCredentialLock()
 
 	// Initial setup mode: All fields are required.
-	proof := strings.TrimSpace(credReq.Proof)
-	if strings.TrimSpace(credReq.ClientID) == "" || strings.TrimSpace(credReq.ClientSecret) == "" || proof == "" {
+	proof := credReq.Proof
+	if strings.TrimSpace(credReq.ClientID) == "" || strings.TrimSpace(credReq.ClientSecret) == "" || strings.TrimSpace(proof) == "" {
 		return types.NewErrBadRequest("clientID, clientSecret, and proof are required")
 	}
 
@@ -1886,7 +1897,7 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	existingCredential, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
 	if err == nil {
 		existingURL := existingCredential.Secrets["MCP_URL"]
-		if existingURL == "" || existingURL == entry.Spec.Manifest.RemoteConfig.FixedURL {
+		if existingURL == entry.Spec.Manifest.RemoteConfig.FixedURL {
 			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
 		}
 		replaceStaleCredential = true
@@ -1948,12 +1959,17 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 	}
 	clientID := credReq.ClientID
 	clientSecret := credReq.ClientSecret
-	proof := strings.TrimSpace(credReq.Proof)
-	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" || proof == "" {
+	proof := credReq.Proof
+	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" || strings.TrimSpace(proof) == "" {
 		return types.NewErrBadRequest("clientID, clientSecret, and proof are required")
 	}
 
 	credName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate OAuth credential with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credName)
 	if err != nil {
 		return fmt.Errorf("failed to lock OAuth credential: %w", err)
@@ -2019,6 +2035,11 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	}
 
 	credName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate OAuth credential with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credName)
 	if err != nil {
 		return fmt.Errorf("failed to lock OAuth credential: %w", err)

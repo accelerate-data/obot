@@ -260,7 +260,18 @@ func (h *Handler) CleanupUnusedOAuthCredentials(req router.Request, _ router.Res
 		return nil
 	}
 
-	deleted, err := h.gatewayClient.DeleteCredential(req.Ctx, system.MCPOAuthCredentialName(entry.Name), "oauth")
+	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate static OAuth cleanup with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
+	credentialName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCredentialLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, credentialName)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate static OAuth cleanup with credential mutation: %w", err)
+	}
+	defer releaseCredentialLock()
+	deleted, err := h.gatewayClient.DeleteCredential(req.Ctx, credentialName, "oauth")
 	if err != nil {
 		return fmt.Errorf("failed to delete OAuth credential: %w", err)
 	}
@@ -305,8 +316,8 @@ func (h *Handler) EnsureOAuthCredentialStatus(req router.Request, _ router.Respo
 
 	var configured bool
 	if err == nil {
-		credentialURL := credential.Secrets["MCP_URL"]
-		configured = credentialURL == "" || credentialURL == entry.Spec.Manifest.RemoteConfig.FixedURL
+		configured = credential.Secrets["MCP_URL"] == entry.Spec.Manifest.RemoteConfig.FixedURL &&
+			credential.Secrets["GENERATION"] != ""
 	} else if !errors.As(err, &gclient.CredentialNotFoundError{}) {
 		return fmt.Errorf("failed to check credential status: %w", err)
 	}
@@ -328,11 +339,19 @@ func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) 
 	if entry.Spec.Manifest.Runtime != types.RuntimeRemote {
 		return nil
 	}
+	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate static OAuth removal with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
+	credentialName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCredentialLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, credentialName)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate static OAuth removal with credential mutation: %w", err)
+	}
+	defer releaseCredentialLock()
 
-	// Build the credential name for this entry
-	credName := system.MCPOAuthCredentialName(entry.Name)
-
-	deleted, err := h.gatewayClient.DeleteCredential(req.Ctx, credName, "oauth")
+	deleted, err := h.gatewayClient.DeleteCredential(req.Ctx, credentialName, "oauth")
 	if err != nil {
 		return fmt.Errorf("failed to delete OAuth credential: %w", err)
 	}

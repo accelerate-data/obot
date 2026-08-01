@@ -27,7 +27,7 @@ import (
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
+func TestReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t *testing.T) {
 	const (
 		entryName = "catalog-entry-1"
 		mcpID     = "mcp-instance-1"
@@ -60,7 +60,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
 			Context: system.MCPOAuthCredentialName(entryName),
 			Name:    "oauth",
-			Secrets: map[string]string{"CLIENT_ID": clientID, "CLIENT_SECRET": clientSecret},
+			Secrets: map[string]string{"CLIENT_ID": clientID, "CLIENT_SECRET": clientSecret, "MCP_URL": mcpURL, "GENERATION": "generation-1"},
 		}); err != nil {
 			t.Fatalf("seed catalog OAuth credential: %v", err)
 		}
@@ -70,7 +70,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		c := newClient(t)
 		seedCredential(t, c, "client-1", "secret-1")
 
-		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "request-1", entryName,
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "request-1", entryName, "generation-1",
 			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 			&oauth2.Token{AccessToken: "access-1"})
 		if err != nil {
@@ -89,7 +89,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		c := newClient(t)
 		seedCredential(t, c, "client-1", "secret-2")
 
-		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 			&oauth2.Token{AccessToken: "stale-access"})
 		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
@@ -105,7 +105,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
 			Context: system.MCPOAuthCredentialName(entryName),
 			Name:    "oauth",
-			Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "GENERATION": "generation-2"},
+			Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "MCP_URL": mcpURL, "GENERATION": "generation-2"},
 		}); err != nil {
 			t.Fatalf("seed replaced catalog OAuth credential: %v", err)
 		}
@@ -124,7 +124,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 	t.Run("clear rejects stale grant when credential no longer exists", func(t *testing.T) {
 		c := newClient(t)
 
-		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 			&oauth2.Token{AccessToken: "stale-access"})
 		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
@@ -147,7 +147,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 			t.Fatalf("reassign MCP instance: %v", err)
 		}
 
-		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 			&oauth2.Token{AccessToken: "stale-access"})
 		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
@@ -167,7 +167,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 			t.Fatalf("change catalog URL: %v", err)
 		}
 
-		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 			&oauth2.Token{AccessToken: "stale-access"})
 		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
@@ -187,7 +187,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		writeStarted := make(chan struct{})
 		go func() {
 			close(writeStarted)
-			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 				&oauth2.Token{AccessToken: "old-app-access"})
 		}()
@@ -217,7 +217,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		writeStarted := make(chan struct{})
 		go func() {
 			close(writeStarted)
-			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 				&oauth2.Token{AccessToken: "old-app-access"})
 		}()
@@ -252,7 +252,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		}
 		writeResult := make(chan error, 1)
 		go func() {
-			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
 				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
 				&oauth2.Token{AccessToken: "old-app-access"})
 		}()
@@ -315,7 +315,7 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
 			Context: system.MCPOAuthCredentialName(otherEntry),
 			Name:    "oauth",
-			Secrets: map[string]string{"CLIENT_ID": "other-client", "CLIENT_SECRET": "other-secret"},
+			Secrets: map[string]string{"CLIENT_ID": "other-client", "CLIENT_SECRET": "other-secret", "MCP_URL": mcpURL, "GENERATION": "generation-1"},
 		}); err != nil {
 			t.Fatalf("seed unrelated credential: %v", err)
 		}
@@ -326,44 +326,17 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		defer release()
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
-		if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, "user-1", otherMCPID, mcpURL, "", otherEntry,
+		if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, "user-1", otherMCPID, mcpURL, "", otherEntry, "generation-1",
 			&oauth2.Config{ClientID: "other-client", ClientSecret: "other-secret"},
 			&oauth2.Token{AccessToken: "other-access"}); err != nil {
 			t.Fatalf("unrelated entry write was blocked: %v", err)
 		}
 	})
 
-	t.Run("pending state commit recovers legacy fence and uses explicit auth request", func(t *testing.T) {
+	t.Run("pending state commit rejects and deletes legacy static state", func(t *testing.T) {
 		c := newClient(t)
 		seedCredential(t, c, "client-1", "secret-1")
 		conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
-		if err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, "stored-request", "", "legacy-state", "verifier", conf); err != nil {
-			t.Fatalf("create legacy pending state: %v", err)
-		}
-		pending, err := c.GetMCPOAuthPendingState(t.Context(), "legacy-state")
-		if err != nil {
-			t.Fatalf("load legacy pending state: %v", err)
-		}
-
-		if err := c.CommitMCPOAuthPendingStateToken(t.Context(), pending, "explicit-request", conf, &oauth2.Token{AccessToken: "access-1"}); err != nil {
-			t.Fatalf("commit pending state token: %v", err)
-		}
-		stored, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
-		if err != nil {
-			t.Fatalf("load committed token: %v", err)
-		}
-		if stored.CatalogEntryName != entryName || stored.OAuthAuthRequestID != "explicit-request" {
-			t.Fatalf("committed token = entry %q request %q", stored.CatalogEntryName, stored.OAuthAuthRequestID)
-		}
-		if _, err := c.GetMCPOAuthPendingState(t.Context(), "legacy-state"); !errors.Is(err, gorm.ErrRecordNotFound) {
-			t.Fatalf("committed pending state remains: %v", err)
-		}
-	})
-
-	t.Run("pending state commit deletes stale legacy state after fence rejection", func(t *testing.T) {
-		c := newClient(t)
-		seedCredential(t, c, "client-1", "rotated-secret")
-		conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "old-secret"}
 		if err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "stale-state", "verifier", conf); err != nil {
 			t.Fatalf("create stale pending state: %v", err)
 		}
@@ -826,6 +799,53 @@ func TestCreateMCPOAuthPendingStateRejectsCredentialBoundToAnotherCatalogURL(t *
 	err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, newURL, "request-1", entryName, "state-1", "verifier-1", conf)
 	if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
 		t.Fatalf("changed catalog URL error = %v, want catalog credential changed", err)
+	}
+}
+
+func TestCreateMCPOAuthPendingStateRejectsCredentialWithoutCatalogURL(t *testing.T) {
+	c := newTestClient(t)
+	const entryName = "catalog-entry-1"
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "client-1",
+			"CLIENT_SECRET": "secret-1",
+			"GENERATION":    "generation-1",
+		},
+	}); err != nil {
+		t.Fatalf("seed credential without provider URL: %v", err)
+	}
+	conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+
+	err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", "server-1", "https://mcp.example/api", "request-1", entryName, "state-1", "verifier-1", conf)
+	if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+		t.Fatalf("credential without provider URL error = %v, want catalog credential changed", err)
+	}
+}
+
+func TestCreateMCPOAuthPendingStateRejectsCredentialWithoutGeneration(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName = "catalog-entry-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "client-1",
+			"CLIENT_SECRET": "secret-1",
+			"MCP_URL":       mcpURL,
+		},
+	}); err != nil {
+		t.Fatalf("seed credential without generation: %v", err)
+	}
+	conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+
+	err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", "server-1", mcpURL, "request-1", entryName, "state-1", "verifier-1", conf)
+	if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+		t.Fatalf("credential without generation error = %v, want catalog credential changed", err)
 	}
 }
 

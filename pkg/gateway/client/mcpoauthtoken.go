@@ -84,19 +84,18 @@ func (c *Client) ReplaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, o
 	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, "", "", oauthConf, token)
 }
 
-// ReplaceMCPOAuthTokenWithCatalogCredentialFence persists a grant only while the
-// static catalog app captured by the OAuth flow is still active for this MCP.
-func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName string, oauthConf *oauth2.Config, token *oauth2.Token) error {
-	return c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, "", oauthConf, token)
-}
-
-// ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence also rejects writes
+// ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence rejects writes
 // from an OAuth flow or refresh that began before a same-value credential replacement.
 func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	if catalogEntryName == "" {
 		return c.ReplaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, oauthConf, token)
 	}
 
+	releaseCatalogMutationLock, err := c.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog OAuth token write with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	credentialKey := system.MCPOAuthCredentialName(catalogEntryName)
 	release, err := c.AcquireCredentialLock(ctx, credentialKey)
 	if err != nil {
@@ -114,6 +113,11 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx co
 // ValidateCatalogOAuthToken rejects a persisted grant when its catalog entry,
 // provider URL, or shared application no longer matches the active catalog state.
 func (c *Client) ValidateCatalogOAuthToken(ctx context.Context, mcpID, url, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config) error {
+	releaseCatalogMutationLock, err := c.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog OAuth token read with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	credentialKey := system.MCPOAuthCredentialName(catalogEntryName)
 	release, err := c.AcquireCredentialLock(ctx, credentialKey)
 	if err != nil {
@@ -138,10 +142,12 @@ func (c *Client) validateCatalogOAuthCredential(ctx context.Context, mcpID, url,
 		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-	if !secureStringEqual(credential.Secrets["GENERATION"], catalogCredentialGeneration) {
+	credentialGeneration := credential.Secrets["GENERATION"]
+	if credentialGeneration == "" || catalogCredentialGeneration == "" ||
+		!secureStringEqual(credentialGeneration, catalogCredentialGeneration) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-	if credentialURL := credential.Secrets["MCP_URL"]; credentialURL != "" && !secureStringEqual(credentialURL, url) {
+	if !secureStringEqual(credential.Secrets["MCP_URL"], url) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
 	return nil
@@ -211,6 +217,11 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 	if entryName == "" {
 		return "", nil
 	}
+	releaseCatalogMutationLock, err := c.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return "", fmt.Errorf("failed to coordinate legacy catalog OAuth token read with catalog mutation: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	credentialKey := system.MCPOAuthCredentialName(entryName)
 	release, err := c.AcquireCredentialLock(ctx, credentialKey)
 	if err != nil {
@@ -219,6 +230,9 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 	defer release()
 	entry, err := c.mcpCatalogEntry(ctx, entryName)
 	if err != nil || entry.Spec.Manifest.RemoteConfig == nil || !secureStringEqual(entry.Spec.Manifest.RemoteConfig.FixedURL, url) {
+		return "", ErrMCPOAuthCatalogCredentialChanged
+	}
+	if entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
 		return "", ErrMCPOAuthCatalogCredentialChanged
 	}
 	if _, err := c.GetMCPOAuthToken(ctx, userID, mcpID, url); err != nil {
@@ -705,14 +719,28 @@ func secureStringEqual(a, b string) bool {
 func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier string, oauthConf *oauth2.Config) error {
 	catalogCredentialGeneration := ""
 	if catalogEntryName != "" {
-		credential, err := c.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(catalogEntryName)}, "oauth")
+		releaseCatalogMutationLock, err := c.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+		if err != nil {
+			return fmt.Errorf("failed to coordinate catalog OAuth state with catalog mutation: %w", err)
+		}
+		defer releaseCatalogMutationLock()
+		credentialKey := system.MCPOAuthCredentialName(catalogEntryName)
+		releaseCredentialLock, err := c.AcquireCredentialLock(ctx, credentialKey)
+		if err != nil {
+			return fmt.Errorf("failed to coordinate catalog OAuth state with credential mutation: %w", err)
+		}
+		defer releaseCredentialLock()
+		credential, err := c.RevealCredential(ctx, []string{credentialKey}, "oauth")
 		if err != nil || !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) || !secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
 			return ErrMCPOAuthCatalogCredentialChanged
 		}
-		if credentialURL := credential.Secrets["MCP_URL"]; credentialURL != "" && !secureStringEqual(credentialURL, mcpURL) {
+		if !secureStringEqual(credential.Secrets["MCP_URL"], mcpURL) {
 			return ErrMCPOAuthCatalogCredentialChanged
 		}
 		catalogCredentialGeneration = credential.Secrets["GENERATION"]
+		if catalogCredentialGeneration == "" {
+			return ErrMCPOAuthCatalogCredentialChanged
+		}
 	}
 	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
 	ps := &types.MCPOAuthPendingState{

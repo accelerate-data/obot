@@ -451,6 +451,10 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 		prepare       func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string
 	}{
 		{name: "wrong proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(*testing.T, *gatewayclient.Client, *v1.MCPServerCatalogEntry) string { return "wrong-proof" }},
+		{name: "proof with surrounding whitespace", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+			t.Helper()
+			return " " + successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1") + " "
+		}},
 		{name: "wrong caller", userID: "user-2", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
 			t.Helper()
 			return successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
@@ -550,6 +554,28 @@ func TestSetOAuthCredentialsReplacesCredentialBoundToPreviousCatalogURL(t *testi
 	}
 }
 
+func TestSetOAuthCredentialsReplacesCredentialWithoutProviderBinding(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "legacy-client",
+			"CLIENT_SECRET": "legacy-secret",
+		},
+	}))
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	req, _ := newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+
+	require.NoError(t, (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).SetOAuthCredentials(req))
+	credential, err := gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(entry.Name)}, "oauth")
+	require.NoError(t, err)
+	require.Equal(t, "candidate-client", credential.Secrets["CLIENT_ID"])
+	require.Equal(t, entry.Spec.Manifest.RemoteConfig.FixedURL, credential.Secrets["MCP_URL"])
+	require.NotEmpty(t, credential.Secrets["GENERATION"])
+}
+
 func TestSetOAuthCredentialsProofConsumptionOnRejectedSave(t *testing.T) {
 	t.Run("storage failure", func(t *testing.T) {
 		transformer := &toggleCredentialWriteErrorTransformer{failWrite: true}
@@ -572,7 +598,10 @@ func TestSetOAuthCredentialsProofConsumptionOnRejectedSave(t *testing.T) {
 	t.Run("existing credential", func(t *testing.T) {
 		gateway := newOAuthCredentialTestGatewayClient(t)
 		entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
-		if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "existing", "CLIENT_SECRET": "existing-secret"}}); err != nil {
+		if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth", Secrets: map[string]string{
+			"CLIENT_ID": "existing", "CLIENT_SECRET": "existing-secret",
+			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "existing-generation",
+		}}); err != nil {
 			t.Fatalf("seed existing credential: %v", err)
 		}
 		proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
@@ -640,6 +669,72 @@ func TestSetOAuthCredentialsSerializesConcurrentSameProofSaves(t *testing.T) {
 	if credential.Secrets["CLIENT_ID"] != "candidate-client" || credential.Secrets["CLIENT_SECRET"] != "candidate-secret" {
 		t.Fatalf("configured credential = %#v", credential.Secrets)
 	}
+}
+
+func TestStaticOAuthSaveAndProviderUpdateShareCatalogMutationFence(t *testing.T) {
+	const catalogMutationLock = "mcp-static-oauth-catalog-mutation"
+
+	t.Run("Save waits for catalog mutation", func(t *testing.T) {
+		gateway := newOAuthCredentialTestGatewayClient(t)
+		entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+		proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+		req, _ := newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+		release, err := gateway.AcquireCredentialLock(t.Context(), catalogMutationLock)
+		require.NoError(t, err)
+
+		result := make(chan error, 1)
+		go func() {
+			result <- (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).SetOAuthCredentials(req)
+		}()
+		select {
+		case err := <-result:
+			release()
+			t.Fatalf("Save bypassed catalog mutation fence: %v", err)
+		case <-time.After(250 * time.Millisecond):
+		}
+		release()
+		select {
+		case err := <-result:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for fenced Save")
+		}
+	})
+
+	t.Run("provider update waits for credential mutation", func(t *testing.T) {
+		gateway := newOAuthCredentialTestGatewayClient(t)
+		entry := staticOAuthTestEntry("entry-1", "default", "https://example.com/old")
+		entry.Spec.Editable = true
+		manifest := entry.Spec.Manifest
+		manifest.RemoteConfig.FixedURL = "https://example.com/new"
+		body, err := json.Marshal(manifest)
+		require.NoError(t, err)
+		recorder := httptest.NewRecorder()
+		req := newStaticOAuthTestRequest(t, http.MethodPut, "/", string(body), recorder, gateway,
+			&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		req.SetPathValue("catalog_id", "default")
+		req.SetPathValue("entry_id", entry.Name)
+
+		release, err := gateway.AcquireCredentialLock(t.Context(), catalogMutationLock)
+		require.NoError(t, err)
+		result := make(chan error, 1)
+		go func() {
+			result <- (&MCPCatalogHandler{gatewayClient: gateway}).UpdateEntry(req)
+		}()
+		select {
+		case err := <-result:
+			release()
+			t.Fatalf("provider update bypassed credential mutation fence: %v", err)
+		case <-time.After(250 * time.Millisecond):
+		}
+		release()
+		select {
+		case err := <-result:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for fenced provider update")
+		}
+	})
 }
 
 func TestSetOAuthCredentialsRejectsProviderChangeWhileWaitingForCredentialLock(t *testing.T) {
@@ -979,7 +1074,7 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: system.MCPOAuthCredentialName(entry.Name),
 		Name:    "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": "safe-generation"},
+		Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "safe-generation"},
 	}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
@@ -1002,6 +1097,53 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), "saved-secret") {
 		t.Fatalf("credential status exposed secret: %s", recorder.Body.String())
 	}
+}
+
+func TestGetOAuthCredentialsFailsClosedWithoutProviderBinding(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "legacy-client", "CLIENT_SECRET": "legacy-secret"},
+	}))
+	recorder := httptest.NewRecorder()
+	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+
+	require.NoError(t, (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).GetOAuthCredentials(req))
+	var got types.MCPServerOAuthCredentialStatus
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &got))
+	require.False(t, got.Configured)
+	require.Empty(t, got.ClientID)
+	require.Empty(t, got.Generation)
+}
+
+func TestGetOAuthCredentialsFailsClosedWithoutGeneration(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID": "legacy-client", "CLIENT_SECRET": "legacy-secret",
+			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL,
+		},
+	}))
+	recorder := httptest.NewRecorder()
+	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+
+	require.NoError(t, (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).GetOAuthCredentials(req))
+	var got types.MCPServerOAuthCredentialStatus
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &got))
+	require.False(t, got.Configured)
+	require.Empty(t, got.ClientID)
+	require.Empty(t, got.Generation)
 }
 
 func TestGetOAuthCredentialsFailsClosedAfterCatalogURLChanges(t *testing.T) {

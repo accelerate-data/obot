@@ -123,7 +123,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	}
 }
 
-func TestFailedClearLegacyRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
+func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 	const (
 		entryName = "entry-1"
 		mcpID     = "instance-1"
@@ -167,14 +167,19 @@ func TestFailedClearLegacyRefreshCannotResurrectAfterSuccessfulRetry(t *testing.
 	credentialKey := system.MCPOAuthCredentialName(entryName)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: credentialKey, Name: "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
+		Secrets: map[string]string{
+			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
+			"MCP_URL": mcpURL, "GENERATION": "generation-1",
+		},
 	}); err != nil {
 		t.Fatalf("seed catalog credential: %v", err)
 	}
 	config := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
-	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", config,
-		&oauth2.Token{AccessToken: "legacy-access", RefreshToken: "legacy-refresh"}); err != nil {
-		t.Fatalf("seed legacy token: %v", err)
+	if err := gateway.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(
+		t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1", config,
+		&oauth2.Token{AccessToken: "active-access", RefreshToken: "active-refresh"},
+	); err != nil {
+		t.Fatalf("seed active token: %v", err)
 	}
 
 	newDeleteRequest := func(client storage.Client) api.Context {
@@ -195,12 +200,12 @@ func TestFailedClearLegacyRefreshCannotResurrectAfterSuccessfulRetry(t *testing.
 		t.Fatal("first Clear succeeded despite target list failure")
 	}
 	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); err != nil {
-		t.Fatalf("failed Clear removed legacy token before retry: %v", err)
+		t.Fatalf("failed Clear removed active token before retry: %v", err)
 	}
 
 	store := mcpgateway.NewGlobalTokenStore(gateway).ForUserAndMCP("user-1", mcpID)
 	if _, _, err := store.GetTokenConfig(t.Context(), mcpURL); err != nil {
-		t.Fatalf("legacy refresh after failed Clear: %v", err)
+		t.Fatalf("refresh after failed Clear: %v", err)
 	}
 	refreshStarted := make(chan struct{})
 	writeRefresh := make(chan struct{})
