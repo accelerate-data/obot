@@ -1933,10 +1933,19 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	if err := req.List(&mcpServers, client.MatchingFields{"spec.mcpServerCatalogEntryName": entry.Name}); err != nil {
 		return fmt.Errorf("failed to list MCP servers for OAuth token cleanup: %w", err)
 	}
+	var mcpServerInstances v1.MCPServerInstanceList
+	if err := req.List(&mcpServerInstances, client.MatchingFields{"spec.mcpServerCatalogEntryName": entry.Name}); err != nil {
+		return fmt.Errorf("failed to list MCP server instances for OAuth token cleanup: %w", err)
+	}
 	var cleanupErrs []error
 	for _, server := range mcpServers.Items {
 		if err := h.gatewayClient.DeleteMCPOAuthTokenForAllUsers(req.Context(), server.Name); err != nil {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to delete OAuth tokens for MCP server %s: %w", server.Name, err))
+		}
+	}
+	for _, instance := range mcpServerInstances.Items {
+		if err := h.gatewayClient.DeleteMCPOAuthTokenForAllUsers(req.Context(), instance.Name); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to delete OAuth tokens for MCP server instance %s: %w", instance.Name, err))
 		}
 	}
 	if err := errors.Join(cleanupErrs...); err != nil {

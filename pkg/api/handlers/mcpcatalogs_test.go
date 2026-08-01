@@ -763,6 +763,19 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 		{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "server-b", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}},
 	}
+	instances := []*v1.MCPServerInstance{
+		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: servers[0].Name, MCPServerCatalogEntryName: entry.Name}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-2", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: servers[0].Name, MCPServerCatalogEntryName: entry.Name}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "instance-b-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: servers[1].Name, MCPServerCatalogEntryName: entry.Name}},
+	}
+	unrelatedServer := &v1.MCPServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "server-unrelated", Namespace: system.DefaultNamespace},
+		Spec:       v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-unrelated"},
+	}
+	unrelatedInstance := &v1.MCPServerInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: "instance-unrelated", Namespace: system.DefaultNamespace},
+		Spec:       v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: unrelatedServer.Name, MCPServerCatalogEntryName: "entry-unrelated"},
+	}
 	rules := []*v1.AccessControlRule{
 		{ObjectMeta: metav1.ObjectMeta{Name: "acr-a", Namespace: system.DefaultNamespace}, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "acr-b", Namespace: system.DefaultNamespace}, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
@@ -775,21 +788,35 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 	}
 	clear(triggered)
 	conf := &oauth2.Config{ClientID: "saved-client", ClientSecret: "saved-secret"}
-	for i, server := range servers {
-		if err := gateway.ReplaceMCPOAuthToken(t.Context(), fmt.Sprintf("user-%d", i+1), server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: fmt.Sprintf("token-%d", i+1)}); err != nil {
-			t.Fatalf("seed user token for %s: %v", server.Name, err)
+	for _, instance := range instances {
+		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "instance-token-" + instance.Name}); err != nil {
+			t.Fatalf("seed user token for %s: %v", instance.Name, err)
 		}
+	}
+	for _, server := range servers {
+		if err := gateway.ReplaceMCPOAuthToken(t.Context(), "single-user", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "server-token-" + server.Name}); err != nil {
+			t.Fatalf("seed server-name token for %s: %v", server.Name, err)
+		}
+	}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), unrelatedInstance.Spec.UserID, unrelatedInstance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "unrelated-instance-token"}); err != nil {
+		t.Fatalf("seed unrelated instance token: %v", err)
+	}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "single-user", unrelatedServer.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "unrelated-server-token"}); err != nil {
+		t.Fatalf("seed unrelated server token: %v", err)
 	}
 	clear(triggered)
 
 	objects := []client.Object{
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}},
-		entry, servers[0], servers[1], rules[0], rules[1],
+		entry, servers[0], servers[1], instances[0], instances[1], instances[2], unrelatedServer, unrelatedInstance, rules[0], rules[1],
 	}
 	storageClient := fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
 		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
 			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
+		}).
+		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
 		}).
 		WithObjects(objects...).
 		Build()
@@ -817,10 +844,21 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 			t.Fatalf("sibling deployment %s was removed: %v", server.Name, err)
 		}
 	}
-	for i, server := range servers {
-		if _, err := gateway.GetMCPOAuthToken(t.Context(), fmt.Sprintf("user-%d", i+1), server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
-			t.Fatalf("user token for %s remains: %v", server.Name, err)
+	for _, instance := range instances {
+		if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("user token for %s remains: %v", instance.Name, err)
 		}
+	}
+	for _, server := range servers {
+		if _, err := gateway.GetMCPOAuthToken(t.Context(), "single-user", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("server-name token for %s remains: %v", server.Name, err)
+		}
+	}
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), unrelatedInstance.Spec.UserID, unrelatedInstance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); err != nil {
+		t.Fatalf("unrelated instance token was removed: %v", err)
+	}
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), "single-user", unrelatedServer.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); err != nil {
+		t.Fatalf("unrelated server token was removed: %v", err)
 	}
 	for _, rule := range rules {
 		var retained v1.AccessControlRule
@@ -828,8 +866,13 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 			t.Fatalf("access control rule %s was removed: %v", rule.Name, err)
 		}
 	}
-	if triggered["server-a"] != 1 || triggered["server-b"] != 1 || len(triggered) != 2 {
-		t.Fatalf("token cleanup triggers = %#v", triggered)
+	for _, id := range []string{"server-a", "server-b", "instance-a-user-1", "instance-a-user-2", "instance-b-user-1"} {
+		if triggered[id] != 1 {
+			t.Fatalf("token cleanup triggers = %#v; %s count = %d, want 1", triggered, id, triggered[id])
+		}
+	}
+	if len(triggered) != 5 {
+		t.Fatalf("token cleanup triggers = %#v, want only matching servers and instances", triggered)
 	}
 	var updated v1.MCPServerCatalogEntry
 	if err := req.Get(&updated, entry.Name); err != nil {
@@ -858,35 +901,70 @@ func TestDeleteOAuthCredentialsReturnsServerListFailure(t *testing.T) {
 	}
 }
 
+func TestDeleteOAuthCredentialsReturnsInstanceListFailure(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+		t.Fatalf("seed OAuth credential: %v", err)
+	}
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry)
+	req.Storage = oauthInstanceListErrorStorage{Client: req.Storage}
+
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req); err == nil {
+		t.Fatal("Clear reported success after instance list failure")
+	}
+	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
+		t.Fatalf("shared credential remained after Clear began: %v", err)
+	}
+}
+
 func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 	failPurge := false
+	triggered := map[string]int{}
 	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
-		if failPurge && mcpID == "server-a" {
+		triggered[mcpID]++
+		if failPurge && mcpID == "instance-a-user-1" {
 			return errors.New("token purge trigger unavailable")
 		}
 		return nil
 	})
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instances := []*v1.MCPServerInstance{
+		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-2", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
+	}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
-	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "user-1", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
-		t.Fatalf("seed user token: %v", err)
+	for _, instance := range instances {
+		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token-" + instance.Name}); err != nil {
+			t.Fatalf("seed user token for %s: %v", instance.Name, err)
+		}
 	}
+	clear(triggered)
 	failPurge = true
-	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server)
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server, instances[0], instances[1])
 
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req); err == nil {
-		t.Fatal("Clear reported success after per-server token purge failure")
+		t.Fatal("Clear reported success after per-instance token purge failure")
+	}
+	for _, instance := range instances {
+		if triggered[instance.Name] != 1 {
+			t.Fatalf("cleanup did not attempt every matching instance: %#v", triggered)
+		}
+		if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("token for %s remained after partial cleanup failure: %v", instance.Name, err)
+		}
 	}
 }
 
 func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T) {
 	purgeAttempts := 0
 	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
-		if mcpID != "server-a" {
+		if mcpID != "instance-a-user-1" {
 			return nil
 		}
 		purgeAttempts++
@@ -897,14 +975,15 @@ func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T
 	})
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
-	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "user-1", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
 		t.Fatalf("seed user token: %v", err)
 	}
-	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server)
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server, instance)
 	handler := &MCPCatalogHandler{gatewayClient: gateway}
 
 	if err := handler.DeleteOAuthCredentials(req); err == nil {
@@ -919,8 +998,44 @@ func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T
 	if purgeAttempts != 3 {
 		t.Fatalf("token purge attempts = %d, want seed plus first Clear plus retry", purgeAttempts)
 	}
-	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("user token remained after retry: %v", err)
+	}
+}
+
+func TestReplaceOAuthCredentialsClearsInstanceTokensBeforeSavingNewApp(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "old-client", "CLIENT_SECRET": "old-secret"}}); err != nil {
+		t.Fatalf("seed old OAuth credential: %v", err)
+	}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{ClientID: "old-client", ClientSecret: "old-secret"}, &oauth2.Token{AccessToken: "old-token"}); err != nil {
+		t.Fatalf("seed old user token: %v", err)
+	}
+
+	deleteReq := newDeleteOAuthCredentialRequest(t, gateway, entry.DeepCopy(), server, instance)
+	handler := &MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}
+	if err := handler.DeleteOAuthCredentials(deleteReq); err != nil {
+		t.Fatalf("clear old OAuth app: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
+	setReq, _ := newSetOAuthCredentialRequest(t, gateway, entry.DeepCopy(), instance.Spec.UserID, "candidate-client", "candidate-secret", proof)
+	if err := handler.SetOAuthCredentials(setReq); err != nil {
+		t.Fatalf("save replacement OAuth app: %v", err)
+	}
+
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("old instance token survived OAuth app replacement: %v", err)
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal replacement OAuth credential: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "candidate-client" || credential.Secrets["CLIENT_SECRET"] != "candidate-secret" {
+		t.Fatalf("replacement credential = %#v", credential.Secrets)
 	}
 }
 
@@ -935,6 +1050,9 @@ func newDeleteOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client
 		WithScheme(storagescheme.Scheme).
 		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
 			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
+		}).
+		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
 		}).
 		WithObjects(allObjects...).
 		Build()
@@ -952,6 +1070,17 @@ func newDeleteOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client
 
 type oauthServerListErrorStorage struct {
 	storage.Client
+}
+
+type oauthInstanceListErrorStorage struct {
+	storage.Client
+}
+
+func (s oauthInstanceListErrorStorage) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*v1.MCPServerInstanceList); ok {
+		return errors.New("server instance list unavailable")
+	}
+	return s.Client.List(ctx, list, opts...)
 }
 
 func (oauthServerListErrorStorage) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
