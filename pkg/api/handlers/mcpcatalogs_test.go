@@ -510,7 +510,7 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 	}
 }
 
-func TestSetOAuthCredentialsDoesNotConsumeProofWhenStorageFailsOrCredentialExists(t *testing.T) {
+func TestSetOAuthCredentialsProofConsumptionOnRejectedSave(t *testing.T) {
 	t.Run("storage failure", func(t *testing.T) {
 		transformer := &toggleCredentialWriteErrorTransformer{failWrite: true}
 		gateway := newOAuthCredentialTestGatewayClientWithEncryption(t, &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
@@ -541,8 +541,8 @@ func TestSetOAuthCredentialsDoesNotConsumeProofWhenStorageFailsOrCredentialExist
 			t.Fatal("Save overwrote existing credential")
 		}
 		retry := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
-		if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err != nil {
-			t.Fatalf("existing-credential rejection consumed proof: %v", err)
+		if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err == nil || !strings.Contains(err.Error(), "invalid or expired OAuth credential test") {
+			t.Fatalf("existing-credential rejection left proof reusable: %v", err)
 		}
 	})
 }
@@ -635,8 +635,8 @@ func TestReplaceOAuthCredentialsRejectsMismatchedProofWithoutMutatingActiveConfi
 		}
 	}
 	retry := newReplaceOAuthCredentialRequest(t, gateway, entry, instance.Spec.UserID, "candidate-client", "candidate-secret", proof, server, instance)
-	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err != nil {
-		t.Fatalf("rejected replacement consumed the valid proof: %v", err)
+	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err == nil || !strings.Contains(err.Error(), "invalid or expired OAuth credential test") {
+		t.Fatalf("rejected replacement left proof reusable: %v", err)
 	}
 }
 

@@ -1844,29 +1844,16 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredentialLock()
 
-	_, err = req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
-	if err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
-		return fmt.Errorf("failed to read OAuth credential: %w", err)
-	}
-	credentialsExist := err == nil
-
 	var clientID, clientSecret string
 
-	if credentialsExist {
-		return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
-	}
-
-	// Initial setup mode: All fields are required
-	// Trim whitespace before validation
-	trimmedClientID := strings.TrimSpace(credReq.ClientID)
-	trimmedClientSecret := strings.TrimSpace(credReq.ClientSecret)
+	// Initial setup mode: All fields are required.
 	proof := strings.TrimSpace(credReq.Proof)
-	if trimmedClientID == "" || trimmedClientSecret == "" || proof == "" {
+	if strings.TrimSpace(credReq.ClientID) == "" || strings.TrimSpace(credReq.ClientSecret) == "" || proof == "" {
 		return types.NewErrBadRequest("clientID, clientSecret, and proof are required")
 	}
 
-	clientID = trimmedClientID
-	clientSecret = trimmedClientSecret
+	clientID = credReq.ClientID
+	clientSecret = credReq.ClientSecret
 	if err := h.gatewayClient.CommitMCPStaticOAuthCredential(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret, false); err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
 			return types.NewErrBadRequest("invalid or expired OAuth credential test")
@@ -1915,10 +1902,10 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 	if err := req.Read(&credReq); err != nil {
 		return err
 	}
-	clientID := strings.TrimSpace(credReq.ClientID)
-	clientSecret := strings.TrimSpace(credReq.ClientSecret)
+	clientID := credReq.ClientID
+	clientSecret := credReq.ClientSecret
 	proof := strings.TrimSpace(credReq.Proof)
-	if clientID == "" || clientSecret == "" || proof == "" {
+	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" || proof == "" {
 		return types.NewErrBadRequest("clientID, clientSecret, and proof are required")
 	}
 
@@ -1928,13 +1915,6 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 		return fmt.Errorf("failed to lock OAuth credential: %w", err)
 	}
 	defer releaseCredentialLock()
-
-	if _, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth"); err != nil {
-		if errors.As(err, &gclient.CredentialNotFoundError{}) {
-			return types.NewErrBadRequest("OAuth credential does not exist")
-		}
-		return fmt.Errorf("failed to read OAuth credential: %w", err)
-	}
 
 	cleanupTargets, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
 	if err != nil {

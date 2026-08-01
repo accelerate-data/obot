@@ -32,17 +32,32 @@ func (r *RoleUplift) AuthenticateRequest(req *http.Request) (*authenticator.Resp
 	if err != nil || !ok || resp == nil || resp.User == nil {
 		return resp, ok, err
 	}
-	jwtRoles := resp.User.GetExtra()[jwtRolesExtraKey]
-	role := types.RoleAdmin
-	if r.hasRole(jwtRoles, r.ownerRoles) {
-		role = types.RoleOwner
-	} else if !r.hasRole(jwtRoles, r.adminRoles) {
+	jwtRoles, authoritative := resp.User.GetExtra()[jwtRolesExtraKey]
+	if !authoritative {
 		return resp, ok, nil
 	}
 
-	groups := append([]string{}, resp.User.GetGroups()...)
-	for _, group := range role.Groups() {
-		if (role != types.RoleOwner && group == types.GroupOwner) || slices.Contains(groups, group) {
+	var claimedGroups []string
+	if r.hasRole(jwtRoles, r.ownerRoles) {
+		claimedGroups = types.RoleOwner.Groups()
+	} else if r.hasRole(jwtRoles, r.adminRoles) {
+		claimedGroups = types.RoleAdmin.Groups()
+	}
+
+	baseRoleGroups := []string{
+		types.GroupOwner,
+		types.GroupAdmin,
+		types.GroupPowerUserPlus,
+		types.GroupPowerUser,
+	}
+	groups := make([]string, 0, len(resp.User.GetGroups())+len(claimedGroups))
+	for _, group := range resp.User.GetGroups() {
+		if !slices.Contains(baseRoleGroups, group) {
+			groups = append(groups, group)
+		}
+	}
+	for _, group := range claimedGroups {
+		if slices.Contains(groups, group) {
 			continue
 		}
 		groups = append(groups, group)

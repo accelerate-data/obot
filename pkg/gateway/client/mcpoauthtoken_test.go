@@ -808,12 +808,12 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 		if _, err := c.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName("catalog-entry-1")}, "oauth"); !errors.Is(err, gorm.ErrRecordNotFound) {
 			t.Fatalf("mismatched proof wrote credential: %v", err)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); err != nil {
-			t.Fatalf("mismatched attempt consumed exact proof: %v", err)
+		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+			t.Fatalf("mismatched attempt left proof reusable: %v", err)
 		}
 	})
 
-	t.Run("initial commit rejects existing credential without consuming proof", func(t *testing.T) {
+	t.Run("initial commit rejects existing credential and consumes proof", func(t *testing.T) {
 		c := newTestClient(t)
 		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
 			Context: system.MCPOAuthCredentialName("catalog-entry-1"),
@@ -836,8 +836,8 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 		if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
 			t.Fatalf("active credential changed: %#v", credential.Secrets)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
-			t.Fatalf("existing-credential rejection consumed proof: %v", err)
+		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+			t.Fatalf("existing-credential rejection left proof reusable: %v", err)
 		}
 	})
 

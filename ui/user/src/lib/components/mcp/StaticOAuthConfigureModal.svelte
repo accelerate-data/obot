@@ -146,8 +146,8 @@
 		credentialTest = beginStaticOAuthCredentialTest(form.clientID, form.clientSecret);
 		try {
 			const started = await onStartTest({
-				clientID: form.clientID.trim(),
-				clientSecret: form.clientSecret.trim()
+				clientID: form.clientID,
+				clientSecret: form.clientSecret
 			});
 			if (generation !== testGeneration) return;
 			const oauthURL = safeStaticOAuthAuthorizationURL(started.oauthURL);
@@ -246,8 +246,8 @@
 		loading = true;
 		try {
 			await onSave({
-				clientID: form.clientID.trim(),
-				clientSecret: form.clientSecret.trim(),
+				clientID: form.clientID,
+				clientSecret: form.clientSecret,
 				proof
 			});
 			dialog?.close();

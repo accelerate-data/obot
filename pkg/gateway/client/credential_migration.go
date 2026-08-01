@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -162,19 +162,18 @@ func (c *Client) moveCredentialToNameContext(ctx context.Context, credential *ga
 }
 
 func (c *Client) migrateIfNotRun(ctx context.Context, name string, f func(*gorm.DB) error) error {
-	db := c.db.WithContext(ctx)
-
-	var migration gatewaytypes.Migration
-	if err := db.Where("name = ?", name).First(&migration).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
-		return err
-	}
-
-	return db.Transaction(func(tx *gorm.DB) error {
+	return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&gatewaytypes.Migration{Name: name})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
 		if err := f(tx); err != nil {
 			return err
 		}
-
-		return tx.Create(&gatewaytypes.Migration{Name: name}).Error
+		return nil
 	})
 }
 

@@ -2,14 +2,48 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	"k8s.io/apiserver/pkg/storage/value"
 )
+
+func TestMigrateIfNotRunRollsBackMarkerOnFailureAndRunsOnce(t *testing.T) {
+	c := newTestClient(t)
+	runs := 0
+	migration := func(tx *gorm.DB) error {
+		runs++
+		var markerCount int64
+		if err := tx.Model(&gatewaytypes.Migration{}).Where("name = ?", "test_atomic_marker").Count(&markerCount).Error; err != nil {
+			return err
+		}
+		if markerCount != 1 {
+			return errors.New("migration marker was not claimed before the migration body")
+		}
+		if runs == 1 {
+			return errors.New("injected migration failure")
+		}
+		return nil
+	}
+
+	if err := c.migrateIfNotRun(t.Context(), "test_atomic_marker", migration); err == nil {
+		t.Fatal("migration unexpectedly succeeded")
+	}
+	if err := c.migrateIfNotRun(t.Context(), "test_atomic_marker", migration); err != nil {
+		t.Fatalf("migration retry failed: %v", err)
+	}
+	if err := c.migrateIfNotRun(t.Context(), "test_atomic_marker", migration); err != nil {
+		t.Fatalf("completed migration was not idempotent: %v", err)
+	}
+	if runs != 2 {
+		t.Fatalf("migration body ran %d times, want 2", runs)
+	}
+}
 
 func TestMigrateUnencryptedCredentialsPreservesAndEncryptsLegacyRows(t *testing.T) {
 	c := newTestClient(t)

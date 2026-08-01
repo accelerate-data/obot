@@ -74,7 +74,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	if err != nil {
 		t.Fatalf("parse OAuth URL: %v", err)
 	}
-	if authURL.Query().Get("client_id") != "static-client" || authURL.Query().Get("redirect_uri") != "https://obot.example/oauth/mcp/callback" {
+	if authURL.Query().Get("client_id") != "  static-client  " || authURL.Query().Get("redirect_uri") != "https://obot.example/oauth/mcp/callback" {
 		t.Fatalf("OAuth URL query = %s", authURL.RawQuery)
 	}
 	if authURL.Query().Get("code_challenge") == "" || authURL.Query().Get("code_challenge_method") != "S256" {
@@ -554,14 +554,14 @@ func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
 				"token_endpoint_auth_methods_supported": []string{"client_secret_basic"},
 			})
 		case "/authorize":
-			if req.URL.Query().Get("client_id") != "static-client" || req.URL.Query().Get("code_challenge") == "" || req.URL.Query().Get("code_challenge_method") != "S256" {
+			if req.URL.Query().Get("client_id") != "  static-client  " || req.URL.Query().Get("code_challenge") == "" || req.URL.Query().Get("code_challenge_method") != "S256" {
 				http.Error(w, "invalid authorization request", http.StatusBadRequest)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case "/token":
 			clientID, clientSecret, ok := req.BasicAuth()
-			if !ok || clientID != "static-client" || clientSecret != "static-secret" || req.FormValue("code_verifier") == "" {
+			if !ok || clientID != "  static-client  " || clientSecret != "  static-secret  " || req.FormValue("code_verifier") == "" {
 				http.Error(w, "invalid token request", http.StatusUnauthorized)
 				return
 			}

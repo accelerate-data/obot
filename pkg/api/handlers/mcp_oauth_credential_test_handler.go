@@ -43,9 +43,7 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	if err := req.Read(&candidate); err != nil {
 		return err
 	}
-	candidate.ClientID = strings.TrimSpace(candidate.ClientID)
-	candidate.ClientSecret = strings.TrimSpace(candidate.ClientSecret)
-	if candidate.ClientID == "" || candidate.ClientSecret == "" {
+	if strings.TrimSpace(candidate.ClientID) == "" || strings.TrimSpace(candidate.ClientSecret) == "" {
 		return types.NewErrBadRequest("clientID and clientSecret are required")
 	}
 

@@ -37,8 +37,8 @@ test('save requires a successful proof for the exact tested credentials', () => 
 	assert.equal(
 		canSaveStaticOAuthCredentials(
 			succeeded,
-			'client-id',
-			'client-secret',
+			' client-id ',
+			' client-secret ',
 			Date.parse(expiresAt) - 1
 		),
 		true
@@ -62,7 +62,12 @@ test('save requires a successful proof for the exact tested credentials', () => 
 		false
 	);
 	assert.equal(
-		canSaveStaticOAuthCredentials(succeeded, 'client-id', 'client-secret', Date.parse(expiresAt)),
+		canSaveStaticOAuthCredentials(
+			succeeded,
+			' client-id ',
+			' client-secret ',
+			Date.parse(expiresAt)
+		),
 		false
 	);
 });

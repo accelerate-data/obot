@@ -20,8 +20,8 @@ export function beginStaticOAuthCredentialTest(
 ): StaticOAuthCredentialTestState {
 	return {
 		status: 'pending',
-		clientID: clientID.trim(),
-		clientSecret: clientSecret.trim()
+		clientID,
+		clientSecret
 	};
 }
 
@@ -70,8 +70,8 @@ export function canSaveStaticOAuthCredentials(
 ): state is Extract<StaticOAuthCredentialTestState, { status: 'succeeded' }> {
 	return (
 		state.status === 'succeeded' &&
-		state.clientID === clientID.trim() &&
-		state.clientSecret === clientSecret.trim() &&
+		state.clientID === clientID &&
+		state.clientSecret === clientSecret &&
 		Date.parse(state.expiresAt) > now
 	);
 }

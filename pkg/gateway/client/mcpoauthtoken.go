@@ -487,6 +487,7 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 
 	hashedProof := hashMCPStaticOAuthValue(state)
 	var changedMCPIDs []string
+	var rejectedErr error
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var proof types.MCPOAuthPendingState
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -500,6 +501,13 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 		if err := c.decryptMCPOAuthPendingState(ctx, &proof); err != nil {
 			return fmt.Errorf("failed to decrypt static OAuth test: %w", err)
 		}
+		rejectSave := func(err error) error {
+			if deleteErr := tx.Delete(&proof).Error; deleteErr != nil {
+				return deleteErr
+			}
+			rejectedErr = err
+			return nil
+		}
 		if !proof.StaticOAuthTest ||
 			proof.StaticOAuthTestStatus != apitypes.MCPStaticOAuthTestStatusSucceeded ||
 			time.Since(proof.CreatedAt) >= pendingStateTTL ||
@@ -509,15 +517,18 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 			!secureStringEqual(proof.ClientID, clientID) ||
 			!secureStringEqual(proof.ClientSecret, clientSecret) ||
 			!secureStringEqual(proof.StaticOAuthSaveProof, state) {
-			return ErrMCPStaticOAuthTestInvalid
+			return rejectSave(ErrMCPStaticOAuthTestInvalid)
 		}
 		if replace {
 			var existingCredential types.Credential
-			if err := tx.Select("id").Where("context = ? AND name = ?", credential.Context, credential.Name).First(&existingCredential).Error; err != nil {
+			if err := tx.Where("context = ? AND name = ?", credential.Context, credential.Name).First(&existingCredential).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return ErrMCPStaticOAuthCredentialNotFound
+					return rejectSave(ErrMCPStaticOAuthCredentialNotFound)
 				}
 				return err
+			}
+			if err := c.decryptCredential(ctx, &existingCredential); err != nil {
+				return fmt.Errorf("failed to decrypt existing static OAuth credential: %w", err)
 			}
 		}
 
@@ -534,7 +545,7 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 			return result.Error
 		}
 		if !replace && result.RowsAffected != 1 {
-			return ErrMCPStaticOAuthCredentialExists
+			return rejectSave(ErrMCPStaticOAuthCredentialExists)
 		}
 
 		if replace {
@@ -561,6 +572,9 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 	})
 	if err != nil {
 		return err
+	}
+	if rejectedErr != nil {
+		return rejectedErr
 	}
 	return c.triggerMCPOAuthTokenChanges(ctx, changedMCPIDs)
 }
