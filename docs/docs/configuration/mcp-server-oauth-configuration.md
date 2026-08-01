@@ -7,13 +7,13 @@ Some remote MCP servers require OAuth authentication with pre-registered client 
 Static OAuth allows you to:
 
 - Connect to remote MCP servers that require pre-registered OAuth applications
-- Configure a single set of OAuth credentials that all users share
+- Configure one OAuth application for a catalog entry that all matching deployments share
 - Manage OAuth settings through the Obot admin interface
 
-When static OAuth is configured for a remote MCP server:
+When static OAuth is configured for a remote MCP catalog entry:
 
 1. Administrators register an OAuth application with the provider and enter the credentials in Obot
-2. Users can add the MCP server to their projects without needing their own OAuth apps
+2. Administrators can create one or more matching MCP server deployments without registering another OAuth app
 3. Each user still authenticates individually through the OAuth flow using the shared client credentials
 
 ## Configuring static OAuth
@@ -53,7 +53,7 @@ After saving the remote MCP server with static OAuth enabled:
 
 Obot enables **Save** only for the exact client ID and secret that passed the test. Editing either field, closing the dialog, a denied authorization, a failed token exchange, or an expired test requires a new successful test.
 
-Once configured, the MCP server becomes available to users.
+Once configured, matching MCP server deployments become available to users. Each user still creates a separate OAuth grant for each deployment.
 
 ## Managing OAuth credentials
 
@@ -64,17 +64,30 @@ The remote MCP server shows whether OAuth credentials are configured. When viewi
 - If credentials are configured, you'll see the Client ID
 - The Client Secret is never displayed after initial configuration
 
-### Changing client credentials
+### Replacing client credentials without interrupting the active app
 
-To change the Client ID and Client Secret:
+API clients can rotate an existing application with one replacement request. Replacement requires the same successful exact-value test used for initial Save. Obot validates and consumes that proof, replaces the saved application atomically, and then removes local user grants for every matching server and server instance.
 
-1. Click **Configure OAuth Credentials**
-2. Click **Clear Credentials**
-3. Confirm the deletion
-4. Re-enter OAuth credentials with the new values
-5. Test the new credentials and save them
+An invalid or expired proof leaves the active application and grants unchanged. A successful replacement retains catalog servers and access rules, but each user must authorize each deployment again. Obot does not revoke grants at the provider.
 
-Clearing credentials temporarily makes the MCP server unavailable to users until new credentials are configured.
+The Obot admin interface retains its explicit clear workflow:
+
+1. Click **Configure OAuth Credentials**.
+2. Click **Clear Credentials**.
+3. Confirm the deletion.
+4. Reopen **Configure OAuth Credentials**.
+5. Enter and test the new values.
+6. Click **Save** only after **Test Credentials** succeeds.
+
+This clear-then-save workflow intentionally creates an unconfigured interval. Matching deployments remain present but unavailable until the new application is saved.
+
+### Credential API lifecycle
+
+- Initial configuration uses `POST` on the catalog-entry or workspace credential resource. Existing credentials are not overwritten.
+- Replacement uses `PUT` on that same resource. Proof validation, credential upsert, and local grant cleanup are serialized under one cross-process credential lock.
+- Clear uses `DELETE`. It retains catalog servers and access rules but removes the shared application and matching local grants.
+
+For static-required catalog entries, token writes verify the current catalog entry, server URL, client ID, and client secret under the same lock. A callback or refresh that began with an older static application cannot recreate its grant after replacement or clear. Direct non-catalog dynamic registration, including CIMD, and optional-catalog dynamic registration do not use this static-application fence.
 
 ## Example: GitHub MCP Server
 
