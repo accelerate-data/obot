@@ -10,6 +10,7 @@ const recordVideo = process.env.OBOT_E2E_RECORD_VIDEO === 'true';
 
 export default defineConfig({
 	testDir: './e2e',
+	outputDir: './e2e/.tmp/test-results',
 	timeout: 60_000,
 	expect: {
 		timeout: 10_000

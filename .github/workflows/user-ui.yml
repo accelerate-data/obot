@@ -9,6 +9,7 @@ on:
       - main
     paths:
       - ui/user/**
+      - .github/workflows/user-ui.yml
 
 jobs:
   lint:
@@ -18,22 +19,41 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          node-version: "24.15.0"
+          go-version: "1.26"
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 11.0.3
 
-      - name: Run linter
-        run: | 
-          cd ui/user
-          pnpm install
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+          cache: pnpm
+          cache-dependency-path: ui/user/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: ui/user
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        working-directory: ui/user
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run UI checks
+        working-directory: ui/user
+        run: |
           pnpm run build
           pnpm run ci
+          pnpm run test:static-oauth
+
+      - name: Run static OAuth browser tests
+        working-directory: ui/user
+        run: pnpm run e2e:static-oauth
 
       - name: Verify no changes
         run: make no-changes
