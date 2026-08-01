@@ -1922,7 +1922,10 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredentialLock()
 
-	if _, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth"); err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
+	if _, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth"); err != nil {
+		if errors.As(err, &gclient.CredentialNotFoundError{}) {
+			return types.NewErrBadRequest("OAuth credential does not exist")
+		}
 		return fmt.Errorf("failed to read OAuth credential: %w", err)
 	}
 
@@ -1931,15 +1934,14 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 		return err
 	}
 
-	if err := h.gatewayClient.CommitMCPStaticOAuthCredential(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret, true); err != nil {
+	if err := h.gatewayClient.CommitMCPStaticOAuthCredential(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret, true, cleanupTargets.ids()...); err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
 			return types.NewErrBadRequest("invalid or expired OAuth credential test")
 		}
+		if errors.Is(err, gclient.ErrMCPStaticOAuthCredentialNotFound) {
+			return types.NewErrBadRequest("OAuth credential does not exist")
+		}
 		return fmt.Errorf("failed to replace OAuth credential: %w", err)
-	}
-
-	if err := h.deleteOAuthTokensForTargets(req.Context(), cleanupTargets); err != nil {
-		return err
 	}
 
 	if entry.Annotations == nil {
@@ -1977,16 +1979,12 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredentialLock()
 
-	deleted, err := req.GatewayClient.DeleteCredential(req.Context(), credName, "oauth")
-	if err != nil {
-		return err
-	}
-
 	cleanupTargets, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
 	if err != nil {
 		return err
 	}
-	if err := h.deleteOAuthTokensForTargets(req.Context(), cleanupTargets); err != nil {
+	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredential(req.Context(), entry.Name, cleanupTargets.ids()...)
+	if err != nil {
 		return err
 	}
 
@@ -2005,6 +2003,12 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 type oauthTokenCleanupTargets struct {
 	serverIDs   []string
 	instanceIDs []string
+}
+
+func (t oauthTokenCleanupTargets) ids() []string {
+	ids := make([]string, 0, len(t.serverIDs)+len(t.instanceIDs))
+	ids = append(ids, t.serverIDs...)
+	return append(ids, t.instanceIDs...)
 }
 
 func resolveOAuthTokenCleanupTargets(req api.Context, entryName string) (oauthTokenCleanupTargets, error) {
@@ -2028,19 +2032,4 @@ func resolveOAuthTokenCleanupTargets(req api.Context, entryName string) (oauthTo
 		targets.instanceIDs = append(targets.instanceIDs, instance.Name)
 	}
 	return targets, nil
-}
-
-func (h *MCPCatalogHandler) deleteOAuthTokensForTargets(ctx context.Context, targets oauthTokenCleanupTargets) error {
-	var cleanupErrs []error
-	for _, serverID := range targets.serverIDs {
-		if err := h.gatewayClient.DeleteMCPOAuthTokenForAllUsers(ctx, serverID); err != nil {
-			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to delete OAuth tokens for MCP server %s: %w", serverID, err))
-		}
-	}
-	for _, instanceID := range targets.instanceIDs {
-		if err := h.gatewayClient.DeleteMCPOAuthTokenForAllUsers(ctx, instanceID); err != nil {
-			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to delete OAuth tokens for MCP server instance %s: %w", instanceID, err))
-		}
-	}
-	return errors.Join(cleanupErrs...)
 }

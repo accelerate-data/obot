@@ -101,7 +101,15 @@ func (h *MCPCatalogHandler) GetOAuthCredentialTest(req api.Context) error {
 	if err != nil {
 		return err
 	}
-	result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), req.PathValue("state"), req.User.GetUID(), entry.Name)
+	var statusRequest types.MCPServerOAuthCredentialTestStatusRequest
+	if err := req.Read(&statusRequest); err != nil {
+		return err
+	}
+	statusRequest.State = strings.TrimSpace(statusRequest.State)
+	if statusRequest.State == "" {
+		return types.NewErrBadRequest("state is required")
+	}
+	result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), statusRequest.State, req.User.GetUID(), entry.Name)
 	if errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
 		return types.NewErrBadRequest("invalid or expired OAuth credential test")
 	} else if err != nil {

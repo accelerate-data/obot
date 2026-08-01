@@ -787,6 +787,12 @@ type MCPServerOAuthCredentialTestRequest struct {
 	ClientSecret string `json:"clientSecret"`
 }
 
+// MCPServerOAuthCredentialTestStatusRequest carries an opaque proof outside
+// the URL so access and audit logs cannot persist it.
+type MCPServerOAuthCredentialTestStatusRequest struct {
+	State string `json:"state"`
+}
+
 // MCPServerOAuthCredentialTestStart identifies a pending static OAuth verification.
 type MCPServerOAuthCredentialTestStart struct {
 	State    string `json:"state"`

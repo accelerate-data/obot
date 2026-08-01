@@ -91,7 +91,7 @@ var apiResources = map[string][]string{
 		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/restart",
 		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/trigger-update",
 		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests/{state}",
+		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests/status",
 		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
 		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
 		"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",

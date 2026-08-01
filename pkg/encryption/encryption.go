@@ -2,6 +2,7 @@ package encryption
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,7 @@ type Options struct {
 	AzureKeyVersion      string `usage:"The version of the Azure Key Vault key to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_VERSION" name:"azure-key-vault-key-version"`
 	EncryptionProvider   string `usage:"The encryption provider to use. Options are AWS, GCP, None, or Custom. Default is None." default:"None"`
 	EncryptionConfigFile string `usage:"The path to the encryption configuration file. Only used with the Custom encryption provider."`
+	EncryptionKey        string `usage:"A base64-encoded 32-byte AES key used to build the Custom encryption configuration when no file is provided."`
 }
 
 func (o *Options) Validate() error {
@@ -44,8 +46,11 @@ func (o *Options) Validate() error {
 		}
 		o.EncryptionConfigFile = "/azure-encryption.yaml"
 	case "custom":
-		if o.EncryptionConfigFile == "" {
-			return fmt.Errorf("missing custom encryption config file")
+		if o.EncryptionConfigFile == "" && o.EncryptionKey == "" {
+			return fmt.Errorf("missing custom encryption config file or key")
+		}
+		if o.EncryptionConfigFile != "" && o.EncryptionKey != "" {
+			return fmt.Errorf("custom encryption config file and key are mutually exclusive")
 		}
 	case "none", "":
 		if o.EncryptionConfigFile != "" {
@@ -78,6 +83,9 @@ func Init(ctx context.Context, opts Options) (*encryptionconfig.EncryptionConfig
 			return nil, fmt.Errorf("failed to setup Azure Key Vault: %w", err)
 		}
 	}
+	if strings.EqualFold(opts.EncryptionProvider, "custom") && opts.EncryptionKey != "" {
+		return loadManagedAESConfig(ctx, opts.EncryptionKey)
+	}
 
 	if opts.EncryptionConfigFile != "" {
 		log.Infof("Encryption: Using encryption config file: %s", opts.EncryptionConfigFile)
@@ -87,6 +95,51 @@ func Init(ctx context.Context, opts Options) (*encryptionconfig.EncryptionConfig
 
 	log.Warnf("Encryption: No encryption config file provided, using unencrypted storage")
 	return nil, nil
+}
+
+func loadManagedAESConfig(ctx context.Context, encodedKey string) (*encryptionconfig.EncryptionConfiguration, error) {
+	key, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("custom encryption key must be base64-encoded 32-byte data")
+	}
+	file, err := os.CreateTemp("", "obot-encryption-*.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create custom encryption config: %w", err)
+	}
+	path := file.Name()
+	defer os.Remove(path)
+	config := fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - credentials.obot.obot.ai
+      - users.obot.obot.ai
+      - identities.obot.obot.ai
+      - mcpoauthtokens.obot.obot.ai
+      - mcpoauthpendingstates.obot.obot.ai
+      - mcpauditlogs.obot.obot.ai
+      - llmauditlogs.obot.obot.ai
+      - policyviolations.obot.obot.ai
+      - properties.obot.obot.ai
+    providers:
+      - aesgcm:
+          keys:
+            - name: key0
+              secret: %q
+      - identity: {}
+`, base64.StdEncoding.EncodeToString(key))
+	if _, err := io.WriteString(file, config); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to write custom encryption config: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close custom encryption config: %w", err)
+	}
+	loaded, err := encryptionconfig.LoadEncryptionConfig(ctx, path, false, "obot")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load custom encryption config: %w", err)
+	}
+	return loaded, nil
 }
 
 func setUpAzureKeyVault(ctx context.Context, keyvaultName, keyName, keyVersion string) error {

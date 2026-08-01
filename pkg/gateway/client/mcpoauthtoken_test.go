@@ -439,6 +439,46 @@ func TestCreateMCPStaticOAuthTestStoresEncryptedPendingProof(t *testing.T) {
 	}
 }
 
+func TestCreateMCPStaticOAuthTestFailsClosedWithoutEncryption(t *testing.T) {
+	c := newTestClient(t)
+	conf := &oauth2.Config{ClientID: "candidate-client", ClientSecret: "candidate-secret"}
+
+	_, err := c.CreateMCPStaticOAuthTest(t.Context(), "user-1", "catalog-entry-1", "https://mcp.example/api", "verifier", conf)
+	if !errors.Is(err, ErrMCPStaticOAuthEncryptionRequired) {
+		t.Fatalf("create without encryption error = %v, want encryption required", err)
+	}
+
+	var count int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthPendingState{}).Count(&count).Error; err != nil {
+		t.Fatalf("count pending states: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("unencrypted pending states = %d, want 0", count)
+	}
+}
+
+func TestCommitMCPStaticOAuthCredentialFailsClosedWithoutCredentialEncryption(t *testing.T) {
+	c := newTestClient(t)
+	c.encryptionConfig = &encryptionconfig.EncryptionConfiguration{
+		Transformers: map[schema.GroupResource]value.Transformer{
+			mcpOAuthPendingStateGroupResource: staticOAuthTestTransformer{},
+		},
+	}
+	state, conf := createStaticOAuthTest(t, c)
+	completeSuccessfulStaticOAuthTest(t, c, state)
+
+	err := c.CommitMCPStaticOAuthCredential(t.Context(), state, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
+	if !errors.Is(err, ErrMCPStaticOAuthEncryptionRequired) {
+		t.Fatalf("commit without credential encryption error = %v, want encryption required", err)
+	}
+	if _, err := c.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName("catalog-entry-1")}, "oauth"); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("unencrypted credential was stored: %v", err)
+	}
+	if _, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1"); err != nil {
+		t.Fatalf("failed commit consumed encrypted proof: %v", err)
+	}
+}
+
 func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 	t.Run("pending", func(t *testing.T) {
 		c := newTestClient(t)
@@ -925,6 +965,76 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 			t.Fatalf("proof-delete rollback consumed proof: %v", err)
 		}
 	})
+
+	t.Run("token delete failure rolls back replacement and proof", func(t *testing.T) {
+		c := newTestClient(t)
+		state, conf := createStaticOAuthTest(t, c)
+		completeSuccessfulStaticOAuthTest(t, c, state)
+		credentialKey := system.MCPOAuthCredentialName("catalog-entry-1")
+		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+			Context: credentialKey,
+			Name:    "oauth",
+			Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"},
+		}); err != nil {
+			t.Fatalf("seed active credential: %v", err)
+		}
+		if err := c.ReplaceMCPOAuthToken(t.Context(), "user-1", "instance-1", "https://mcp.example/api", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "active-token"}); err != nil {
+			t.Fatalf("seed active token: %v", err)
+		}
+		if err := c.db.WithContext(t.Context()).Exec(`CREATE TRIGGER fail_static_token_delete BEFORE DELETE ON mcpo_auth_tokens BEGIN SELECT RAISE(FAIL, 'injected token delete failure'); END`).Error; err != nil {
+			t.Fatalf("install token failure trigger: %v", err)
+		}
+
+		err := c.CommitMCPStaticOAuthCredential(t.Context(), state, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1")
+		if err == nil {
+			t.Fatal("replacement succeeded despite injected token delete failure")
+		}
+		if err := c.db.WithContext(t.Context()).Exec(`DROP TRIGGER fail_static_token_delete`).Error; err != nil {
+			t.Fatalf("remove token failure trigger: %v", err)
+		}
+		credential, revealErr := c.RevealCredential(t.Context(), []string{credentialKey}, "oauth")
+		if revealErr != nil {
+			t.Fatalf("reveal active credential after rollback: %v", revealErr)
+		}
+		if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
+			t.Fatalf("active credential changed after token rollback: %#v", credential.Secrets)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", "instance-1", "https://mcp.example/api"); err != nil {
+			t.Fatalf("active token was deleted despite rollback: %v", err)
+		}
+		if err := c.ConsumeMCPStaticOAuthTest(t.Context(), state, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret); err != nil {
+			t.Fatalf("token-delete rollback consumed proof: %v", err)
+		}
+	})
+}
+
+func TestCommitMCPStaticOAuthCredentialInvalidatesSiblingProofs(t *testing.T) {
+	c := newTestClient(t)
+	firstState, conf := createStaticOAuthTest(t, c)
+	secondState, _ := createStaticOAuthTest(t, c)
+	completeSuccessfulStaticOAuthTest(t, c, firstState)
+	completeSuccessfulStaticOAuthTest(t, c, secondState)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName("catalog-entry-1"),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"},
+	}); err != nil {
+		t.Fatalf("seed active credential: %v", err)
+	}
+	firstProof, err := c.GetMCPOAuthPendingState(t.Context(), firstState)
+	if err != nil {
+		t.Fatalf("read first proof before replacement: %v", err)
+	}
+	if !firstProof.StaticOAuthTest || firstProof.StaticOAuthTestStatus != apitypes.MCPStaticOAuthTestStatusSucceeded || firstProof.UserID != "user-1" || firstProof.MCPID != "catalog-entry-1" || firstProof.URL != "https://mcp.example/api" || firstProof.ClientID != conf.ClientID || firstProof.ClientSecret != conf.ClientSecret {
+		t.Fatalf("first proof changed before replacement: static=%v status=%q user=%q mcp=%q url=%q clientIDMatch=%v secretMatch=%v", firstProof.StaticOAuthTest, firstProof.StaticOAuthTestStatus, firstProof.UserID, firstProof.MCPID, firstProof.URL, firstProof.ClientID == conf.ClientID, firstProof.ClientSecret == conf.ClientSecret)
+	}
+
+	if err := c.CommitMCPStaticOAuthCredential(t.Context(), firstState, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
+		t.Fatalf("commit replacement: %v", err)
+	}
+	if _, err := c.GetMCPStaticOAuthTestStatus(t.Context(), secondState, "user-1", "catalog-entry-1"); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+		t.Fatalf("sibling proof status error = %v, want invalid", err)
+	}
 }
 
 func TestCommitMCPStaticOAuthCredentialAllowsOneConcurrentWinner(t *testing.T) {
@@ -1034,6 +1144,14 @@ func completeSuccessfulStaticOAuthTest(t *testing.T, c *Client, state string) {
 
 func createStaticOAuthTest(t *testing.T, c *Client) (string, *oauth2.Config) {
 	t.Helper()
+	if c.encryptionConfig == nil {
+		c.encryptionConfig = &encryptionconfig.EncryptionConfiguration{
+			Transformers: map[schema.GroupResource]value.Transformer{
+				mcpOAuthPendingStateGroupResource: staticOAuthTestTransformer{},
+				credentialGroupResource:           staticOAuthTestTransformer{},
+			},
+		}
+	}
 	conf := &oauth2.Config{
 		ClientID:     "candidate-client-id",
 		ClientSecret: "candidate-client-secret",

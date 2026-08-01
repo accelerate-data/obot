@@ -241,7 +241,7 @@ func Router(ctx context.Context, services *services.Services) (http.Handler, err
 
 	// MCP Catalog Entry OAuth Credentials (admin only)
 	mux.HandleFunc("POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credential-tests", mcpCatalogs.StartOAuthCredentialTest)
-	mux.HandleFunc("GET /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credential-tests/{state}", mcpCatalogs.GetOAuthCredentialTest)
+	mux.HandleFunc("POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credential-tests/status", mcpCatalogs.GetOAuthCredentialTest)
 	mux.HandleFunc("GET /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.GetOAuthCredentials)
 	mux.HandleFunc("POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.SetOAuthCredentials)
 	mux.HandleFunc("PUT /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.ReplaceOAuthCredentials)
@@ -317,7 +317,7 @@ func Router(ctx context.Context, services *services.Services) (http.Handler, err
 
 	// Workspace-scoped MCP Server Catalog Entry OAuth Credentials (PowerUser and higher only)
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests", mcpCatalogs.StartOAuthCredentialTest)
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests/{state}", mcpCatalogs.GetOAuthCredentialTest)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests/status", mcpCatalogs.GetOAuthCredentialTest)
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.GetOAuthCredentials)
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.SetOAuthCredentials)
 	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.ReplaceOAuthCredentials)

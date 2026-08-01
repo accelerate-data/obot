@@ -785,6 +785,13 @@ func TestReplaceOAuthCredentialsSupportsWorkspaceScope(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "", "https://mcp.example/api")
 	entry.Spec.PowerUserWorkspaceID = "workspace-1"
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"},
+	}); err != nil {
+		t.Fatalf("seed workspace OAuth credential: %v", err)
+	}
 	workspace := &v1.PowerUserWorkspace{ObjectMeta: metav1.ObjectMeta{Name: "workspace-1", Namespace: system.DefaultNamespace}, Spec: v1.PowerUserWorkspaceSpec{UserID: "user-1"}}
 	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 	req := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof, workspace)
@@ -800,6 +807,32 @@ func TestReplaceOAuthCredentialsSupportsWorkspaceScope(t *testing.T) {
 	}
 	if credential.Secrets["CLIENT_ID"] != "candidate-client" {
 		t.Fatalf("workspace replacement credential = %#v", credential.Secrets)
+	}
+}
+
+func TestReplaceOAuthCredentialsCannotRecreateApplicationAfterClear(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credentialName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: credentialName,
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"},
+	}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	handler := &MCPCatalogHandler{gatewayClient: gateway}
+
+	if err := handler.DeleteOAuthCredentials(newDeleteOAuthCredentialRequest(t, gateway, entry.DeepCopy())); err != nil {
+		t.Fatalf("clear OAuth credential: %v", err)
+	}
+	replace := newReplaceOAuthCredentialRequest(t, gateway, entry.DeepCopy(), "user-1", "candidate-client", "candidate-secret", proof)
+	if err := handler.ReplaceOAuthCredentials(replace); err == nil {
+		t.Fatal("stale replacement proof recreated a cleared OAuth application")
+	}
+	if _, err := gateway.RevealCredential(t.Context(), []string{credentialName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
+		t.Fatalf("cleared credential was recreated: %v", err)
 	}
 }
 
@@ -1132,8 +1165,8 @@ func TestDeleteOAuthCredentialsReturnsServerListFailure(t *testing.T) {
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req); err == nil {
 		t.Fatal("Clear reported success after server list failure")
 	}
-	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
-		t.Fatalf("shared credential remained after Clear began: %v", err)
+	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); err != nil {
+		t.Fatalf("server-list failure removed the shared credential: %v", err)
 	}
 }
 
@@ -1150,8 +1183,8 @@ func TestDeleteOAuthCredentialsReturnsInstanceListFailure(t *testing.T) {
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req); err == nil {
 		t.Fatal("Clear reported success after instance list failure")
 	}
-	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
-		t.Fatalf("shared credential remained after Clear began: %v", err)
+	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); err != nil {
+		t.Fatalf("instance-list failure removed the shared credential: %v", err)
 	}
 }
 
@@ -1197,7 +1230,7 @@ func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 	}
 }
 
-func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T) {
+func TestDeleteOAuthCredentialsRetryAfterTriggerFailureIsSafeNoOp(t *testing.T) {
 	purgeAttempts := 0
 	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
 		if mcpID != "instance-a-user-1" {
@@ -1231,8 +1264,8 @@ func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T
 	if err := handler.DeleteOAuthCredentials(req); err != nil {
 		t.Fatalf("retry Clear after credential removal: %v", err)
 	}
-	if purgeAttempts != 3 {
-		t.Fatalf("token purge attempts = %d, want seed plus first Clear plus retry", purgeAttempts)
+	if purgeAttempts != 2 {
+		t.Fatalf("token purge attempts = %d, want seed plus first Clear only", purgeAttempts)
 	}
 	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("user token remained after retry: %v", err)

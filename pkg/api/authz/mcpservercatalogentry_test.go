@@ -85,7 +85,7 @@ func TestPowerUserWorkspaceOAuthCredentialRoutesResolveOwnedEntry(t *testing.T) 
 		path   string
 	}{
 		{name: "start test", method: http.MethodPost, path: "/api/workspaces/workspace-1/entries/entry-1/oauth-credential-tests"},
-		{name: "read status", method: http.MethodGet, path: "/api/workspaces/workspace-1/entries/entry-1/oauth-credential-tests/proof-state"},
+		{name: "read status", method: http.MethodPost, path: "/api/workspaces/workspace-1/entries/entry-1/oauth-credential-tests/status"},
 	}
 
 	for _, route := range routes {
@@ -130,7 +130,7 @@ func TestWorkspaceOAuthCredentialTestRoutesRejectLowerRoleAndForeignOwner(t *tes
 		path   string
 	}{
 		{name: "start test", method: http.MethodPost, path: "/api/workspaces/workspace-1/entries/entry-1/oauth-credential-tests"},
-		{name: "read status", method: http.MethodGet, path: "/api/workspaces/workspace-1/entries/entry-1/oauth-credential-tests/proof-state"},
+		{name: "read status", method: http.MethodPost, path: "/api/workspaces/workspace-1/entries/entry-1/oauth-credential-tests/status"},
 	}
 	users := []struct {
 		name string

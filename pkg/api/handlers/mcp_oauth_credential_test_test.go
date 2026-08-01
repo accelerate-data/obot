@@ -26,8 +26,10 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
+	"k8s.io/apiserver/pkg/storage/value"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -88,11 +90,10 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	}
 
 	statusRecorder := httptest.NewRecorder()
-	statusReq := newStaticOAuthTestRequest(t, http.MethodGet, `/`, ``, statusRecorder, gateway,
+	statusReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["state"]), statusRecorder, gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 	statusReq.SetPathValue("catalog_id", "default")
 	statusReq.SetPathValue("entry_id", entry.Name)
-	statusReq.SetPathValue("state", started["state"])
 	if err := handler.GetOAuthCredentialTest(statusReq); err != nil {
 		t.Fatalf("get static OAuth credential test: %v", err)
 	}
@@ -109,12 +110,11 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 		}
 	}
 
-	wrongCallerReq := newStaticOAuthTestRequest(t, http.MethodGet, `/`, ``, httptest.NewRecorder(), gateway,
+	wrongCallerReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["state"]), httptest.NewRecorder(), gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 	wrongCallerReq.User = &user.DefaultInfo{Name: "other", UID: "user-2"}
 	wrongCallerReq.SetPathValue("catalog_id", "default")
 	wrongCallerReq.SetPathValue("entry_id", entry.Name)
-	wrongCallerReq.SetPathValue("state", started["state"])
 	if err := handler.GetOAuthCredentialTest(wrongCallerReq); err == nil {
 		t.Fatal("wrong caller read static OAuth test status")
 	}
@@ -196,8 +196,8 @@ func TestFailedClearLegacyRefreshCannotResurrectAfterSuccessfulRetry(t *testing.
 	}
 
 	store := mcpgateway.NewGlobalTokenStore(gateway).ForUserAndMCP("user-1", mcpID)
-	if _, _, err := store.GetTokenConfig(t.Context(), mcpURL); !errors.Is(err, gatewayclient.ErrMCPOAuthCatalogCredentialChanged) {
-		t.Fatalf("legacy refresh after failed Clear error = %v, want credential changed", err)
+	if _, _, err := store.GetTokenConfig(t.Context(), mcpURL); err != nil {
+		t.Fatalf("legacy refresh after failed Clear: %v", err)
 	}
 	refreshStarted := make(chan struct{})
 	writeRefresh := make(chan struct{})
@@ -279,11 +279,10 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 				t.Fatalf("complete proof: %v", err)
 			}
 			recorder := httptest.NewRecorder()
-			req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
+			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state), recorder, gateway,
 				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
-			req.SetPathValue("state", state)
 			if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err != nil {
 				t.Fatalf("get proof status: %v", err)
 			}
@@ -306,11 +305,10 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 	entryOne := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	entryTwo := staticOAuthTestEntry("entry-2", "default", "https://mcp.example/api")
 	state := pendingStaticOAuthCredentialProof(t, gateway, entryOne.Name, entryOne.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
-	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", httptest.NewRecorder(), gateway,
+	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state), httptest.NewRecorder(), gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entryTwo)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entryTwo.Name)
-	req.SetPathValue("state", state)
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err == nil {
 		t.Fatal("proof status crossed entry boundary")
 	}
@@ -327,11 +325,10 @@ func TestGetOAuthCredentialTestProjectsExpiredStatusAtHandlerBoundary(t *testing
 	}
 
 	recorder := httptest.NewRecorder()
-	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
+	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state), recorder, gateway,
 		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
-	req.SetPathValue("state", state)
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err != nil {
 		t.Fatalf("get expired proof status: %v", err)
 	}
@@ -371,11 +368,10 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 			gateway := newOAuthCredentialTestGatewayClient(t)
 			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 			proof := tt.prepare(t, gateway, entry)
-			req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", httptest.NewRecorder(), gateway,
+			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, proof), httptest.NewRecorder(), gateway,
 				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
-			req.SetPathValue("state", proof)
 
 			err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req)
 			var httpErr *types.ErrHTTP
@@ -418,9 +414,18 @@ func newStaticOAuthTestRequest(t *testing.T, method, target, body string, record
 	}
 }
 
+func staticOAuthStatusBody(t *testing.T, state string) string {
+	t.Helper()
+	body, err := json.Marshal(types.MCPServerOAuthCredentialTestStatusRequest{State: state})
+	if err != nil {
+		t.Fatalf("marshal status request: %v", err)
+	}
+	return string(body)
+}
+
 func newOAuthCredentialTestGatewayClient(t *testing.T) *gatewayclient.Client {
 	t.Helper()
-	return newOAuthCredentialTestGatewayClientWithOptions(t, nil, nil)
+	return newOAuthCredentialTestGatewayClientWithOptions(t, staticOAuthTestEncryptionConfig(), nil)
 }
 
 func newOAuthCredentialTestGatewayClientWithEncryption(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration) *gatewayclient.Client {
@@ -430,17 +435,43 @@ func newOAuthCredentialTestGatewayClientWithEncryption(t *testing.T, encryptionC
 
 func newOAuthCredentialTestGatewayClientWithTrigger(t *testing.T, trigger func(context.Context, string) error) *gatewayclient.Client {
 	t.Helper()
-	return newOAuthCredentialTestGatewayClientWithOptions(t, nil, trigger)
+	return newOAuthCredentialTestGatewayClientWithOptions(t, staticOAuthTestEncryptionConfig(), trigger)
 }
 
 func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) *gatewayclient.Client {
 	t.Helper()
+	if encryptionConfig == nil {
+		encryptionConfig = staticOAuthTestEncryptionConfig()
+	} else {
+		if encryptionConfig.Transformers == nil {
+			encryptionConfig.Transformers = map[schema.GroupResource]value.Transformer{}
+		}
+		pendingResource := schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpoauthpendingstates"}
+		credentialResource := schema.GroupResource{Group: "obot.obot.ai", Resource: "credentials"}
+		if encryptionConfig.Transformers[pendingResource] == nil {
+			encryptionConfig.Transformers[pendingResource] = &toggleCredentialWriteErrorTransformer{}
+		}
+		if encryptionConfig.Transformers[credentialResource] == nil {
+			encryptionConfig.Transformers[credentialResource] = &toggleCredentialWriteErrorTransformer{}
+		}
+	}
 	client, _ := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, encryptionConfig, trigger)
 	return client
 }
 
+func staticOAuthTestEncryptionConfig() *encryptionconfig.EncryptionConfiguration {
+	transformer := &toggleCredentialWriteErrorTransformer{}
+	return &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
+		{Group: "obot.obot.ai", Resource: "mcpoauthpendingstates"}: transformer,
+		{Group: "obot.obot.ai", Resource: "credentials"}:           transformer,
+	}}
+}
+
 func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) (*gatewayclient.Client, *gorm.DB) {
 	t.Helper()
+	if encryptionConfig == nil {
+		encryptionConfig = staticOAuthTestEncryptionConfig()
+	}
 	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
 	if err != nil {
 		t.Fatalf("create storage services: %v", err)

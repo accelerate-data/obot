@@ -59,9 +59,9 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 		}
 	);
 	await page.route(
-		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credential-tests/*`,
+		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credential-tests/status`,
 		async (route) => {
-			const state = route.request().url().split('/').pop() ?? '';
+			const { state } = route.request().postDataJSON() as { state: string };
 			const reads = (statusReads.get(state) ?? 0) + 1;
 			statusReads.set(state, reads);
 			const expiresAt = new Date(

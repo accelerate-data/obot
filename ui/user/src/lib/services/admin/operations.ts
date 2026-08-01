@@ -892,8 +892,9 @@ export async function getMCPCatalogEntryOAuthCredentialTest(
 	state: string,
 	opts?: { fetch?: Fetcher }
 ): Promise<MCPServerOAuthCredentialTestResult> {
-	return (await doGet(
-		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credential-tests/${encodeURIComponent(state)}`,
+	return (await doPost(
+		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credential-tests/status`,
+		{ state },
 		opts
 	)) as MCPServerOAuthCredentialTestResult;
 }

@@ -867,8 +867,9 @@ export async function getWorkspaceMCPCatalogEntryOAuthCredentialTest(
 	state: string,
 	opts?: { fetch?: Fetcher }
 ): Promise<MCPServerOAuthCredentialTestResult> {
-	return (await doGet(
-		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credential-tests/${encodeURIComponent(state)}`,
+	return (await doPost(
+		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credential-tests/status`,
+		{ state },
 		opts
 	)) as MCPServerOAuthCredentialTestResult;
 }
