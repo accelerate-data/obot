@@ -49,10 +49,12 @@ const (
 	MCPStaticOAuthTestFailureExpired             MCPStaticOAuthTestFailureCategory = "expired"
 )
 
+// MCPStaticOAuthTestResult contains the non-secret state of one credential test.
 type MCPStaticOAuthTestResult struct {
 	Status          MCPStaticOAuthTestStatus          `json:"status"`
 	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
-	ExpiresAt       Time                              `json:"expiresAt"`
+	// ExpiresAt is the server-authoritative time after which the proof cannot be saved.
+	ExpiresAt Time `json:"expiresAt"`
 }
 
 // IsSingleUser returns true if the type represents a single-user server.
@@ -760,11 +762,13 @@ func ValidateURLHostname(u string, hostname string) error {
 	return nil
 }
 
-// MCPServerOAuthCredentialRequest represents a request to set OAuth credentials for an MCP server
+// MCPServerOAuthCredentialRequest sets the exact credentials authorized by a successful one-time proof.
+// Obot stores the credential and consumes the proof in one database transaction.
 type MCPServerOAuthCredentialRequest struct {
 	ClientID     string `json:"clientID"`
 	ClientSecret string `json:"clientSecret"`
-	Proof        string `json:"proof"`
+	// Proof is the opaque state returned by the successful test for these exact values.
+	Proof string `json:"proof"`
 }
 
 // MCPServerOAuthCredentialStatus represents the status of OAuth credentials for an MCP server

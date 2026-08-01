@@ -8802,7 +8802,7 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialRequest(r
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "MCPServerOAuthCredentialRequest represents a request to set OAuth credentials for an MCP server",
+				Description: "MCPServerOAuthCredentialRequest sets the exact credentials authorized by a successful one-time proof. Obot stores the credential and consumes the proof in one database transaction.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"clientID": {
@@ -8821,9 +8821,10 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialRequest(r
 					},
 					"proof": {
 						SchemaProps: spec.SchemaProps{
-							Default: "",
-							Type:    []string{"string"},
-							Format:  "",
+							Description: "Proof is the opaque state returned by the successful test for these exact values.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
 						},
 					},
 				},
@@ -9030,7 +9031,8 @@ func schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref comm
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Type: []string{"object"},
+				Description: "MCPStaticOAuthTestResult contains the non-secret state of one credential test.",
+				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"status": {
 						SchemaProps: spec.SchemaProps{
@@ -9047,7 +9049,8 @@ func schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref comm
 					},
 					"expiresAt": {
 						SchemaProps: spec.SchemaProps{
-							Ref: ref("github.com/obot-platform/obot/apiclient/types.Time"),
+							Description: "ExpiresAt is the server-authoritative time after which the proof cannot be saved.",
+							Ref:         ref("github.com/obot-platform/obot/apiclient/types.Time"),
 						},
 					},
 				},
