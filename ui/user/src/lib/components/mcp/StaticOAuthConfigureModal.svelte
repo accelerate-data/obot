@@ -18,6 +18,7 @@
 		failStaticOAuthCredentialTest,
 		idleStaticOAuthCredentialTest,
 		invalidateStaticOAuthCredentialTest,
+		safeStaticOAuthAuthorizationURL,
 		scheduleStaticOAuthCredentialTestExpiry,
 		succeedStaticOAuthCredentialTest
 	} from './staticOAuthCredentialTestState';
@@ -149,7 +150,9 @@
 				clientSecret: form.clientSecret.trim()
 			});
 			if (generation !== testGeneration) return;
-			popup.location.href = started.oauthURL;
+			const oauthURL = safeStaticOAuthAuthorizationURL(started.oauthURL);
+			if (!oauthURL) throw new Error('The OAuth provider returned an unsafe authorization URL.');
+			popup.location.href = oauthURL;
 
 			await poll(
 				async () => {
@@ -236,12 +239,16 @@
 			return;
 		}
 
+		const proof = credentialTest.proof;
+		credentialTest = invalidateStaticOAuthCredentialTest(credentialTest);
+		cancelTestExpiry?.();
+		cancelTestExpiry = undefined;
 		loading = true;
 		try {
 			await onSave({
 				clientID: form.clientID.trim(),
 				clientSecret: form.clientSecret.trim(),
-				proof: credentialTest.proof
+				proof
 			});
 			dialog?.close();
 		} catch (err) {

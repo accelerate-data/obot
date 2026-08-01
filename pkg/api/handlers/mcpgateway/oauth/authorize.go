@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -578,7 +579,11 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 		if pendingState.Scopes != "" {
 			conf.Scopes = strings.Fields(pendingState.Scopes)
 		}
-		if _, err := nmcp.ExchangeOAuthToken(req.Context(), conf, code, pendingState.Verifier); err != nil {
+		exchangeContext := req.Context()
+		if h.staticOAuthHTTPClient != nil {
+			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.staticOAuthHTTPClient)
+		}
+		if _, err := nmcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier); err != nil {
 			status = types.MCPStaticOAuthTestStatusFailed
 			failureCategory = types.MCPStaticOAuthTestFailureTokenExchange
 		}

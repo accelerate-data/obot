@@ -14,15 +14,22 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 
 	let configured = false;
 	let cleared = false;
+	let statusLoadFailures = 1;
+	let saveFailures = 1;
 	let attempt = 0;
 	const statusReads = new Map<string, number>();
 	let savedBody: Record<string, string> | undefined;
+	let recoveredBody: Record<string, string> | undefined;
 	let replacedBody: Record<string, string> | undefined;
 	await page.route(
 		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credentials`,
 		async (route) => {
 			switch (route.request().method()) {
 				case 'GET':
+					if (statusLoadFailures-- > 0) {
+						await route.fulfill({ status: 500, body: 'status unavailable' });
+						return;
+					}
 					await json(route, {
 						configured,
 						clientID: configured ? clientID : undefined,
@@ -31,6 +38,11 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 					return;
 				case 'POST':
 					savedBody = route.request().postDataJSON() as Record<string, string>;
+					if (saveFailures-- > 0) {
+						configured = true;
+						await route.fulfill({ status: 500, body: 'ambiguous save failure' });
+						return;
+					}
 					configured = true;
 					await json(route, {
 						configured: true,
@@ -39,10 +51,15 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 					});
 					return;
 				case 'PUT':
-					replacedBody = route.request().postDataJSON() as Record<string, string>;
+					const replacement = route.request().postDataJSON() as Record<string, string>;
+					if (replacement.clientID === clientID) {
+						recoveredBody = replacement;
+					} else {
+						replacedBody = replacement;
+					}
 					await json(route, {
 						configured: true,
-						clientID: replacementClientID,
+						clientID: replacement.clientID,
 						callbackURL: 'http://127.0.0.1:18080/oauth/mcp/callback'
 					});
 					return;
@@ -63,7 +80,7 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 			attempt += 1;
 			const request = route.request().postDataJSON() as Record<string, string>;
 			const expectedCredentials =
-				attempt === 4
+				attempt === 5
 					? { clientID: replacementClientID, clientSecret: replacementClientSecret }
 					: { clientID, clientSecret };
 			expect(request).toEqual(expectedCredentials);
@@ -110,6 +127,8 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 	await page.goto('/admin/mcp-catalog');
 	await expect(page.locator('#initial-loader.loaded')).toBeVisible({ timeout: 30_000 });
 	await closeOpenDialogs(page);
+	await clickConfigureOAuth(page);
+	await expect(staticOAuthDialog(page)).not.toBeVisible();
 	await openStaticOAuthModal(page);
 	const dialog = staticOAuthDialog(page);
 	await dialog.getByLabel('Client ID').fill(clientID);
@@ -147,8 +166,19 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 	await expect(savingPopup).toHaveURL(/oauth-test-popup\?attempt=3/);
 	await expect(save).toBeEnabled();
 	await save.click();
+	await expect(dialog).toBeVisible();
+	const recover = dialog.getByRole('button', { name: 'Replace Credentials' });
+	await expect(recover).toBeDisabled();
+	await expect(dialog.getByText(/ambiguous save failure/)).toBeVisible();
+	const retrySavePopupPromise = page.waitForEvent('popup');
+	await testCredentials.click();
+	const retrySavePopup = await retrySavePopupPromise;
+	await expect(retrySavePopup).toHaveURL(/oauth-test-popup\?attempt=4/);
+	await expect(recover).toBeEnabled();
+	await recover.click();
 	await expect(dialog).not.toBeVisible();
 	expect(savedBody).toEqual({ clientID, clientSecret, proof: 'save-proof-3' });
+	expect(recoveredBody).toEqual({ clientID, clientSecret, proof: 'save-proof-4' });
 
 	await openStaticOAuthModal(page);
 	await expect(dialog.getByText(/active app and user grants remain usable/)).toBeVisible();
@@ -159,14 +189,14 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 	const replacementPopupPromise = page.waitForEvent('popup');
 	await dialog.getByRole('button', { name: 'Test Credentials' }).click();
 	const replacementPopup = await replacementPopupPromise;
-	await expect(replacementPopup).toHaveURL(/oauth-test-popup\?attempt=4/);
+	await expect(replacementPopup).toHaveURL(/oauth-test-popup\?attempt=5/);
 	await expect(replace).toBeEnabled();
 	await replace.click();
 	await expect(dialog).not.toBeVisible();
 	expect(replacedBody).toEqual({
 		clientID: replacementClientID,
 		clientSecret: replacementClientSecret,
-		proof: 'save-proof-4'
+		proof: 'save-proof-5'
 	});
 
 	await openStaticOAuthModal(page);
@@ -204,11 +234,15 @@ async function createStaticOAuthEntry(page: Page): Promise<{ id: string }> {
 }
 
 async function openStaticOAuthModal(page: Page) {
+	await clickConfigureOAuth(page);
+	await expect(staticOAuthDialog(page)).toBeVisible();
+}
+
+async function clickConfigureOAuth(page: Page) {
 	const row = page.getByRole('row').filter({ hasText: entryName });
 	await expect(row).toBeVisible({ timeout: 30_000 });
 	await row.getByRole('button', { name: 'Row actions' }).click();
 	await page.getByRole('button', { name: 'Configure OAuth' }).click();
-	await expect(staticOAuthDialog(page)).toBeVisible();
 }
 
 function staticOAuthDialog(page: Page) {

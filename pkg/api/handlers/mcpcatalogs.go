@@ -1850,8 +1850,7 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	var clientID, clientSecret string
 
 	if credentialsExist {
-		// Credentials already exist - must delete and recreate to change them
-		return types.NewErrBadRequest("credentials already exist; delete and recreate credentials to change them")
+		return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
 	}
 
 	// Initial setup mode: All fields are required
@@ -1870,7 +1869,7 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 			return types.NewErrBadRequest("invalid or expired OAuth credential test")
 		}
 		if errors.Is(err, gclient.ErrMCPStaticOAuthCredentialExists) {
-			return types.NewErrBadRequest("credentials already exist; delete and recreate credentials to change them")
+			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
 		}
 		return fmt.Errorf("failed to create OAuth credential: %w", err)
 	}

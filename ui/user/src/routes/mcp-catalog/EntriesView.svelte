@@ -204,17 +204,20 @@
 	async function handleConfigureOAuth(entry: MCPCatalogEntry) {
 		oauthConfigEntry = entry;
 		try {
-			const catalogId = entry.powerUserWorkspaceID ? undefined : 'default';
-			oauthStatus = entry.powerUserWorkspaceID
-				? await UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(
-						entry.powerUserWorkspaceID,
-						entry.id
-					)
-				: await AdminService.getMCPCatalogEntryOAuthCredentials(catalogId!, entry.id);
+			oauthStatus = await loadOAuthStatus(entry);
 		} catch {
-			oauthStatus = { configured: false, callbackURL: '' };
+			return;
 		}
 		oauthConfigModal?.open();
+	}
+
+	function loadOAuthStatus(entry: MCPCatalogEntry) {
+		return entry.powerUserWorkspaceID
+			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(
+					entry.powerUserWorkspaceID,
+					entry.id
+				)
+			: AdminService.getMCPCatalogEntryOAuthCredentials('default', entry.id);
 	}
 
 	async function handleSaveOAuth(credentials: {
@@ -224,16 +227,25 @@
 	}) {
 		if (!oauthConfigEntry) return;
 		const replacing = oauthStatus?.configured === true;
-		if (oauthConfigEntry.powerUserWorkspaceID) {
-			const save = replacing
-				? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
-				: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
-			await save(oauthConfigEntry.powerUserWorkspaceID, oauthConfigEntry.id, credentials);
-		} else {
-			const save = replacing
-				? AdminService.replaceMCPCatalogEntryOAuthCredentials
-				: AdminService.setMCPCatalogEntryOAuthCredentials;
-			await save('default', oauthConfigEntry.id, credentials);
+		try {
+			if (oauthConfigEntry.powerUserWorkspaceID) {
+				const save = replacing
+					? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
+					: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
+				await save(oauthConfigEntry.powerUserWorkspaceID, oauthConfigEntry.id, credentials);
+			} else {
+				const save = replacing
+					? AdminService.replaceMCPCatalogEntryOAuthCredentials
+					: AdminService.setMCPCatalogEntryOAuthCredentials;
+				await save('default', oauthConfigEntry.id, credentials);
+			}
+		} catch (error) {
+			try {
+				oauthStatus = await loadOAuthStatus(oauthConfigEntry);
+			} catch {
+				// The request layer reports the status-refresh failure separately.
+			}
+			throw error;
 		}
 		// Refresh the table to update status
 		mcpServersAndEntries.refreshAll();

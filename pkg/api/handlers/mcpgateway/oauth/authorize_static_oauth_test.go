@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/obot-platform/nanobot/pkg/safehttp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authn"
@@ -264,6 +265,38 @@ func TestStaticOAuthCallbackExchangesAndDiscardsTokenBeforeNormalOAuth(t *testin
 	}
 	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/auth/oauth/complete" {
 		t.Fatalf("callback response = %d Location=%q", recorder.Code, recorder.Header().Get("Location"))
+	}
+}
+
+func TestStaticOAuthCallbackBlocksPrivateTokenEndpoint(t *testing.T) {
+	provider := newStaticOAuthCallbackProvider(t)
+	gateway := newStaticOAuthCallbackGateway(t)
+	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	req := api.Context{
+		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil),
+		ResponseWriter: recorder,
+	}
+	h := &handler{
+		oauthChecker:          &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)},
+		staticOAuthHTTPClient: safehttp.NewClient(true, true, true),
+	}
+	if err := h.oauthCallback(req); err != nil {
+		t.Fatalf("handle static OAuth callback: %v", err)
+	}
+	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
+	if err != nil {
+		t.Fatalf("get static OAuth result: %v", err)
+	}
+	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != types.MCPStaticOAuthTestFailureTokenExchange {
+		t.Fatalf("callback result = %+v, want failed token exchange", result)
+	}
+	if got := provider.tokenExchangeCount(); got != 0 {
+		t.Fatalf("blocked provider received %d token exchanges, want 0", got)
 	}
 }
 

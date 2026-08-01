@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/url"
 	"strings"
 
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
@@ -64,6 +67,12 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	if len(metadata.AuthorizationServerMetadata) == 0 || json.Unmarshal(metadata.AuthorizationServerMetadata, &authorizationServer) != nil || authorizationServer.AuthorizationEndpoint == "" || authorizationServer.TokenEndpoint == "" {
 		return types.NewErrBadRequest("OAuth provider metadata is incomplete")
 	}
+	if err := validateStaticOAuthEndpoint(req.Context(), authorizationServer.AuthorizationEndpoint, h.remoteURLValidationConfig); err != nil {
+		return types.NewErrBadRequest("OAuth authorization endpoint is not allowed")
+	}
+	if err := validateStaticOAuthEndpoint(req.Context(), authorizationServer.TokenEndpoint, h.remoteURLValidationConfig); err != nil {
+		return types.NewErrBadRequest("OAuth token endpoint is not allowed")
+	}
 	var registration nmcp.ClientRegistrationMetadata
 	if len(metadata.ClientRegistration) > 0 && json.Unmarshal(metadata.ClientRegistration, &registration) != nil {
 		return types.NewErrBadRequest("OAuth provider metadata is incomplete")
@@ -93,6 +102,21 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 		return errors.New("failed to create static OAuth authorization URL")
 	}
 	return req.Write(types.MCPServerOAuthCredentialTestStart{TestState: started.TestState, OAuthURL: oauthURL})
+}
+
+func validateStaticOAuthEndpoint(ctx context.Context, rawURL string, config mcp.RemoteMCPURLValidationConfig) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	if u.Scheme == "http" {
+		host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+		ip := net.ParseIP(host)
+		if !config.AllowLocalhostMCP || (host != "localhost" && !strings.HasSuffix(host, ".localhost") && (ip == nil || !ip.IsLoopback())) {
+			return errors.New("OAuth endpoints must use HTTPS except for explicitly allowed loopback hosts")
+		}
+	}
+	return mcp.ValidateRemoteMCPURL(ctx, rawURL, config)
 }
 
 // GetOAuthCredentialTest returns only the caller- and entry-bound safe verification status.

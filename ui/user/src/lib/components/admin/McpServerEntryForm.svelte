@@ -659,14 +659,17 @@
 	async function handleConfigureOAuth() {
 		if (!entry || !id) return;
 		try {
-			staticOauthStatus =
-				entity === 'workspace'
-					? await UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(id, entry.id)
-					: await AdminService.getMCPCatalogEntryOAuthCredentials(id, entry.id);
+			staticOauthStatus = await loadOAuthStatus(entry, id);
 		} catch {
-			staticOauthStatus = { configured: false, callbackURL: '' };
+			return;
 		}
 		staticOauthConfigModal?.open();
+	}
+
+	function loadOAuthStatus(target: MCPCatalogEntry | MCPCatalogServer, catalogOrWorkspaceID: string) {
+		return entity === 'workspace'
+			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(catalogOrWorkspaceID, target.id)
+			: AdminService.getMCPCatalogEntryOAuthCredentials(catalogOrWorkspaceID, target.id);
 	}
 
 	function handleCancel() {
@@ -1511,16 +1514,25 @@
 	onSave={async (credentials) => {
 		if (!entry || !id) return;
 		const replacing = staticOauthStatus?.configured === true;
-		if (entity === 'workspace') {
-			const save = replacing
-				? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
-				: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
-			await save(id, entry.id, credentials);
-		} else {
-			const save = replacing
-				? AdminService.replaceMCPCatalogEntryOAuthCredentials
-				: AdminService.setMCPCatalogEntryOAuthCredentials;
-			await save(id, entry.id, credentials);
+		try {
+			if (entity === 'workspace') {
+				const save = replacing
+					? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
+					: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
+				await save(id, entry.id, credentials);
+			} else {
+				const save = replacing
+					? AdminService.replaceMCPCatalogEntryOAuthCredentials
+					: AdminService.setMCPCatalogEntryOAuthCredentials;
+				await save(id, entry.id, credentials);
+			}
+		} catch (error) {
+			try {
+				staticOauthStatus = await loadOAuthStatus(entry, id);
+			} catch {
+				// The request layer reports the status-refresh failure separately.
+			}
+			throw error;
 		}
 		staticOauthStatus = {
 			...staticOauthStatus,

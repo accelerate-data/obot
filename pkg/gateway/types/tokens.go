@@ -44,16 +44,17 @@ type MCPOAuthToken struct {
 	RedirectURL  string
 	Scopes       string
 
-	MCPID              string `gorm:"primaryKey"`
-	UserID             string `gorm:"primaryKey"`
-	URL                string
-	CatalogEntryName   string `gorm:"index:idx_mcp_oauth_token_catalog_entry"`
-	OAuthAuthRequestID string `gorm:"index"`
-	AccessToken        string
-	TokenType          string
-	RefreshToken       string
-	Expiry             time.Time
-	ExpiresIn          int64
+	MCPID                       string `gorm:"primaryKey"`
+	UserID                      string `gorm:"primaryKey"`
+	URL                         string
+	CatalogEntryName            string `gorm:"index:idx_mcp_oauth_token_catalog_entry"`
+	CatalogCredentialGeneration string
+	OAuthAuthRequestID          string `gorm:"index"`
+	AccessToken                 string
+	TokenType                   string
+	RefreshToken                string
+	Expiry                      time.Time
+	ExpiresIn                   int64
 
 	Encrypted bool
 }
@@ -66,6 +67,7 @@ type MCPOAuthPendingState struct {
 	MCPID                          string `gorm:"index:idx_pending_user_mcp;index:idx_pending_mcp_static_test,priority:1"`
 	URL                            string
 	CatalogEntryName               string
+	CatalogCredentialGeneration    string
 	OAuthAuthRequestID             string
 	ClientID                       string
 	ClientSecret                   string

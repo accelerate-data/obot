@@ -295,16 +295,20 @@
 	async function openStaticOAuthConfig() {
 		if (!entry) return;
 		try {
-			oauthStatus = entry.powerUserWorkspaceID
-				? await UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(
-						entry.powerUserWorkspaceID,
-						entry.id
-					)
-				: await AdminService.getMCPCatalogEntryOAuthCredentials('default', entry.id);
+			oauthStatus = await loadOAuthStatus(entry);
 		} catch {
-			oauthStatus = { configured: false, callbackURL: '' };
+			return;
 		}
 		oauthConfigModal?.open();
+	}
+
+	function loadOAuthStatus(target: MCPCatalogEntry) {
+		return target.powerUserWorkspaceID
+			? UserService.getWorkspaceMCPCatalogEntryOAuthCredentials(
+					target.powerUserWorkspaceID,
+					target.id
+				)
+			: AdminService.getMCPCatalogEntryOAuthCredentials('default', target.id);
 	}
 
 	function handleShowSelectServerDialog(
@@ -843,16 +847,25 @@
 	onSave={async (credentials) => {
 		if (!entry) return;
 		const replacing = oauthStatus?.configured === true;
-		if (entry.powerUserWorkspaceID) {
-			const save = replacing
-				? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
-				: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
-			await save(entry.powerUserWorkspaceID, entry.id, credentials);
-		} else {
-			const save = replacing
-				? AdminService.replaceMCPCatalogEntryOAuthCredentials
-				: AdminService.setMCPCatalogEntryOAuthCredentials;
-			await save('default', entry.id, credentials);
+		try {
+			if (entry.powerUserWorkspaceID) {
+				const save = replacing
+					? UserService.replaceWorkspaceMCPCatalogEntryOAuthCredentials
+					: UserService.setWorkspaceMCPCatalogEntryOAuthCredentials;
+				await save(entry.powerUserWorkspaceID, entry.id, credentials);
+			} else {
+				const save = replacing
+					? AdminService.replaceMCPCatalogEntryOAuthCredentials
+					: AdminService.setMCPCatalogEntryOAuthCredentials;
+				await save('default', entry.id, credentials);
+			}
+		} catch (error) {
+			try {
+				oauthStatus = await loadOAuthStatus(entry);
+			} catch {
+				// The request layer reports the status-refresh failure separately.
+			}
+			throw error;
 		}
 		oauthConfiguredOverride = true;
 		onOAuthConfigured?.();

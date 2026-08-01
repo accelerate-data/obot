@@ -3,11 +3,13 @@ package encryption
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,14 +20,16 @@ import (
 var log = logger.Package()
 
 type Options struct {
-	AWSKMSKeyARN         string `usage:"The ARN of the AWS KMS key to use for encrypting credential storage. Only used with the AWS encryption provider." env:"OBOT_AWS_KMS_KEY_ARN" name:"aws-kms-key-arn"`
-	GCPKMSKeyURI         string `usage:"The URI of the Google Cloud KMS key to use for encrypting credential storage. Only used with the GCP encryption provider." env:"OBOT_GCP_KMS_KEY_URI" name:"gcp-kms-key-uri"`
-	AzureKeyVaultName    string `usage:"The name of the Azure Key Vault to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_VAULT_NAME" name:"azure-key-vault-name"`
-	AzureKeyName         string `usage:"The name of the Azure Key Vault key to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_NAME" name:"azure-key-vault-key-name"`
-	AzureKeyVersion      string `usage:"The version of the Azure Key Vault key to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_VERSION" name:"azure-key-vault-key-version"`
-	EncryptionProvider   string `usage:"The encryption provider to use. Options are AWS, GCP, None, or Custom. Default is None." default:"None"`
-	EncryptionConfigFile string `usage:"The path to the encryption configuration file. Only used with the Custom encryption provider."`
-	EncryptionKey        string `usage:"A base64-encoded 32-byte AES key used to build the Custom encryption configuration when no file is provided."`
+	AWSKMSKeyARN          string `usage:"The ARN of the AWS KMS key to use for encrypting credential storage. Only used with the AWS encryption provider." env:"OBOT_AWS_KMS_KEY_ARN" name:"aws-kms-key-arn"`
+	GCPKMSKeyURI          string `usage:"The URI of the Google Cloud KMS key to use for encrypting credential storage. Only used with the GCP encryption provider." env:"OBOT_GCP_KMS_KEY_URI" name:"gcp-kms-key-uri"`
+	AzureKeyVaultName     string `usage:"The name of the Azure Key Vault to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_VAULT_NAME" name:"azure-key-vault-name"`
+	AzureKeyName          string `usage:"The name of the Azure Key Vault key to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_NAME" name:"azure-key-vault-key-name"`
+	AzureKeyVersion       string `usage:"The version of the Azure Key Vault key to use for encrypting credential storage. Only used with the Azure encryption provider." env:"OBOT_AZURE_KEY_VERSION" name:"azure-key-vault-key-version"`
+	EncryptionProvider    string `usage:"The encryption provider to use. Options are AWS, GCP, None, or Custom. Default is None." default:"None"`
+	EncryptionConfigFile  string `usage:"The path to the encryption configuration file. Only used with the Custom encryption provider."`
+	EncryptionKey         string `usage:"A base64-encoded 32-byte AES key used to build the Custom encryption configuration when no file is provided."`
+	EncryptionKeyID       string `usage:"The key ID used for new ciphertext when EncryptionKey is configured." default:"key0"`
+	EncryptionRetiredKeys string `usage:"A JSON object mapping retired key IDs to base64-encoded 32-byte AES keys used for decrypt-only rotation support."`
 }
 
 func (o *Options) Validate() error {
@@ -84,7 +88,7 @@ func Init(ctx context.Context, opts Options) (*encryptionconfig.EncryptionConfig
 		}
 	}
 	if strings.EqualFold(opts.EncryptionProvider, "custom") && opts.EncryptionKey != "" {
-		return loadManagedAESConfig(ctx, opts.EncryptionKey)
+		return loadManagedAESConfig(ctx, opts.EncryptionKeyID, opts.EncryptionKey, opts.EncryptionRetiredKeys)
 	}
 
 	if opts.EncryptionConfigFile != "" {
@@ -97,17 +101,47 @@ func Init(ctx context.Context, opts Options) (*encryptionconfig.EncryptionConfig
 	return nil, nil
 }
 
-func loadManagedAESConfig(ctx context.Context, encodedKey string) (*encryptionconfig.EncryptionConfiguration, error) {
-	key, err := base64.StdEncoding.DecodeString(encodedKey)
-	if err != nil || len(key) != 32 {
-		return nil, fmt.Errorf("custom encryption key must be base64-encoded 32-byte data")
+func loadManagedAESConfig(ctx context.Context, activeKeyID, encodedKey, encodedRetiredKeys string) (*encryptionconfig.EncryptionConfiguration, error) {
+	if activeKeyID == "" {
+		activeKeyID = "key0"
 	}
+	if err := validateManagedKeyID(activeKeyID); err != nil {
+		return nil, err
+	}
+	if err := validateManagedKey(encodedKey); err != nil {
+		return nil, fmt.Errorf("custom encryption key %w", err)
+	}
+	retiredKeys := map[string]string{}
+	if strings.TrimSpace(encodedRetiredKeys) != "" {
+		if err := json.Unmarshal([]byte(encodedRetiredKeys), &retiredKeys); err != nil {
+			return nil, fmt.Errorf("custom retired encryption keys must be a JSON object: %w", err)
+		}
+	}
+	retiredKeyIDs := make([]string, 0, len(retiredKeys))
+	for keyID, key := range retiredKeys {
+		if keyID == activeKeyID {
+			return nil, fmt.Errorf("custom retired encryption keys must not include active key ID %s", activeKeyID)
+		}
+		if err := validateManagedKeyID(keyID); err != nil {
+			return nil, err
+		}
+		if err := validateManagedKey(key); err != nil {
+			return nil, fmt.Errorf("custom retired encryption key %s %w", keyID, err)
+		}
+		retiredKeyIDs = append(retiredKeyIDs, keyID)
+	}
+	sort.Strings(retiredKeyIDs)
 	file, err := os.CreateTemp("", "obot-encryption-*.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create custom encryption config: %w", err)
 	}
 	path := file.Name()
 	defer os.Remove(path)
+	var keys strings.Builder
+	fmt.Fprintf(&keys, "            - name: %s\n              secret: %q\n", activeKeyID, encodedKey)
+	for _, keyID := range retiredKeyIDs {
+		fmt.Fprintf(&keys, "            - name: %s\n              secret: %q\n", keyID, retiredKeys[keyID])
+	}
 	config := fmt.Sprintf(`apiVersion: apiserver.config.k8s.io/v1
 kind: EncryptionConfiguration
 resources:
@@ -124,10 +158,9 @@ resources:
     providers:
       - aesgcm:
           keys:
-            - name: key0
-              secret: %q
+%s
       - identity: {}
-`, base64.StdEncoding.EncodeToString(key))
+`, strings.TrimSuffix(keys.String(), "\n"))
 	if _, err := io.WriteString(file, config); err != nil {
 		_ = file.Close()
 		return nil, fmt.Errorf("failed to write custom encryption config: %w", err)
@@ -140,6 +173,26 @@ resources:
 		return nil, fmt.Errorf("failed to load custom encryption config: %w", err)
 	}
 	return loaded, nil
+}
+
+func validateManagedKeyID(keyID string) error {
+	if len(keyID) > 64 || keyID == "" {
+		return fmt.Errorf("custom encryption key ID must be 1-64 URL-safe characters")
+	}
+	for _, char := range keyID {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '.' || char == '_' || char == '-') {
+			return fmt.Errorf("custom encryption key ID must be 1-64 URL-safe characters")
+		}
+	}
+	return nil
+}
+
+func validateManagedKey(encodedKey string) error {
+	key, err := base64.StdEncoding.DecodeString(encodedKey)
+	if err != nil || len(key) != 32 {
+		return fmt.Errorf("must be base64-encoded 32-byte data")
+	}
+	return nil
 }
 
 func setUpAzureKeyVault(ctx context.Context, keyvaultName, keyName, keyVersion string) error {

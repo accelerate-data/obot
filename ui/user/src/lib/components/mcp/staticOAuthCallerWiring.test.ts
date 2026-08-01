@@ -41,6 +41,10 @@ for (const caller of callers) {
 		for (const operation of expectedOperations) {
 			assert.ok(source.includes(operation), `${caller.name} is missing ${operation}`);
 		}
+		assert.ok(
+			!source.includes("= { configured: false, callbackURL: '' }"),
+			`${caller.name} must not fabricate an unconfigured status when the status request fails`
+		);
 
 		if (caller.deletesCredentials) {
 			for (const operation of [

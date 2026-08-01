@@ -100,6 +100,27 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
 		}
 	})
 
+	t.Run("same-value replacement generation rejects stale grant", func(t *testing.T) {
+		c := newClient(t)
+		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+			Context: system.MCPOAuthCredentialName(entryName),
+			Name:    "oauth",
+			Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "GENERATION": "generation-2"},
+		}); err != nil {
+			t.Fatalf("seed replaced catalog OAuth credential: %v", err)
+		}
+
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "generation-1",
+			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+			&oauth2.Token{AccessToken: "stale-access"})
+		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("stale generation write error = %v, want catalog credential changed", err)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("stale generation grant was persisted: %v", err)
+		}
+	})
+
 	t.Run("clear rejects stale grant when credential no longer exists", func(t *testing.T) {
 		c := newClient(t)
 

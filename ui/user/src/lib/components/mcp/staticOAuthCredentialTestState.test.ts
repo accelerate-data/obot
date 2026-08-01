@@ -8,9 +8,20 @@ const {
 	canSaveStaticOAuthCredentials,
 	failStaticOAuthCredentialTest,
 	invalidateStaticOAuthCredentialTest,
+	safeStaticOAuthAuthorizationURL,
 	scheduleStaticOAuthCredentialTestExpiry,
 	succeedStaticOAuthCredentialTest
 } = staticOAuthCredentialTestState;
+
+test('authorization navigation accepts only HTTP URLs with a hostname', () => {
+	assert.equal(
+		safeStaticOAuthAuthorizationURL('https://provider.example/authorize?client_id=client'),
+		'https://provider.example/authorize?client_id=client'
+	);
+	assert.equal(safeStaticOAuthAuthorizationURL('http://127.0.0.1:8080/authorize'), 'http://127.0.0.1:8080/authorize');
+	assert.equal(safeStaticOAuthAuthorizationURL('javascript:alert(document.domain)'), undefined);
+	assert.equal(safeStaticOAuthAuthorizationURL('not a URL'), undefined);
+});
 
 test('save requires a successful proof for the exact tested credentials', () => {
 	const pending = beginStaticOAuthCredentialTest(' client-id ', ' client-secret ');

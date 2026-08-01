@@ -411,7 +411,7 @@ func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.
 
 	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "static-client", "CLIENT_SECRET": "static-secret"},
+		Secrets: map[string]string{"CLIENT_ID": "static-client", "CLIENT_SECRET": "static-secret", "GENERATION": "generation-1"},
 	}))
 	clientID, clientSecret, err := handler.Lookup(t.Context(), "")
 	require.NoError(t, err)
@@ -423,6 +423,7 @@ func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.
 	pending, err = client.GetMCPOAuthPendingState(t.Context(), state)
 	require.NoError(t, err)
 	require.Equal(t, entryName, pending.CatalogEntryName)
+	require.Equal(t, "generation-1", pending.CatalogCredentialGeneration)
 }
 
 func newStateManagerTestClient(t *testing.T, entryName, mcpID string) *gateway.Client {

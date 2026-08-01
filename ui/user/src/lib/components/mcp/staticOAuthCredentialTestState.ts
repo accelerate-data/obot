@@ -50,6 +50,18 @@ export function invalidateStaticOAuthCredentialTest(
 	return idleStaticOAuthCredentialTest();
 }
 
+export function safeStaticOAuthAuthorizationURL(rawURL: string): string | undefined {
+	try {
+		const parsed = new URL(rawURL);
+		if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || !parsed.hostname) {
+			return undefined;
+		}
+		return parsed.href;
+	} catch {
+		return undefined;
+	}
+}
+
 export function canSaveStaticOAuthCredentials(
 	state: StaticOAuthCredentialTestState,
 	clientID: string,

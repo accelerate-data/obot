@@ -50,6 +50,17 @@ func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T
 				require.True(t, deleted)
 			},
 		},
+		{
+			name: "same values replaced with a new generation",
+			change: func(t *testing.T, client *gateway.Client) {
+				t.Helper()
+				require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+					Context: system.MCPOAuthCredentialName(entryName),
+					Name:    "oauth",
+					Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1", "GENERATION": "generation-2"},
+				}))
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := newCatalogTokenStoreTestClient(t, entryName, mcpID, true)

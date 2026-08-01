@@ -35,7 +35,12 @@ type tokenStore struct {
 	gatewayClient *gateway.Client
 	userID, mcpID string
 	mu            sync.Mutex
-	catalogEntry  map[string]string
+	catalogEntry  map[string]catalogCredentialFence
+}
+
+type catalogCredentialFence struct {
+	entryName  string
+	generation string
 }
 
 func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2.Config, *oauth2.Token, error) {
@@ -69,9 +74,9 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2
 	}
 	t.mu.Lock()
 	if t.catalogEntry == nil {
-		t.catalogEntry = map[string]string{}
+		t.catalogEntry = map[string]catalogCredentialFence{}
 	}
-	t.catalogEntry[mcpURL] = catalogEntryName
+	t.catalogEntry[mcpURL] = catalogCredentialFence{entryName: catalogEntryName, generation: mcpToken.CatalogCredentialGeneration}
 	t.mu.Unlock()
 
 	return conf, &oauth2.Token{
@@ -85,16 +90,16 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2
 
 func (t *tokenStore) SetTokenConfig(ctx context.Context, mcpURL string, config *oauth2.Config, token *oauth2.Token) error {
 	t.mu.Lock()
-	catalogEntryName, captured := t.catalogEntry[mcpURL]
+	fence, captured := t.catalogEntry[mcpURL]
 	t.mu.Unlock()
 	if !captured {
 		var err error
-		catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, config)
+		fence.entryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, config)
 		if err != nil {
 			return err
 		}
 	}
-	return t.gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, t.userID, t.mcpID, mcpURL, "", catalogEntryName, config, token)
+	return t.gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, t.userID, t.mcpID, mcpURL, "", fence.entryName, fence.generation, config, token)
 }
 
 func (t *tokenStore) DeleteTokenConfig(ctx context.Context, mcpURL string) error {

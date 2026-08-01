@@ -81,12 +81,18 @@ func (c *Client) GetMCPOAuthToken(ctx context.Context, userID, mcpID, url string
 }
 
 func (c *Client) ReplaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
-	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, "", oauthConf, token)
+	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, "", "", oauthConf, token)
 }
 
 // ReplaceMCPOAuthTokenWithCatalogCredentialFence persists a grant only while the
 // static catalog app captured by the OAuth flow is still active for this MCP.
 func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	return c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, "", oauthConf, token)
+}
+
+// ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence also rejects writes
+// from an OAuth flow or refresh that began before a same-value credential replacement.
+func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	if catalogEntryName == "" {
 		return c.ReplaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, oauthConf, token)
 	}
@@ -111,11 +117,12 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx context.Cont
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
 	if !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) ||
-		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
+		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) ||
+		!secureStringEqual(credential.Secrets["GENERATION"], catalogCredentialGeneration) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
 
-	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, oauthConf, token)
+	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration, oauthConf, token)
 }
 
 // CatalogEntryForStaticOAuthMCP recovers the fence identity for OAuth state
@@ -156,7 +163,7 @@ func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pendingSta
 		}
 	}
 
-	if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, pendingState.UserID, pendingState.MCPID, pendingState.URL, oauthAuthRequestID, catalogEntryName, oauthConf, token); err != nil {
+	if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, pendingState.UserID, pendingState.MCPID, pendingState.URL, oauthAuthRequestID, catalogEntryName, pendingState.CatalogCredentialGeneration, oauthConf, token); err != nil {
 		c.deleteChangedMCPOAuthPendingState(ctx, pendingState.HashedState, err)
 		return err
 	}
@@ -216,23 +223,24 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 	return entryName, nil
 }
 
-func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	t := &types.MCPOAuthToken{
-		UserID:             userID,
-		MCPID:              mcpID,
-		URL:                url,
-		CatalogEntryName:   catalogEntryName,
-		OAuthAuthRequestID: oauthAuthRequestID,
-		AccessToken:        token.AccessToken,
-		TokenType:          token.TokenType,
-		RefreshToken:       token.RefreshToken,
-		Expiry:             token.Expiry,
-		ExpiresIn:          token.ExpiresIn,
-		ClientID:           oauthConf.ClientID,
-		ClientSecret:       oauthConf.ClientSecret,
-		Endpoint:           oauthConf.Endpoint,
-		RedirectURL:        oauthConf.RedirectURL,
-		Scopes:             strings.Join(oauthConf.Scopes, " "),
+		UserID:                      userID,
+		MCPID:                       mcpID,
+		URL:                         url,
+		CatalogEntryName:            catalogEntryName,
+		CatalogCredentialGeneration: catalogCredentialGeneration,
+		OAuthAuthRequestID:          oauthAuthRequestID,
+		AccessToken:                 token.AccessToken,
+		TokenType:                   token.TokenType,
+		RefreshToken:                token.RefreshToken,
+		Expiry:                      token.Expiry,
+		ExpiresIn:                   token.ExpiresIn,
+		ClientID:                    oauthConf.ClientID,
+		ClientSecret:                oauthConf.ClientSecret,
+		Endpoint:                    oauthConf.Endpoint,
+		RedirectURL:                 oauthConf.RedirectURL,
+		Scopes:                      strings.Join(oauthConf.Scopes, " "),
 	}
 
 	if err := c.encryptMCPOAuthToken(ctx, t); err != nil {
@@ -470,6 +478,7 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 		Secrets: map[string]string{
 			"CLIENT_ID":     clientID,
 			"CLIENT_SECRET": clientSecret,
+			"GENERATION":    strings.ToLower(rand.Text()),
 		},
 	}
 	if err := c.encryptCredential(ctx, &credential); err != nil {
@@ -623,23 +632,32 @@ func secureStringEqual(a, b string) bool {
 }
 
 func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier string, oauthConf *oauth2.Config) error {
+	catalogCredentialGeneration := ""
+	if catalogEntryName != "" {
+		credential, err := c.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(catalogEntryName)}, "oauth")
+		if err != nil || !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) || !secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
+			return ErrMCPOAuthCatalogCredentialChanged
+		}
+		catalogCredentialGeneration = credential.Secrets["GENERATION"]
+	}
 	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
 	ps := &types.MCPOAuthPendingState{
-		HashedState:        hashedState,
-		State:              state,
-		Verifier:           verifier,
-		UserID:             userID,
-		MCPID:              mcpID,
-		URL:                mcpURL,
-		CatalogEntryName:   catalogEntryName,
-		OAuthAuthRequestID: oauthAuthRequestID,
-		ClientID:           oauthConf.ClientID,
-		ClientSecret:       oauthConf.ClientSecret,
-		AuthURL:            oauthConf.Endpoint.AuthURL,
-		TokenURL:           oauthConf.Endpoint.TokenURL,
-		AuthStyle:          oauthConf.Endpoint.AuthStyle,
-		RedirectURL:        oauthConf.RedirectURL,
-		Scopes:             strings.Join(oauthConf.Scopes, " "),
+		HashedState:                 hashedState,
+		State:                       state,
+		Verifier:                    verifier,
+		UserID:                      userID,
+		MCPID:                       mcpID,
+		URL:                         mcpURL,
+		CatalogEntryName:            catalogEntryName,
+		CatalogCredentialGeneration: catalogCredentialGeneration,
+		OAuthAuthRequestID:          oauthAuthRequestID,
+		ClientID:                    oauthConf.ClientID,
+		ClientSecret:                oauthConf.ClientSecret,
+		AuthURL:                     oauthConf.Endpoint.AuthURL,
+		TokenURL:                    oauthConf.Endpoint.TokenURL,
+		AuthStyle:                   oauthConf.Endpoint.AuthStyle,
+		RedirectURL:                 oauthConf.RedirectURL,
+		Scopes:                      strings.Join(oauthConf.Scopes, " "),
 	}
 
 	if err := c.encryptMCPOAuthPendingState(ctx, ps); err != nil {

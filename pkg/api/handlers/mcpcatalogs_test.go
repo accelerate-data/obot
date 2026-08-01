@@ -640,6 +640,32 @@ func TestReplaceOAuthCredentialsRejectsMismatchedProofWithoutMutatingActiveConfi
 	}
 }
 
+func TestReplaceOAuthCredentialsRotatesGenerationForSameValueReplacement(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: credName,
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"},
+	}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProofFor(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1", "active-client", "active-secret")
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "active-client", "active-secret", proof)
+
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(req); err != nil {
+		t.Fatalf("same-value replacement failed: %v", err)
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal replaced credential: %v", err)
+	}
+	if credential.Secrets["GENERATION"] == "" {
+		t.Fatal("same-value replacement did not rotate the credential generation")
+	}
+}
+
 func TestReplaceOAuthCredentialsListFailureLeavesActiveConfigurationAndProofUsable(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
@@ -1399,8 +1425,12 @@ func newReplaceOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Clien
 }
 
 func successfulStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) string {
+	return successfulStaticOAuthCredentialProofFor(t, gateway, entryName, fixedURL, userID, "candidate-client", "candidate-secret")
+}
+
+func successfulStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID, clientID, clientSecret string) string {
 	t.Helper()
-	started := pendingStaticOAuthCredentialProof(t, gateway, entryName, fixedURL, userID)
+	started := pendingStaticOAuthCredentialProofFor(t, gateway, entryName, fixedURL, userID, clientID, clientSecret)
 	if err := gateway.CompleteMCPStaticOAuthTest(t.Context(), started.CallbackState, types.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
 		t.Fatalf("complete static OAuth test: %v", err)
 	}
@@ -1415,9 +1445,13 @@ func successfulStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.C
 }
 
 func pendingStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) gatewayclient.MCPStaticOAuthTestStart {
+	return pendingStaticOAuthCredentialProofFor(t, gateway, entryName, fixedURL, userID, "candidate-client", "candidate-secret")
+}
+
+func pendingStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID, clientID, clientSecret string) gatewayclient.MCPStaticOAuthTestStart {
 	t.Helper()
 	proof, err := gateway.CreateMCPStaticOAuthTest(t.Context(), userID, entryName, fixedURL, "verifier", &oauth2.Config{
-		ClientID: "candidate-client", ClientSecret: "candidate-secret",
+		ClientID: clientID, ClientSecret: clientSecret,
 		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: "https://provider.example/token"},
 	})
 	if err != nil {

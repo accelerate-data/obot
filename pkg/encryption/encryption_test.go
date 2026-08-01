@@ -1,6 +1,7 @@
 package encryption
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"testing"
@@ -55,5 +56,50 @@ func TestCustomProviderRejectsMissingOrInvalidManagedKey(t *testing.T) {
 				t.Fatal("custom encryption accepted an unusable managed key")
 			}
 		})
+	}
+}
+
+func TestManagedAESConfigDecryptsRetiredKeyAndWritesWithActiveKey(t *testing.T) {
+	oldKey := base64.StdEncoding.EncodeToString([]byte("old-key-0123456789abcdef01234567"))
+	newKey := base64.StdEncoding.EncodeToString([]byte("new-key-0123456789abcdef01234567"))
+	resource := schema.GroupResource{Group: "obot.obot.ai", Resource: "credentials"}
+	dataContext := value.DefaultContext(resource.String())
+
+	oldConfig, err := Init(t.Context(), Options{
+		EncryptionProvider: "custom",
+		EncryptionKey:      oldKey,
+		EncryptionKeyID:    "k1",
+	})
+	if err != nil {
+		t.Fatalf("initialize old key: %v", err)
+	}
+	oldCiphertext, err := oldConfig.Transformers[resource].TransformToStorage(t.Context(), []byte("secret"), dataContext)
+	if err != nil {
+		t.Fatalf("encrypt with old key: %v", err)
+	}
+
+	rotatedConfig, err := Init(t.Context(), Options{
+		EncryptionProvider:    "custom",
+		EncryptionKey:         newKey,
+		EncryptionKeyID:       "k2",
+		EncryptionRetiredKeys: `{"k1":"` + oldKey + `"}`,
+	})
+	if err != nil {
+		t.Fatalf("initialize rotated keyring: %v", err)
+	}
+	plaintext, stale, err := rotatedConfig.Transformers[resource].TransformFromStorage(t.Context(), oldCiphertext, dataContext)
+	if err != nil {
+		t.Fatalf("decrypt with retired key: %v", err)
+	}
+	if string(plaintext) != "secret" || !stale {
+		t.Fatalf("retired-key decrypt = %q stale=%v, want secret/true", plaintext, stale)
+	}
+
+	newCiphertext, err := rotatedConfig.Transformers[resource].TransformToStorage(t.Context(), []byte("secret"), dataContext)
+	if err != nil {
+		t.Fatalf("encrypt with active key: %v", err)
+	}
+	if !bytes.Contains(newCiphertext, []byte(":k2:")) {
+		t.Fatalf("new ciphertext %q does not use active key ID k2", newCiphertext)
 	}
 }

@@ -263,6 +263,39 @@ func TestStartOAuthCredentialTestRejectsWrongScopeShapeCandidatesAndBlockedURL(t
 	}
 }
 
+func TestStartOAuthCredentialTestRejectsUnsafeDiscoveredEndpoints(t *testing.T) {
+	for _, tt := range []struct {
+		name                  string
+		authorizationEndpoint string
+		tokenEndpoint         string
+	}{
+		{name: "script authorization endpoint", authorizationEndpoint: "javascript:alert(document.domain)", tokenEndpoint: "https://provider.example/token"},
+		{name: "private token endpoint", authorizationEndpoint: "https://provider.example/authorize", tokenEndpoint: "http://127.0.0.1/token"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := newStaticOAuthMetadataProvider(t, tt.authorizationEndpoint, tt.tokenEndpoint)
+			gateway := newOAuthCredentialTestGatewayClient(t)
+			entry := staticOAuthTestEntry("entry-1", "default", provider.URL+"/mcp")
+			handler := &MCPCatalogHandler{
+				serverURL:     "https://obot.example",
+				gatewayClient: gateway,
+				remoteURLValidationConfig: mcp.RemoteMCPURLValidationConfig{
+					AllowLocalhostMCP: true,
+					AllowPrivateIPMCP: false,
+					AllowLinkLocalMCP: false,
+				},
+			}
+			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", `{"clientID":"client","clientSecret":"secret"}`, httptest.NewRecorder(), gateway,
+				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+			req.SetPathValue("catalog_id", "default")
+			req.SetPathValue("entry_id", entry.Name)
+			if err := handler.StartOAuthCredentialTest(req); err == nil {
+				t.Fatal("unsafe discovered OAuth endpoint was accepted")
+			}
+		})
+	}
+}
+
 func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
@@ -533,6 +566,32 @@ func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(&oauth2.Token{AccessToken: "discard-me", TokenType: "Bearer"})
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	providerURL = server.URL
+	t.Cleanup(server.Close)
+	return server
+}
+
+func newStaticOAuthMetadataProvider(t *testing.T, authorizationEndpoint, tokenEndpoint string) *httptest.Server {
+	t.Helper()
+	var providerURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/mcp":
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "/.well-known/oauth-protected-resource/mcp":
+			http.NotFound(w, req)
+		case "/.well-known/oauth-protected-resource":
+			_ = json.NewEncoder(w).Encode(map[string]any{"resource": providerURL + "/mcp", "authorization_servers": []string{providerURL}})
+		case "/.well-known/oauth-authorization-server":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"issuer": providerURL, "authorization_endpoint": authorizationEndpoint, "token_endpoint": tokenEndpoint,
+				"response_types_supported": []string{"code"}, "code_challenge_methods_supported": []string{"S256"},
+			})
 		default:
 			http.NotFound(w, req)
 		}
