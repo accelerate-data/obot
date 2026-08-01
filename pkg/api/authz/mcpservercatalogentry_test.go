@@ -66,6 +66,19 @@ func TestAllMCPCatalogEntryAuthorizationUsesAccessControlRules(t *testing.T) {
 	}
 }
 
+func TestPowerUserOAuthCredentialReplacementRouteIsAuthorized(t *testing.T) {
+	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, false)
+	req := httptest.NewRequest(http.MethodPut, "/api/workspaces/workspace-1/entries/entry-1/oauth-credentials", nil)
+
+	vars, matched := authorizer.apiResources[types.GroupPowerUser].Match(req)
+	if !matched {
+		t.Fatal("Power User OAuth credential replacement route is not authorized")
+	}
+	if vars("workspace_id") != "workspace-1" || vars("entry_id") != "entry-1" {
+		t.Fatalf("replacement route variables = workspace %q, entry %q", vars("workspace_id"), vars("entry_id"))
+	}
+}
+
 func newCatalogEntryTestAuthorizer(t *testing.T, storage client.Client, acrs ...*v1.AccessControlRule) *Authorizer {
 	t.Helper()
 

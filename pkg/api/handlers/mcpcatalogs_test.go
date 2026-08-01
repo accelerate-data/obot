@@ -595,6 +595,214 @@ func TestSetOAuthCredentialsSerializesConcurrentSameProofSaves(t *testing.T) {
 	}
 }
 
+func TestReplaceOAuthCredentialsRejectsMismatchedProofWithoutMutatingActiveConfiguration(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	for _, mcpID := range []string{server.Name, instance.Name} {
+		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "active-token-" + mcpID}); err != nil {
+			t.Fatalf("seed active user token for %s: %v", mcpID, err)
+		}
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry, instance.Spec.UserID, "changed-after-test", "candidate-secret", proof, server, instance)
+
+	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).ReplaceOAuthCredentials(req); err == nil {
+		t.Fatal("Replace accepted credentials that did not match the successful proof")
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal active credential after rejected replacement: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
+		t.Fatalf("active credential changed after rejected replacement: %#v", credential.Secrets)
+	}
+	for _, mcpID := range []string{server.Name, instance.Name} {
+		if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL); err != nil {
+			t.Fatalf("active user token for %s was removed after rejected replacement: %v", mcpID, err)
+		}
+	}
+	if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, instance.Spec.UserID, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
+		t.Fatalf("rejected replacement consumed the valid proof: %v", err)
+	}
+}
+
+func TestReplaceOAuthCredentialsListFailureLeavesActiveConfigurationAndProofUsable(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+	req.Storage = oauthInstanceListErrorStorage{Client: req.Storage}
+
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(req); err == nil {
+		t.Fatal("Replace reported success after instance list failure")
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal active credential after list failure: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
+		t.Fatalf("active credential changed after list failure: %#v", credential.Secrets)
+	}
+	if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); err != nil {
+		t.Fatalf("list failure consumed the valid proof: %v", err)
+	}
+}
+
+func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndConsumesProof(t *testing.T) {
+	transformer := &toggleCredentialWriteErrorTransformer{}
+	gateway := newOAuthCredentialTestGatewayClientWithEncryption(t, &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
+		{Group: "obot.obot.ai", Resource: "credentials"}: transformer,
+	}})
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	transformer.failWrite = true
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(req); err == nil {
+		t.Fatal("Replace reported success after credential upsert failure")
+	}
+	transformer.failWrite = false
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal active credential after upsert failure: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
+		t.Fatalf("active credential changed after upsert failure: %#v", credential.Secrets)
+	}
+	if err := gateway.ConsumeMCPStaticOAuthTest(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret"); !errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		t.Fatalf("upsert failure left proof reusable: %v", err)
+	}
+}
+
+func TestReplaceOAuthCredentialsSerializesConcurrentSameProofRequests(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	handler := &MCPCatalogHandler{gatewayClient: gateway}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		req := newReplaceOAuthCredentialRequest(t, gateway, entry.DeepCopy(), "user-1", "candidate-client", "candidate-secret", proof)
+		go func() {
+			<-start
+			results <- handler.ReplaceOAuthCredentials(req)
+		}()
+	}
+	close(start)
+
+	var successes int
+	for range 2 {
+		select {
+		case err := <-results:
+			if err == nil {
+				successes++
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent replacements")
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent replacement successes = %d, want exactly 1", successes)
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal credential after concurrent replacements: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "candidate-client" || credential.Secrets["CLIENT_SECRET"] != "candidate-secret" {
+		t.Fatalf("credential after concurrent replacements = %#v", credential.Secrets)
+	}
+}
+
+func TestReplaceOAuthCredentialsCleanupFailureLeavesNewConfigurationAndRequiresFreshProofToRetry(t *testing.T) {
+	failCleanup := false
+	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+		if failCleanup && mcpID == "instance-a-user-1" {
+			return errors.New("instance token reconciliation unavailable")
+		}
+		return nil
+	})
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
+		t.Fatalf("seed active OAuth credential: %v", err)
+	}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "active-token"}); err != nil {
+		t.Fatalf("seed active instance token: %v", err)
+	}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
+	failCleanup = true
+	handler := &MCPCatalogHandler{gatewayClient: gateway}
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry.DeepCopy(), instance.Spec.UserID, "candidate-client", "candidate-secret", proof, server, instance)
+
+	err := handler.ReplaceOAuthCredentials(req)
+	if err == nil || !strings.Contains(err.Error(), instance.Name) {
+		t.Fatalf("Replace cleanup error = %v, want instance-scoped error", err)
+	}
+	credential, revealErr := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if revealErr != nil {
+		t.Fatalf("reveal credential after cleanup failure: %v", revealErr)
+	}
+	if credential.Secrets["CLIENT_ID"] != "candidate-client" || credential.Secrets["CLIENT_SECRET"] != "candidate-secret" {
+		t.Fatalf("replacement credential after cleanup failure = %#v", credential.Secrets)
+	}
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("instance token remained after cleanup trigger failure: %v", err)
+	}
+
+	retryReq := newReplaceOAuthCredentialRequest(t, gateway, entry.DeepCopy(), instance.Spec.UserID, "candidate-client", "candidate-secret", proof, server, instance)
+	if err := handler.ReplaceOAuthCredentials(retryReq); err == nil {
+		t.Fatal("Replace reused the proof consumed by the applied replacement")
+	}
+	failCleanup = false
+	freshProof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
+	freshReq := newReplaceOAuthCredentialRequest(t, gateway, entry.DeepCopy(), instance.Spec.UserID, "candidate-client", "candidate-secret", freshProof, server, instance)
+	if err := handler.ReplaceOAuthCredentials(freshReq); err != nil {
+		t.Fatalf("Replace with a fresh proof did not retry cleanup: %v", err)
+	}
+}
+
+func TestReplaceOAuthCredentialsSupportsWorkspaceScope(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "", "https://mcp.example/api")
+	entry.Spec.PowerUserWorkspaceID = "workspace-1"
+	workspace := &v1.PowerUserWorkspace{ObjectMeta: metav1.ObjectMeta{Name: "workspace-1", Namespace: system.DefaultNamespace}, Spec: v1.PowerUserWorkspaceSpec{UserID: "user-1"}}
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof, workspace)
+	req.SetPathValue("catalog_id", "")
+	req.SetPathValue("workspace_id", workspace.Name)
+
+	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).ReplaceOAuthCredentials(req); err != nil {
+		t.Fatalf("replace workspace OAuth app: %v", err)
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(entry.Name)}, "oauth")
+	if err != nil {
+		t.Fatalf("reveal workspace OAuth credential: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "candidate-client" {
+		t.Fatalf("workspace replacement credential = %#v", credential.Secrets)
+	}
+}
+
 func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
@@ -656,6 +864,16 @@ func TestOAuthCredentialsFailClosedOnCredentialReadErrors(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:   "Replace does not overwrite an unreadable credential",
+			method: http.MethodPut,
+			run: func(t *testing.T, handler *MCPCatalogHandler, req api.Context) {
+				t.Helper()
+				if err := handler.ReplaceOAuthCredentials(req); err == nil {
+					t.Fatal("Replace overwrote an unreadable OAuth credential")
+				}
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			transformer := &toggleCredentialReadErrorTransformer{}
@@ -673,10 +891,14 @@ func TestOAuthCredentialsFailClosedOnCredentialReadErrors(t *testing.T) {
 			}
 
 			var req api.Context
-			if tt.method == http.MethodPost {
+			switch tt.method {
+			case http.MethodPost:
 				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 				req, _ = newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
-			} else {
+			case http.MethodPut:
+				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				req = newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+			default:
 				recorder := httptest.NewRecorder()
 				req = newStaticOAuthTestRequest(t, tt.method, "/", "", recorder, gateway,
 					&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
@@ -700,7 +922,7 @@ func TestOAuthCredentialsFailClosedOnCredentialReadErrors(t *testing.T) {
 }
 
 func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
 		t.Run(method, func(t *testing.T) {
 			gateway, rawDB := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, nil, nil)
 			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
@@ -714,10 +936,14 @@ func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
 			}
 
 			var req api.Context
-			if method == http.MethodPost {
+			switch method {
+			case http.MethodPost:
 				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 				req, _ = newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
-			} else {
+			case http.MethodPut:
+				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				req = newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+			default:
 				recorder := httptest.NewRecorder()
 				req = newStaticOAuthTestRequest(t, method, "/", "", recorder, gateway,
 					&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
@@ -738,9 +964,12 @@ func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
 
 			handler := &MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}
 			var err error
-			if method == http.MethodPost {
+			switch method {
+			case http.MethodPost:
 				err = handler.SetOAuthCredentials(req)
-			} else {
+			case http.MethodPut:
+				err = handler.ReplaceOAuthCredentials(req)
+			default:
 				err = handler.GetOAuthCredentials(req)
 			}
 			if err == nil {
@@ -1010,32 +1239,38 @@ func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T
 	}
 }
 
-func TestReplaceOAuthCredentialsClearsInstanceTokensBeforeSavingNewApp(t *testing.T) {
+func TestReplaceOAuthCredentialsAtomicallySwapsAppAndClearsOnlyMatchingTokens(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
 	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	unrelatedServer := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-unrelated", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-unrelated"}}
+	unrelatedInstance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-unrelated", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: unrelatedServer.Name, MCPServerCatalogEntryName: "entry-unrelated"}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "old-client", "CLIENT_SECRET": "old-secret"}}); err != nil {
 		t.Fatalf("seed old OAuth credential: %v", err)
 	}
-	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{ClientID: "old-client", ClientSecret: "old-secret"}, &oauth2.Token{AccessToken: "old-token"}); err != nil {
-		t.Fatalf("seed old user token: %v", err)
+	for _, mcpID := range []string{server.Name, instance.Name, unrelatedServer.Name, unrelatedInstance.Name} {
+		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{ClientID: "old-client", ClientSecret: "old-secret"}, &oauth2.Token{AccessToken: "old-token-" + mcpID}); err != nil {
+			t.Fatalf("seed old user token for %s: %v", mcpID, err)
+		}
 	}
 
-	deleteReq := newDeleteOAuthCredentialRequest(t, gateway, entry.DeepCopy(), server, instance)
-	handler := &MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}
-	if err := handler.DeleteOAuthCredentials(deleteReq); err != nil {
-		t.Fatalf("clear old OAuth app: %v", err)
-	}
 	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
-	setReq, _ := newSetOAuthCredentialRequest(t, gateway, entry.DeepCopy(), instance.Spec.UserID, "candidate-client", "candidate-secret", proof)
-	if err := handler.SetOAuthCredentials(setReq); err != nil {
-		t.Fatalf("save replacement OAuth app: %v", err)
+	req := newReplaceOAuthCredentialRequest(t, gateway, entry.DeepCopy(), instance.Spec.UserID, "candidate-client", "candidate-secret", proof, server, instance, unrelatedServer, unrelatedInstance)
+	if err := (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).ReplaceOAuthCredentials(req); err != nil {
+		t.Fatalf("replace OAuth app: %v", err)
 	}
 
-	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
-		t.Fatalf("old instance token survived OAuth app replacement: %v", err)
+	for _, mcpID := range []string{server.Name, instance.Name} {
+		if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("old matching token for %s survived OAuth app replacement: %v", mcpID, err)
+		}
+	}
+	for _, mcpID := range []string{unrelatedServer.Name, unrelatedInstance.Name} {
+		if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL); err != nil {
+			t.Fatalf("unrelated token for %s was removed: %v", mcpID, err)
+		}
 	}
 	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
 	if err != nil {
@@ -1109,6 +1344,17 @@ func newSetOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client, e
 	return req, recorder
 }
 
+func newReplaceOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry, userID, clientID, clientSecret, proof string, objects ...client.Object) api.Context {
+	t.Helper()
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry, objects...)
+	req.Request = httptest.NewRequest(http.MethodPut, "/", strings.NewReader(fmt.Sprintf(`{"clientID":%q,"clientSecret":%q,"proof":%q}`, clientID, clientSecret, proof)))
+	req.ResponseWriter = httptest.NewRecorder()
+	req.User = &user.DefaultInfo{Name: "owner", UID: userID}
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+	return req
+}
+
 func successfulStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) string {
 	t.Helper()
 	proof := pendingStaticOAuthCredentialProof(t, gateway, entryName, fixedURL, userID)
@@ -1142,6 +1388,21 @@ func (failingCredentialTransformer) TransformFromStorage(_ context.Context, data
 
 type toggleCredentialReadErrorTransformer struct {
 	failRead bool
+}
+
+type toggleCredentialWriteErrorTransformer struct {
+	failWrite bool
+}
+
+func (t *toggleCredentialWriteErrorTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
+	if t.failWrite {
+		return nil, errors.New("credential encryption unavailable")
+	}
+	return append([]byte("encrypted:"), data...), nil
+}
+
+func (*toggleCredentialWriteErrorTransformer) TransformFromStorage(_ context.Context, data []byte, _ value.Context) ([]byte, bool, error) {
+	return bytes.TrimPrefix(data, []byte("encrypted:")), false, nil
 }
 
 func (*toggleCredentialReadErrorTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
