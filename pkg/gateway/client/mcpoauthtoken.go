@@ -465,28 +465,17 @@ func validMCPStaticOAuthTestCompletion(status apitypes.MCPStaticOAuthTestStatus,
 	}
 }
 
-// CommitMCPStaticOAuthCredential validates and consumes an exact successful
-// proof in the same transaction that stores its credential. The caller must
-// hold the catalog entry's credential lock for the complete operation.
-func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
-	if c.encryptionConfig == nil || c.encryptionConfig.Transformers[credentialGroupResource] == nil {
-		return ErrMCPStaticOAuthEncryptionRequired
-	}
-	credential := types.Credential{
-		Context: system.MCPOAuthCredentialName(mcpID),
-		Name:    "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID":     clientID,
-			"CLIENT_SECRET": clientSecret,
-			"GENERATION":    strings.ToLower(rand.Text()),
-		},
-	}
-	if err := c.encryptCredential(ctx, &credential); err != nil {
-		return fmt.Errorf("failed to encrypt credential: %w", err)
-	}
+type MCPStaticOAuthCredentialClaim struct {
+	mcpID        string
+	clientID     string
+	clientSecret string
+}
 
+// ClaimMCPStaticOAuthCredentialProof validates and durably consumes one proof.
+// Once the proof row is found, even a rejected Save consumes it. The caller
+// must hold the catalog entry's credential lock until the mutation finishes.
+func (c *Client) ClaimMCPStaticOAuthCredentialProof(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string) (*MCPStaticOAuthCredentialClaim, error) {
 	hashedProof := hashMCPStaticOAuthValue(state)
-	var changedMCPIDs []string
 	var rejectedErr error
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var proof types.MCPOAuthPendingState
@@ -501,12 +490,8 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 		if err := c.decryptMCPOAuthPendingState(ctx, &proof); err != nil {
 			return fmt.Errorf("failed to decrypt static OAuth test: %w", err)
 		}
-		rejectSave := func(err error) error {
-			if deleteErr := tx.Delete(&proof).Error; deleteErr != nil {
-				return deleteErr
-			}
-			rejectedErr = err
-			return nil
+		if err := tx.Delete(&proof).Error; err != nil {
+			return err
 		}
 		if !proof.StaticOAuthTest ||
 			proof.StaticOAuthTestStatus != apitypes.MCPStaticOAuthTestStatusSucceeded ||
@@ -517,13 +502,49 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 			!secureStringEqual(proof.ClientID, clientID) ||
 			!secureStringEqual(proof.ClientSecret, clientSecret) ||
 			!secureStringEqual(proof.StaticOAuthSaveProof, state) {
-			return rejectSave(ErrMCPStaticOAuthTestInvalid)
+			rejectedErr = ErrMCPStaticOAuthTestInvalid
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if rejectedErr != nil {
+		return nil, rejectedErr
+	}
+	return &MCPStaticOAuthCredentialClaim{mcpID: mcpID, clientID: clientID, clientSecret: clientSecret}, nil
+}
+
+// CommitClaimedMCPStaticOAuthCredential applies a previously claimed Save.
+// Credential replacement, grant cleanup, and sibling-proof invalidation remain
+// atomic even though the submitted proof was consumed before this operation.
+func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, claim *MCPStaticOAuthCredentialClaim, replace bool, cleanupMCPIDs ...string) error {
+	if claim == nil {
+		return ErrMCPStaticOAuthTestInvalid
+	}
+	if c.encryptionConfig == nil || c.encryptionConfig.Transformers[credentialGroupResource] == nil {
+		return ErrMCPStaticOAuthEncryptionRequired
+	}
+	credential := types.Credential{
+		Context: system.MCPOAuthCredentialName(claim.mcpID),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     claim.clientID,
+			"CLIENT_SECRET": claim.clientSecret,
+			"GENERATION":    strings.ToLower(rand.Text()),
+		},
+	}
+	if err := c.encryptCredential(ctx, &credential); err != nil {
+		return fmt.Errorf("failed to encrypt credential: %w", err)
+	}
+
+	var changedMCPIDs []string
+	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if replace {
 			var existingCredential types.Credential
 			if err := tx.Where("context = ? AND name = ?", credential.Context, credential.Name).First(&existingCredential).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return rejectSave(ErrMCPStaticOAuthCredentialNotFound)
+					return ErrMCPStaticOAuthCredentialNotFound
 				}
 				return err
 			}
@@ -545,12 +566,12 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 			return result.Error
 		}
 		if !replace && result.RowsAffected != 1 {
-			return rejectSave(ErrMCPStaticOAuthCredentialExists)
+			return ErrMCPStaticOAuthCredentialExists
 		}
 
 		if replace {
 			var err error
-			changedMCPIDs, err = deleteMCPStaticOAuthTokens(tx, mcpID, cleanupMCPIDs)
+			changedMCPIDs, err = deleteMCPStaticOAuthTokens(tx, claim.mcpID, cleanupMCPIDs)
 			if err != nil {
 				return err
 			}
@@ -559,24 +580,29 @@ func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, user
 		result = tx.Delete(
 			&types.MCPOAuthPendingState{},
 			"mcp_id = ? AND static_o_auth_test = ?",
-			mcpID,
+			claim.mcpID,
 			true,
 		)
 		if result.Error != nil {
 			return result.Error
-		}
-		if result.RowsAffected < 1 {
-			return ErrMCPStaticOAuthTestInvalid
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if rejectedErr != nil {
-		return rejectedErr
-	}
 	return c.triggerMCPOAuthTokenChanges(ctx, changedMCPIDs)
+}
+
+// CommitMCPStaticOAuthCredential claims the exact proof before attempting the
+// credential mutation. Any failure after a successful claim requires a new
+// OAuth test while leaving the prior credential and grants unchanged.
+func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
+	claim, err := c.ClaimMCPStaticOAuthCredentialProof(ctx, state, userID, mcpID, mcpURL, clientID, clientSecret)
+	if err != nil {
+		return err
+	}
+	return c.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
 }
 
 // DeleteMCPStaticOAuthCredential removes the shared application, all pending

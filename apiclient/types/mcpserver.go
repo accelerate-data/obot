@@ -348,7 +348,7 @@ type MCPServer struct {
 	Configured              bool           `json:"configured"`
 	MissingRequiredEnvVars  []string       `json:"missingRequiredEnvVars,omitempty"`
 	MissingRequiredHeaders  []string       `json:"missingRequiredHeader,omitempty"`
-	MissingOAuthCredentials bool           `json:"missingOAuthCredentials,omitempty"`
+	MissingOAuthCredentials bool           `json:"missingOAuthCredentials"`
 	CatalogEntryID          string         `json:"catalogEntryID"`
 	PowerUserWorkspaceID    string         `json:"powerUserWorkspaceID"`
 	MCPCatalogID            string         `json:"mcpCatalogID,omitempty"`

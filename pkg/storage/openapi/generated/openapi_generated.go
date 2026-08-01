@@ -7893,8 +7893,9 @@ func schema_obot_platform_obot_apiclient_types_MCPServer(ref common.ReferenceCal
 					},
 					"missingOAuthCredentials": {
 						SchemaProps: spec.SchemaProps{
-							Type:   []string{"boolean"},
-							Format: "",
+							Default: false,
+							Type:    []string{"boolean"},
+							Format:  "",
 						},
 					},
 					"catalogEntryID": {
@@ -8040,7 +8041,7 @@ func schema_obot_platform_obot_apiclient_types_MCPServer(ref common.ReferenceCal
 						},
 					},
 				},
-				Required: []string{"Metadata", "manifest", "userID", "configured", "catalogEntryID", "powerUserWorkspaceID"},
+				Required: []string{"Metadata", "manifest", "userID", "configured", "missingOAuthCredentials", "catalogEntryID", "powerUserWorkspaceID"},
 			},
 		},
 		Dependencies: []string{

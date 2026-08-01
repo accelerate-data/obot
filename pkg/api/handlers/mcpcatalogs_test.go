@@ -524,8 +524,8 @@ func TestSetOAuthCredentialsProofConsumptionOnRejectedSave(t *testing.T) {
 		}
 		transformer.failWrite = false
 		retry, _ := newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
-		if err := (&MCPCatalogHandler{gatewayClient: gateway}).SetOAuthCredentials(retry); err != nil {
-			t.Fatalf("storage failure consumed proof: %v", err)
+		if err := (&MCPCatalogHandler{gatewayClient: gateway}).SetOAuthCredentials(retry); err == nil || !strings.Contains(err.Error(), "invalid or expired OAuth credential test") {
+			t.Fatalf("storage failure left proof reusable: %v", err)
 		}
 	})
 
@@ -666,7 +666,7 @@ func TestReplaceOAuthCredentialsRotatesGenerationForSameValueReplacement(t *test
 	}
 }
 
-func TestReplaceOAuthCredentialsListFailureLeavesActiveConfigurationAndProofUsable(t *testing.T) {
+func TestReplaceOAuthCredentialsListFailureLeavesActiveConfigurationAndConsumesProof(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	credName := system.MCPOAuthCredentialName(entry.Name)
@@ -688,12 +688,12 @@ func TestReplaceOAuthCredentialsListFailureLeavesActiveConfigurationAndProofUsab
 		t.Fatalf("active credential changed after list failure: %#v", credential.Secrets)
 	}
 	retry := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
-	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err != nil {
-		t.Fatalf("list failure consumed the valid proof: %v", err)
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err == nil || !strings.Contains(err.Error(), "invalid or expired OAuth credential test") {
+		t.Fatalf("list failure left proof reusable: %v", err)
 	}
 }
 
-func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndProofUsable(t *testing.T) {
+func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndConsumesProof(t *testing.T) {
 	transformer := &toggleCredentialWriteErrorTransformer{}
 	gateway := newOAuthCredentialTestGatewayClientWithEncryption(t, &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
 		{Group: "obot.obot.ai", Resource: "credentials"}: transformer,
@@ -719,8 +719,8 @@ func TestReplaceOAuthCredentialsUpsertFailureLeavesActiveConfigurationAndProofUs
 		t.Fatalf("active credential changed after upsert failure: %#v", credential.Secrets)
 	}
 	retry := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
-	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err != nil {
-		t.Fatalf("upsert failure consumed proof: %v", err)
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).ReplaceOAuthCredentials(retry); err == nil || !strings.Contains(err.Error(), "invalid or expired OAuth credential test") {
+		t.Fatalf("upsert failure left proof reusable: %v", err)
 	}
 }
 

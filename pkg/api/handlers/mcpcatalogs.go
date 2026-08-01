@@ -1916,15 +1916,20 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredentialLock()
 
+	claim, err := h.gatewayClient.ClaimMCPStaticOAuthCredentialProof(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret)
+	if err != nil {
+		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
+			return types.NewErrBadRequest("invalid or expired OAuth credential test")
+		}
+		return fmt.Errorf("failed to claim OAuth credential test: %w", err)
+	}
+
 	cleanupTargets, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
 	if err != nil {
 		return err
 	}
 
-	if err := h.gatewayClient.CommitMCPStaticOAuthCredential(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret, true, cleanupTargets.ids()...); err != nil {
-		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
-			return types.NewErrBadRequest("invalid or expired OAuth credential test")
-		}
+	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, true, cleanupTargets.ids()...); err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthCredentialNotFound) {
 			return types.NewErrBadRequest("OAuth credential does not exist")
 		}

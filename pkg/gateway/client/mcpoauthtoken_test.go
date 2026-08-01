@@ -534,8 +534,8 @@ func TestCommitMCPStaticOAuthCredentialFailsClosedWithoutCredentialEncryption(t 
 	if _, err := c.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName("catalog-entry-1")}, "oauth"); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("unencrypted credential was stored: %v", err)
 	}
-	if _, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "catalog-entry-1"); err != nil {
-		t.Fatalf("failed commit consumed encrypted proof: %v", err)
+	if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+		t.Fatalf("failed commit left proof reusable: %v", err)
 	}
 }
 
@@ -795,7 +795,7 @@ func TestCommitMCPStaticOAuthCredentialAtomicallyStoresAndConsumesExactProof(t *
 	}
 }
 
-func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *testing.T) {
+func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *testing.T) {
 	t.Run("mismatched proof never writes", func(t *testing.T) {
 		c := newTestClient(t)
 		state, conf := createStaticOAuthTest(t, c)
@@ -841,7 +841,7 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 		}
 	})
 
-	t.Run("replacement upsert failure preserves old credential and proof", func(t *testing.T) {
+	t.Run("replacement upsert failure preserves old credential and consumes proof", func(t *testing.T) {
 		c := newTestClient(t)
 		credentialKey := system.MCPOAuthCredentialName("catalog-entry-1")
 		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
@@ -870,8 +870,8 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 		if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
 			t.Fatalf("active credential changed after rollback: %#v", credential.Secrets)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
-			t.Fatalf("failed upsert consumed proof: %v", err)
+		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+			t.Fatalf("failed upsert left proof reusable: %v", err)
 		}
 	})
 
@@ -909,7 +909,7 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 		}
 	})
 
-	t.Run("token delete failure rolls back replacement and proof", func(t *testing.T) {
+	t.Run("token delete failure rolls back replacement and consumes proof", func(t *testing.T) {
 		c := newTestClient(t)
 		state, conf := createStaticOAuthTest(t, c)
 		proof := completeSuccessfulStaticOAuthTest(t, c, state)
@@ -945,8 +945,8 @@ func TestCommitMCPStaticOAuthCredentialRollsBackCredentialAndProofTogether(t *te
 		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", "instance-1", "https://mcp.example/api"); err != nil {
 			t.Fatalf("active token was deleted despite rollback: %v", err)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1"); err != nil {
-			t.Fatalf("token-delete rollback consumed proof: %v", err)
+		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1"); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+			t.Fatalf("token-delete rollback left proof reusable: %v", err)
 		}
 	})
 }
