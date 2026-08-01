@@ -104,12 +104,31 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 		c := newTestClient(t)
 		state, _ := createStaticOAuthTest(t, c)
 
-		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state)
+		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1")
 		if err != nil {
 			t.Fatalf("read pending status: %v", err)
 		}
 		assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusPending, "")
 	})
+
+	for _, tt := range []struct {
+		name   string
+		userID string
+		mcpID  string
+	}{
+		{name: "wrong caller", userID: "user-2", mcpID: "catalog-entry-1"},
+		{name: "wrong entry", userID: "user-1", mcpID: "catalog-entry-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestClient(t)
+			state, _ := createStaticOAuthTest(t, c)
+
+			result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, tt.userID, tt.mcpID)
+			if !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+				t.Fatalf("read status returned result %+v and error %v, want invalid proof", result, err)
+			}
+		})
+	}
 
 	t.Run("succeeded", func(t *testing.T) {
 		c := newTestClient(t)
@@ -118,7 +137,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 		if err := c.CompleteMCPStaticOAuthTest(t.Context(), state, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
 			t.Fatalf("complete successful test: %v", err)
 		}
-		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state)
+		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1")
 		if err != nil {
 			t.Fatalf("read succeeded status: %v", err)
 		}
@@ -140,7 +159,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 		if err := c.CompleteMCPStaticOAuthTest(t.Context(), state, apitypes.MCPStaticOAuthTestStatusFailed, apitypes.MCPStaticOAuthTestFailureTokenExchange); err != nil {
 			t.Fatalf("complete failed test: %v", err)
 		}
-		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state)
+		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1")
 		if err != nil {
 			t.Fatalf("read failed status: %v", err)
 		}
@@ -157,7 +176,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 			t.Fatalf("age pending proof: %v", err)
 		}
 
-		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state)
+		result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1")
 		if err != nil {
 			t.Fatalf("read expired status: %v", err)
 		}
@@ -180,7 +199,7 @@ func TestCompleteMCPStaticOAuthTestRejectsUnsafeFailureCategoryWithoutEchoingIt(
 		}
 	}
 
-	result, readErr := c.GetMCPStaticOAuthTestStatus(t.Context(), state)
+	result, readErr := c.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "catalog-entry-1")
 	if readErr != nil {
 		t.Fatalf("read status after rejected completion: %v", readErr)
 	}

@@ -149,12 +149,12 @@ func (c *Client) CreateMCPStaticOAuthTest(ctx context.Context, userID, mcpID, mc
 	return state, nil
 }
 
-func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state string) (apitypes.MCPStaticOAuthTestResult, error) {
+func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID, mcpID string) (apitypes.MCPStaticOAuthTestResult, error) {
 	ps, err := c.GetMCPOAuthPendingState(ctx, state)
 	if err != nil {
 		return apitypes.MCPStaticOAuthTestResult{}, err
 	}
-	if !ps.StaticOAuthTest {
+	if !ps.StaticOAuthTest || !secureStringEqual(ps.UserID, userID) || !secureStringEqual(ps.MCPID, mcpID) {
 		return apitypes.MCPStaticOAuthTestResult{}, ErrMCPStaticOAuthTestInvalid
 	}
 	if time.Since(ps.CreatedAt) >= pendingStateTTL {
