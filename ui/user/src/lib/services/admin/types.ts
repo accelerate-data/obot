@@ -890,6 +890,7 @@ export interface MCPServerOAuthCredentialTestStart {
 }
 export interface MCPServerOAuthCredentialTestResult {
 	status: 'pending' | 'succeeded' | 'failed';
+	expiresAt: string;
 	failureCategory?:
 		| 'authorization_denied'
 		| 'invalid_callback'

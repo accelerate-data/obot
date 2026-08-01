@@ -36,6 +36,7 @@ export default defineConfig({
 				'OBOT_SERVER_ENABLE_AUTHENTICATION=true',
 				'OBOT_SERVER_FORCE_ENABLE_BOOTSTRAP=true',
 				'OBOT_DEV_MODE=true',
+				'OBOT_SERVER_DISALLOW_LOCALHOST_MCP=false',
 				`OBOT_SERVER_HOSTNAME='http://127.0.0.1:${uiPort}'`,
 				`OBOT_SERVER_UI_HOSTNAME='http://127.0.0.1:${uiPort}'`,
 				`OBOT_SERVER_DSN='sqlite://file:${userUIRoot}/e2e/.tmp/obot.db?_journal=WAL&cache=shared&_busy_timeout=30000'`,

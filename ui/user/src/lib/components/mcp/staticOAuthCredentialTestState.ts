@@ -1,7 +1,13 @@
 export type StaticOAuthCredentialTestState =
 	| { status: 'idle' }
 	| { status: 'pending'; clientID: string; clientSecret: string }
-	| { status: 'succeeded'; clientID: string; clientSecret: string; proof: string }
+	| {
+			status: 'succeeded';
+			clientID: string;
+			clientSecret: string;
+			proof: string;
+			expiresAt: string;
+	  }
 	| { status: 'failed'; failureCategory: string };
 
 export const idleStaticOAuthCredentialTest = (): StaticOAuthCredentialTestState => ({
@@ -21,12 +27,14 @@ export function beginStaticOAuthCredentialTest(
 
 export function succeedStaticOAuthCredentialTest(
 	state: StaticOAuthCredentialTestState,
-	proof: string
+	proof: string,
+	expiresAt: string
 ): StaticOAuthCredentialTestState {
-	if (state.status !== 'pending' || !proof.trim()) {
+	const expiry = Date.parse(expiresAt);
+	if (state.status !== 'pending' || !proof.trim() || !Number.isFinite(expiry)) {
 		return { status: 'failed', failureCategory: 'invalid_test_result' };
 	}
-	return { ...state, status: 'succeeded', proof: proof.trim() };
+	return { ...state, status: 'succeeded', proof: proof.trim(), expiresAt };
 }
 
 export function failStaticOAuthCredentialTest(
@@ -45,11 +53,23 @@ export function invalidateStaticOAuthCredentialTest(
 export function canSaveStaticOAuthCredentials(
 	state: StaticOAuthCredentialTestState,
 	clientID: string,
-	clientSecret: string
+	clientSecret: string,
+	now = Date.now()
 ): state is Extract<StaticOAuthCredentialTestState, { status: 'succeeded' }> {
 	return (
 		state.status === 'succeeded' &&
 		state.clientID === clientID.trim() &&
-		state.clientSecret === clientSecret.trim()
+		state.clientSecret === clientSecret.trim() &&
+		Date.parse(state.expiresAt) > now
 	);
+}
+
+export function scheduleStaticOAuthCredentialTestExpiry(
+	expiresAt: string,
+	onExpire: () => void,
+	now = Date.now()
+): () => void {
+	const expiresIn = Math.max(0, Date.parse(expiresAt) - now);
+	const timeout = setTimeout(onExpire, expiresIn);
+	return () => clearTimeout(timeout);
 }

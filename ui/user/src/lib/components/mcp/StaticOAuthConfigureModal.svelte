@@ -18,6 +18,7 @@
 		failStaticOAuthCredentialTest,
 		idleStaticOAuthCredentialTest,
 		invalidateStaticOAuthCredentialTest,
+		scheduleStaticOAuthCredentialTestExpiry,
 		succeedStaticOAuthCredentialTest
 	} from './staticOAuthCredentialTestState';
 	import { CircleAlert, CircleCheckBig, ExternalLink, Trash2 } from '@lucide/svelte';
@@ -62,6 +63,7 @@
 	let credentialTest = $state(idleStaticOAuthCredentialTest());
 	let testGeneration = 0;
 	let testPopup: Window | null = null;
+	let cancelTestExpiry: (() => void) | undefined;
 
 	let form = $state({
 		clientID: '',
@@ -95,6 +97,8 @@
 	function resetCredentialTest() {
 		testGeneration += 1;
 		testing = false;
+		cancelTestExpiry?.();
+		cancelTestExpiry = undefined;
 		credentialTest = invalidateStaticOAuthCredentialTest(credentialTest);
 		closeTestPopup();
 	}
@@ -158,7 +162,25 @@
 						return true;
 					}
 					if (result.status === 'succeeded') {
-						credentialTest = succeedStaticOAuthCredentialTest(credentialTest, started.state);
+						credentialTest = succeedStaticOAuthCredentialTest(
+							credentialTest,
+							started.state,
+							result.expiresAt
+						);
+						if (credentialTest.status !== 'succeeded') {
+							error = credentialTestFailureMessage('invalid_test_result');
+							return true;
+						}
+						cancelTestExpiry?.();
+						cancelTestExpiry = scheduleStaticOAuthCredentialTestExpiry(
+							credentialTest.expiresAt,
+							() => {
+								if (generation !== testGeneration) return;
+								credentialTest = invalidateStaticOAuthCredentialTest(credentialTest);
+								error = credentialTestFailureMessage('expired');
+								cancelTestExpiry = undefined;
+							}
+						);
 					} else {
 						credentialTest = failStaticOAuthCredentialTest(
 							credentialTest,

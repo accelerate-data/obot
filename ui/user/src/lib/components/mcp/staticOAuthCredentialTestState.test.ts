@@ -8,6 +8,7 @@ const {
 	canSaveStaticOAuthCredentials,
 	failStaticOAuthCredentialTest,
 	invalidateStaticOAuthCredentialTest,
+	scheduleStaticOAuthCredentialTestExpiry,
 	succeedStaticOAuthCredentialTest
 } = staticOAuthCredentialTestState;
 
@@ -16,16 +17,46 @@ test('save requires a successful proof for the exact tested credentials', () => 
 
 	assert.equal(canSaveStaticOAuthCredentials(pending, 'client-id', 'client-secret'), false);
 
-	const succeeded = succeedStaticOAuthCredentialTest(pending, 'proof');
-	assert.equal(canSaveStaticOAuthCredentials(succeeded, 'client-id', 'client-secret'), true);
-	assert.equal(canSaveStaticOAuthCredentials(succeeded, 'changed-id', 'client-secret'), false);
-	assert.equal(canSaveStaticOAuthCredentials(succeeded, 'client-id', 'changed-secret'), false);
+	const expiresAt = '2026-08-02T02:00:00.000Z';
+	const succeeded = succeedStaticOAuthCredentialTest(pending, 'proof', expiresAt);
+	assert.equal(
+		canSaveStaticOAuthCredentials(
+			succeeded,
+			'client-id',
+			'client-secret',
+			Date.parse(expiresAt) - 1
+		),
+		true
+	);
+	assert.equal(
+		canSaveStaticOAuthCredentials(
+			succeeded,
+			'changed-id',
+			'client-secret',
+			Date.parse(expiresAt) - 1
+		),
+		false
+	);
+	assert.equal(
+		canSaveStaticOAuthCredentials(
+			succeeded,
+			'client-id',
+			'changed-secret',
+			Date.parse(expiresAt) - 1
+		),
+		false
+	);
+	assert.equal(
+		canSaveStaticOAuthCredentials(succeeded, 'client-id', 'client-secret', Date.parse(expiresAt)),
+		false
+	);
 });
 
 test('editing either value invalidates the proof even if the original value is restored', () => {
 	const succeeded = succeedStaticOAuthCredentialTest(
 		beginStaticOAuthCredentialTest('client-id', 'client-secret'),
-		'proof'
+		'proof',
+		'2026-08-02T02:00:00.000Z'
 	);
 	const invalidated = invalidateStaticOAuthCredentialTest(succeeded);
 
@@ -35,11 +66,47 @@ test('editing either value invalidates the proof even if the original value is r
 test('a failed test and a new test cannot reuse an earlier proof', () => {
 	const succeeded = succeedStaticOAuthCredentialTest(
 		beginStaticOAuthCredentialTest('client-id', 'client-secret'),
-		'old-proof'
+		'old-proof',
+		'2026-08-02T02:00:00.000Z'
 	);
 	const failed = failStaticOAuthCredentialTest(succeeded, 'token_exchange_failed');
 	const restarted = beginStaticOAuthCredentialTest('client-id', 'client-secret');
 
 	assert.equal(canSaveStaticOAuthCredentials(failed, 'client-id', 'client-secret'), false);
 	assert.equal(canSaveStaticOAuthCredentials(restarted, 'client-id', 'client-secret'), false);
+});
+
+test('server expiry invalidates the proof at the authoritative time', (t) => {
+	const now = Date.parse('2026-08-02T01:00:00.000Z');
+	t.mock.timers.enable({ apis: ['setTimeout'], now });
+	let expired = false;
+	scheduleStaticOAuthCredentialTestExpiry(
+		new Date(now + 1_000).toISOString(),
+		() => {
+			expired = true;
+		},
+		now
+	);
+
+	t.mock.timers.tick(999);
+	assert.equal(expired, false);
+	t.mock.timers.tick(1);
+	assert.equal(expired, true);
+});
+
+test('expiry cleanup prevents an unmounted modal from being updated', (t) => {
+	const now = Date.parse('2026-08-02T01:00:00.000Z');
+	t.mock.timers.enable({ apis: ['setTimeout'], now });
+	let expiryCallbacks = 0;
+	const cleanup = scheduleStaticOAuthCredentialTestExpiry(
+		new Date(now + 1_000).toISOString(),
+		() => {
+			expiryCallbacks += 1;
+		},
+		now
+	);
+
+	cleanup();
+	t.mock.timers.tick(1_000);
+	assert.equal(expiryCallbacks, 0);
 });
