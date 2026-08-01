@@ -324,7 +324,7 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID,
 		return apitypes.MCPStaticOAuthTestResult{
 			Status:          apitypes.MCPStaticOAuthTestStatusFailed,
 			FailureCategory: apitypes.MCPStaticOAuthTestFailureExpired,
-			ExpiresAt:       expiresAt,
+			ExpiresAt:       apitypes.Time{Time: expiresAt},
 		}, nil
 	}
 	status := ps.StaticOAuthTestStatus
@@ -334,7 +334,7 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, state, userID,
 	return apitypes.MCPStaticOAuthTestResult{
 		Status:          status,
 		FailureCategory: ps.StaticOAuthTestFailureCategory,
-		ExpiresAt:       expiresAt,
+		ExpiresAt:       apitypes.Time{Time: expiresAt},
 	}, nil
 }
 

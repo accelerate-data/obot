@@ -96,8 +96,17 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	if err := handler.GetOAuthCredentialTest(statusReq); err != nil {
 		t.Fatalf("get static OAuth credential test: %v", err)
 	}
-	if got := strings.TrimSpace(statusRecorder.Body.String()); got != `{"status":"pending"}` {
-		t.Fatalf("status response = %s, want safe pending status", got)
+	var status types.MCPStaticOAuthTestResult
+	if err := json.Unmarshal(statusRecorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode pending status response: %v", err)
+	}
+	if status.Status != types.MCPStaticOAuthTestStatusPending || status.ExpiresAt.IsZero() || !status.ExpiresAt.Time.After(time.Now()) {
+		t.Fatalf("status response = %+v, want safe pending status with future expiry", status)
+	}
+	for _, sensitive := range []string{"static-secret", provider.URL + "/token"} {
+		if strings.Contains(statusRecorder.Body.String(), sensitive) {
+			t.Fatalf("status response exposed sensitive value %q: %s", sensitive, statusRecorder.Body.String())
+		}
 	}
 
 	wrongCallerReq := newStaticOAuthTestRequest(t, http.MethodGet, `/`, ``, httptest.NewRecorder(), gateway,
@@ -330,7 +339,7 @@ func TestGetOAuthCredentialTestProjectsExpiredStatusAtHandlerBoundary(t *testing
 	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
 		t.Fatalf("decode expired status response: %v", err)
 	}
-	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != types.MCPStaticOAuthTestFailureExpired || result.ExpiresAt.IsZero() || !result.ExpiresAt.Before(time.Now()) {
+	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != types.MCPStaticOAuthTestFailureExpired || result.ExpiresAt.IsZero() || !result.ExpiresAt.Time.Before(time.Now()) {
 		t.Fatalf("expired status response = %+v", result)
 	}
 }

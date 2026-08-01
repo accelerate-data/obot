@@ -9047,14 +9047,15 @@ func schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref comm
 					},
 					"expiresAt": {
 						SchemaProps: spec.SchemaProps{
-							Type:   []string{"string"},
-							Format: "date-time",
+							Ref: ref("github.com/obot-platform/obot/apiclient/types.Time"),
 						},
 					},
 				},
 				Required: []string{"status", "expiresAt"},
 			},
 		},
+		Dependencies: []string{
+			"github.com/obot-platform/obot/apiclient/types.Time"},
 	}
 }
 

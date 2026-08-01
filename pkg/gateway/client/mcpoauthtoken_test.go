@@ -405,7 +405,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read pending proof: %v", err)
 		}
-		if want := proof.CreatedAt.Add(pendingStateTTL); !result.ExpiresAt.Equal(want) {
+		if want := proof.CreatedAt.Add(pendingStateTTL); !result.ExpiresAt.Time.Equal(want) {
 			t.Fatalf("pending expiry = %s, want %s", result.ExpiresAt, want)
 		}
 	})
@@ -449,7 +449,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 		if proof.StaticOAuthTestCompletedAt.IsZero() {
 			t.Fatal("expected successful test completion time")
 		}
-		if want := proof.CreatedAt.Add(pendingStateTTL); !result.ExpiresAt.Equal(want) {
+		if want := proof.CreatedAt.Add(pendingStateTTL); !result.ExpiresAt.Time.Equal(want) {
 			t.Fatalf("succeeded expiry = %s, want %s", result.ExpiresAt, want)
 		}
 	})
@@ -470,7 +470,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read failed proof: %v", err)
 		}
-		if want := proof.CreatedAt.Add(pendingStateTTL); !result.ExpiresAt.Equal(want) {
+		if want := proof.CreatedAt.Add(pendingStateTTL); !result.ExpiresAt.Time.Equal(want) {
 			t.Fatalf("failed expiry = %s, want %s", result.ExpiresAt, want)
 		}
 	})
@@ -490,7 +490,7 @@ func TestMCPStaticOAuthTestLifecycleReturnsOnlySafeStatus(t *testing.T) {
 			t.Fatalf("read expired status: %v", err)
 		}
 		assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusFailed, apitypes.MCPStaticOAuthTestFailureExpired)
-		if result.ExpiresAt.IsZero() || !result.ExpiresAt.Before(time.Now()) {
+		if result.ExpiresAt.IsZero() || !result.ExpiresAt.Time.Before(time.Now()) {
 			t.Fatalf("expired proof expiry = %s, want authoritative past timestamp", result.ExpiresAt)
 		}
 	})
