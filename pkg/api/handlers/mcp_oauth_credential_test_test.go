@@ -14,6 +14,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -21,6 +22,7 @@ import (
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
+	"gorm.io/gorm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
@@ -203,6 +205,30 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 	}
 }
 
+func TestGetOAuthCredentialTestProjectsExpiredStatusAtHandlerBoundary(t *testing.T) {
+	gateway, rawDB := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, nil, nil)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	state := pendingStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	if err := rawDB.Model(&gatewaytypes.MCPOAuthPendingState{}).
+		Where("static_o_auth_test = ?", true).
+		Update("created_at", time.Now().Add(-time.Hour)).Error; err != nil {
+		t.Fatalf("expire pending proof: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+	req.SetPathValue("state", state)
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err != nil {
+		t.Fatalf("get expired proof status: %v", err)
+	}
+	if got := strings.TrimSpace(recorder.Body.String()); got != `{"status":"failed","failureCategory":"expired"}` {
+		t.Fatalf("expired status response = %s", got)
+	}
+}
+
 func staticOAuthTestEntry(name, catalogName, fixedURL string) *v1.MCPServerCatalogEntry {
 	return &v1.MCPServerCatalogEntry{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: system.DefaultNamespace},
@@ -249,6 +275,12 @@ func newOAuthCredentialTestGatewayClientWithTrigger(t *testing.T, trigger func(c
 
 func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) *gatewayclient.Client {
 	t.Helper()
+	client, _ := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, encryptionConfig, trigger)
+	return client
+}
+
+func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) (*gatewayclient.Client, *gorm.DB) {
+	t.Helper()
 	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
 	if err != nil {
 		t.Fatalf("create storage services: %v", err)
@@ -260,7 +292,7 @@ func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConf
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, false)
+	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, false), services.DB.DB
 }
 
 func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {

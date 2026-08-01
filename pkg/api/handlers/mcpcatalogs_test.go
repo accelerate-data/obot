@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
@@ -531,6 +533,61 @@ func TestSetOAuthCredentialsDoesNotConsumeProofWhenStorageFailsOrCredentialExist
 	})
 }
 
+func TestSetOAuthCredentialsSerializesConcurrentSameProofSaves(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+
+	release, err := gateway.AcquireCredentialLock(t.Context(), credName)
+	if err != nil {
+		t.Fatalf("hold credential lock: %v", err)
+	}
+	defer release()
+
+	handler := &MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		req, _ := newSetOAuthCredentialRequest(t, gateway, entry.DeepCopy(), "user-1", "candidate-client", "candidate-secret", proof)
+		go func() {
+			<-start
+			results <- handler.SetOAuthCredentials(req)
+		}()
+	}
+	close(start)
+
+	select {
+	case err := <-results:
+		t.Fatalf("concurrent Save bypassed the held credential lock: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	release()
+
+	var successes int
+	for range 2 {
+		select {
+		case err := <-results:
+			if err == nil {
+				successes++
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for serialized Save")
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent Save successes = %d, want exactly 1", successes)
+	}
+
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	if err != nil {
+		t.Fatalf("verified credential did not remain configured: %v", err)
+	}
+	if credential.Secrets["CLIENT_ID"] != "candidate-client" || credential.Secrets["CLIENT_SECRET"] != "candidate-secret" {
+		t.Fatalf("configured credential = %#v", credential.Secrets)
+	}
+}
+
 func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
@@ -559,6 +616,139 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), "saved-secret") {
 		t.Fatalf("credential status exposed secret: %s", recorder.Body.String())
+	}
+}
+
+func TestOAuthCredentialsFailClosedOnCredentialReadErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method string
+		run    func(t *testing.T, handler *MCPCatalogHandler, req api.Context)
+	}{
+		{
+			name:   "GET does not report an unreadable credential as unconfigured",
+			method: http.MethodGet,
+			run: func(t *testing.T, handler *MCPCatalogHandler, req api.Context) {
+				t.Helper()
+				recorder := req.ResponseWriter.(*httptest.ResponseRecorder)
+				if err := handler.GetOAuthCredentials(req); err == nil {
+					t.Fatal("GET reported unreadable OAuth credential status")
+				}
+				if strings.Contains(recorder.Body.String(), `"configured":false`) {
+					t.Fatalf("GET failed open with response %s", recorder.Body.String())
+				}
+			},
+		},
+		{
+			name:   "Save does not overwrite an unreadable credential",
+			method: http.MethodPost,
+			run: func(t *testing.T, handler *MCPCatalogHandler, req api.Context) {
+				t.Helper()
+				if err := handler.SetOAuthCredentials(req); err == nil {
+					t.Fatal("Save overwrote an unreadable OAuth credential")
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			transformer := &toggleCredentialReadErrorTransformer{}
+			gateway := newOAuthCredentialTestGatewayClientWithEncryption(t, &encryptionconfig.EncryptionConfiguration{Transformers: map[schema.GroupResource]value.Transformer{
+				{Group: "obot.obot.ai", Resource: "credentials"}: transformer,
+			}})
+			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+			credName := system.MCPOAuthCredentialName(entry.Name)
+			if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+				Context: credName,
+				Name:    "oauth",
+				Secrets: map[string]string{"CLIENT_ID": "existing", "CLIENT_SECRET": "existing-secret"},
+			}); err != nil {
+				t.Fatalf("seed OAuth credential: %v", err)
+			}
+
+			var req api.Context
+			if tt.method == http.MethodPost {
+				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				req, _ = newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+			} else {
+				recorder := httptest.NewRecorder()
+				req = newStaticOAuthTestRequest(t, tt.method, "/", "", recorder, gateway,
+					&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+				req.SetPathValue("catalog_id", "default")
+				req.SetPathValue("entry_id", entry.Name)
+			}
+
+			transformer.failRead = true
+			tt.run(t, &MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}, req)
+			transformer.failRead = false
+
+			credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+			if err != nil {
+				t.Fatalf("reveal original credential: %v", err)
+			}
+			if credential.Secrets["CLIENT_ID"] != "existing" || credential.Secrets["CLIENT_SECRET"] != "existing-secret" {
+				t.Fatalf("credential changed after read failure: %#v", credential.Secrets)
+			}
+		})
+	}
+}
+
+func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		t.Run(method, func(t *testing.T) {
+			gateway, rawDB := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, nil, nil)
+			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+			credName := system.MCPOAuthCredentialName(entry.Name)
+			if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+				Context: credName,
+				Name:    "oauth",
+				Secrets: map[string]string{"CLIENT_ID": "existing", "CLIENT_SECRET": "existing-secret"},
+			}); err != nil {
+				t.Fatalf("seed OAuth credential: %v", err)
+			}
+
+			var req api.Context
+			if method == http.MethodPost {
+				proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				req, _ = newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof)
+			} else {
+				recorder := httptest.NewRecorder()
+				req = newStaticOAuthTestRequest(t, method, "/", "", recorder, gateway,
+					&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+				req.SetPathValue("catalog_id", "default")
+				req.SetPathValue("entry_id", entry.Name)
+			}
+
+			failCredentialRead := true
+			callbackName := "test:transient_oauth_credential_read_" + strings.ToLower(method)
+			if err := rawDB.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if failCredentialRead && tx.Statement.Table == "credentials" {
+					tx.AddError(errors.New("transient credential database failure"))
+				}
+			}); err != nil {
+				t.Fatalf("register transient credential read failure: %v", err)
+			}
+			t.Cleanup(func() { _ = rawDB.Callback().Query().Remove(callbackName) })
+
+			handler := &MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}
+			var err error
+			if method == http.MethodPost {
+				err = handler.SetOAuthCredentials(req)
+			} else {
+				err = handler.GetOAuthCredentials(req)
+			}
+			if err == nil {
+				t.Fatalf("%s failed open on transient credential database error", method)
+			}
+
+			failCredentialRead = false
+			credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+			if err != nil {
+				t.Fatalf("reveal original credential: %v", err)
+			}
+			if credential.Secrets["CLIENT_ID"] != "existing" || credential.Secrets["CLIENT_SECRET"] != "existing-secret" {
+				t.Fatalf("credential changed after transient read failure: %#v", credential.Secrets)
+			}
+		})
 	}
 }
 
@@ -650,6 +840,127 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 	}
 }
 
+func TestDeleteOAuthCredentialsReturnsServerListFailure(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+		t.Fatalf("seed OAuth credential: %v", err)
+	}
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry)
+	req.Storage = oauthServerListErrorStorage{Client: req.Storage}
+
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req); err == nil {
+		t.Fatal("Clear reported success after server list failure")
+	}
+	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
+		t.Fatalf("shared credential remained after Clear began: %v", err)
+	}
+}
+
+func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
+	failPurge := false
+	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+		if failPurge && mcpID == "server-a" {
+			return errors.New("token purge trigger unavailable")
+		}
+		return nil
+	})
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+		t.Fatalf("seed OAuth credential: %v", err)
+	}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "user-1", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
+		t.Fatalf("seed user token: %v", err)
+	}
+	failPurge = true
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server)
+
+	if err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req); err == nil {
+		t.Fatal("Clear reported success after per-server token purge failure")
+	}
+}
+
+func TestDeleteOAuthCredentialsRetriesCleanupAfterCredentialRemoval(t *testing.T) {
+	purgeAttempts := 0
+	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+		if mcpID != "server-a" {
+			return nil
+		}
+		purgeAttempts++
+		if purgeAttempts == 2 {
+			return errors.New("token purge trigger unavailable")
+		}
+		return nil
+	})
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+		t.Fatalf("seed OAuth credential: %v", err)
+	}
+	if err := gateway.ReplaceMCPOAuthToken(t.Context(), "user-1", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
+		t.Fatalf("seed user token: %v", err)
+	}
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server)
+	handler := &MCPCatalogHandler{gatewayClient: gateway}
+
+	if err := handler.DeleteOAuthCredentials(req); err == nil {
+		t.Fatal("first Clear reported success after token purge failure")
+	}
+	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
+		t.Fatalf("shared credential remained after first Clear: %v", err)
+	}
+	if err := handler.DeleteOAuthCredentials(req); err != nil {
+		t.Fatalf("retry Clear after credential removal: %v", err)
+	}
+	if purgeAttempts != 3 {
+		t.Fatalf("token purge attempts = %d, want seed plus first Clear plus retry", purgeAttempts)
+	}
+	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("user token remained after retry: %v", err)
+	}
+}
+
+func newDeleteOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry, objects ...client.Object) api.Context {
+	t.Helper()
+	allObjects := []client.Object{
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}},
+		entry,
+	}
+	allObjects = append(allObjects, objects...)
+	storageClient := fake.NewClientBuilder().
+		WithScheme(storagescheme.Scheme).
+		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
+		}).
+		WithObjects(allObjects...).
+		Build()
+	req := api.Context{
+		Request:        httptest.NewRequest(http.MethodDelete, "/", nil),
+		ResponseWriter: httptest.NewRecorder(),
+		Storage:        storage.Client(storageClient),
+		GatewayClient:  gateway,
+		User:           &user.DefaultInfo{Name: "owner", UID: "user-1"},
+	}
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+	return req
+}
+
+type oauthServerListErrorStorage struct {
+	storage.Client
+}
+
+func (oauthServerListErrorStorage) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	if _, ok := list.(*v1.MCPServerList); ok {
+		return errors.New("server list unavailable")
+	}
+	return errors.New("unexpected list type")
+}
+
 func newSetOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry, userID, clientID, clientSecret, proof string) (api.Context, *httptest.ResponseRecorder) {
 	t.Helper()
 	recorder := httptest.NewRecorder()
@@ -691,4 +1002,19 @@ func (failingCredentialTransformer) TransformToStorage(context.Context, []byte, 
 
 func (failingCredentialTransformer) TransformFromStorage(_ context.Context, data []byte, _ value.Context) ([]byte, bool, error) {
 	return data, false, nil
+}
+
+type toggleCredentialReadErrorTransformer struct {
+	failRead bool
+}
+
+func (*toggleCredentialReadErrorTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
+	return append([]byte("encrypted:"), data...), nil
+}
+
+func (t *toggleCredentialReadErrorTransformer) TransformFromStorage(_ context.Context, data []byte, _ value.Context) ([]byte, bool, error) {
+	if t.failRead {
+		return nil, false, errors.New("transient credential decryption failure")
+	}
+	return bytes.TrimPrefix(data, []byte("encrypted:")), false, nil
 }

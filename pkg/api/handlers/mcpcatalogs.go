@@ -1798,6 +1798,9 @@ func (h *MCPCatalogHandler) GetOAuthCredentials(req api.Context) error {
 	// Check if credentials exist
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	cred, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
+	if err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
+		return fmt.Errorf("failed to read OAuth credential: %w", err)
+	}
 	configured := err == nil
 
 	var clientID string
@@ -1832,7 +1835,16 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 
 	// Check if credentials already exist
 	credName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credName)
+	if err != nil {
+		return fmt.Errorf("failed to lock OAuth credential: %w", err)
+	}
+	defer releaseCredentialLock()
+
 	_, err = req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
+	if err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
+		return fmt.Errorf("failed to read OAuth credential: %w", err)
+	}
 	credentialsExist := err == nil
 
 	var clientID, clientSecret string
@@ -1906,21 +1918,29 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	}
 
 	credName := system.MCPOAuthCredentialName(entry.Name)
+	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credName)
+	if err != nil {
+		return fmt.Errorf("failed to lock OAuth credential: %w", err)
+	}
+	defer releaseCredentialLock()
+
 	deleted, err := req.GatewayClient.DeleteCredential(req.Context(), credName, "oauth")
 	if err != nil {
 		return err
 	}
 
-	// Best-effort cleanup of per-user OAuth tokens associated with this catalog entry.
 	var mcpServers v1.MCPServerList
 	if err := req.List(&mcpServers, client.MatchingFields{"spec.mcpServerCatalogEntryName": entry.Name}); err != nil {
-		log.Warnf("failed to list MCP servers for token cleanup of catalog entry %s: %v", entry.Name, err)
-	} else {
-		for _, server := range mcpServers.Items {
-			if err := h.gatewayClient.DeleteMCPOAuthTokenForAllUsers(req.Context(), server.Name); err != nil {
-				log.Warnf("failed to delete OAuth tokens for MCP server %s (catalog entry %s): %v", server.Name, entry.Name, err)
-			}
+		return fmt.Errorf("failed to list MCP servers for OAuth token cleanup: %w", err)
+	}
+	var cleanupErrs []error
+	for _, server := range mcpServers.Items {
+		if err := h.gatewayClient.DeleteMCPOAuthTokenForAllUsers(req.Context(), server.Name); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("failed to delete OAuth tokens for MCP server %s: %w", server.Name, err))
 		}
+	}
+	if err := errors.Join(cleanupErrs...); err != nil {
+		return err
 	}
 
 	// Trigger reconciliation to update the status
