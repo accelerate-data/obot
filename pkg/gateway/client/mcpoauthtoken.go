@@ -116,6 +116,9 @@ func (c *Client) CatalogEntryForStaticOAuthMCP(ctx context.Context, mcpID, url s
 	if err != nil {
 		return "", ErrMCPOAuthCatalogCredentialChanged
 	}
+	if entryName == "" {
+		return "", nil
+	}
 	entry, err := c.mcpCatalogEntry(ctx, entryName)
 	if err != nil || entry.Spec.Manifest.RemoteConfig == nil {
 		return "", ErrMCPOAuthCatalogCredentialChanged

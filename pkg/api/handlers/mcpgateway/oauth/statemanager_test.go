@@ -254,6 +254,55 @@ func TestStateManagerPreservesLegacyDynamicPendingState(t *testing.T) {
 	require.Empty(t, stored.CatalogEntryName)
 }
 
+func TestStateManagerPersistsDirectDynamicAndCIMDCallbacks(t *testing.T) {
+	const (
+		mcpID  = "direct-mcp-server"
+		mcpURL = "https://direct-mcp.example/api"
+	)
+	for _, tc := range []struct {
+		name   string
+		legacy bool
+		config *oauth2.Config
+	}{
+		{name: "new dynamic registration", config: &oauth2.Config{ClientID: "dynamic-client", ClientSecret: "dynamic-secret"}},
+		{name: "new CIMD", config: &oauth2.Config{ClientID: "https://obot.example/oauth/client-metadata"}},
+		{name: "legacy dynamic registration", legacy: true, config: &oauth2.Config{ClientID: "dynamic-client", ClientSecret: "dynamic-secret"}},
+		{name: "legacy CIMD", legacy: true, config: &oauth2.Config{ClientID: "https://obot.example/oauth/client-metadata"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gatewayClient, storageClient := newDirectStateManagerTestClient(t, mcpID)
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"access_token":"direct-access","refresh_token":"direct-refresh","token_type":"Bearer"}`)
+			}))
+			t.Cleanup(provider.Close)
+			config := *tc.config
+			config.Endpoint = oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL}
+			manager := newStateManager(gatewayClient)
+			var state string
+			if tc.legacy {
+				state = "legacy-direct-state"
+				require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", state, "verifier-1", &config))
+			} else {
+				handler := &mcpOAuthHandler{
+					client: storageClient, gatewayClient: gatewayClient, stateMgr: manager,
+					userID: "user-1", mcpID: mcpID, mcpURL: mcpURL, urlChan: make(chan string, 1),
+				}
+				var err error
+				state, _, err = handler.NewState(t.Context(), &config, "verifier-1")
+				require.NoError(t, err)
+			}
+
+			_, _, err := manager.createToken(t.Context(), state, "code-1", "", "")
+			require.NoError(t, err)
+			stored, err := gatewayClient.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+			require.NoError(t, err)
+			require.Equal(t, "direct-access", stored.AccessToken)
+			require.Empty(t, stored.CatalogEntryName)
+		})
+	}
+}
+
 func changeStaticCatalogApp(t *testing.T, gatewayClient *gateway.Client, entryName, mcpID, mcpURL string, clearCredential bool) error {
 	t.Helper()
 	entry := &v1.MCPServerCatalogEntry{
@@ -402,4 +451,23 @@ func newStateManagerTestClientWithStaticRequirement(t *testing.T, entryName, mcp
 	client := gateway.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	return client
+}
+
+func newDirectStateManagerTestClient(t *testing.T, mcpID string) (*gateway.Client, kclient.Client) {
+	t.Helper()
+	storageClient := clientfake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(&v1.MCPServer{
+			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
+			Spec:       v1.MCPServerSpec{},
+		}).
+		Build()
+	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate())
+	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, true)
+	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
+	return gatewayClient, storageClient
 }

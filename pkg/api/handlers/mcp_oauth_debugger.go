@@ -165,30 +165,10 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return types.NewErrNotFound("OAuth debugger authorization state not found")
 	}
 
-	conf := oauthDebuggerConfigFromPendingState(pendingState)
-
-	token, err := conf.Exchange(req.Context(), input.Code, oauth2.VerifierOption(pendingState.Verifier))
+	token, err := exchangeAndPersistOAuthDebuggerToken(req.Context(), req.GatewayClient, pendingState, input.Code)
 	if err != nil {
-		return fmt.Errorf("failed to exchange OAuth code: %w", err)
-	}
-
-	catalogEntryName := pendingState.CatalogEntryName
-	if catalogEntryName == "" {
-		catalogEntryName, err = req.GatewayClient.CatalogEntryForStaticOAuthMCP(req.Context(), server.Name, serverConfig.URL)
-		if err != nil {
-			if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
-				_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
-			}
-			return err
-		}
-	}
-	if err := req.GatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", catalogEntryName, conf, token); err != nil {
-		if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
-			_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
-		}
 		return err
 	}
-	_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
 
 	var expiresIn int
 	if !token.Expiry.IsZero() {
@@ -201,6 +181,33 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		TokenType:    token.TokenType,
 		ExpiresIn:    expiresIn,
 	})
+}
+
+func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, pendingState *gwtypes.MCPOAuthPendingState, code string) (*oauth2.Token, error) {
+	conf := oauthDebuggerConfigFromPendingState(pendingState)
+	token, err := conf.Exchange(ctx, code, oauth2.VerifierOption(pendingState.Verifier))
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange OAuth code: %w", err)
+	}
+
+	catalogEntryName := pendingState.CatalogEntryName
+	if catalogEntryName == "" {
+		catalogEntryName, err = gatewayClient.CatalogEntryForStaticOAuthMCP(ctx, pendingState.MCPID, pendingState.URL)
+		if err != nil {
+			if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
+				_ = gatewayClient.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
+			}
+			return nil, err
+		}
+	}
+	if err := gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, pendingState.UserID, pendingState.MCPID, pendingState.URL, "", catalogEntryName, conf, token); err != nil {
+		if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
+			_ = gatewayClient.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
+		}
+		return nil, err
+	}
+	_ = gatewayClient.DeleteMCPOAuthPendingState(ctx, pendingState.HashedState)
+	return token, nil
 }
 
 func quarterToken(token string) string {
