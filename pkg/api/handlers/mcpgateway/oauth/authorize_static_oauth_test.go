@@ -11,13 +11,151 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	"github.com/obot-platform/obot/pkg/api/authn"
+	"github.com/obot-platform/obot/pkg/api/authz"
+	apiserver "github.com/obot-platform/obot/pkg/api/server"
+	"github.com/obot-platform/obot/pkg/api/server/audit"
+	"github.com/obot-platform/obot/pkg/api/server/ratelimiter"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/license"
+	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestUnauthenticatedStaticOAuthCallbackPassesServerMiddleware(t *testing.T) {
+	provider := newStaticOAuthCallbackProvider(t)
+	gateway := newStaticOAuthCallbackGateway(t)
+	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+
+	server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state+"&code=valid-code", nil))
+
+	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/auth/oauth/complete" {
+		t.Fatalf("callback response = %d Location=%q body=%q, want handler completion redirect", recorder.Code, recorder.Header().Get("Location"), recorder.Body.String())
+	}
+	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state, "user-1", "entry-1")
+	if err != nil {
+		t.Fatalf("get completed static OAuth test: %v", err)
+	}
+	if result.Status != types.MCPStaticOAuthTestStatusSucceeded || result.FailureCategory != "" {
+		t.Fatalf("callback result = %+v, want succeeded", result)
+	}
+}
+
+func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
+	provider := newStaticOAuthCallbackProvider(t)
+
+	t.Run("missing state", func(t *testing.T) {
+		gateway := newStaticOAuthCallbackGateway(t)
+		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback", http.StatusBadRequest, "")
+	})
+
+	t.Run("unknown state", func(t *testing.T) {
+		gateway := newStaticOAuthCallbackGateway(t)
+		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state=attacker-state&error_description=provider-secret", http.StatusBadRequest, "attacker-state", "provider-secret")
+	})
+
+	t.Run("expired state", func(t *testing.T) {
+		gateway := newStaticOAuthCallbackGateway(t)
+		state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+		if err != nil {
+			t.Fatalf("create static OAuth test: %v", err)
+		}
+		if err := gateway.CleanupExpiredMCPOAuthPendingStates(t.Context(), 0); err != nil {
+			t.Fatalf("expire static OAuth test: %v", err)
+		}
+		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state+"&code=valid-code", http.StatusBadRequest, state)
+	})
+
+	t.Run("replayed state", func(t *testing.T) {
+		gateway := newStaticOAuthCallbackGateway(t)
+		state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+		if err != nil {
+			t.Fatalf("create static OAuth test: %v", err)
+		}
+		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+		first := httptest.NewRecorder()
+		server.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state+"&code=valid-code", nil))
+		if first.Code != http.StatusFound {
+			t.Fatalf("first callback response = %d body=%q, want completion redirect", first.Code, first.Body.String())
+		}
+		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state+"&code=valid-code", http.StatusBadRequest, state)
+	})
+}
+
+func TestUnauthenticatedStaticOAuthCallbackDoesNotExposeSiblingRoutes(t *testing.T) {
+	gateway := newStaticOAuthCallbackGateway(t)
+	server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/oauth/userinfo", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("protected route response = %d body=%q, want unauthorized", recorder.Code, recorder.Body.String())
+	}
+}
+
+func newUnauthenticatedStaticOAuthCallbackServer(t *testing.T, gateway *gatewayclient.Client) *apiserver.Server {
+	t.Helper()
+	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).Build()
+	limiter, err := ratelimiter.New(ratelimiter.Options{UnauthenticatedRateLimit: 100, AuthenticatedRateLimit: 100})
+	if err != nil {
+		t.Fatalf("create rate limiter: %v", err)
+	}
+	licenseProvider, err := license.NewProvider(t.Context(), nil, license.Config{})
+	if err != nil {
+		t.Fatalf("create license provider: %v", err)
+	}
+	auditLogger, err := audit.New(t.Context(), audit.Options{AuditLogsMode: audit.ModeOff})
+	if err != nil {
+		t.Fatalf("create audit logger: %v", err)
+	}
+	server := apiserver.NewServer(
+		storage,
+		gateway,
+		storage,
+		"default",
+		authn.NewAuthenticator(authn.Anonymous{}),
+		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, false),
+		nil,
+		auditLogger,
+		limiter,
+		"https://obot.example",
+		nil,
+		false,
+		licenseProvider,
+	)
+	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
+	server.HandleFunc("GET /oauth/mcp/callback", h.oauthCallback)
+	server.HandleFunc("GET /oauth/userinfo", func(api.Context) error {
+		return nil
+	})
+	return server
+}
+
+func assertSafeStaticOAuthCallbackFailure(t *testing.T, server http.Handler, path string, wantStatus int, sensitive ...string) {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+	if recorder.Code != wantStatus {
+		t.Fatalf("callback response = %d body=%q, want %d", recorder.Code, recorder.Body.String(), wantStatus)
+	}
+	for _, value := range sensitive {
+		if value != "" && strings.Contains(recorder.Body.String(), value) {
+			t.Fatalf("callback response leaked sensitive value %q: %q", value, recorder.Body.String())
+		}
+	}
+}
 
 func TestStaticOAuthCallbackExchangesAndDiscardsTokenBeforeNormalOAuth(t *testing.T) {
 	provider := newStaticOAuthCallbackProvider(t)

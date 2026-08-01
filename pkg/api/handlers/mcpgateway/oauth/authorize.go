@@ -546,6 +546,9 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 	} else if !pendingState.StaticOAuthTest {
 		return false, nil
 	}
+	if pendingState.StaticOAuthTestStatus != types.MCPStaticOAuthTestStatusPending {
+		return true, types.NewErrBadRequest("invalid or expired static OAuth credential test")
+	}
 
 	code := req.URL.Query().Get("code")
 	failureCategory := staticOAuthCallbackInputFailure(pendingState, state, code, req.URL.Query().Get("error"))

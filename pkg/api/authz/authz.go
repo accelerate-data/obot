@@ -213,6 +213,10 @@ var (
 			// Allow access to the oauth2 endpoints
 			"/oauth2/",
 
+			// Third-party OAuth providers redirect without an Obot session. The handler
+			// validates the high-entropy, expiring, one-use state before completing OAuth.
+			"GET /oauth/mcp/callback",
+
 			"GET /api/token-request/{id}",
 			"POST /api/token-request",
 			"GET /api/token-request/{id}/{service}",
