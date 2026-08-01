@@ -25,7 +25,7 @@ for (const caller of callers) {
 		const source = await readFile(caller.url, 'utf8');
 		const expectedOperations = [
 			'StaticOAuthConfigureModal',
-			'staticOAuthReplacementWasCommitted',
+			'staticOAuthSaveWasCommitted',
 			'onStartTest=',
 			'onGetTest=',
 			'onSave=',

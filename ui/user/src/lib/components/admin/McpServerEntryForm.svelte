@@ -44,7 +44,7 @@
 	import McpServerInfo from '../mcp/McpServerInfo.svelte';
 	import McpServerTools from '../mcp/McpServerTools.svelte';
 	import StaticOAuthConfigureModal from '../mcp/StaticOAuthConfigureModal.svelte';
-	import { staticOAuthReplacementWasCommitted } from '../mcp/staticOAuthCredentialTestState';
+	import { staticOAuthSaveWasCommitted } from '../mcp/staticOAuthCredentialTestState';
 	import IconButton from '../primitives/IconButton.svelte';
 	import Table from '../table/Table.svelte';
 	import { setVirtualPageDisabled } from '../ui/virtual-page/context';
@@ -1538,7 +1538,13 @@
 			} catch {
 				// The request layer reports the status-refresh failure separately.
 			}
-			if (!staticOAuthReplacementWasCommitted(statusBeforeSave, staticOauthStatus)) {
+			if (
+				!(await staticOAuthSaveWasCommitted(
+					staticOauthStatus,
+					credentials.clientID,
+					credentials.proof
+				))
+			) {
 				throw error;
 			}
 			savedStatus = staticOauthStatus;

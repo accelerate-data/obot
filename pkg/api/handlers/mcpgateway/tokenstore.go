@@ -71,6 +71,8 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2
 		if err != nil {
 			return nil, nil, err
 		}
+	} else if err := t.gatewayClient.ValidateCatalogOAuthToken(ctx, t.mcpID, mcpURL, catalogEntryName, mcpToken.CatalogCredentialGeneration, conf); err != nil {
+		return nil, nil, err
 	}
 	t.mu.Lock()
 	if t.catalogEntry == nil {

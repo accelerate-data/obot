@@ -34,7 +34,7 @@
 	import McpSelectServerDeployment from './McpSelectServerDeployment.svelte';
 	import StaticOAuthConfigureModal from './StaticOAuthConfigureModal.svelte';
 	import DebugOauthDialog from './oauth/DebugOauthDialog.svelte';
-	import { staticOAuthReplacementWasCommitted } from './staticOAuthCredentialTestState';
+	import { staticOAuthSaveWasCommitted } from './staticOAuthCredentialTestState';
 	import {
 		KeyRound,
 		PencilLine,
@@ -869,7 +869,13 @@
 			} catch {
 				// The request layer reports the status-refresh failure separately.
 			}
-			if (!staticOAuthReplacementWasCommitted(statusBeforeSave, oauthStatus)) {
+			if (
+				!(await staticOAuthSaveWasCommitted(
+					oauthStatus,
+					credentials.clientID,
+					credentials.proof
+				))
+			) {
 				throw error;
 			}
 		}

@@ -78,20 +78,23 @@ export function canSaveStaticOAuthCredentials(
 
 type StaticOAuthCredentialGeneration = {
 	configured: boolean;
+	clientID?: string;
 	generation?: string;
 };
 
-export function staticOAuthReplacementWasCommitted(
-	previous: StaticOAuthCredentialGeneration | undefined,
-	current: StaticOAuthCredentialGeneration | undefined
-): boolean {
-	return Boolean(
-		previous?.configured &&
-		previous.generation &&
-		current?.configured &&
-		current.generation &&
-		current.generation !== previous.generation
+export async function staticOAuthSaveWasCommitted(
+	current: StaticOAuthCredentialGeneration | undefined,
+	clientID: string,
+	proof: string
+): Promise<boolean> {
+	if (!current?.configured || current.clientID !== clientID || !current.generation || !proof) {
+		return false;
+	}
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(proof));
+	const receipt = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
+		''
 	);
+	return current.generation === receipt;
 }
 
 export function scheduleStaticOAuthCredentialTestExpiry(

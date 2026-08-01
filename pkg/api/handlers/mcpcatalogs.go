@@ -1782,6 +1782,17 @@ func verifyOAuthCredentialAccess(req api.Context, catalogName, workspaceID, entr
 	return &entry, nil
 }
 
+func verifyOAuthCredentialProviderUnchanged(req api.Context, catalogName, workspaceID, entryName, testedURL string) (*v1.MCPServerCatalogEntry, error) {
+	entry, err := verifyOAuthCredentialAccess(req, catalogName, workspaceID, entryName)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Spec.Manifest.RemoteConfig.FixedURL != testedURL {
+		return nil, types.NewErrBadRequest("OAuth provider changed after the credential test; test the credentials again")
+	}
+	return entry, nil
+}
+
 // GetOAuthCredentials returns the OAuth credential status for a catalog entry.
 // GET /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials
 // GET /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials
@@ -1858,12 +1869,17 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 
 	clientID := credReq.ClientID
 	clientSecret := credReq.ClientSecret
-	claim, err := h.gatewayClient.ClaimMCPStaticOAuthCredentialProof(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret)
+	testedURL := entry.Spec.Manifest.RemoteConfig.FixedURL
+	claim, err := h.gatewayClient.ClaimMCPStaticOAuthCredentialProof(req.Context(), proof, req.User.GetUID(), entry.Name, testedURL, clientID, clientSecret)
 	if err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
 			return types.NewErrBadRequest("invalid or expired OAuth credential test")
 		}
 		return fmt.Errorf("failed to claim OAuth credential test: %w", err)
+	}
+	entry, err = verifyOAuthCredentialProviderUnchanged(req, catalogName, workspaceID, entryName, testedURL)
+	if err != nil {
+		return err
 	}
 
 	replaceStaleCredential := false
@@ -1944,12 +1960,17 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredentialLock()
 
-	claim, err := h.gatewayClient.ClaimMCPStaticOAuthCredentialProof(req.Context(), proof, req.User.GetUID(), entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, clientID, clientSecret)
+	testedURL := entry.Spec.Manifest.RemoteConfig.FixedURL
+	claim, err := h.gatewayClient.ClaimMCPStaticOAuthCredentialProof(req.Context(), proof, req.User.GetUID(), entry.Name, testedURL, clientID, clientSecret)
 	if err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthTestInvalid) {
 			return types.NewErrBadRequest("invalid or expired OAuth credential test")
 		}
 		return fmt.Errorf("failed to claim OAuth credential test: %w", err)
+	}
+	entry, err = verifyOAuthCredentialProviderUnchanged(req, catalogName, workspaceID, entryName, testedURL)
+	if err != nil {
+		return err
 	}
 
 	cleanupTargets, err := resolveOAuthTokenCleanupTargets(req, entry.Name)

@@ -8,7 +8,7 @@
 	import McpMultiDeleteBlockedDialog from '$lib/components/mcp/McpMultiDeleteBlockedDialog.svelte';
 	import McpTunnelDisconnectedStatus from '$lib/components/mcp/McpTunnelDisconnectedStatus.svelte';
 	import StaticOAuthConfigureModal from '$lib/components/mcp/StaticOAuthConfigureModal.svelte';
-	import { staticOAuthReplacementWasCommitted } from '$lib/components/mcp/staticOAuthCredentialTestState';
+	import { staticOAuthSaveWasCommitted } from '$lib/components/mcp/staticOAuthCredentialTestState';
 	import Table, { type InitSort, type InitSortFn } from '$lib/components/table/Table.svelte';
 	import {
 		AdminService,
@@ -253,7 +253,13 @@
 			} catch {
 				// The request layer reports the status-refresh failure separately.
 			}
-			if (!staticOAuthReplacementWasCommitted(statusBeforeSave, oauthStatus)) {
+			if (
+				!(await staticOAuthSaveWasCommitted(
+					oauthStatus,
+					credentials.clientID,
+					credentials.proof
+				))
+			) {
 				throw error;
 			}
 		}

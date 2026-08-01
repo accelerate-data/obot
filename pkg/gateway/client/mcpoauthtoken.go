@@ -104,6 +104,26 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx co
 	}
 	defer release()
 
+	if err := c.validateCatalogOAuthCredential(ctx, mcpID, url, catalogEntryName, catalogCredentialGeneration, oauthConf); err != nil {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
+
+	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration, oauthConf, token)
+}
+
+// ValidateCatalogOAuthToken rejects a persisted grant when its catalog entry,
+// provider URL, or shared application no longer matches the active catalog state.
+func (c *Client) ValidateCatalogOAuthToken(ctx context.Context, mcpID, url, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config) error {
+	credentialKey := system.MCPOAuthCredentialName(catalogEntryName)
+	release, err := c.AcquireCredentialLock(ctx, credentialKey)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog OAuth token read: %w", err)
+	}
+	defer release()
+	return c.validateCatalogOAuthCredential(ctx, mcpID, url, catalogEntryName, catalogCredentialGeneration, oauthConf)
+}
+
+func (c *Client) validateCatalogOAuthCredential(ctx context.Context, mcpID, url, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config) error {
 	currentEntryName, err := c.mcpCatalogEntryName(ctx, mcpID)
 	if err != nil || !secureStringEqual(currentEntryName, catalogEntryName) {
 		return ErrMCPOAuthCatalogCredentialChanged
@@ -112,20 +132,19 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx co
 	if err != nil || !secureStringEqual(currentURL, url) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-	credential, err := c.RevealCredential(ctx, []string{credentialKey}, "oauth")
-	if err != nil {
+	credential, err := c.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(catalogEntryName)}, "oauth")
+	if err != nil ||
+		!secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) ||
+		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-	if !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) ||
-		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) ||
-		!secureStringEqual(credential.Secrets["GENERATION"], catalogCredentialGeneration) {
+	if !secureStringEqual(credential.Secrets["GENERATION"], catalogCredentialGeneration) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
 	if credentialURL := credential.Secrets["MCP_URL"]; credentialURL != "" && !secureStringEqual(credentialURL, url) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-
-	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration, oauthConf, token)
+	return nil
 }
 
 // CatalogEntryForStaticOAuthMCP recovers the fence identity for OAuth state

@@ -17,8 +17,43 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestTokenStoreRejectsCatalogGrantAfterProviderURLChanges(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		oldURL    = "https://mcp.example/api"
+		newURL    = "https://new-mcp.example/api"
+	)
+	client, storage := newCatalogTokenStoreTestClientWithStorage(t, entryName, mcpID, true)
+	config := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
+	require.NoError(t, client.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     config.ClientID,
+			"CLIENT_SECRET": config.ClientSecret,
+			"MCP_URL":       oldURL,
+			"GENERATION":    "generation-1",
+		},
+	}))
+	require.NoError(t, client.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(
+		t.Context(), "user-1", mcpID, oldURL, "", entryName, "generation-1", config,
+		&oauth2.Token{AccessToken: "old-provider-access"},
+	))
+
+	var entry v1.MCPServerCatalogEntry
+	require.NoError(t, storage.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: entryName}, &entry))
+	entry.Spec.Manifest.RemoteConfig.FixedURL = newURL
+	require.NoError(t, storage.Update(t.Context(), &entry))
+
+	store := &tokenStore{gatewayClient: client, userID: "user-1", mcpID: mcpID}
+	_, _, err := store.GetTokenConfig(t.Context(), oldURL)
+	require.ErrorIs(t, err, gateway.ErrMCPOAuthCatalogCredentialChanged)
+}
 
 func TestTokenStoreRefreshCannotResurrectCatalogGrantAfterAppChange(t *testing.T) {
 	const (
@@ -177,6 +212,11 @@ func TestTokenStorePreservesLegacyDynamicGrantRefresh(t *testing.T) {
 }
 
 func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) *gateway.Client {
+	client, _ := newCatalogTokenStoreTestClientWithStorage(t, entryName, mcpID, staticOAuthRequired)
+	return client
+}
+
+func newCatalogTokenStoreTestClientWithStorage(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) (*gateway.Client, kclient.Client) {
 	t.Helper()
 	storage := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
@@ -200,5 +240,5 @@ func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string, stati
 	require.NoError(t, db.AutoMigrate())
 	client := gateway.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	return client
+	return client, storage
 }

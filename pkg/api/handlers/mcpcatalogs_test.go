@@ -642,6 +642,67 @@ func TestSetOAuthCredentialsSerializesConcurrentSameProofSaves(t *testing.T) {
 	}
 }
 
+func TestSetOAuthCredentialsRejectsProviderChangeWhileWaitingForCredentialLock(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://new-mcp.example/api")
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: credName,
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "old-client",
+			"CLIENT_SECRET": "old-secret",
+			"MCP_URL":       "https://old-mcp.example/api",
+			"GENERATION":    "old-generation",
+		},
+	}))
+	proof := successfulStaticOAuthCredentialProofFor(
+		t,
+		gateway,
+		entry.Name,
+		entry.Spec.Manifest.RemoteConfig.FixedURL,
+		"user-1",
+		"new-client",
+		"new-secret",
+	)
+	req, _ := newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "new-client", "new-secret", proof)
+
+	release, err := gateway.AcquireCredentialLock(t.Context(), credName)
+	require.NoError(t, err)
+	result := make(chan error, 1)
+	go func() {
+		result <- (&MCPCatalogHandler{serverURL: "https://obot.example", gatewayClient: gateway}).SetOAuthCredentials(req)
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("Save bypassed held credential lock: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	var currentEntry v1.MCPServerCatalogEntry
+	require.NoError(t, req.Storage.Get(t.Context(), client.ObjectKey{Namespace: entry.Namespace, Name: entry.Name}, &currentEntry))
+	currentEntry.Spec.Manifest.RemoteConfig.FixedURL = "https://old-mcp.example/api"
+	require.NoError(t, req.Storage.Update(t.Context(), &currentEntry))
+	release()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "provider changed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for rejected Save")
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth")
+	require.NoError(t, err)
+	require.Equal(t, "old-client", credential.Secrets["CLIENT_ID"])
+	require.Equal(t, "old-generation", credential.Secrets["GENERATION"])
+
+	retry, _ := newSetOAuthCredentialRequest(t, gateway, entry, "user-1", "new-client", "new-secret", proof)
+	err = (&MCPCatalogHandler{gatewayClient: gateway}).SetOAuthCredentials(retry)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid or expired OAuth credential test")
+}
+
 func TestReplaceOAuthCredentialsRejectsMismatchedProofWithoutMutatingActiveConfiguration(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")

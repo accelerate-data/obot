@@ -10,7 +10,7 @@ const {
 	invalidateStaticOAuthCredentialTest,
 	safeStaticOAuthAuthorizationURL,
 	scheduleStaticOAuthCredentialTestExpiry,
-	staticOAuthReplacementWasCommitted,
+	staticOAuthSaveWasCommitted,
 	succeedStaticOAuthCredentialTest
 } = staticOAuthCredentialTestState;
 
@@ -96,32 +96,37 @@ test('a failed test and a new test cannot reuse an earlier proof', () => {
 	assert.equal(canSaveStaticOAuthCredentials(restarted, 'client-id', 'client-secret'), false);
 });
 
-test('only an advanced generation confirms an ambiguous replacement', () => {
+test('only the exact proof receipt confirms an ambiguous save', async () => {
+	const receipt = 'c1cda26362828b69266512052b97cb3729e3b052e4ade47c0a1e3383defe73c7';
 	assert.equal(
-		staticOAuthReplacementWasCommitted(
-			{ configured: true, generation: 'generation-1' },
-			{ configured: true, generation: 'generation-2' }
+		await staticOAuthSaveWasCommitted(
+			{ configured: true, clientID: 'client-id', generation: receipt },
+			'client-id',
+			'proof'
 		),
 		true
 	);
 	assert.equal(
-		staticOAuthReplacementWasCommitted(
-			{ configured: true, generation: 'generation-1' },
-			{ configured: true, generation: 'generation-1' }
+		await staticOAuthSaveWasCommitted(
+			{ configured: true, clientID: 'other-client', generation: receipt },
+			'client-id',
+			'proof'
 		),
 		false
 	);
 	assert.equal(
-		staticOAuthReplacementWasCommitted(
-			{ configured: true },
-			{ configured: true, generation: 'generation-2' }
+		await staticOAuthSaveWasCommitted(
+			{ configured: true, clientID: 'client-id', generation: 'other-generation' },
+			'client-id',
+			'proof'
 		),
 		false
 	);
 	assert.equal(
-		staticOAuthReplacementWasCommitted(
-			{ configured: false, generation: 'generation-1' },
-			{ configured: true, generation: 'generation-2' }
+		await staticOAuthSaveWasCommitted(
+			{ configured: false, clientID: 'client-id', generation: receipt },
+			'client-id',
+			'proof'
 		),
 		false
 	);
