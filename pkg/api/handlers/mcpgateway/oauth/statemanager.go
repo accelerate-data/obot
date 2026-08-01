@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -19,8 +20,8 @@ func newStateManager(gatewayClient *client.Client) *stateManager {
 	}
 }
 
-func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, state, verifier string, conf *oauth2.Config) error {
-	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, state, verifier, conf)
+func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier string, conf *oauth2.Config) error {
+	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, conf)
 }
 
 func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, errorDescription string) (string, string, error) {
@@ -56,7 +57,10 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	}
 
 	// Save the completed token
-	if err := sm.gatewayClient.ReplaceMCPOAuthToken(ctx, ps.UserID, ps.MCPID, ps.URL, ps.OAuthAuthRequestID, conf, token); err != nil {
+	if err := sm.gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, ps.UserID, ps.MCPID, ps.URL, ps.OAuthAuthRequestID, ps.CatalogEntryName, conf, token); err != nil {
+		if errors.Is(err, client.ErrMCPOAuthCatalogCredentialChanged) {
+			_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
+		}
 		return "", "", err
 	}
 

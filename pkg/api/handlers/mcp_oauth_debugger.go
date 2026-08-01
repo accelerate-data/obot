@@ -39,7 +39,7 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 		return err
 	}
 
-	clientID, clientSecret, err := m.lookupStaticOAuthClient(req, server)
+	clientID, clientSecret, catalogEntryName, err := m.lookupStaticOAuthClient(req, server)
 	useCIMD := m.useOAuthDebuggerCIMD(server, clientID, clientSecret)
 	if err != nil && authServer.RegistrationEndpoint == "" && !useCIMD {
 		return err
@@ -86,6 +86,7 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 		server.Name,
 		serverConfig.URL,
 		OAuthDebuggerPendingStateMarker,
+		catalogEntryName,
 		state,
 		oauth2.GenerateVerifier(),
 		conf,
@@ -171,7 +172,10 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return fmt.Errorf("failed to exchange OAuth code: %w", err)
 	}
 
-	if err := req.GatewayClient.ReplaceMCPOAuthToken(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", conf, token); err != nil {
+	if err := req.GatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialFence(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", pendingState.CatalogEntryName, conf, token); err != nil {
+		if errors.Is(err, gateway.ErrMCPOAuthCatalogCredentialChanged) {
+			_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
+		}
 		return err
 	}
 	_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
@@ -268,19 +272,19 @@ func registerOAuthDebuggerClient(ctx context.Context, registrationEndpoint strin
 	return registered, nil
 }
 
-func (m *MCPHandler) lookupStaticOAuthClient(req api.Context, server v1.MCPServer) (string, string, error) {
+func (m *MCPHandler) lookupStaticOAuthClient(req api.Context, server v1.MCPServer) (string, string, string, error) {
 	if server.Spec.MCPServerCatalogEntryName != "" {
 		credName := system.MCPOAuthCredentialName(server.Spec.MCPServerCatalogEntryName)
 		cred, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
 		if err == nil && cred.Secrets["CLIENT_ID"] != "" && cred.Secrets["CLIENT_SECRET"] != "" {
-			return cred.Secrets["CLIENT_ID"], cred.Secrets["CLIENT_SECRET"], nil
+			return cred.Secrets["CLIENT_ID"], cred.Secrets["CLIENT_SECRET"], server.Spec.MCPServerCatalogEntryName, nil
 		}
 		if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
-			return "", "", err
+			return "", "", "", err
 		}
 	}
 
-	return "", "", nil
+	return "", "", "", nil
 }
 
 func (m *MCPHandler) useOAuthDebuggerCIMD(server v1.MCPServer, clientID, clientSecret string) bool {

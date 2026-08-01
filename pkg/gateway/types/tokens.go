@@ -47,6 +47,7 @@ type MCPOAuthToken struct {
 	MCPID              string `gorm:"primaryKey"`
 	UserID             string `gorm:"primaryKey"`
 	URL                string
+	CatalogEntryName   string
 	OAuthAuthRequestID string `gorm:"index"`
 	AccessToken        string
 	TokenType          string
@@ -64,6 +65,7 @@ type MCPOAuthPendingState struct {
 	UserID                         string `gorm:"index:idx_pending_user_mcp"`
 	MCPID                          string `gorm:"index:idx_pending_user_mcp"`
 	URL                            string
+	CatalogEntryName               string
 	OAuthAuthRequestID             string
 	ClientID                       string
 	ClientSecret                   string

@@ -13,10 +13,14 @@ import (
 
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/storage/value"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var mcpOAuthTokenGroupResource = schema.GroupResource{
@@ -29,7 +33,10 @@ var mcpOAuthPendingStateGroupResource = schema.GroupResource{
 	Resource: "mcpoauthpendingstates",
 }
 
-var ErrMCPStaticOAuthTestInvalid = errors.New("invalid static OAuth test proof")
+var (
+	ErrMCPStaticOAuthTestInvalid        = errors.New("invalid static OAuth test proof")
+	ErrMCPOAuthCatalogCredentialChanged = errors.New("catalog OAuth credential changed")
+)
 
 const mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
 
@@ -65,10 +72,91 @@ func (c *Client) GetMCPOAuthToken(ctx context.Context, userID, mcpID, url string
 }
 
 func (c *Client) ReplaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, "", oauthConf, token)
+}
+
+// ReplaceMCPOAuthTokenWithCatalogCredentialFence persists a grant only while the
+// static catalog app captured by the OAuth flow is still active for this MCP.
+func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	if catalogEntryName == "" {
+		return c.ReplaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, oauthConf, token)
+	}
+
+	credentialKey := system.MCPOAuthCredentialName(catalogEntryName)
+	release, err := c.AcquireCredentialLock(ctx, credentialKey)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog OAuth token write: %w", err)
+	}
+	defer release()
+
+	currentEntryName, err := c.mcpCatalogEntryName(ctx, mcpID)
+	if err != nil || !secureStringEqual(currentEntryName, catalogEntryName) {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
+	currentURL, err := c.mcpCatalogEntryURL(ctx, catalogEntryName)
+	if err != nil || !secureStringEqual(currentURL, url) {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
+	credential, err := c.RevealCredential(ctx, []string{credentialKey}, "oauth")
+	if err != nil {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
+	if !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) ||
+		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
+
+	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, oauthConf, token)
+}
+
+// CatalogEntryForCurrentOAuthCredential identifies a legacy grant that uses
+// the static app which is active for its MCP. A present but different app makes
+// the grant stale; no configured static app means the grant is dynamic.
+func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, userID, mcpID, url string, oauthConf *oauth2.Config) (string, error) {
+	entryName, err := c.mcpCatalogEntryName(ctx, mcpID)
+	if err != nil {
+		return "", err
+	}
+	if entryName == "" {
+		return "", nil
+	}
+	credentialKey := system.MCPOAuthCredentialName(entryName)
+	release, err := c.AcquireCredentialLock(ctx, credentialKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to coordinate catalog OAuth token read: %w", err)
+	}
+	defer release()
+	currentURL, err := c.mcpCatalogEntryURL(ctx, entryName)
+	if err != nil || !secureStringEqual(currentURL, url) {
+		return "", ErrMCPOAuthCatalogCredentialChanged
+	}
+	if _, err := c.GetMCPOAuthToken(ctx, userID, mcpID, url); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", ErrMCPOAuthCatalogCredentialChanged
+		}
+		return "", err
+	}
+	credential, err := c.RevealCredential(ctx, []string{credentialKey}, "oauth")
+	if err != nil {
+		var notFound CredentialNotFoundError
+		if errors.As(err, &notFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if !secureStringEqual(credential.Secrets["CLIENT_ID"], oauthConf.ClientID) ||
+		!secureStringEqual(credential.Secrets["CLIENT_SECRET"], oauthConf.ClientSecret) {
+		return "", ErrMCPOAuthCatalogCredentialChanged
+	}
+	return entryName, nil
+}
+
+func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	t := &types.MCPOAuthToken{
 		UserID:             userID,
 		MCPID:              mcpID,
 		URL:                url,
+		CatalogEntryName:   catalogEntryName,
 		OAuthAuthRequestID: oauthAuthRequestID,
 		AccessToken:        token.AccessToken,
 		TokenType:          token.TokenType,
@@ -90,6 +178,39 @@ func (c *Client) ReplaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, o
 		return err
 	}
 	return c.triggerMCPOAuthTokenChange(ctx, mcpID)
+}
+
+func (c *Client) mcpCatalogEntryName(ctx context.Context, mcpID string) (string, error) {
+	if c.storageClient == nil {
+		return "", fmt.Errorf("storage client is unavailable")
+	}
+
+	var server v1.MCPServer
+	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: mcpID}, &server); err == nil {
+		return server.Spec.MCPServerCatalogEntryName, nil
+	} else if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+
+	var instance v1.MCPServerInstance
+	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: mcpID}, &instance); err == nil {
+		return instance.Spec.MCPServerCatalogEntryName, nil
+	} else if !apierrors.IsNotFound(err) {
+		return "", err
+	}
+
+	return "", apierrors.NewNotFound(v1.SchemeGroupVersion.WithResource("mcpservers").GroupResource(), mcpID)
+}
+
+func (c *Client) mcpCatalogEntryURL(ctx context.Context, entryName string) (string, error) {
+	var entry v1.MCPServerCatalogEntry
+	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: entryName}, &entry); err != nil {
+		return "", err
+	}
+	if entry.Spec.Manifest.RemoteConfig == nil {
+		return "", fmt.Errorf("catalog entry has no remote configuration")
+	}
+	return entry.Spec.Manifest.RemoteConfig.FixedURL, nil
 }
 
 func (c *Client) DeleteMCPOAuthTokenForURL(ctx context.Context, userID, mcpID, mcpURL string) error {
@@ -276,7 +397,7 @@ func secureStringEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare(aHash[:], bHash[:]) == 1
 }
 
-func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, state, verifier string, oauthConf *oauth2.Config) error {
+func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier string, oauthConf *oauth2.Config) error {
 	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
 	ps := &types.MCPOAuthPendingState{
 		HashedState:        hashedState,
@@ -285,6 +406,7 @@ func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, 
 		UserID:             userID,
 		MCPID:              mcpID,
 		URL:                mcpURL,
+		CatalogEntryName:   catalogEntryName,
 		OAuthAuthRequestID: oauthAuthRequestID,
 		ClientID:           oauthConf.ClientID,
 		ClientSecret:       oauthConf.ClientSecret,

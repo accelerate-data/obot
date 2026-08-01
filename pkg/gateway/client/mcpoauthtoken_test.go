@@ -13,12 +13,310 @@ import (
 
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	gwtypes "github.com/obot-platform/obot/pkg/gateway/types"
+	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/storage/scheme"
+	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	"k8s.io/apiserver/pkg/storage/value"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestReplaceMCPOAuthTokenWithCatalogCredentialFence(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	newClient := func(t *testing.T) *Client {
+		t.Helper()
+		c := newTestClient(t)
+		c.storageClient = clientfake.NewClientBuilder().
+			WithScheme(scheme.Scheme).
+			WithObjects(
+				&v1.MCPServerInstance{
+					ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
+					Spec: v1.MCPServerInstanceSpec{
+						MCPServerCatalogEntryName: entryName,
+					},
+				},
+				&v1.MCPServerCatalogEntry{
+					ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
+					Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
+						RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL},
+					}},
+				},
+			).
+			Build()
+		return c
+	}
+	seedCredential := func(t *testing.T, c *Client, clientID, clientSecret string) {
+		t.Helper()
+		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+			Context: system.MCPOAuthCredentialName(entryName),
+			Name:    "oauth",
+			Secrets: map[string]string{"CLIENT_ID": clientID, "CLIENT_SECRET": clientSecret},
+		}); err != nil {
+			t.Fatalf("seed catalog OAuth credential: %v", err)
+		}
+	}
+
+	t.Run("matching current app persists grant with fence identity", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "request-1", entryName,
+			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+			&oauth2.Token{AccessToken: "access-1"})
+		if err != nil {
+			t.Fatalf("persist matching OAuth grant: %v", err)
+		}
+		stored, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+		if err != nil {
+			t.Fatalf("load persisted OAuth grant: %v", err)
+		}
+		if stored.CatalogEntryName != entryName || stored.AccessToken != "access-1" {
+			t.Fatalf("stored grant = entry %q access token %q", stored.CatalogEntryName, stored.AccessToken)
+		}
+	})
+
+	t.Run("same client ID with rotated secret rejects stale grant", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-2")
+
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+			&oauth2.Token{AccessToken: "stale-access"})
+		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("stale write error = %v, want catalog credential changed", err)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("stale grant was persisted: %v", err)
+		}
+	})
+
+	t.Run("clear rejects stale grant when credential no longer exists", func(t *testing.T) {
+		c := newClient(t)
+
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+			&oauth2.Token{AccessToken: "stale-access"})
+		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("post-clear write error = %v, want catalog credential changed", err)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("post-clear grant was persisted: %v", err)
+		}
+	})
+
+	t.Run("server reassignment rejects a grant captured for the old entry", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+		var instance v1.MCPServerInstance
+		if err := c.storageClient.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: mcpID}, &instance); err != nil {
+			t.Fatalf("get MCP instance: %v", err)
+		}
+		instance.Spec.MCPServerCatalogEntryName = "catalog-entry-2"
+		if err := c.storageClient.Update(t.Context(), &instance); err != nil {
+			t.Fatalf("reassign MCP instance: %v", err)
+		}
+
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+			&oauth2.Token{AccessToken: "stale-access"})
+		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("reassigned entry write error = %v, want catalog credential changed", err)
+		}
+	})
+
+	t.Run("catalog URL change rejects a grant captured for the old URL", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+		var entry v1.MCPServerCatalogEntry
+		if err := c.storageClient.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: entryName}, &entry); err != nil {
+			t.Fatalf("get catalog entry: %v", err)
+		}
+		entry.Spec.Manifest.RemoteConfig.FixedURL = "https://new-mcp.example/api"
+		if err := c.storageClient.Update(t.Context(), &entry); err != nil {
+			t.Fatalf("change catalog URL: %v", err)
+		}
+
+		err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+			&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+			&oauth2.Token{AccessToken: "stale-access"})
+		if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("changed URL write error = %v, want catalog credential changed", err)
+		}
+	})
+
+	t.Run("rotation winning the lock prevents old grant resurrection", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+		credentialKey := system.MCPOAuthCredentialName(entryName)
+		releaseRotation, err := c.AcquireCredentialLock(t.Context(), credentialKey)
+		if err != nil {
+			t.Fatalf("acquire rotation lock: %v", err)
+		}
+		writeResult := make(chan error, 1)
+		go func() {
+			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+				&oauth2.Token{AccessToken: "old-app-access"})
+		}()
+		select {
+		case err := <-writeResult:
+			t.Fatalf("old-app write bypassed held rotation lock: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		seedCredential(t, c, "client-1", "secret-2")
+		if err := c.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID); err != nil {
+			t.Fatalf("clear grants during rotation: %v", err)
+		}
+		releaseRotation()
+		if err := <-writeResult; !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("post-rotation write error = %v, want catalog credential changed", err)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("old-app grant resurrected after rotation: %v", err)
+		}
+	})
+
+	t.Run("clear winning the lock prevents old grant resurrection", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+		credentialKey := system.MCPOAuthCredentialName(entryName)
+		releaseClear, err := c.AcquireCredentialLock(t.Context(), credentialKey)
+		if err != nil {
+			t.Fatalf("acquire clear lock: %v", err)
+		}
+		writeResult := make(chan error, 1)
+		go func() {
+			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+				&oauth2.Token{AccessToken: "old-app-access"})
+		}()
+		select {
+		case err := <-writeResult:
+			t.Fatalf("old-app write bypassed held clear lock: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		if _, err := c.DeleteCredential(t.Context(), credentialKey, "oauth"); err != nil {
+			t.Fatalf("clear catalog credential: %v", err)
+		}
+		if err := c.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID); err != nil {
+			t.Fatalf("clear grants: %v", err)
+		}
+		releaseClear()
+		if err := <-writeResult; !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+			t.Fatalf("post-clear write error = %v, want catalog credential changed", err)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("old-app grant resurrected after clear: %v", err)
+		}
+	})
+
+	t.Run("callback winning the lock is cleaned by later rotation", func(t *testing.T) {
+		c := newClient(t)
+		seedCredential(t, c, "client-1", "secret-1")
+		writeReachedTrigger := make(chan struct{})
+		releaseWrite := make(chan struct{})
+		var firstTrigger sync.Once
+		c.mcpOAuthTokenTrigger = func(context.Context, string) error {
+			firstTrigger.Do(func() {
+				close(writeReachedTrigger)
+				<-releaseWrite
+			})
+			return nil
+		}
+		writeResult := make(chan error, 1)
+		go func() {
+			writeResult <- c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(t.Context(), "user-1", mcpID, mcpURL, "", entryName,
+				&oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"},
+				&oauth2.Token{AccessToken: "old-app-access"})
+		}()
+		<-writeReachedTrigger
+
+		rotationResult := make(chan error, 1)
+		go func() {
+			credentialKey := system.MCPOAuthCredentialName(entryName)
+			releaseRotation, err := c.AcquireCredentialLock(t.Context(), credentialKey)
+			if err != nil {
+				rotationResult <- err
+				return
+			}
+			defer releaseRotation()
+			if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+				Context: credentialKey,
+				Name:    "oauth",
+				Secrets: map[string]string{"CLIENT_ID": "client-2", "CLIENT_SECRET": "secret-2"},
+			}); err != nil {
+				rotationResult <- err
+				return
+			}
+			rotationResult <- c.DeleteMCPOAuthTokenForAllUsers(t.Context(), mcpID)
+		}()
+		select {
+		case err := <-rotationResult:
+			t.Fatalf("rotation bypassed callback's held lock: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(releaseWrite)
+		if err := <-writeResult; err != nil {
+			t.Fatalf("callback that won lock failed: %v", err)
+		}
+		if err := <-rotationResult; err != nil {
+			t.Fatalf("rotation after callback: %v", err)
+		}
+		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("callback grant survived later rotation: %v", err)
+		}
+	})
+
+	t.Run("unrelated entry is not blocked", func(t *testing.T) {
+		c := newClient(t)
+		const (
+			otherEntry = "catalog-entry-2"
+			otherMCPID = "mcp-instance-2"
+		)
+		if err := c.storageClient.Create(t.Context(), &v1.MCPServerInstance{
+			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: otherMCPID},
+			Spec:       v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: otherEntry},
+		}); err != nil {
+			t.Fatalf("create unrelated MCP instance: %v", err)
+		}
+		if err := c.storageClient.Create(t.Context(), &v1.MCPServerCatalogEntry{
+			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: otherEntry},
+			Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
+				RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL},
+			}},
+		}); err != nil {
+			t.Fatalf("create unrelated catalog entry: %v", err)
+		}
+		if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+			Context: system.MCPOAuthCredentialName(otherEntry),
+			Name:    "oauth",
+			Secrets: map[string]string{"CLIENT_ID": "other-client", "CLIENT_SECRET": "other-secret"},
+		}); err != nil {
+			t.Fatalf("seed unrelated credential: %v", err)
+		}
+		release, err := c.AcquireCredentialLock(t.Context(), system.MCPOAuthCredentialName(entryName))
+		if err != nil {
+			t.Fatalf("acquire first entry lock: %v", err)
+		}
+		defer release()
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialFence(ctx, "user-1", otherMCPID, mcpURL, "", otherEntry,
+			&oauth2.Config{ClientID: "other-client", ClientSecret: "other-secret"},
+			&oauth2.Token{AccessToken: "other-access"}); err != nil {
+			t.Fatalf("unrelated entry write was blocked: %v", err)
+		}
+	})
+}
 
 func TestCreateMCPStaticOAuthTestStoresEncryptedPendingProof(t *testing.T) {
 	c := newTestClient(t)
