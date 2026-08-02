@@ -44,6 +44,15 @@ var (
 
 const mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
 
+// MCPStaticOAuthCredentialReady reports whether a stored application is
+// complete and bound to the current catalog provider generation.
+func MCPStaticOAuthCredentialReady(secrets map[string]string, fixedURL string) bool {
+	return secrets["MCP_URL"] == fixedURL &&
+		strings.TrimSpace(secrets["GENERATION"]) != "" &&
+		strings.TrimSpace(secrets["CLIENT_ID"]) != "" &&
+		strings.TrimSpace(secrets["CLIENT_SECRET"]) != ""
+}
+
 type MCPStaticOAuthTestStart struct {
 	CallbackState string
 	TestState     string

@@ -72,6 +72,19 @@ test('save requires a successful proof for the exact tested credentials', () => 
 	);
 });
 
+test('a successful test preserves the proof as an exact opaque value', () => {
+	const succeeded = succeedStaticOAuthCredentialTest(
+		beginStaticOAuthCredentialTest('client-id', 'client-secret'),
+		' proof ',
+		'2026-08-02T02:00:00.000Z'
+	);
+
+	assert.equal(succeeded.status, 'succeeded');
+	if (succeeded.status === 'succeeded') {
+		assert.equal(succeeded.proof, ' proof ');
+	}
+});
+
 test('editing either value invalidates the proof even if the original value is restored', () => {
 	const succeeded = succeedStaticOAuthCredentialTest(
 		beginStaticOAuthCredentialTest('client-id', 'client-secret'),

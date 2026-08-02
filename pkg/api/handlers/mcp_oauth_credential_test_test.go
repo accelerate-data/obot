@@ -411,6 +411,14 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 				return started.TestState
 			},
 		},
+		{
+			name: "surrounding whitespace is not normalized",
+			prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
+				t.Helper()
+				started := pendingStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
+				return " " + started.TestState + " "
+			},
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			gateway := newOAuthCredentialTestGatewayClient(t)

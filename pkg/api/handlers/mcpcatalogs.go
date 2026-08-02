@@ -1822,9 +1822,7 @@ func (h *MCPCatalogHandler) GetOAuthCredentials(req api.Context) error {
 	if err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
 		return fmt.Errorf("failed to read OAuth credential: %w", err)
 	}
-	configured := err == nil &&
-		cred.Secrets["MCP_URL"] == entry.Spec.Manifest.RemoteConfig.FixedURL &&
-		cred.Secrets["GENERATION"] != ""
+	configured := err == nil && gclient.MCPStaticOAuthCredentialReady(cred.Secrets, entry.Spec.Manifest.RemoteConfig.FixedURL)
 
 	var clientID string
 	var generation string
@@ -1896,8 +1894,7 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 	replaceStaleCredential := false
 	existingCredential, err := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, "oauth")
 	if err == nil {
-		existingURL := existingCredential.Secrets["MCP_URL"]
-		if existingURL == entry.Spec.Manifest.RemoteConfig.FixedURL {
+		if gclient.MCPStaticOAuthCredentialReady(existingCredential.Secrets, entry.Spec.Manifest.RemoteConfig.FixedURL) {
 			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
 		}
 		replaceStaleCredential = true

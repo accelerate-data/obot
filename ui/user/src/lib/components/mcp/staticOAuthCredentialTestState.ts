@@ -34,7 +34,7 @@ export function succeedStaticOAuthCredentialTest(
 	if (state.status !== 'pending' || !proof.trim() || !Number.isFinite(expiry)) {
 		return { status: 'failed', failureCategory: 'invalid_test_result' };
 	}
-	return { ...state, status: 'succeeded', proof: proof.trim(), expiresAt };
+	return { ...state, status: 'succeeded', proof, expiresAt };
 }
 
 export function failStaticOAuthCredentialTest(

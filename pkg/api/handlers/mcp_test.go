@@ -1837,8 +1837,9 @@ func TestStaticOAuthCredentialReadyUsesCredentialStoreInsteadOfCachedStatus(t *t
 		Status: v1.MCPServerCatalogEntryStatus{OAuthCredentialConfigured: true},
 	}
 	gatewayClient := newOAuthCredentialTestGatewayClient(t)
+	storageClient := newFakeStorage(t, &entry)
 
-	release, ready, err := lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, entry)
+	release, _, ready, err := lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, storageClient, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name})
 	require.NoError(t, err)
 	release()
 	assert.False(t, ready, "stale configured status must not authorize creation after clear")
@@ -1848,10 +1849,73 @@ func TestStaticOAuthCredentialReadyUsesCredentialStoreInsteadOfCachedStatus(t *t
 		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
 	}))
 	entry.Status.OAuthCredentialConfigured = false
-	release, ready, err = lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, entry)
+	release, _, ready, err = lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, storageClient, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name})
 	require.NoError(t, err)
 	release()
-	assert.True(t, ready, "stale unconfigured status must not block creation after save")
+	assert.False(t, ready, "legacy credentials without provider binding and generation must fail closed")
+
+	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
+			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
+		},
+	}))
+	release, _, ready, err = lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, storageClient, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name})
+	require.NoError(t, err)
+	release()
+	assert.True(t, ready, "an exact provider-bound generated credential must authorize creation")
+}
+
+func TestCreateServerRereadsStaticOAuthProviderInsideCatalogMutationFence(t *testing.T) {
+	const catalogName = "default"
+	entry := staticOAuthTestEntry("entry-1", catalogName, "https://example.com/old")
+	entry.Spec.Manifest.Name = "entry-1"
+	storageClient := newFakeStorage(t,
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: catalogName, Namespace: system.DefaultNamespace}},
+		entry,
+	)
+	gatewayClient := newOAuthCredentialTestGatewayClient(t)
+	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
+			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
+		},
+	}))
+
+	releaseCatalogMutation, err := gatewayClient.AcquireCredentialLock(t.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	require.NoError(t, err)
+	req := newCreateServerSecretBindingRequest(t, storageClient, nil, catalogName, "", types.MCPServer{CatalogEntryID: entry.Name})
+	req.GatewayClient = gatewayClient
+	result := make(chan error, 1)
+	go func() {
+		result <- newCreateServerSecretBindingTestHandler().CreateServer(req)
+	}()
+
+	select {
+	case err := <-result:
+		releaseCatalogMutation()
+		t.Fatalf("server creation bypassed the catalog mutation fence: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	var updated v1.MCPServerCatalogEntry
+	require.NoError(t, storageClient.Get(t.Context(), kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name}, &updated))
+	updated.Spec.Manifest.RemoteConfig.FixedURL = "https://example.com/new"
+	require.NoError(t, storageClient.Update(t.Context(), &updated))
+	releaseCatalogMutation()
+
+	select {
+	case err := <-result:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "requires OAuth configuration")
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for fenced server creation")
+	}
+	var servers v1.MCPServerList
+	require.NoError(t, storageClient.List(t.Context(), &servers))
+	require.Empty(t, servers.Items)
 }
 
 // composite builds a composite catalog entry manifest from the given components.

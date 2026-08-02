@@ -271,9 +271,13 @@ func (h *Handler) CleanupUnusedOAuthCredentials(req router.Request, _ router.Res
 		return fmt.Errorf("failed to coordinate static OAuth cleanup with credential mutation: %w", err)
 	}
 	defer releaseCredentialLock()
-	deleted, err := h.gatewayClient.DeleteCredential(req.Ctx, credentialName, "oauth")
+	cleanupMCPIDs, err := staticOAuthCleanupTargetIDs(req, entry.Name)
 	if err != nil {
-		return fmt.Errorf("failed to delete OAuth credential: %w", err)
+		return err
+	}
+	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthCredential(req.Ctx, entry.Name, cleanupMCPIDs...)
+	if err != nil {
+		return fmt.Errorf("failed to clean up static OAuth state: %w", err)
 	}
 	if deleted {
 		log.Infof("Deleted unused static OAuth credential for MCP catalog entry: entry=%s", entry.Name)
@@ -316,8 +320,7 @@ func (h *Handler) EnsureOAuthCredentialStatus(req router.Request, _ router.Respo
 
 	var configured bool
 	if err == nil {
-		configured = credential.Secrets["MCP_URL"] == entry.Spec.Manifest.RemoteConfig.FixedURL &&
-			credential.Secrets["GENERATION"] != ""
+		configured = gclient.MCPStaticOAuthCredentialReady(credential.Secrets, entry.Spec.Manifest.RemoteConfig.FixedURL)
 	} else if !errors.As(err, &gclient.CredentialNotFoundError{}) {
 		return fmt.Errorf("failed to check credential status: %w", err)
 	}
@@ -351,13 +354,43 @@ func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) 
 	}
 	defer releaseCredentialLock()
 
-	deleted, err := h.gatewayClient.DeleteCredential(req.Ctx, credentialName, "oauth")
+	cleanupMCPIDs, err := staticOAuthCleanupTargetIDs(req, entry.Name)
 	if err != nil {
-		return fmt.Errorf("failed to delete OAuth credential: %w", err)
+		return err
+	}
+	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthCredential(req.Ctx, entry.Name, cleanupMCPIDs...)
+	if err != nil {
+		return fmt.Errorf("failed to remove static OAuth state: %w", err)
 	}
 	if deleted {
 		log.Infof("Removed static OAuth credential for deleted MCP catalog entry: entry=%s", entry.Name)
 	}
 
 	return nil
+}
+
+func staticOAuthCleanupTargetIDs(req router.Request, entryName string) ([]string, error) {
+	var servers v1.MCPServerList
+	if err := req.List(&servers, &kclient.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entryName),
+		Namespace:     system.DefaultNamespace,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list MCP servers for static OAuth cleanup: %w", err)
+	}
+	var instances v1.MCPServerInstanceList
+	if err := req.List(&instances, &kclient.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entryName),
+		Namespace:     system.DefaultNamespace,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to list MCP server instances for static OAuth cleanup: %w", err)
+	}
+
+	ids := make([]string, 0, len(servers.Items)+len(instances.Items))
+	for _, server := range servers.Items {
+		ids = append(ids, server.Name)
+	}
+	for _, instance := range instances.Items {
+		ids = append(ids, instance.Name)
+	}
+	return ids, nil
 }

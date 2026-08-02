@@ -127,8 +127,7 @@ func (h *MCPCatalogHandler) GetOAuthCredentialTest(req api.Context) error {
 	if err := req.Read(&statusRequest); err != nil {
 		return err
 	}
-	statusRequest.TestState = strings.TrimSpace(statusRequest.TestState)
-	if statusRequest.TestState == "" {
+	if strings.TrimSpace(statusRequest.TestState) == "" {
 		return types.NewErrBadRequest("testState is required")
 	}
 	result, err := h.gatewayClient.GetMCPStaticOAuthTestStatus(req.Context(), statusRequest.TestState, req.User.GetUID(), entry.Name)
