@@ -254,11 +254,7 @@
 				// The request layer reports the status-refresh failure separately.
 			}
 			if (
-				!(await staticOAuthSaveWasCommitted(
-					oauthStatus,
-					credentials.clientID,
-					credentials.proof
-				))
+				!(await staticOAuthSaveWasCommitted(oauthStatus, credentials.clientID, credentials.proof))
 			) {
 				throw error;
 			}
@@ -267,15 +263,29 @@
 		mcpServersAndEntries.refreshAll();
 	}
 
-	async function handleDeleteOAuth() {
+	async function handleDeleteOAuth(expectedGeneration: string) {
 		if (!oauthConfigEntry) return;
-		if (oauthConfigEntry.powerUserWorkspaceID) {
-			await UserService.deleteWorkspaceMCPCatalogEntryOAuthCredentials(
-				oauthConfigEntry.powerUserWorkspaceID,
-				oauthConfigEntry.id
-			);
-		} else {
-			await AdminService.deleteMCPCatalogEntryOAuthCredentials('default', oauthConfigEntry.id);
+		try {
+			if (oauthConfigEntry.powerUserWorkspaceID) {
+				await UserService.deleteWorkspaceMCPCatalogEntryOAuthCredentials(
+					oauthConfigEntry.powerUserWorkspaceID,
+					oauthConfigEntry.id,
+					expectedGeneration
+				);
+			} else {
+				await AdminService.deleteMCPCatalogEntryOAuthCredentials(
+					'default',
+					oauthConfigEntry.id,
+					expectedGeneration
+				);
+			}
+		} catch (error) {
+			try {
+				oauthStatus = await loadOAuthStatus(oauthConfigEntry);
+			} catch {
+				// Preserve the stale-generation error if the refresh also fails.
+			}
+			throw error;
 		}
 		// Refresh the table to update status
 		mcpServersAndEntries.refreshAll();

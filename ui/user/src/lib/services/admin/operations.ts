@@ -9,6 +9,7 @@ import {
 	doPatch,
 	doPost,
 	doPut,
+	doWithBody,
 	handleResponse,
 	type Fetcher,
 	type PaginatedResponse
@@ -929,9 +930,15 @@ export async function replaceMCPCatalogEntryOAuthCredentials(
 export async function deleteMCPCatalogEntryOAuthCredentials(
 	catalogID: string,
 	entryID: string,
-	opts?: { signal?: AbortSignal }
+	expectedGeneration: string,
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<void> {
-	await doDelete(`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credentials`, opts);
+	await doWithBody(
+		'DELETE',
+		`/mcp-catalogs/${catalogID}/entries/${entryID}/oauth-credentials`,
+		{ expectedGeneration },
+		opts
+	);
 }
 
 export async function refreshCompositeComponents(

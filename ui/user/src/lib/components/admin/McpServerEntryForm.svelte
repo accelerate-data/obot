@@ -1551,12 +1551,25 @@
 		}
 		staticOauthStatus = savedStatus;
 	}}
-	onDelete={async () => {
+	onDelete={async (expectedGeneration) => {
 		if (!entry || !id) return;
-		if (entity === 'workspace') {
-			await UserService.deleteWorkspaceMCPCatalogEntryOAuthCredentials(id, entry.id);
-		} else {
-			await AdminService.deleteMCPCatalogEntryOAuthCredentials(id, entry.id);
+		try {
+			if (entity === 'workspace') {
+				await UserService.deleteWorkspaceMCPCatalogEntryOAuthCredentials(
+					id,
+					entry.id,
+					expectedGeneration
+				);
+			} else {
+				await AdminService.deleteMCPCatalogEntryOAuthCredentials(id, entry.id, expectedGeneration);
+			}
+		} catch (error) {
+			try {
+				staticOauthStatus = await loadOAuthStatus(entry, id);
+			} catch {
+				// Preserve the stale-generation error if the refresh also fails.
+			}
+			throw error;
 		}
 		staticOauthStatus = {
 			...staticOauthStatus,

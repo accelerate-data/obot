@@ -184,7 +184,9 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 
 	newDeleteRequest := func(client storage.Client) api.Context {
 		req := api.Context{
-			Request:        httptest.NewRequest(http.MethodDelete, "/", nil),
+			Request: httptest.NewRequest(
+				http.MethodDelete, "/", strings.NewReader(`{"expectedGeneration":"generation-1"}`),
+			),
 			ResponseWriter: httptest.NewRecorder(),
 			Storage:        client,
 			GatewayClient:  gateway,
@@ -405,7 +407,7 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 				if err != nil {
 					t.Fatalf("read proof: %v", err)
 				}
-				if err := gateway.CommitMCPStaticOAuthCredential(t.Context(), result.Proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", false); err != nil {
+				if err := commitMCPStaticOAuthCredential(t.Context(), gateway, result.Proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", false); err != nil {
 					t.Fatalf("consume proof through commit: %v", err)
 				}
 				return started.TestState

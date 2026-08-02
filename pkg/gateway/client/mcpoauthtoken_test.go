@@ -500,14 +500,14 @@ func TestCommitMCPStaticOAuthCredentialFailsClosedWithoutCredentialEncryption(t 
 	state, conf := createStaticOAuthTest(t, c)
 	proof := completeSuccessfulStaticOAuthTest(t, c, state)
 
-	err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
+	err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
 	if !errors.Is(err, ErrMCPStaticOAuthEncryptionRequired) {
 		t.Fatalf("commit without credential encryption error = %v, want encryption required", err)
 	}
 	if _, err := c.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName("catalog-entry-1")}, "oauth"); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("unencrypted credential was stored: %v", err)
 	}
-	if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+	if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
 		t.Fatalf("failed commit left proof reusable: %v", err)
 	}
 }
@@ -634,7 +634,7 @@ func TestGetMCPStaticOAuthTestStatusTreatsUnknownConsumedAndCleanedProofsAsInval
 				t.Helper()
 				state, conf := createStaticOAuthTest(t, c)
 				proof := completeSuccessfulStaticOAuthTest(t, c, state)
-				if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); err != nil {
+				if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); err != nil {
 					t.Fatalf("commit proof: %v", err)
 				}
 				return state.TestState
@@ -753,7 +753,7 @@ func TestCommitMCPStaticOAuthCredentialAtomicallyStoresAndConsumesExactProof(t *
 	state, conf := createStaticOAuthTest(t, c)
 	proof := completeSuccessfulStaticOAuthTest(t, c, state)
 
-	if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); err != nil {
+	if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); err != nil {
 		t.Fatalf("commit initial static OAuth credential: %v", err)
 	}
 	credential, err := c.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName("catalog-entry-1")}, "oauth")
@@ -855,14 +855,14 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		state, conf := createStaticOAuthTest(t, c)
 		proof := completeSuccessfulStaticOAuthTest(t, c, state)
 
-		err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", "changed-client", conf.ClientSecret, false)
+		err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", "changed-client", conf.ClientSecret, false)
 		if !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
 			t.Fatalf("mismatched proof error = %v, want invalid proof", err)
 		}
 		if _, err := c.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName("catalog-entry-1")}, "oauth"); !errors.Is(err, gorm.ErrRecordNotFound) {
 			t.Fatalf("mismatched proof wrote credential: %v", err)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
 			t.Fatalf("mismatched attempt left proof reusable: %v", err)
 		}
 	})
@@ -879,7 +879,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		state, conf := createStaticOAuthTest(t, c)
 		proof := completeSuccessfulStaticOAuthTest(t, c, state)
 
-		err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
+		err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
 		if !errors.Is(err, ErrMCPStaticOAuthCredentialExists) {
 			t.Fatalf("initial commit error = %v, want credential exists", err)
 		}
@@ -890,7 +890,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
 			t.Fatalf("active credential changed: %#v", credential.Secrets)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
 			t.Fatalf("existing-credential rejection left proof reusable: %v", err)
 		}
 	})
@@ -911,7 +911,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 			t.Fatalf("install credential failure trigger: %v", err)
 		}
 
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err == nil {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err == nil {
 			t.Fatal("replacement succeeded despite injected upsert failure")
 		}
 		if err := c.db.WithContext(t.Context()).Exec(`DROP TRIGGER fail_oauth_credential_update`).Error; err != nil {
@@ -924,7 +924,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
 			t.Fatalf("active credential changed after rollback: %#v", credential.Secrets)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
 			t.Fatalf("failed upsert left proof reusable: %v", err)
 		}
 	})
@@ -945,7 +945,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 			t.Fatalf("install proof failure trigger: %v", err)
 		}
 
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err == nil {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err == nil {
 			t.Fatal("replacement succeeded despite injected proof delete failure")
 		}
 		if err := c.db.WithContext(t.Context()).Exec(`DROP TRIGGER fail_static_proof_delete`).Error; err != nil {
@@ -958,7 +958,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		if credential.Secrets["CLIENT_ID"] != "active-client" || credential.Secrets["CLIENT_SECRET"] != "active-secret" {
 			t.Fatalf("credential update survived proof-delete rollback: %#v", credential.Secrets)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
 			t.Fatalf("proof-delete rollback consumed proof: %v", err)
 		}
 	})
@@ -982,7 +982,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 			t.Fatalf("install token failure trigger: %v", err)
 		}
 
-		err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1")
+		err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1")
 		if err == nil {
 			t.Fatal("replacement succeeded despite injected token delete failure")
 		}
@@ -999,7 +999,7 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", "instance-1", "https://mcp.example/api"); err != nil {
 			t.Fatalf("active token was deleted despite rollback: %v", err)
 		}
-		if err := c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1"); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+		if err := c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true, "instance-1"); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
 			t.Fatalf("token-delete rollback left proof reusable: %v", err)
 		}
 	})
@@ -1026,7 +1026,7 @@ func TestCommitMCPStaticOAuthCredentialInvalidatesSiblingProofs(t *testing.T) {
 		t.Fatalf("first proof changed before replacement: static=%v status=%q user=%q mcp=%q url=%q clientIDMatch=%v secretMatch=%v", firstProof.StaticOAuthTest, firstProof.StaticOAuthTestStatus, firstProof.UserID, firstProof.MCPID, firstProof.URL, firstProof.ClientID == conf.ClientID, firstProof.ClientSecret == conf.ClientSecret)
 	}
 
-	if err := c.CommitMCPStaticOAuthCredential(t.Context(), firstSaveProof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
+	if err := c.commitMCPStaticOAuthCredential(t.Context(), firstSaveProof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, true); err != nil {
 		t.Fatalf("commit replacement: %v", err)
 	}
 	if _, err := c.GetMCPStaticOAuthTestStatus(t.Context(), secondState.TestState, "user-1", "catalog-entry-1"); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
@@ -1055,7 +1055,7 @@ func TestCommitMCPStaticOAuthCredentialAllowsOneConcurrentWinner(t *testing.T) {
 				return
 			}
 			defer release()
-			results <- c.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
+			results <- c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
 		}()
 	}
 	close(start)
@@ -1206,6 +1206,58 @@ func TestDeleteMCPStaticOAuthCredentialRetriesCleanupNotificationsAfterRowsAreGo
 	if !slices.Equal(triggered, []string{mcpID, mcpID}) {
 		t.Fatalf("cleanup notifications = %v, want retry for %q", triggered, mcpID)
 	}
+}
+
+func TestDeleteMCPStaticOAuthCredentialGenerationRejectsStaleClear(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName         = "catalog-entry-1"
+		mcpID             = "server-1"
+		currentGeneration = "generation-2"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "client",
+			"CLIENT_SECRET": "secret",
+			"MCP_URL":       "https://mcp.example/api",
+			"GENERATION":    currentGeneration,
+		},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: mcpID, UserID: "user-1", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed static OAuth grant: %v", err)
+	}
+
+	if _, err := c.DeleteMCPStaticOAuthCredentialGeneration(
+		t.Context(), entryName, "generation-1", mcpID,
+	); !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+		t.Fatalf("stale Clear error = %v, want catalog credential changed", err)
+	}
+	credential, err := c.RevealCredential(
+		t.Context(), []string{system.MCPOAuthCredentialName(entryName)}, "oauth",
+	)
+	if err != nil {
+		t.Fatalf("stale Clear removed current credential: %v", err)
+	}
+	if credential.Secrets["GENERATION"] != currentGeneration {
+		t.Fatalf("current credential changed: %#v", credential.Secrets)
+	}
+	if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, ""); err != nil {
+		t.Fatalf("stale Clear removed current grant: %v", err)
+	}
+}
+
+func (c *Client) commitMCPStaticOAuthCredential(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
+	claim, err := c.ClaimMCPStaticOAuthCredentialProof(ctx, state, userID, mcpID, mcpURL, clientID, clientSecret)
+	if err != nil {
+		return err
+	}
+	return c.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
 }
 
 func completeSuccessfulStaticOAuthTest(t *testing.T, c *Client, started MCPStaticOAuthTestStart) string {

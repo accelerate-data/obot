@@ -648,25 +648,44 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 	return c.triggerMCPOAuthTokenChanges(ctx, changedMCPIDs)
 }
 
-// CommitMCPStaticOAuthCredential claims the exact proof before attempting the
-// credential mutation. Any failure after a successful claim requires a new
-// OAuth test while leaving the prior credential and grants unchanged.
-func (c *Client) CommitMCPStaticOAuthCredential(ctx context.Context, state, userID, mcpID, mcpURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
-	claim, err := c.ClaimMCPStaticOAuthCredentialProof(ctx, state, userID, mcpID, mcpURL, clientID, clientSecret)
-	if err != nil {
-		return err
-	}
-	return c.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
-}
-
 // DeleteMCPStaticOAuthCredential removes the shared application, all pending
 // proofs for the entry, and every matching local user grant in one transaction.
 // The caller must hold the entry credential lock for the complete operation.
 func (c *Client) DeleteMCPStaticOAuthCredential(ctx context.Context, mcpID string, cleanupMCPIDs ...string) (bool, error) {
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, "", cleanupMCPIDs...)
+}
+
+// DeleteMCPStaticOAuthCredentialGeneration removes the shared application only
+// when it is still the exact generation reviewed by the caller.
+func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, mcpID, expectedGeneration string, cleanupMCPIDs ...string) (bool, error) {
+	if expectedGeneration == "" {
+		return false, ErrMCPOAuthCatalogCredentialChanged
+	}
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, expectedGeneration, cleanupMCPIDs...)
+}
+
+func (c *Client) deleteMCPStaticOAuthCredential(ctx context.Context, mcpID, expectedGeneration string, cleanupMCPIDs ...string) (bool, error) {
 	credentialContext := system.MCPOAuthCredentialName(mcpID)
 	var deleted bool
 	var changedMCPIDs []string
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if expectedGeneration != "" {
+			var current types.Credential
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("context = ? AND name = ?", credentialContext, "oauth").
+				First(&current).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err == nil {
+				if err := c.decryptCredential(ctx, &current); err != nil {
+					return fmt.Errorf("failed to decrypt static OAuth credential: %w", err)
+				}
+				if !secureStringEqual(current.Secrets["GENERATION"], expectedGeneration) {
+					return ErrMCPOAuthCatalogCredentialChanged
+				}
+			}
+		}
 		result := tx.Where("context = ? AND name = ?", credentialContext, "oauth").Delete(&types.Credential{})
 		if result.Error != nil {
 			return fmt.Errorf("failed to delete credential: %w", result.Error)

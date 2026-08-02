@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+const testStaticOAuthCredentialGeneration = "test-generation"
+
 func TestNormalizeName(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -428,7 +430,7 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 		if credential.Secrets["CLIENT_ID"] != "candidate-client" || credential.Secrets["CLIENT_SECRET"] != "candidate-secret" {
 			t.Fatalf("stored credential = %#v", credential.Secrets)
 		}
-		if err := gateway.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", true); !errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		if err := commitMCPStaticOAuthCredential(t.Context(), gateway, proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", true); !errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
 			t.Fatalf("saved proof was reusable: %v", err)
 		}
 		if strings.Contains(recorder.Body.String(), "candidate-secret") {
@@ -482,7 +484,7 @@ func TestSetOAuthCredentialsRequiresExactSuccessfulOneUseProof(t *testing.T) {
 		{name: "consumed proof", userID: "user-1", requestClient: "candidate-client", requestSecret: "candidate-secret", prepare: func(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry) string {
 			t.Helper()
 			proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
-			if err := gateway.CommitMCPStaticOAuthCredential(t.Context(), proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", false); err != nil {
+			if err := commitMCPStaticOAuthCredential(t.Context(), gateway, proof, "user-1", entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "candidate-client", "candidate-secret", false); err != nil {
 				t.Fatalf("consume proof through commit: %v", err)
 			}
 			if _, err := gateway.DeleteMCPStaticOAuthCredential(t.Context(), entry.Name); err != nil {
@@ -1072,7 +1074,10 @@ func TestReplaceOAuthCredentialsCannotRecreateApplicationAfterClear(t *testing.T
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: credentialName,
 		Name:    "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"},
+		Secrets: map[string]string{
+			"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret",
+			"GENERATION": testStaticOAuthCredentialGeneration,
+		},
 	}); err != nil {
 		t.Fatalf("seed active OAuth credential: %v", err)
 	}
@@ -1384,7 +1389,9 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 		{ObjectMeta: metav1.ObjectMeta{Name: "acr-a", Namespace: system.DefaultNamespace}, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
 		{ObjectMeta: metav1.ObjectMeta{Name: "acr-b", Namespace: system.DefaultNamespace}, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
 	}
-	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth", Secrets: map[string]string{
+		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
+	}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
 	if err := gateway.DeleteMCPOAuthTokenForAllUsers(t.Context(), "trigger-probe"); err != nil || triggered["trigger-probe"] != 1 {
@@ -1426,7 +1433,9 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 		Build()
 	recorder := httptest.NewRecorder()
 	req := api.Context{
-		Request:        httptest.NewRequest(http.MethodDelete, "/", nil),
+		Request: httptest.NewRequest(
+			http.MethodDelete, "/", strings.NewReader(`{"expectedGeneration":"`+testStaticOAuthCredentialGeneration+`"}`),
+		),
 		ResponseWriter: recorder,
 		Storage:        storage.Client(storageClient),
 		GatewayClient:  gateway,
@@ -1487,11 +1496,51 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 	}
 }
 
+func TestDeleteOAuthCredentialsRejectsStaleGenerationWithoutRemovingCurrentApp(t *testing.T) {
+	gateway := newOAuthCredentialTestGatewayClient(t)
+	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
+	credentialName := system.MCPOAuthCredentialName(entry.Name)
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: credentialName,
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID":     "current-client",
+			"CLIENT_SECRET": "current-secret",
+			"MCP_URL":       entry.Spec.Manifest.RemoteConfig.FixedURL,
+			"GENERATION":    "generation-2",
+		},
+	}); err != nil {
+		t.Fatalf("seed current OAuth credential: %v", err)
+	}
+	req := newDeleteOAuthCredentialRequest(t, gateway, entry)
+	req.Request = httptest.NewRequest(
+		http.MethodDelete,
+		"/",
+		strings.NewReader(`{"expectedGeneration":"generation-1"}`),
+	)
+	req.SetPathValue("catalog_id", "default")
+	req.SetPathValue("entry_id", entry.Name)
+
+	err := (&MCPCatalogHandler{gatewayClient: gateway}).DeleteOAuthCredentials(req)
+	if err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("stale Clear error = %v, want generation conflict", err)
+	}
+	credential, err := gateway.RevealCredential(t.Context(), []string{credentialName}, "oauth")
+	if err != nil {
+		t.Fatalf("stale Clear removed current OAuth credential: %v", err)
+	}
+	if credential.Secrets["GENERATION"] != "generation-2" {
+		t.Fatalf("current OAuth credential changed: %#v", credential.Secrets)
+	}
+}
+
 func TestDeleteOAuthCredentialsReturnsServerListFailure(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	credName := system.MCPOAuthCredentialName(entry.Name)
-	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{
+		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
+	}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
 	req := newDeleteOAuthCredentialRequest(t, gateway, entry)
@@ -1509,7 +1558,9 @@ func TestDeleteOAuthCredentialsReturnsInstanceListFailure(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	credName := system.MCPOAuthCredentialName(entry.Name)
-	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{
+		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
+	}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
 	req := newDeleteOAuthCredentialRequest(t, gateway, entry)
@@ -1540,7 +1591,9 @@ func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-2", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
 	}
 	credName := system.MCPOAuthCredentialName(entry.Name)
-	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{
+		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
+	}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
 	for _, instance := range instances {
@@ -1581,7 +1634,9 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
 	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
-	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret"}}); err != nil {
+	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{
+		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
+	}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
 	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
@@ -1596,7 +1651,7 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 	if _, err := gateway.RevealCredential(t.Context(), []string{credName}, "oauth"); !errors.As(err, &gatewayclient.CredentialNotFoundError{}) {
 		t.Fatalf("shared credential remained after first Clear: %v", err)
 	}
-	if err := handler.DeleteOAuthCredentials(req); err != nil {
+	if err := handler.DeleteOAuthCredentials(newDeleteOAuthCredentialRequest(t, gateway, entry, server, instance)); err != nil {
 		t.Fatalf("retry Clear after credential removal: %v", err)
 	}
 	if purgeAttempts != 3 {
@@ -1667,7 +1722,9 @@ func newDeleteOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client
 		WithObjects(allObjects...).
 		Build()
 	req := api.Context{
-		Request:        httptest.NewRequest(http.MethodDelete, "/", nil),
+		Request: httptest.NewRequest(
+			http.MethodDelete, "/", strings.NewReader(`{"expectedGeneration":"`+testStaticOAuthCredentialGeneration+`"}`),
+		),
 		ResponseWriter: httptest.NewRecorder(),
 		Storage:        storage.Client(storageClient),
 		GatewayClient:  gateway,
@@ -1726,6 +1783,14 @@ func newReplaceOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Clien
 
 func successfulStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) string {
 	return successfulStaticOAuthCredentialProofFor(t, gateway, entryName, fixedURL, userID, "candidate-client", "candidate-secret")
+}
+
+func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.Client, proof, userID, entryName, fixedURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
+	claim, err := gateway.ClaimMCPStaticOAuthCredentialProof(ctx, proof, userID, entryName, fixedURL, clientID, clientSecret)
+	if err != nil {
+		return err
+	}
+	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
 }
 
 func successfulStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID, clientID, clientSecret string) string {

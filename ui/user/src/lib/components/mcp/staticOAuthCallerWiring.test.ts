@@ -55,6 +55,15 @@ for (const caller of callers) {
 			]) {
 				assert.ok(source.includes(operation), `${caller.name} is missing ${operation}`);
 			}
+			assert.match(
+				source,
+				/onDelete=\{(?:handleDeleteOAuth|async \(expectedGeneration\))/,
+				`${caller.name} must clear the exact OAuth application generation it loaded`
+			);
+			assert.ok(
+				source.includes('expectedGeneration'),
+				`${caller.name} must forward the reviewed OAuth application generation`
+			);
 		}
 	});
 }
@@ -68,4 +77,22 @@ test('shared static OAuth modal keeps submitted values immutable and explains en
 	assert.match(modal, /id="clientID"[\s\S]*?disabled=\{loading\}/);
 	assert.match(modal, /name="clientSecret"[\s\S]*?disabled=\{loading\}/);
 	assert.match(modal, /all deployments remain[\s\S]*?all Users must reconnect/i);
+	assert.match(modal, /onDelete\?: \(expectedGeneration: string\)/);
+	assert.match(modal, /const expectedGeneration = oauthStatus\?\.generation/);
+	assert.match(modal, /Reload the OAuth application status before clearing credentials/);
+});
+
+test('static OAuth Clear services send the reviewed generation in a DELETE body', async () => {
+	for (const [name, url] of [
+		['admin', new URL('../../services/admin/operations.ts', import.meta.url)],
+		['workspace', new URL('../../services/user/operations.ts', import.meta.url)]
+	] as const) {
+		const source = await readFile(url, 'utf8');
+		assert.match(source, /doWithBody\(\s*'DELETE',[\s\S]*?\{ expectedGeneration \}/);
+		assert.match(
+			source,
+			/expectedGeneration: string/,
+			`${name} Clear service must require a generation`
+		);
+	}
 });

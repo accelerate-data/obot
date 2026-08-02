@@ -14,6 +14,8 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 
 	let configured = false;
 	let cleared = false;
+	let clearAttempts = 0;
+	let generation = 'initial-generation';
 	let statusLoadFailures = 1;
 	let saveFailures = 1;
 	let attempt = 0;
@@ -33,6 +35,7 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 					await json(route, {
 						configured,
 						clientID: configured ? clientID : undefined,
+						generation: configured ? generation : undefined,
 						callbackURL: 'http://127.0.0.1:18080/oauth/mcp/callback'
 					});
 					return;
@@ -40,13 +43,16 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 					savedBody = route.request().postDataJSON() as Record<string, string>;
 					if (saveFailures-- > 0) {
 						configured = true;
+						generation = 'ambiguous-generation';
 						await route.fulfill({ status: 500, body: 'ambiguous save failure' });
 						return;
 					}
 					configured = true;
+					generation = 'saved-generation';
 					await json(route, {
 						configured: true,
 						clientID,
+						generation,
 						callbackURL: 'http://127.0.0.1:18080/oauth/mcp/callback'
 					});
 					return;
@@ -57,13 +63,25 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 					} else {
 						replacedBody = replacement;
 					}
+					generation = `generation-${replacement.clientID}`;
 					await json(route, {
 						configured: true,
 						clientID: replacement.clientID,
+						generation,
 						callbackURL: 'http://127.0.0.1:18080/oauth/mcp/callback'
 					});
 					return;
 				case 'DELETE':
+					clearAttempts += 1;
+					expect(route.request().postDataJSON()).toEqual({ expectedGeneration: generation });
+					if (clearAttempts === 1) {
+						generation = 'externally-rotated-generation';
+						await route.fulfill({
+							status: 409,
+							body: 'OAuth application changed; reload its status before clearing'
+						});
+						return;
+					}
 					configured = false;
 					cleared = true;
 					await route.fulfill({ status: 204, body: '' });
@@ -202,6 +220,13 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 	await openStaticOAuthModal(page);
 	await dialog.getByRole('button', { name: 'Clear Credentials' }).click();
 	const confirm = page.getByRole('dialog').filter({ hasText: 'Confirm Delete' });
+	await confirm.getByRole('button', { name: "Yes, I'm sure" }).click();
+	await expect(confirm).not.toBeVisible();
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByText(/OAuth application changed/)).toBeVisible();
+	expect(cleared).toBe(false);
+
+	await dialog.getByRole('button', { name: 'Clear Credentials' }).click();
 	await confirm.getByRole('button', { name: "Yes, I'm sure" }).click();
 	await expect(confirm).not.toBeVisible();
 	expect(cleared).toBe(true);

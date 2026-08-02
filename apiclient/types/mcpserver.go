@@ -773,6 +773,12 @@ type MCPServerOAuthCredentialRequest struct {
 	Proof string `json:"proof"`
 }
 
+// MCPServerOAuthCredentialDeleteRequest protects Clear from deleting an app
+// that changed after the caller loaded its status.
+type MCPServerOAuthCredentialDeleteRequest struct {
+	ExpectedGeneration string `json:"expectedGeneration"`
+}
+
 // MCPServerOAuthCredentialStatus represents the status of OAuth credentials for an MCP server
 type MCPServerOAuthCredentialStatus struct {
 	// Configured is true if OAuth credentials have been set

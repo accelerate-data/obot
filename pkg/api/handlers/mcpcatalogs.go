@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"slices"
 	"sort"
@@ -2030,6 +2031,13 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	if err != nil {
 		return err
 	}
+	var clearRequest types.MCPServerOAuthCredentialDeleteRequest
+	if err := req.Read(&clearRequest); err != nil {
+		return err
+	}
+	if strings.TrimSpace(clearRequest.ExpectedGeneration) == "" {
+		return types.NewErrBadRequest("expectedGeneration is required")
+	}
 
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
@@ -2047,7 +2055,12 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	if err != nil {
 		return err
 	}
-	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredential(req.Context(), entry.Name, cleanupTargets.ids()...)
+	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredentialGeneration(
+		req.Context(), entry.Name, clearRequest.ExpectedGeneration, cleanupTargets.ids()...,
+	)
+	if errors.Is(err, gclient.ErrMCPOAuthCatalogCredentialChanged) {
+		return types.NewErrHTTP(http.StatusConflict, "OAuth application changed; reload its status before clearing")
+	}
 	if err != nil {
 		return err
 	}

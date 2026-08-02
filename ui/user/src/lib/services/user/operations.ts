@@ -24,6 +24,7 @@ import {
 	doPatch,
 	doPost,
 	doPut,
+	doWithBody,
 	handleResponse,
 	type Fetcher,
 	type PaginatedResponse
@@ -904,9 +905,15 @@ export async function replaceWorkspaceMCPCatalogEntryOAuthCredentials(
 export async function deleteWorkspaceMCPCatalogEntryOAuthCredentials(
 	workspaceID: string,
 	entryID: string,
-	opts?: { signal?: AbortSignal }
+	expectedGeneration: string,
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<void> {
-	await doDelete(`/workspaces/${workspaceID}/entries/${entryID}/oauth-credentials`, opts);
+	await doWithBody(
+		'DELETE',
+		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credentials`,
+		{ expectedGeneration },
+		opts
+	);
 }
 
 export async function generateWorkspaceMCPCatalogEntryToolPreviews(

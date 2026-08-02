@@ -173,6 +173,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/obot-platform/obot/apiclient/types.MCPServerList":                             schema_obot_platform_obot_apiclient_types_MCPServerList(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerManifest":                         schema_obot_platform_obot_apiclient_types_MCPServerManifest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerNeedingK8sUpdate":                 schema_obot_platform_obot_apiclient_types_MCPServerNeedingK8sUpdate(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialDeleteRequest":     schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialDeleteRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialRequest":           schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialStatus":            schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialStatus(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestRequest":       schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestRequest(ref),
@@ -8795,6 +8796,27 @@ func schema_obot_platform_obot_apiclient_types_MCPServerNeedingK8sUpdate(ref com
 					},
 				},
 				Required: []string{"mcpServerId"},
+			},
+		},
+	}
+}
+
+func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialDeleteRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "MCPServerOAuthCredentialDeleteRequest protects Clear from deleting an app that changed after the caller loaded its status.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"expectedGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+				},
+				Required: []string{"expectedGeneration"},
 			},
 		},
 	}

@@ -36,7 +36,7 @@
 			clientSecret: string;
 			proof: string;
 		}) => Promise<void>;
-		onDelete?: () => Promise<void>;
+		onDelete?: (expectedGeneration: string) => Promise<void>;
 		onSkip?: () => void;
 		onCancel?: () => void;
 		showSkip?: boolean;
@@ -260,12 +260,21 @@
 
 	async function handleDelete() {
 		if (!onDelete) return;
+		const expectedGeneration = oauthStatus?.generation;
+		if (!expectedGeneration) {
+			showDeleteConfirm = false;
+			dialog?.open();
+			error = 'Reload the OAuth application status before clearing credentials.';
+			return;
+		}
 		loading = true;
 		try {
-			await onDelete();
+			await onDelete(expectedGeneration);
 			showDeleteConfirm = false;
 			dialog?.close();
 		} catch (err) {
+			showDeleteConfirm = false;
+			dialog?.open();
 			error = err instanceof Error ? err.message : 'Failed to delete OAuth credentials';
 		} finally {
 			loading = false;
