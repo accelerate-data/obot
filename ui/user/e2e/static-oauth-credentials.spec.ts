@@ -56,7 +56,7 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 						callbackURL: 'http://127.0.0.1:18080/oauth/mcp/callback'
 					});
 					return;
-				case 'PUT':
+				case 'PUT': {
 					const replacement = route.request().postDataJSON() as Record<string, string>;
 					if (replacement.clientID === clientID) {
 						recoveredBody = replacement;
@@ -71,6 +71,7 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 						callbackURL: 'http://127.0.0.1:18080/oauth/mcp/callback'
 					});
 					return;
+				}
 				case 'DELETE':
 					clearAttempts += 1;
 					expect(route.request().postDataJSON()).toEqual({ expectedGeneration: generation });

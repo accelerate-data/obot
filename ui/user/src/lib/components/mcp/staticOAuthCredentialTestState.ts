@@ -91,9 +91,9 @@ export async function staticOAuthSaveWasCommitted(
 		return false;
 	}
 	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(proof));
-	const receipt = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
-		''
-	);
+	const receipt = Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, '0')
+	).join('');
 	return current.generation === receipt;
 }
 

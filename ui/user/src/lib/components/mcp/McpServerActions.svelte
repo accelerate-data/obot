@@ -870,11 +870,7 @@
 				// The request layer reports the status-refresh failure separately.
 			}
 			if (
-				!(await staticOAuthSaveWasCommitted(
-					oauthStatus,
-					credentials.clientID,
-					credentials.proof
-				))
+				!(await staticOAuthSaveWasCommitted(oauthStatus, credentials.clientID, credentials.proof))
 			) {
 				throw error;
 			}
