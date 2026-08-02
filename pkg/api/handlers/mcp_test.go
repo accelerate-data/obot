@@ -40,6 +40,18 @@ type conflictOnceStorage struct {
 	mutateOnError func(*v1.MCPServer)
 }
 
+type blockingResponseWriter struct {
+	*httptest.ResponseRecorder
+	started chan struct{}
+	release chan struct{}
+}
+
+func (w *blockingResponseWriter) WriteHeader(statusCode int) {
+	close(w.started)
+	<-w.release
+	w.ResponseRecorder.WriteHeader(statusCode)
+}
+
 func (c *conflictOnceStorage) Update(ctx context.Context, obj kclient.Object, opts ...kclient.UpdateOption) error {
 	c.updates++
 	if c.updates == 1 {
@@ -1916,6 +1928,107 @@ func TestCreateServerRereadsStaticOAuthProviderInsideCatalogMutationFence(t *tes
 	var servers v1.MCPServerList
 	require.NoError(t, storageClient.List(t.Context(), &servers))
 	require.Empty(t, servers.Items)
+}
+
+func TestCreateServerReleasesStaticOAuthFenceBeforeWritingResponse(t *testing.T) {
+	const catalogName = "default"
+	entry := staticOAuthTestEntry("entry-1", catalogName, "https://example.com/mcp")
+	entry.Spec.Manifest.Name = "entry-1"
+	storageClient := newFakeStorage(t,
+		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: catalogName, Namespace: system.DefaultNamespace}},
+		entry,
+	)
+	gatewayClient := newOAuthCredentialTestGatewayClient(t)
+	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
+			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
+		},
+	}))
+
+	response := &blockingResponseWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		started:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	req := newCreateServerSecretBindingRequest(t, storageClient, nil, catalogName, "", types.MCPServer{CatalogEntryID: entry.Name})
+	req.GatewayClient = gatewayClient
+	req.ResponseWriter = response
+	handlerResult := make(chan error, 1)
+	go func() {
+		handlerResult <- newCreateServerSecretBindingTestHandler().CreateServer(req)
+	}()
+
+	select {
+	case <-response.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the post-create response")
+	}
+
+	type lockResult struct {
+		release func()
+		err     error
+	}
+	locked := make(chan lockResult, 1)
+	go func() {
+		release, err := gatewayClient.AcquireCredentialLock(t.Context(), system.MCPOAuthCredentialName(entry.Name))
+		locked <- lockResult{release: release, err: err}
+	}()
+
+	select {
+	case result := <-locked:
+		require.NoError(t, result.err)
+		result.release()
+		close(response.release)
+		require.NoError(t, <-handlerResult)
+	case <-time.After(time.Second):
+		close(response.release)
+		require.NoError(t, <-handlerResult)
+		result := <-locked
+		if result.err == nil {
+			result.release()
+		}
+		t.Fatal("static OAuth credential mutation remained blocked while the response writer stalled")
+	}
+}
+
+func TestNonStaticCreateDoesNotAcquireStaticOAuthCredentialLock(t *testing.T) {
+	entry := staticOAuthTestEntry("entry-1", "default", "https://example.com/mcp")
+	entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = false
+	storageClient := newFakeStorage(t, entry)
+	gatewayClient := newOAuthCredentialTestGatewayClient(t)
+
+	releaseCredential, err := gatewayClient.AcquireCredentialLock(t.Context(), system.MCPOAuthCredentialName(entry.Name))
+	require.NoError(t, err)
+	type lockResult struct {
+		release func()
+		ready   bool
+		err     error
+	}
+	result := make(chan lockResult, 1)
+	go func() {
+		release, _, ready, err := lockStaticOAuthCredentialForCreate(
+			t.Context(), gatewayClient, storageClient,
+			kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name},
+		)
+		result <- lockResult{release: release, ready: ready, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		require.NoError(t, got.err)
+		require.True(t, got.ready)
+		got.release()
+		releaseCredential()
+	case <-time.After(time.Second):
+		releaseCredential()
+		got := <-result
+		if got.err == nil {
+			got.release()
+		}
+		t.Fatal("non-static entry creation waited on the static OAuth credential lock")
+	}
 }
 
 // composite builds a composite catalog entry manifest from the given components.

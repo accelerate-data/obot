@@ -1167,6 +1167,47 @@ func TestDeleteMCPOAuthTokenForAllUsersTriggersServerReconciliation(t *testing.T
 	}
 }
 
+func TestDeleteMCPStaticOAuthCredentialRetriesCleanupNotificationsAfterRowsAreGone(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "server-1"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: mcpID, UserID: "user-1", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed static OAuth grant: %v", err)
+	}
+
+	var triggered []string
+	failNotification := true
+	c.mcpOAuthTokenTrigger = func(_ context.Context, gotMCPID string) error {
+		triggered = append(triggered, gotMCPID)
+		if failNotification {
+			failNotification = false
+			return errors.New("injected notification failure")
+		}
+		return nil
+	}
+
+	if _, err := c.DeleteMCPStaticOAuthCredential(t.Context(), entryName, mcpID); err == nil {
+		t.Fatal("first delete succeeded despite injected notification failure")
+	}
+	if _, err := c.DeleteMCPStaticOAuthCredential(t.Context(), entryName, mcpID); err != nil {
+		t.Fatalf("retry static OAuth cleanup: %v", err)
+	}
+	if !slices.Equal(triggered, []string{mcpID, mcpID}) {
+		t.Fatalf("cleanup notifications = %v, want retry for %q", triggered, mcpID)
+	}
+}
+
 func completeSuccessfulStaticOAuthTest(t *testing.T, c *Client, started MCPStaticOAuthTestStart) string {
 	t.Helper()
 	if err := c.CompleteMCPStaticOAuthTest(t.Context(), started.CallbackState, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {

@@ -71,32 +71,52 @@ func TestDetectCompositeDriftMarksEntryNeedingUpdateWhenMultiUserComponentDrifts
 func TestStaticOAuthControllerCleanupRemovesCredentialProofsAndGrants(t *testing.T) {
 	for _, tt := range []struct {
 		name           string
+		runtime        types.Runtime
 		staticRequired bool
 		cleanup        func(*Handler, router.Request) error
 	}{
 		{
 			name:           "provider no longer requires static OAuth",
+			runtime:        types.RuntimeRemote,
 			staticRequired: false,
 			cleanup: func(handler *Handler, req router.Request) error {
 				return handler.CleanupUnusedOAuthCredentials(req, &router.ResponseWrapper{})
 			},
 		},
 		{
+			name:    "provider changed to a non-remote runtime",
+			runtime: types.RuntimeContainerized,
+			cleanup: func(handler *Handler, req router.Request) error {
+				return handler.CleanupUnusedOAuthCredentials(req, &router.ResponseWrapper{})
+			},
+		},
+		{
 			name:           "catalog entry deletion",
+			runtime:        types.RuntimeRemote,
 			staticRequired: true,
+			cleanup: func(handler *Handler, req router.Request) error {
+				return handler.RemoveOAuthCredentials(req, &router.ResponseWrapper{})
+			},
+		},
+		{
+			name:    "catalog entry deletion after a non-remote transition",
+			runtime: types.RuntimeContainerized,
 			cleanup: func(handler *Handler, req router.Request) error {
 				return handler.RemoveOAuthCredentials(req, &router.ResponseWrapper{})
 			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			entry := newMCPServerCatalogEntry("entry-1", types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
+			manifest := types.MCPServerCatalogEntryManifest{Runtime: tt.runtime}
+			if tt.runtime == types.RuntimeRemote {
+				manifest.RemoteConfig = &types.RemoteCatalogConfig{
 					FixedURL:            "https://mcp.example/api",
 					StaticOAuthRequired: tt.staticRequired,
-				},
-			})
+				}
+			} else {
+				manifest.ContainerizedConfig = &types.ContainerizedRuntimeConfig{Image: "example/mcp:latest"}
+			}
+			entry := newMCPServerCatalogEntry("entry-1", manifest)
 			server := newMCPServer("server-1", types.MCPServerManifest{Runtime: types.RuntimeRemote})
 			server.Spec.MCPServerCatalogEntryName = entry.Name
 			instance := &v1.MCPServerInstance{

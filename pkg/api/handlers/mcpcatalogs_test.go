@@ -1565,7 +1565,7 @@ func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 	}
 }
 
-func TestDeleteOAuthCredentialsRetryAfterTriggerFailureIsSafeNoOp(t *testing.T) {
+func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *testing.T) {
 	purgeAttempts := 0
 	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
 		if mcpID != "instance-a-user-1" {
@@ -1599,8 +1599,8 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureIsSafeNoOp(t *testing.T) 
 	if err := handler.DeleteOAuthCredentials(req); err != nil {
 		t.Fatalf("retry Clear after credential removal: %v", err)
 	}
-	if purgeAttempts != 2 {
-		t.Fatalf("token purge attempts = %d, want seed plus first Clear only", purgeAttempts)
+	if purgeAttempts != 3 {
+		t.Fatalf("token purge attempts = %d, want seed plus both Clear attempts", purgeAttempts)
 	}
 	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("user token remained after retry: %v", err)

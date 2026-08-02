@@ -698,7 +698,7 @@ func deleteMCPStaticOAuthTokens(tx *gorm.DB, catalogEntryName string, cleanupMCP
 	if err := scope.Delete(&types.MCPOAuthToken{}).Error; err != nil {
 		return nil, err
 	}
-	return mcpIDs, nil
+	return append(mcpIDs, cleanupMCPIDs...), nil
 }
 
 func (c *Client) triggerMCPOAuthTokenChanges(ctx context.Context, mcpIDs []string) error {

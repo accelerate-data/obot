@@ -245,18 +245,14 @@ func (*Handler) CleanupNestedCompositeEntries(req router.Request, _ router.Respo
 	return kclient.IgnoreNotFound(req.Client.Update(req.Ctx, entry))
 }
 
-// CleanupUnusedOAuthCredentials removes OAuth credentials for remote catalog entries
-// that no longer require static OAuth configuration.
+// CleanupUnusedOAuthCredentials removes entry-owned static OAuth state unless
+// the current catalog entry still uses it.
 func (h *Handler) CleanupUnusedOAuthCredentials(req router.Request, _ router.Response) error {
 	entry := req.Object.(*v1.MCPServerCatalogEntry)
 
-	// Only process remote entries
-	if entry.Spec.Manifest.Runtime != types.RuntimeRemote {
-		return nil
-	}
-
-	// Only cleanup if RemoteConfig exists and StaticOAuthRequired is false
-	if entry.Spec.Manifest.RemoteConfig != nil && entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+	if entry.Spec.Manifest.Runtime == types.RuntimeRemote &&
+		entry.Spec.Manifest.RemoteConfig != nil &&
+		entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
 		return nil
 	}
 
@@ -338,10 +334,6 @@ func (h *Handler) EnsureOAuthCredentialStatus(req router.Request, _ router.Respo
 func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) error {
 	entry := req.Object.(*v1.MCPServerCatalogEntry)
 
-	// Only process remote entries
-	if entry.Spec.Manifest.Runtime != types.RuntimeRemote {
-		return nil
-	}
 	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
 	if err != nil {
 		return fmt.Errorf("failed to coordinate static OAuth removal with catalog mutation: %w", err)

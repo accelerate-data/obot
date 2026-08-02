@@ -1669,24 +1669,28 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
 	if catalogEntrySnapshot != nil {
-		releaseOAuthCredential, currentEntry, oauthCredentialReady, err := lockStaticOAuthCredentialForCreate(
-			req.Context(),
-			req.GatewayClient,
-			req.Storage,
-			kclient.ObjectKey{Namespace: req.Namespace(), Name: catalogEntrySnapshot.Name},
-		)
-		if err != nil {
-			return fmt.Errorf("failed to check static OAuth credential: %w", err)
+		if err := func() error {
+			releaseOAuthCredential, currentEntry, oauthCredentialReady, err := lockStaticOAuthCredentialForCreate(
+				req.Context(),
+				req.GatewayClient,
+				req.Storage,
+				kclient.ObjectKey{Namespace: req.Namespace(), Name: catalogEntrySnapshot.Name},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to check static OAuth credential: %w", err)
+			}
+			defer releaseOAuthCredential()
+			if !oauthCredentialReady {
+				return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
+			}
+			if utils.Digest(currentEntry.Spec) != utils.Digest(catalogEntrySnapshot.Spec) {
+				return types.NewErrBadRequest("catalog entry changed while the server was being prepared; retry creation")
+			}
+			return req.Create(&server)
+		}(); err != nil {
+			return err
 		}
-		defer releaseOAuthCredential()
-		if !oauthCredentialReady {
-			return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
-		}
-		if utils.Digest(currentEntry.Spec) != utils.Digest(catalogEntrySnapshot.Spec) {
-			return types.NewErrBadRequest("catalog entry changed while the server was being prepared; retry creation")
-		}
-	}
-	if err := req.Create(&server); err != nil {
+	} else if err := req.Create(&server); err != nil {
 		return err
 	}
 
@@ -1724,6 +1728,15 @@ func lockStaticOAuthCredentialForCreate(ctx context.Context, gatewayClient *gate
 	if err != nil {
 		return func() {}, entry, false, err
 	}
+	if err := reader.Get(ctx, entryKey, &entry); err != nil {
+		releaseCatalogMutation()
+		return func() {}, entry, false, err
+	}
+	if entry.Spec.Manifest.Runtime != types.RuntimeRemote ||
+		entry.Spec.Manifest.RemoteConfig == nil ||
+		!entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+		return releaseCatalogMutation, entry, true, nil
+	}
 	credentialName := system.MCPOAuthCredentialName(entryKey.Name)
 	releaseCredential, err := gatewayClient.AcquireCredentialLock(ctx, credentialName)
 	if err != nil {
@@ -1733,13 +1746,6 @@ func lockStaticOAuthCredentialForCreate(ctx context.Context, gatewayClient *gate
 	release := func() {
 		releaseCredential()
 		releaseCatalogMutation()
-	}
-	if err := reader.Get(ctx, entryKey, &entry); err != nil {
-		release()
-		return func() {}, entry, false, err
-	}
-	if entry.Spec.Manifest.RemoteConfig == nil || !entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
-		return release, entry, true, nil
 	}
 	credential, err := gatewayClient.RevealCredential(ctx, []string{credentialName}, "oauth")
 	if err != nil {
