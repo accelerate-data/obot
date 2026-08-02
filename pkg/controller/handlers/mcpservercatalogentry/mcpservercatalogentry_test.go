@@ -171,6 +171,57 @@ func TestStaticOAuthControllerCleanupRemovesCredentialProofsAndGrants(t *testing
 	}
 }
 
+func TestStaticOAuthControllerCleanupPreservesRestoredProviderState(t *testing.T) {
+	staleEntry := newMCPServerCatalogEntry("entry-1", types.MCPServerCatalogEntryManifest{
+		Runtime: types.RuntimeRemote,
+		RemoteConfig: &types.RemoteCatalogConfig{
+			FixedURL: "https://mcp.example/api",
+		},
+	})
+	storageClient := newFakeClient(staleEntry)
+	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate())
+	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
+
+	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(staleEntry.Name),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
+	}))
+	require.NoError(t, services.DB.DB.Create(&gatewaytypes.MCPOAuthToken{
+		MCPID: "deployment-1", UserID: "user-1", CatalogEntryName: staleEntry.Name,
+	}).Error)
+
+	releaseCatalogMutationLock, err := gateway.AcquireCredentialLock(t.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	require.NoError(t, err)
+	defer releaseCatalogMutationLock()
+
+	cleanupDone := make(chan error, 1)
+	go func() {
+		cleanupDone <- NewHandler(gateway).CleanupUnusedOAuthCredentials(router.Request{
+			Client: storageClient, Ctx: t.Context(), Object: staleEntry,
+			Namespace: staleEntry.Namespace, Name: staleEntry.Name,
+		}, &router.ResponseWrapper{})
+	}()
+
+	restoredEntry := staleEntry.DeepCopy()
+	restoredEntry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = true
+	require.NoError(t, storageClient.Update(t.Context(), restoredEntry))
+	releaseCatalogMutationLock()
+	require.NoError(t, <-cleanupDone)
+
+	_, err = gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(staleEntry.Name)}, "oauth")
+	require.NoError(t, err)
+	var retainedGrants int64
+	require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
+		Where("catalog_entry_name = ?", staleEntry.Name).Count(&retainedGrants).Error)
+	require.EqualValues(t, 1, retainedGrants)
+}
+
 func TestEnsureOAuthCredentialStatusFailsClosedForIncompleteCredential(t *testing.T) {
 	entry := newMCPServerCatalogEntry("entry-1", types.MCPServerCatalogEntryManifest{
 		Runtime: types.RuntimeRemote,

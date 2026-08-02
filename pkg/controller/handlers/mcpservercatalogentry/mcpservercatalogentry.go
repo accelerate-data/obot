@@ -261,6 +261,20 @@ func (h *Handler) CleanupUnusedOAuthCredentials(req router.Request, _ router.Res
 		return fmt.Errorf("failed to coordinate static OAuth cleanup with catalog mutation: %w", err)
 	}
 	defer releaseCatalogMutationLock()
+
+	// Reconcile from authoritative state after acquiring the mutation lock so a
+	// stale cleanup request cannot delete an application restored while it waited.
+	var currentEntry v1.MCPServerCatalogEntry
+	if err := req.Client.Get(req.Ctx, router.Key(entry.Namespace, entry.Name), &currentEntry); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to confirm static OAuth cleanup is still required: %w", err)
+		}
+	} else if currentEntry.Spec.Manifest.Runtime == types.RuntimeRemote &&
+		currentEntry.Spec.Manifest.RemoteConfig != nil &&
+		currentEntry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+		return nil
+	}
+
 	credentialName := system.MCPOAuthCredentialName(entry.Name)
 	releaseCredentialLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, credentialName)
 	if err != nil {
