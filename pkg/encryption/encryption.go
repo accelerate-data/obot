@@ -180,7 +180,11 @@ func validateManagedKeyID(keyID string) error {
 		return fmt.Errorf("custom encryption key ID must be 1-64 URL-safe characters")
 	}
 	for _, char := range keyID {
-		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '.' || char == '_' || char == '-') {
+		urlSafe := (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '.' || char == '_' || char == '-'
+		if !urlSafe {
 			return fmt.Errorf("custom encryption key ID must be 1-64 URL-safe characters")
 		}
 	}

@@ -88,7 +88,7 @@ func TestExchangeAndPersistOAuthDebuggerTokenForDirectDynamicAndCIMD(t *testing.
 
 func TestExchangeOAuthDebuggerTokenBlocksStaticCatalogPrivateTokenEndpoint(t *testing.T) {
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("restricted client reached the private token endpoint")
+		t.Error("restricted client reached the private token endpoint")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(provider.Close)

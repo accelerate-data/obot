@@ -253,6 +253,7 @@ func TestTokenStorePreservesLegacyDynamicGrantRefresh(t *testing.T) {
 }
 
 func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) *gateway.Client {
+	t.Helper()
 	client, _ := newCatalogTokenStoreTestClientWithStorage(t, entryName, mcpID, staticOAuthRequired)
 	return client
 }

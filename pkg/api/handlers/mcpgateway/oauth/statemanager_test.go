@@ -6,18 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/obot-platform/nanobot/pkg/safehttp"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/pkg/api"
-	apihandlers "github.com/obot-platform/obot/pkg/api/handlers"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
-	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -26,7 +22,6 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apiserver/pkg/authentication/user"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -46,7 +41,7 @@ func TestStateManagerBlocksStaticCatalogTokenExchangeToPrivateAddress(t *testing
 		},
 	}))
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Fatal("restricted client reached the private token endpoint")
+		t.Error("restricted client reached the private token endpoint")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(provider.Close)
@@ -264,72 +259,6 @@ func TestStateManagerPersistsDirectDynamicAndCIMDCallbacks(t *testing.T) {
 			require.Empty(t, stored.CatalogEntryName)
 		})
 	}
-}
-
-func changeStaticCatalogApp(t *testing.T, gatewayClient *gateway.Client, entryName, mcpID, mcpURL string, clearCredential bool) error {
-	t.Helper()
-	entry := &v1.MCPServerCatalogEntry{
-		ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
-		Spec: v1.MCPServerCatalogEntrySpec{
-			MCPCatalogName: "default",
-			Manifest: apitypes.MCPServerCatalogEntryManifest{
-				RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL, StaticOAuthRequired: true},
-			},
-		},
-	}
-	instance := &v1.MCPServerInstance{
-		ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
-		Spec: v1.MCPServerInstanceSpec{
-			UserID:                    "user-1",
-			MCPServerCatalogEntryName: entryName,
-		},
-	}
-	storageClient := clientfake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object kclient.Object) []string {
-			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
-		}).
-		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object kclient.Object) []string {
-			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
-		}).
-		WithObjects(
-			&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: "default"}},
-			entry,
-			instance,
-		).
-		Build()
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodDelete, "/", nil)
-	if !clearCredential {
-		started, err := gatewayClient.CreateMCPStaticOAuthTest(t.Context(), "user-1", entryName, mcpURL, "verifier", &oauth2.Config{
-			ClientID: "client-1", ClientSecret: "secret-2",
-		})
-		if err != nil {
-			return err
-		}
-		if err := gatewayClient.CompleteMCPStaticOAuthTest(t.Context(), started.CallbackState, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); err != nil {
-			return err
-		}
-		result, err := gatewayClient.GetMCPStaticOAuthTestStatus(t.Context(), started.TestState, "user-1", entryName)
-		if err != nil {
-			return err
-		}
-		request = httptest.NewRequest(http.MethodPut, "/", strings.NewReader(fmt.Sprintf(`{"clientID":"client-1","clientSecret":"secret-2","proof":%q}`, result.Proof)))
-	}
-	req := api.Context{
-		Request:        request,
-		ResponseWriter: recorder,
-		Storage:        storage.Client(storageClient),
-		GatewayClient:  gatewayClient,
-		User:           &user.DefaultInfo{Name: "owner", UID: "user-1"},
-	}
-	req.SetPathValue("catalog_id", "default")
-	req.SetPathValue("entry_id", entryName)
-	handler := apihandlers.NewMCPCatalogHandler("", "https://obot.example", "", nil, nil, gatewayClient, nil, "")
-	if clearCredential {
-		return handler.DeleteOAuthCredentials(req)
-	}
-	return handler.ReplaceOAuthCredentials(req)
 }
 
 func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.T) {

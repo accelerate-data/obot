@@ -1782,6 +1782,7 @@ func newReplaceOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Clien
 }
 
 func successfulStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) string {
+	t.Helper()
 	return successfulStaticOAuthCredentialProofFor(t, gateway, entryName, fixedURL, userID, "candidate-client", "candidate-secret")
 }
 
@@ -1810,6 +1811,7 @@ func successfulStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclien
 }
 
 func pendingStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) gatewayclient.MCPStaticOAuthTestStart {
+	t.Helper()
 	return pendingStaticOAuthCredentialProofFor(t, gateway, entryName, fixedURL, userID, "candidate-client", "candidate-secret")
 }
 
@@ -1823,16 +1825,6 @@ func pendingStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclient.C
 		t.Fatalf("create static OAuth test: %v", err)
 	}
 	return proof
-}
-
-type failingCredentialTransformer struct{}
-
-func (failingCredentialTransformer) TransformToStorage(context.Context, []byte, value.Context) ([]byte, error) {
-	return nil, errors.New("credential encryption unavailable")
-}
-
-func (failingCredentialTransformer) TransformFromStorage(_ context.Context, data []byte, _ value.Context) ([]byte, bool, error) {
-	return data, false, nil
 }
 
 type toggleCredentialReadErrorTransformer struct {
