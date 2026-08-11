@@ -66,7 +66,7 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2
 		conf.Scopes = strings.Split(mcpToken.Scopes, " ")
 	}
 	catalogEntryName := mcpToken.CatalogEntryName
-	if catalogEntryName == "" {
+	if catalogEntryName == "" && !mcp.IsContainerOAuthResource(mcpURL) {
 		catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, conf)
 		if err != nil {
 			return nil, nil, err
@@ -95,6 +95,9 @@ func (t *tokenStore) SetTokenConfig(ctx context.Context, mcpURL string, config *
 	fence, captured := t.catalogEntry[mcpURL]
 	t.mu.Unlock()
 	if !captured {
+		if mcp.IsContainerOAuthResource(mcpURL) {
+			return t.gatewayClient.ReplaceMCPOAuthToken(ctx, t.userID, t.mcpID, mcpURL, "", config, token)
+		}
 		var err error
 		fence.entryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, config)
 		if err != nil {

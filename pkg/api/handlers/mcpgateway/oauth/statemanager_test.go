@@ -6,14 +6,18 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
+	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/nanobot/pkg/safehttp"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -25,6 +29,58 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type emptyContainerOAuthTokenStore struct{}
+
+func (emptyContainerOAuthTokenStore) ForUserAndMCP(string, string) nmcp.TokenStorage {
+	return emptyContainerOAuthUserStore{}
+}
+
+type emptyContainerOAuthUserStore struct{}
+
+func (emptyContainerOAuthUserStore) GetTokenConfig(context.Context, string) (*oauth2.Config, *oauth2.Token, error) {
+	return nil, nil, nil
+}
+func (emptyContainerOAuthUserStore) SetTokenConfig(context.Context, string, *oauth2.Config, *oauth2.Token) error {
+	return nil
+}
+func (emptyContainerOAuthUserStore) DeleteTokenConfig(context.Context, string) error { return nil }
+
+func TestContainerOAuthCheckStartsEntraAuthorizationWithPKCE(t *testing.T) {
+	const instanceID = "mcp-server-instance-user-1"
+	gateway := newStateManagerTestClient(t, "entry-1", instanceID)
+	factory := &MCPOAuthHandlerFactory{
+		baseURL:    "https://obot.example",
+		stateMgr:   newStateManager(gateway),
+		tokenStore: emptyContainerOAuthTokenStore{},
+	}
+	container := &apitypes.ContainerizedRuntimeConfig{OAuth: &apitypes.ContainerOAuthConfig{
+		Provider: apitypes.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
+		ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
+	}}
+	server := v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: apitypes.MCPServerManifest{
+		Runtime: apitypes.RuntimeContainerized, ContainerizedConfig: container,
+	}}}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	authURL, err := factory.CheckForMCPAuth(api.Context{Request: request}, server, mcp.ServerConfig{
+		Runtime: apitypes.RuntimeContainerized, MCPServerName: "shared-fabric", Env: []string{
+			"INSTANCE=https://login.microsoftonline.com/", "TENANT=tenant-1", "CLIENT=client-1", "SECRET=secret-1",
+		},
+	}, "user-1", instanceID, "")
+	require.NoError(t, err)
+	parsed, err := url.Parse(authURL)
+	require.NoError(t, err)
+	require.Equal(t, "https://login.microsoftonline.com/tenant-1/oauth2/v2.0/authorize", parsed.Scheme+"://"+parsed.Host+parsed.Path)
+	require.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
+	require.NotEmpty(t, parsed.Query().Get("code_challenge"))
+	require.Contains(t, parsed.Query().Get("scope"), "api://client-1/Mcp.Tools.ReadWrite")
+	require.Contains(t, parsed.Query().Get("scope"), "offline_access")
+	pending, err := gateway.GetMCPOAuthPendingState(t.Context(), parsed.Query().Get("state"))
+	require.NoError(t, err)
+	require.Equal(t, instanceID, pending.MCPID)
+	require.Equal(t, "urn:obot:container-oauth:shared-fabric", pending.URL)
+	require.Equal(t, "secret-1", pending.ClientSecret)
+}
 
 func TestStateManagerBlocksStaticCatalogTokenExchangeToPrivateAddress(t *testing.T) {
 	const (

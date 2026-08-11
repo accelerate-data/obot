@@ -98,6 +98,32 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 		// No component requires OAuth
 		log.Infof("Composite MCP server passed OAuth check with no pending component authentication: compositeMCPID=%s", mcpID)
 		return "", nil
+	} else if mcpServerConfig.Runtime == types.RuntimeContainerized && mcpServer.Spec.Manifest.ContainerizedConfig != nil && mcpServer.Spec.Manifest.ContainerizedConfig.OAuth != nil {
+		conf, resource, err := mcp.ResolveContainerOAuth(*mcpServer.Spec.Manifest.ContainerizedConfig, mcpServerConfig)
+		if err != nil {
+			return "", err
+		}
+		conf.RedirectURL = system.MCPOAuthCallbackURL(f.baseURL)
+		store := f.tokenStore.ForUserAndMCP(userID, mcpID)
+		storedConf, token, err := store.GetTokenConfig(req.Context(), resource)
+		if err != nil {
+			return "", fmt.Errorf("failed to read container OAuth grant: %w", err)
+		}
+		if token != nil && mcp.ContainerOAuthConfigMatches(storedConf, conf) {
+			return "", nil
+		}
+		if token != nil {
+			if err := store.DeleteTokenConfig(req.Context(), resource); err != nil {
+				return "", fmt.Errorf("failed to discard stale container OAuth grant: %w", err)
+			}
+		}
+
+		state := strings.ToLower(rand.Text())
+		verifier := oauth2.GenerateVerifier()
+		if err := f.stateMgr.store(req.Context(), userID, mcpID, resource, oauthAppAuthRequestID, "", state, verifier, conf); err != nil {
+			return "", fmt.Errorf("failed to start container OAuth: %w", err)
+		}
+		return conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier)), nil
 	} else if mcpServerConfig.Runtime != types.RuntimeRemote {
 		// Not a remote or composite server, no OAuth required
 		return "", nil

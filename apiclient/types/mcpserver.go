@@ -85,15 +85,34 @@ type NPXRuntimeConfig struct {
 
 // ContainerizedRuntimeConfig represents configuration for containerized runtime (Docker containers)
 type ContainerizedRuntimeConfig struct {
-	Image                 string   `json:"image"`                           // Required: Docker image name
-	Command               string   `json:"command,omitempty"`               // Optional: Override container command
-	Args                  []string `json:"args,omitempty"`                  // Optional: Container arguments
-	Port                  int      `json:"port"`                            // Required: Container port
-	Path                  string   `json:"path"`                            // Required: HTTP path for MCP endpoint
-	HealthzPath           string   `json:"healthzPath,omitempty"`           // Optional: HTTP path to check for readiness instead of probing the MCP endpoint
-	EgressDomains         []string `json:"egressDomains,omitempty"`         // Optional: Empty means allow all, otherwise allow only the listed domains when network policy enforcement is enabled
-	DenyAllEgress         *bool    `json:"denyAllEgress,omitempty"`         // Optional: Deny all egress when network policy enforcement is enabled
-	StartupTimeoutSeconds int      `json:"startupTimeoutSeconds,omitempty"` // Optional: Timeout to start and connect to the MCP server, in seconds. Defaults to 60s, max 600s.
+	Image         string   `json:"image"`                   // Required: Docker image name
+	Command       string   `json:"command,omitempty"`       // Optional: Override container command
+	Args          []string `json:"args,omitempty"`          // Optional: Container arguments
+	Port          int      `json:"port"`                    // Required: Container port
+	Path          string   `json:"path"`                    // Required: HTTP path for MCP endpoint
+	HealthzPath   string   `json:"healthzPath,omitempty"`   // Optional: HTTP path to check for readiness instead of probing the MCP endpoint
+	EgressDomains []string `json:"egressDomains,omitempty"` // Optional: Empty means allow all, otherwise allow only the listed domains when network policy enforcement is enabled
+	DenyAllEgress *bool    `json:"denyAllEgress,omitempty"` // Optional: Deny all egress when network policy enforcement is enabled
+	// StartupTimeoutSeconds is the timeout to start and connect to the MCP server, in seconds. It defaults to 60 seconds and has a maximum of 600 seconds.
+	StartupTimeoutSeconds int `json:"startupTimeoutSeconds,omitempty"`
+	// OAuth configures Obot-managed per-user OAuth for the shared container.
+	OAuth *ContainerOAuthConfig `json:"oauth,omitempty"`
+}
+
+type ContainerOAuthProvider string
+
+const ContainerOAuthProviderMicrosoftEntra ContainerOAuthProvider = "microsoftEntra"
+
+// ContainerOAuthConfig describes a deployment-owned OAuth application whose
+// values are read from the container's encrypted organization configuration.
+// Access and refresh tokens remain user-scoped and are never added to Env.
+type ContainerOAuthConfig struct {
+	Provider        ContainerOAuthProvider `json:"provider"`
+	AuthorityEnv    string                 `json:"authorityEnv"`
+	TenantIDEnv     string                 `json:"tenantIDEnv"`
+	ClientIDEnv     string                 `json:"clientIDEnv"`
+	ClientSecretEnv string                 `json:"clientSecretEnv"`
+	Scopes          []string               `json:"scopes"`
 }
 
 // RemoteRuntimeConfig represents configuration for remote runtime (External MCP servers)
@@ -647,6 +666,7 @@ func MapCatalogEntryToServer(catalogEntry MCPServerCatalogEntryManifest, userURL
 			EgressDomains:         catalogEntry.ContainerizedConfig.EgressDomains,
 			DenyAllEgress:         catalogEntry.ContainerizedConfig.DenyAllEgress,
 			StartupTimeoutSeconds: catalogEntry.ContainerizedConfig.StartupTimeoutSeconds,
+			OAuth:                 catalogEntry.ContainerizedConfig.OAuth.DeepCopy(),
 		}
 
 	case RuntimeRemote:
