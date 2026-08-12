@@ -14,6 +14,7 @@ import (
 	"github.com/obot-platform/nanobot/pkg/safehttp"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	mcpgateway "github.com/obot-platform/obot/pkg/api/handlers/mcpgateway"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -80,6 +81,50 @@ func TestContainerOAuthCheckStartsEntraAuthorizationWithPKCE(t *testing.T) {
 	require.Equal(t, instanceID, pending.MCPID)
 	require.Equal(t, "urn:obot:container-oauth:shared-fabric", pending.URL)
 	require.Equal(t, "secret-1", pending.ClientSecret)
+}
+
+func TestContainerOAuthCallbacksStoreSeparateGrantsForTwoUsers(t *testing.T) {
+	const (
+		mcpID    = "shared-fabric-deployment"
+		resource = "urn:obot:container-oauth:shared-fabric"
+	)
+	gateway := newStateManagerTestClient(t, "entry-1", mcpID)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		code := r.Form.Get("code")
+		require.Contains(t, []string{"user-a-code", "user-b-code"}, code)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"access_token":"%s-access","refresh_token":"%s-refresh","token_type":"Bearer"}`, code, code)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(gateway, provider.Client())
+	config := &oauth2.Config{
+		ClientID: "deployment-client", ClientSecret: "deployment-secret",
+		Endpoint:    oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL},
+		RedirectURL: "https://obot.example/oauth/mcp/callback",
+		Scopes:      []string{"api://deployment-client/Mcp.Tools.ReadWrite", "offline_access"},
+	}
+	for _, user := range []struct {
+		id, state, code string
+	}{
+		{id: "user-a", state: "state-a", code: "user-a-code"},
+		{id: "user-b", state: "state-b", code: "user-b-code"},
+	} {
+		require.NoError(t, manager.store(t.Context(), user.id, mcpID, resource, "", "", user.state, "verifier-"+user.id, config))
+		_, gotMCPID, err := manager.createToken(t.Context(), user.state, user.code, "", "")
+		require.NoError(t, err)
+		require.Equal(t, mcpID, gotMCPID)
+	}
+
+	store := mcpgateway.NewGlobalTokenStore(gateway)
+	_, tokenA, err := store.ForUserAndMCP("user-a", mcpID).GetTokenConfig(t.Context(), resource)
+	require.NoError(t, err)
+	_, tokenB, err := store.ForUserAndMCP("user-b", mcpID).GetTokenConfig(t.Context(), resource)
+	require.NoError(t, err)
+	require.Equal(t, "user-a-code-access", tokenA.AccessToken)
+	require.Equal(t, "user-b-code-access", tokenB.AccessToken)
+	require.NotEqual(t, tokenA.AccessToken, tokenB.AccessToken)
 }
 
 func TestStateManagerBlocksStaticCatalogTokenExchangeToPrivateAddress(t *testing.T) {

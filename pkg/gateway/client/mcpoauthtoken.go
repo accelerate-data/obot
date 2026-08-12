@@ -44,6 +44,12 @@ var (
 
 const mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
 
+const ContainerOAuthResourcePrefix = "urn:obot:container-oauth:"
+
+func IsContainerOAuthResource(resource string) bool {
+	return strings.HasPrefix(resource, ContainerOAuthResourcePrefix)
+}
+
 // MCPStaticOAuthCredentialReady reports whether a stored application is
 // complete and bound to the current catalog provider generation.
 func MCPStaticOAuthCredentialReady(secrets map[string]string, fixedURL string) bool {
@@ -191,7 +197,7 @@ func (c *Client) CatalogEntryForStaticOAuthMCP(ctx context.Context, mcpID, url s
 // belongs to their flow rather than trusting a legacy state value.
 func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pendingState *types.MCPOAuthPendingState, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	catalogEntryName := pendingState.CatalogEntryName
-	if catalogEntryName == "" {
+	if catalogEntryName == "" && !IsContainerOAuthResource(pendingState.URL) {
 		var err error
 		catalogEntryName, err = c.CatalogEntryForStaticOAuthMCP(ctx, pendingState.MCPID, pendingState.URL)
 		if err != nil {

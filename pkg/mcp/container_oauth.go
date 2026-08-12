@@ -9,10 +9,9 @@ import (
 	"strings"
 
 	"github.com/obot-platform/obot/apiclient/types"
+	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"golang.org/x/oauth2"
 )
-
-const containerOAuthResourcePrefix = "urn:obot:container-oauth:"
 
 var (
 	containerOAuthTemplate = regexp.MustCompile(`\$\{([^}]+)\}`)
@@ -26,7 +25,7 @@ var (
 )
 
 func IsContainerOAuthResource(resource string) bool {
-	return strings.HasPrefix(resource, containerOAuthResourcePrefix)
+	return gateway.IsContainerOAuthResource(resource)
 }
 
 func ResolveContainerOAuth(container types.ContainerizedRuntimeConfig, server ServerConfig) (*oauth2.Config, string, error) {
@@ -91,7 +90,7 @@ func ResolveContainerOAuth(container types.ContainerizedRuntimeConfig, server Se
 		ClientID: env[descriptor.ClientIDEnv], ClientSecret: env[descriptor.ClientSecretEnv],
 		Endpoint: oauth2.Endpoint{AuthURL: base + "/authorize", TokenURL: base + "/token"},
 		Scopes:   scopes,
-	}, containerOAuthResourcePrefix + server.MCPServerName, nil
+	}, gateway.ContainerOAuthResourcePrefix + server.MCPServerName, nil
 }
 
 func ContainerOAuthConfigMatches(stored, current *oauth2.Config) bool {

@@ -66,13 +66,17 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context, mcpURL string) (*oauth2
 		conf.Scopes = strings.Split(mcpToken.Scopes, " ")
 	}
 	catalogEntryName := mcpToken.CatalogEntryName
-	if catalogEntryName == "" && !mcp.IsContainerOAuthResource(mcpURL) {
-		catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, conf)
-		if err != nil {
+	// Container OAuth grants are fenced by their stable deployment resource,
+	// not a remote static-OAuth catalog credential.
+	if !mcp.IsContainerOAuthResource(mcpURL) {
+		if catalogEntryName == "" {
+			catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, mcpURL, conf)
+			if err != nil {
+				return nil, nil, err
+			}
+		} else if err := t.gatewayClient.ValidateCatalogOAuthToken(ctx, t.mcpID, mcpURL, catalogEntryName, mcpToken.CatalogCredentialGeneration, conf); err != nil {
 			return nil, nil, err
 		}
-	} else if err := t.gatewayClient.ValidateCatalogOAuthToken(ctx, t.mcpID, mcpURL, catalogEntryName, mcpToken.CatalogCredentialGeneration, conf); err != nil {
-		return nil, nil, err
 	}
 	t.mu.Lock()
 	if t.catalogEntry == nil {
