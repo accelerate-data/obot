@@ -183,6 +183,14 @@ func TestMapCatalogEntryToServer_Containerized(t *testing.T) {
 			HealthzPath:   "/healthz",
 			EgressDomains: []string{},
 			DenyAllEgress: new(true),
+			OAuth: &ContainerOAuthConfig{
+				Provider:        ContainerOAuthProviderMicrosoftEntra,
+				AuthorityEnv:    "INSTANCE",
+				TenantIDEnv:     "TENANT",
+				ClientIDEnv:     "CLIENT",
+				ClientSecretEnv: "SECRET",
+				Scopes:          []string{"scope"},
+			},
 		},
 	}
 
@@ -221,6 +229,10 @@ func TestMapCatalogEntryToServer_Containerized(t *testing.T) {
 
 	if result.ContainerizedConfig.DenyAllEgress == nil || !*result.ContainerizedConfig.DenyAllEgress {
 		t.Errorf("Expected denyAllEgress true, got %v", result.ContainerizedConfig.DenyAllEgress)
+	}
+
+	if result.ContainerizedConfig.OAuth == nil || result.ContainerizedConfig.OAuth.ClientIDEnv != "CLIENT" {
+		t.Errorf("Expected OAuth descriptor to be copied, got %#v", result.ContainerizedConfig.OAuth)
 	}
 }
 

@@ -64,6 +64,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/obot-platform/obot/apiclient/types.ComponentServer":                           schema_obot_platform_obot_apiclient_types_ComponentServer(ref),
 		"github.com/obot-platform/obot/apiclient/types.CompositeCatalogConfig":                    schema_obot_platform_obot_apiclient_types_CompositeCatalogConfig(ref),
 		"github.com/obot-platform/obot/apiclient/types.CompositeRuntimeConfig":                    schema_obot_platform_obot_apiclient_types_CompositeRuntimeConfig(ref),
+		"github.com/obot-platform/obot/apiclient/types.ContainerOAuthConfig":                      schema_obot_platform_obot_apiclient_types_ContainerOAuthConfig(ref),
 		"github.com/obot-platform/obot/apiclient/types.ContainerizedRuntimeConfig":                schema_obot_platform_obot_apiclient_types_ContainerizedRuntimeConfig(ref),
 		"github.com/obot-platform/obot/apiclient/types.CustomS3Config":                            schema_obot_platform_obot_apiclient_types_CustomS3Config(ref),
 		"github.com/obot-platform/obot/apiclient/types.DefaultModelAlias":                         schema_obot_platform_obot_apiclient_types_DefaultModelAlias(ref),
@@ -2907,6 +2908,68 @@ func schema_obot_platform_obot_apiclient_types_CompositeRuntimeConfig(ref common
 	}
 }
 
+func schema_obot_platform_obot_apiclient_types_ContainerOAuthConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ContainerOAuthConfig describes a deployment-owned OAuth application whose values are read from the container's encrypted organization configuration. Access and refresh tokens remain user-scoped and are never added to Env.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"provider": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"authorityEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"tenantIDEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"clientIDEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"clientSecretEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"scopes": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Type:   []string{"string"},
+										Format: "",
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"provider", "authorityEnv", "tenantIDEnv", "clientIDEnv", "clientSecretEnv", "scopes"},
+			},
+		},
+	}
+}
+
 func schema_obot_platform_obot_apiclient_types_ContainerizedRuntimeConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -2988,15 +3051,23 @@ func schema_obot_platform_obot_apiclient_types_ContainerizedRuntimeConfig(ref co
 					},
 					"startupTimeoutSeconds": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Optional: Deny all egress when network policy enforcement is enabled",
+							Description: "StartupTimeoutSeconds is the timeout to start and connect to the MCP server, in seconds. It defaults to 60 seconds and has a maximum of 600 seconds.",
 							Type:        []string{"integer"},
 							Format:      "int32",
+						},
+					},
+					"oauth": {
+						SchemaProps: spec.SchemaProps{
+							Description: "OAuth configures Obot-managed per-user OAuth for the shared container.",
+							Ref:         ref("github.com/obot-platform/obot/apiclient/types.ContainerOAuthConfig"),
 						},
 					},
 				},
 				Required: []string{"image", "port", "path"},
 			},
 		},
+		Dependencies: []string{
+			"github.com/obot-platform/obot/apiclient/types.ContainerOAuthConfig"},
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/obot-platform/obot/pkg/gateway/client"
+	"github.com/obot-platform/obot/pkg/mcp"
 	"golang.org/x/oauth2"
 )
 
@@ -54,7 +55,7 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	}
 
 	exchangeContext := ctx
-	if ps.CatalogEntryName != "" && sm.staticOAuthHTTPClient != nil {
+	if (ps.CatalogEntryName != "" || mcp.IsContainerOAuthResource(ps.URL)) && sm.staticOAuthHTTPClient != nil {
 		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, sm.staticOAuthHTTPClient)
 	}
 	token, err := conf.Exchange(exchangeContext, code, oauth2.SetAuthURLParam("code_verifier", ps.Verifier))
