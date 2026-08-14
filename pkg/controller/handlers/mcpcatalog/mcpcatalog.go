@@ -916,14 +916,18 @@ func readCatalogDirectory[T any](catalog string) ([]T, error) {
 	return entries, nil
 }
 
+// Defaults shipped by earlier builds. Only these may be replaced on start-up;
+// any other source was chosen by the operator. Add to it when the default moves.
+var retiredDefaultCatalogSource = regexp.MustCompile(
+	`^((\./)?/?catalog|https://github\.com/obot-platform/mcp-catalog(\.git)?/?)$`)
+
 func (h *Handler) SetUpDefaultMCPCatalog(ctx context.Context, c client.Client) error {
 	var existing v1.MCPCatalog
 	if err := c.Get(ctx, router.Key(system.DefaultNamespace, system.DefaultCatalog), &existing); err == nil {
-		// TODO: Remove this migration logic once we've migrated all Obot deployments to the new catalog path.
-		if i := slices.IndexFunc(existing.Spec.SourceURLs, func(url string) bool {
-			matched, _ := regexp.MatchString(`^(\./)?/?catalog$`, url)
-			return matched
-		}); i >= 0 {
+		// The configured default seeds the catalog only at creation, so without
+		// this an upgraded deployment keeps an outdated source forever.
+		if i := slices.IndexFunc(existing.Spec.SourceURLs, retiredDefaultCatalogSource.MatchString); i >= 0 &&
+			h.defaultCatalogPath != "" && existing.Spec.SourceURLs[i] != h.defaultCatalogPath {
 			existing.Spec.SourceURLs[i] = h.defaultCatalogPath
 			if err := c.Update(ctx, &existing); err != nil {
 				return fmt.Errorf("failed to migrate default catalog: %w", err)
