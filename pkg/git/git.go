@@ -124,7 +124,7 @@ func Clone(ctx context.Context, repoURL, token, ref string) (dir string, commitS
 		parts := strings.SplitN(repoPath, "/", 2)
 		if len(parts) == 2 {
 			if err := checkGitHubRepoSize(ctx, parts[0], parts[1], maxRepoSizeMB, apiToken); err != nil {
-				if errors.Is(err, errRepoTooLarge) || isContextError(err) {
+				if shouldAbortRepositorySizeCheck(ctx, err) {
 					return "", "", nil, fmt.Errorf("repository size check failed: %w", err)
 				}
 				log.Warnf("GitHub repository size check failed; continuing with clone-time size limit: repo=%s error=%v", repoPath, err)
@@ -132,7 +132,7 @@ func Clone(ctx context.Context, repoURL, token, ref string) (dir string, commitS
 		}
 	case "gitlab.com":
 		if err := checkGitLabRepoSize(ctx, u.Host, repoPath, maxRepoSizeMB, token); err != nil {
-			if errors.Is(err, errRepoTooLarge) || isContextError(err) {
+			if shouldAbortRepositorySizeCheck(ctx, err) {
 				return "", "", nil, fmt.Errorf("repository size check failed: %w", err)
 			}
 			log.Warnf("GitLab repository size check failed; continuing with clone-time size limit: repo=%s error=%v", repoPath, err)
@@ -332,6 +332,10 @@ func isContextError(err error) bool {
 // githubRepoInfo represents repository information from the GitHub API.
 type githubRepoInfo struct {
 	Size int `json:"size"` // Size in KB
+}
+
+func shouldAbortRepositorySizeCheck(ctx context.Context, err error) bool {
+	return errors.Is(err, errRepoTooLarge) || ctx.Err() != nil
 }
 
 // checkGitHubRepoSize checks repo size via the GitHub API before cloning.

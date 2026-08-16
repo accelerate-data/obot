@@ -72,15 +72,103 @@ func TestSyncSkipsRecentCatalogAndForceSyncPrunesRemovedEntries(t *testing.T) {
 	require.NotContains(t, afterForce.Annotations, v1.MCPCatalogSyncAnnotation)
 }
 
+func TestSyncRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+
+	catalog := &v1.MCPCatalog{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "MCPCatalog",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      system.DefaultCatalog,
+			Namespace: system.DefaultNamespace,
+		},
+		Spec: v1.MCPCatalogSpec{
+			DisplayName: "Default",
+			SourceURLs:  []string{catalogDir},
+		},
+	}
+	storageClient := newCatalogFakeClient(catalog)
+	handler := &Handler{gatewayClient: newCatalogGatewayClient(t, storageClient)}
+
+	resp := &router.ResponseWrapper{}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, catalog), resp))
+	require.Equal(t, []string{"Alpha"}, catalogEntryManifestNames(ctx, t, storageClient))
+
+	failingCatalog := getCatalog(ctx, t, storageClient)
+	failingSource := filepath.Join(t.TempDir(), "missing")
+	failingCatalog.Spec.SourceURLs = []string{failingSource}
+	failingCatalog.Annotations[v1.MCPCatalogSyncAnnotation] = "true"
+	require.NoError(t, storageClient.Update(ctx, failingCatalog))
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), resp))
+	require.Equal(t, 30*time.Second, resp.Delay)
+	require.Equal(t, []string{"Alpha"}, catalogEntryManifestNames(ctx, t, storageClient))
+	require.Contains(t, getCatalog(ctx, t, storageClient).Status.SyncErrors, failingSource)
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), resp))
+	require.True(t, resp.Delay > 0 && resp.Delay <= 30*time.Second)
+}
+
+func TestSyncSystemRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+
+	catalog := &v1.SystemMCPCatalog{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "SystemMCPCatalog",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "system",
+			Namespace: system.DefaultNamespace,
+		},
+		Spec: v1.SystemMCPCatalogSpec{
+			DisplayName: "System",
+			SourceURLs:  []string{catalogDir},
+		},
+	}
+	storageClient := newCatalogFakeClient(catalog)
+	handler := &Handler{gatewayClient: newCatalogGatewayClient(t, storageClient)}
+
+	resp := &router.ResponseWrapper{}
+	require.NoError(t, handler.SyncSystem(syncRequestForObject(ctx, storageClient, catalog), resp))
+	require.Equal(t, []string{"Alpha"}, systemCatalogEntryManifestNames(ctx, t, storageClient))
+
+	failingCatalog := getSystemCatalog(ctx, t, storageClient, catalog.Name)
+	failingSource := filepath.Join(t.TempDir(), "missing")
+	failingCatalog.Spec.SourceURLs = []string{failingSource}
+	failingCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] = "true"
+	require.NoError(t, storageClient.Update(ctx, failingCatalog))
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, handler.SyncSystem(syncRequestForObject(ctx, storageClient, getSystemCatalog(ctx, t, storageClient, catalog.Name)), resp))
+	require.Equal(t, 30*time.Second, resp.Delay)
+	require.Equal(t, []string{"Alpha"}, systemCatalogEntryManifestNames(ctx, t, storageClient))
+	require.Contains(t, getSystemCatalog(ctx, t, storageClient, catalog.Name).Status.SyncErrors, failingSource)
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, handler.SyncSystem(syncRequestForObject(ctx, storageClient, getSystemCatalog(ctx, t, storageClient, catalog.Name)), resp))
+	require.True(t, resp.Delay > 0 && resp.Delay <= 30*time.Second)
+}
+
 func newCatalogFakeClient(objects ...kclient.Object) kclient.WithWatch {
 	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{v1.SchemeGroupVersion})
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("MCPCatalog"), meta.RESTScopeNamespace)
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("MCPServerCatalogEntry"), meta.RESTScopeNamespace)
+	restMapper.Add(v1.SchemeGroupVersion.WithKind("SystemMCPCatalog"), meta.RESTScopeNamespace)
+	restMapper.Add(v1.SchemeGroupVersion.WithKind("SystemMCPServerCatalogEntry"), meta.RESTScopeNamespace)
 
 	return fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
 		WithRESTMapper(restMapper).
-		WithStatusSubresource(&v1.MCPCatalog{}, &v1.MCPServerCatalogEntry{}).
+		WithStatusSubresource(&v1.MCPCatalog{}, &v1.MCPServerCatalogEntry{}, &v1.SystemMCPCatalog{}, &v1.SystemMCPServerCatalogEntry{}).
 		WithObjects(objects...).
 		Build()
 }
@@ -114,6 +202,17 @@ func syncRequest(ctx context.Context, storageClient kclient.WithWatch, catalog *
 	}
 }
 
+func syncRequestForObject(ctx context.Context, storageClient kclient.WithWatch, object kclient.Object) router.Request {
+	return router.Request{
+		Client:    storageClient,
+		Object:    object,
+		Ctx:       ctx,
+		Namespace: object.GetNamespace(),
+		Name:      object.GetName(),
+		Key:       object.GetNamespace() + "/" + object.GetName(),
+	}
+}
+
 func writeCatalogEntry(t *testing.T, dir, filename, name string) {
 	t.Helper()
 
@@ -140,11 +239,35 @@ func catalogEntryManifestNames(ctx context.Context, t *testing.T, storageClient 
 	return names
 }
 
+func systemCatalogEntryManifestNames(ctx context.Context, t *testing.T, storageClient kclient.Client) []string {
+	t.Helper()
+
+	var entries v1.SystemMCPServerCatalogEntryList
+	require.NoError(t, storageClient.List(ctx, &entries, kclient.InNamespace(system.DefaultNamespace)))
+	names := make([]string, 0, len(entries.Items))
+	for _, entry := range entries.Items {
+		names = append(names, entry.Spec.Manifest.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
 func getCatalog(ctx context.Context, t *testing.T, storageClient kclient.Client) *v1.MCPCatalog {
 	t.Helper()
 
 	var catalog v1.MCPCatalog
 	require.NoError(t, storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: system.DefaultCatalog}, &catalog))
+	if catalog.Annotations == nil {
+		catalog.Annotations = map[string]string{}
+	}
+	return &catalog
+}
+
+func getSystemCatalog(ctx context.Context, t *testing.T, storageClient kclient.Client, name string) *v1.SystemMCPCatalog {
+	t.Helper()
+
+	var catalog v1.SystemMCPCatalog
+	require.NoError(t, storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: name}, &catalog))
 	if catalog.Annotations == nil {
 		catalog.Annotations = map[string]string{}
 	}
