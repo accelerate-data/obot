@@ -59,6 +59,8 @@ const CatalogCredentialToolName = "catalog-source-tokens"
 
 const (
 	catalogReferenceSeparator = "::"
+	catalogSyncInterval       = time.Hour
+	catalogSyncFailureBackoff = 30 * time.Second
 
 	// These are used to force catalog sync on startup, used for times when changes are made to
 	// catalogs, and they must be synced on the next start.
@@ -101,8 +103,9 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	forceSync := mcpCatalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true" || mcpCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
 	if !forceSync && !mcpCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(mcpCatalog.Status.LastSyncTime.Time)
-		if timeSinceLastSync < time.Hour {
-			resp.RetryAfter(time.Hour - timeSinceLastSync)
+		syncInterval := catalogRetryInterval(mcpCatalog.Status.SyncErrors)
+		if timeSinceLastSync < syncInterval {
+			resp.RetryAfter(syncInterval - timeSinceLastSync)
 			return nil
 		}
 	}
@@ -172,9 +175,7 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 		}
 	}
 
-	// We want to refresh this every hour.
-	// TODO(g-linville): make this configurable.
-	resp.RetryAfter(time.Hour)
+	resp.RetryAfter(catalogRetryInterval(mcpCatalog.Status.SyncErrors))
 
 	// I know we don't want to do apply anymore. But we were doing it before in a different place.
 	// Now we're doing it here. It's not important enough to change right now.
@@ -203,6 +204,13 @@ func addSyncError(syncErrors map[string]string, sourceURL, errMsg string) {
 	} else {
 		syncErrors[sourceURL] = errMsg
 	}
+}
+
+func catalogRetryInterval(syncErrors map[string]string) time.Duration {
+	if len(syncErrors) > 0 {
+		return catalogSyncFailureBackoff
+	}
+	return catalogSyncInterval
 }
 
 // resolveCompositeSourceRefs rewrites GitOps portable component refs to stored
@@ -357,8 +365,9 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 	forceSync := systemCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] == "true" || systemCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
 	if !forceSync && !systemCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(systemCatalog.Status.LastSyncTime.Time)
-		if timeSinceLastSync < time.Hour {
-			resp.RetryAfter(time.Hour - timeSinceLastSync)
+		syncInterval := catalogRetryInterval(systemCatalog.Status.SyncErrors)
+		if timeSinceLastSync < syncInterval {
+			resp.RetryAfter(syncInterval - timeSinceLastSync)
 			return nil
 		}
 	}
@@ -422,7 +431,7 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 		}
 	}
 
-	resp.RetryAfter(time.Hour)
+	resp.RetryAfter(catalogRetryInterval(systemCatalog.Status.SyncErrors))
 
 	app := apply.New(req.Client).WithOwnerSubContext(fmt.Sprintf("system-catalog-%s", systemCatalog.Name))
 	if len(systemCatalog.Status.SyncErrors) > 0 {
