@@ -62,7 +62,14 @@ export default defineConfig(({ mode }) => {
 						name: 'server',
 						environment: 'node',
 						include: ['src/**/*.{test,spec}.{js,ts}'],
-						exclude: ['src/**/*.svelte.{test,spec}.{js,ts}', 'src/**/*.ssr.{test,spec}.{js,ts}']
+						exclude: [
+							'src/**/*.svelte.{test,spec}.{js,ts}',
+							'src/**/*.ssr.{test,spec}.{js,ts}',
+							// These source-wiring and timer tests use Node's native test runner so
+							// they can execute directly through --experimental-strip-types.
+							'src/lib/components/mcp/staticOAuthCallerWiring.test.ts',
+							'src/lib/components/mcp/staticOAuthCredentialTestState.test.ts'
+						]
 					}
 				}
 			]
