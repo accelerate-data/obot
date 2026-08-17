@@ -2,9 +2,11 @@ package mcpcatalog
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestSyncSkipsRecentCatalogAndForceSyncPrunesRemovedEntries(t *testing.T) {
@@ -70,6 +73,149 @@ func TestSyncSkipsRecentCatalogAndForceSyncPrunesRemovedEntries(t *testing.T) {
 
 	afterForce := getCatalog(ctx, t, storageClient)
 	require.NotContains(t, afterForce.Annotations, v1.MCPCatalogSyncAnnotation)
+}
+
+func TestSyncRefreshesRecentlySyncedCatalogOnRestart(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+	writeCatalogEntry(t, catalogDir, "beta.yaml", "Beta")
+
+	catalog := &v1.MCPCatalog{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "MCPCatalog",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      system.DefaultCatalog,
+			Namespace: system.DefaultNamespace,
+		},
+		Spec: v1.MCPCatalogSpec{
+			DisplayName: "Default",
+			SourceURLs:  []string{catalogDir},
+		},
+	}
+	storageClient := newCatalogSyncFakeClient(catalog)
+	gatewayClient := newCatalogGatewayClient(t, storageClient)
+
+	resp := &router.ResponseWrapper{}
+	handler := &Handler{gatewayClient: gatewayClient}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, catalog), resp))
+	require.ElementsMatch(t, []string{"Alpha", "Beta"}, catalogEntryManifestNames(ctx, t, storageClient))
+
+	// The source content changes while the last sync is still recent.
+	require.NoError(t, os.Remove(filepath.Join(catalogDir, "beta.yaml")))
+	writeCatalogEntry(t, catalogDir, "gamma.yaml", "Gamma")
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), resp))
+	require.ElementsMatch(t, []string{"Alpha", "Beta"}, catalogEntryManifestNames(ctx, t, storageClient))
+
+	sourceURLs := getCatalog(ctx, t, storageClient).Spec.SourceURLs
+	restarted := &Handler{gatewayClient: gatewayClient}
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, restarted.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), resp))
+	require.Equal(t, time.Hour, resp.Delay)
+	require.ElementsMatch(t, []string{"Alpha", "Gamma"}, catalogEntryManifestNames(ctx, t, storageClient))
+	require.Equal(t, sourceURLs, getCatalog(ctx, t, storageClient).Spec.SourceURLs)
+}
+
+func TestSyncSystemRefreshesRecentlySyncedCatalogOnRestart(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+	writeCatalogEntry(t, catalogDir, "beta.yaml", "Beta")
+
+	// Both are named "default" in a deployment, so both must refresh on a restart.
+	catalog := &v1.MCPCatalog{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "MCPCatalog",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      system.DefaultCatalog,
+			Namespace: system.DefaultNamespace,
+		},
+		Spec: v1.MCPCatalogSpec{
+			DisplayName: "Default",
+			SourceURLs:  []string{catalogDir},
+		},
+	}
+	systemCatalog := &v1.SystemMCPCatalog{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "SystemMCPCatalog",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      system.DefaultCatalog,
+			Namespace: system.DefaultNamespace,
+		},
+		Spec: v1.SystemMCPCatalogSpec{
+			DisplayName: "Default",
+			SourceURLs:  []string{catalogDir},
+		},
+	}
+	storageClient := newCatalogSyncFakeClient(catalog, systemCatalog)
+	gatewayClient := newCatalogGatewayClient(t, storageClient)
+
+	resp := &router.ResponseWrapper{}
+	handler := &Handler{gatewayClient: gatewayClient}
+	require.NoError(t, handler.SyncSystem(syncRequestForObject(ctx, storageClient, systemCatalog), resp))
+	require.ElementsMatch(t, []string{"Alpha", "Beta"}, systemCatalogEntryManifestNames(ctx, t, storageClient))
+
+	require.NoError(t, os.Remove(filepath.Join(catalogDir, "beta.yaml")))
+	writeCatalogEntry(t, catalogDir, "gamma.yaml", "Gamma")
+
+	restarted := &Handler{gatewayClient: gatewayClient}
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, restarted.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), resp))
+
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, restarted.SyncSystem(syncRequestForObject(ctx, storageClient, getSystemCatalog(ctx, t, storageClient, systemCatalog.Name)), resp))
+	require.Equal(t, time.Hour, resp.Delay)
+	require.ElementsMatch(t, []string{"Alpha", "Gamma"}, systemCatalogEntryManifestNames(ctx, t, storageClient))
+}
+
+// A sync that fails to apply has not refreshed anything, so the next one must retry.
+func TestStartupRefreshIsNotConsumedByAFailedApply(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+
+	catalog := &v1.MCPCatalog{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "MCPCatalog",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      system.DefaultCatalog,
+			Namespace: system.DefaultNamespace,
+		},
+		Spec: v1.MCPCatalogSpec{
+			DisplayName: "Default",
+			SourceURLs:  []string{catalogDir},
+		},
+	}
+	var applies atomic.Int32
+	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
+		Create: func(ctx context.Context, c kclient.WithWatch, obj kclient.Object, opts ...kclient.CreateOption) error {
+			if applies.Add(1) == 1 {
+				return errors.New("apply failed")
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}, catalog)
+	handler := &Handler{gatewayClient: newCatalogGatewayClient(t, storageClient)}
+
+	resp := &router.ResponseWrapper{}
+	require.Error(t, handler.Sync(syncRequest(ctx, storageClient, catalog), resp))
+	require.Empty(t, catalogEntryManifestNames(ctx, t, storageClient))
+
+	// LastSyncTime is already stamped, so without a retry the entries stay missing.
+	resp = &router.ResponseWrapper{}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), resp))
+	require.Equal(t, []string{"Alpha"}, catalogEntryManifestNames(ctx, t, storageClient))
 }
 
 func TestSyncRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testing.T) {
@@ -159,6 +305,10 @@ func TestSyncSystemRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testi
 }
 
 func newCatalogSyncFakeClient(objects ...kclient.Object) kclient.WithWatch {
+	return newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{}, objects...)
+}
+
+func newCatalogSyncFakeClientWithInterceptor(funcs interceptor.Funcs, objects ...kclient.Object) kclient.WithWatch {
 	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{v1.SchemeGroupVersion})
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("MCPCatalog"), meta.RESTScopeNamespace)
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("MCPServerCatalogEntry"), meta.RESTScopeNamespace)
@@ -184,6 +334,7 @@ func newCatalogSyncFakeClient(objects ...kclient.Object) kclient.WithWatch {
 		}).
 		WithStatusSubresource(&v1.MCPCatalog{}, &v1.MCPServerCatalogEntry{}, &v1.SystemMCPCatalog{}, &v1.SystemMCPServerCatalogEntry{}).
 		WithObjects(objects...).
+		WithInterceptorFuncs(funcs).
 		Build()
 }
 

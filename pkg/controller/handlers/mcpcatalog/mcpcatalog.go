@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/obot-platform/nah/pkg/apply"
@@ -46,12 +47,6 @@ const (
 	catalogReferenceSeparator = "::"
 	catalogSyncInterval       = time.Hour
 	catalogSyncFailureBackoff = 30 * time.Second
-
-	// These are used to force catalog sync on startup, used for times when changes are made to
-	// catalogs, and they must be synced on the next start.
-	forceSyncStartupAnnotation = "obot.ai/force-sync-startup"
-	// Bump this any time this functionality is needed.
-	startupSyncGeneration = "1"
 )
 
 type Handler struct {
@@ -63,6 +58,10 @@ type Handler struct {
 	remoteURLValidationConfig mcp.ValidationOptions
 	mcpBackend                string
 	mcpSessionManager         *mcp.SessionManager
+
+	// Catalogs this process has already synced. In memory on purpose: it empties on
+	// restart, which is when a fresh read is wanted.
+	startupSynced sync.Map
 }
 
 func New(defaultCatalogPath, defaultSystemCatalogPath string, gatewayClient *gclient.Client, accessControlRuleHelper *accesscontrolrule.Helper, mcpSessionManager *mcp.SessionManager) *Handler {
@@ -96,7 +95,11 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	validationOptions := h.remoteURLValidationConfig
 	validationOptions.ResourceMaximums = maximums
 
-	forceSync := mcpCatalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true" || mcpCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
+	requested := mcpCatalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true"
+	// A catalog and a system catalog are both named "default", so qualify the key.
+	startupKey := "mcpcatalog/" + mcpCatalog.Namespace + "/" + mcpCatalog.Name
+	_, syncedSinceStart := h.startupSynced.Load(startupKey)
+	forceSync := requested || !syncedSinceStart
 	if !forceSync && !mcpCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(mcpCatalog.Status.LastSyncTime.Time)
 		syncInterval := catalogRetryInterval(mcpCatalog.Status.SyncErrors)
@@ -168,12 +171,8 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	if err := req.Client.Status().Update(req.Ctx, mcpCatalog); err != nil {
 		return fmt.Errorf("failed to update catalog status: %w", err)
 	}
-	if forceSync {
+	if requested {
 		delete(mcpCatalog.Annotations, v1.MCPCatalogSyncAnnotation)
-		if mcpCatalog.Annotations == nil {
-			mcpCatalog.Annotations = make(map[string]string, 1)
-		}
-		mcpCatalog.Annotations[forceSyncStartupAnnotation] = startupSyncGeneration
 		if err := req.Client.Update(req.Ctx, mcpCatalog); err != nil {
 			return fmt.Errorf("failed to update catalog: %w", err)
 		}
@@ -203,7 +202,14 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 		return fmt.Errorf("failed to coordinate catalog sync with static OAuth: %w", err)
 	}
 	defer releaseCatalogMutationLock()
-	return app.Apply(req.Ctx, mcpCatalog, toAdd...)
+	if err := app.Apply(req.Ctx, mcpCatalog, toAdd...); err != nil {
+		return err
+	}
+
+	// Mark only after the apply succeeds, so a failure retries instead of waiting
+	// out the interval.
+	h.startupSynced.Store(startupKey, struct{}{})
+	return nil
 }
 
 func addSyncError(syncErrors map[string]string, sourceURL, errMsg string) {
@@ -520,7 +526,10 @@ func sourceRef(sourceID, entryKey string) string {
 func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 	systemCatalog := req.Object.(*v1.SystemMCPCatalog)
 
-	forceSync := systemCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] == "true" || systemCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
+	requested := systemCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] == "true"
+	startupKey := "systemmcpcatalog/" + systemCatalog.Namespace + "/" + systemCatalog.Name
+	_, syncedSinceStart := h.startupSynced.Load(startupKey)
+	forceSync := requested || !syncedSinceStart
 	if !forceSync && !systemCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(systemCatalog.Status.LastSyncTime.Time)
 		syncInterval := catalogRetryInterval(systemCatalog.Status.SyncErrors)
@@ -578,12 +587,8 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 	if err := req.Client.Status().Update(req.Ctx, systemCatalog); err != nil {
 		return fmt.Errorf("failed to update system catalog status: %w", err)
 	}
-	if forceSync {
+	if requested {
 		delete(systemCatalog.Annotations, v1.SystemMCPCatalogSyncAnnotation)
-		if systemCatalog.Annotations == nil {
-			systemCatalog.Annotations = make(map[string]string, 1)
-		}
-		systemCatalog.Annotations[forceSyncStartupAnnotation] = startupSyncGeneration
 		if err := req.Client.Update(req.Ctx, systemCatalog); err != nil {
 			return fmt.Errorf("failed to update system catalog: %w", err)
 		}
@@ -600,7 +605,12 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 		app = app.WithPruneTypes(&v1.SystemMCPServerCatalogEntry{})
 	}
 
-	return app.Apply(req.Ctx, systemCatalog, toAdd...)
+	if err := app.Apply(req.Ctx, systemCatalog, toAdd...); err != nil {
+		return err
+	}
+
+	h.startupSynced.Store(startupKey, struct{}{})
+	return nil
 }
 
 func (h *Handler) readSystemMCPCatalog(ctx context.Context, catalogName, sourceURL, token string) ([]client.Object, error) {
