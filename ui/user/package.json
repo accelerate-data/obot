@@ -48,7 +48,7 @@
 		"@lucide/svelte": "^1.21.0",
 		"@milkdown/crepe": "^7.21.2",
 		"@milkdown/kit": "^7.21.2",
-		"@playwright/test": "1.60.0",
+		"@playwright/test": "1.62.1",
 		"@sveltejs/adapter-auto": "^7.0.1",
 		"@sveltejs/adapter-node": "^5.5.4",
 		"@sveltejs/adapter-static": "^3.0.10",
