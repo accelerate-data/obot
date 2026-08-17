@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"maps"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -87,9 +88,7 @@ func MintTestJWT(t *testing.T, priv *rsa.PrivateKey, kid, iss, aud, sub string, 
 		"iat": now.Unix(),
 		"exp": now.Add(ttl).Unix(),
 	}
-	for k, v := range extra {
-		claims[k] = v
-	}
+	maps.Copy(claims, extra)
 	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	tok.Header["kid"] = kid
 	signed, err := tok.SignedString(priv)

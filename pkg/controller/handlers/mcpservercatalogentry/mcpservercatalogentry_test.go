@@ -130,7 +130,7 @@ func TestStaticOAuthControllerCleanupRemovesCredentialProofsAndGrants(t *testing
 			database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 			require.NoError(t, err)
 			require.NoError(t, database.AutoMigrate())
-			gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+			gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
 			t.Cleanup(func() { require.NoError(t, gateway.Close()) })
 
 			require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
@@ -184,7 +184,7 @@ func TestStaticOAuthControllerCleanupPreservesRestoredProviderState(t *testing.T
 	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, database.AutoMigrate())
-	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
 	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
 
 	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
@@ -236,7 +236,7 @@ func TestEnsureOAuthCredentialStatusFailsClosedForIncompleteCredential(t *testin
 	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, database.AutoMigrate())
-	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
 	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
 	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth",

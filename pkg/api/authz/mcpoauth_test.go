@@ -64,7 +64,7 @@ func TestMCPGroupAllowsMCPAndAnyGroupRoutes(t *testing.T) {
 }
 
 func TestUnauthenticatedOAuthCallbackAuthorizationIsExact(t *testing.T) {
-	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, false)
+	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, nil, false)
 	unauthenticatedUser := &user.DefaultInfo{
 		Name:   "anonymous",
 		UID:    "anonymous",
@@ -202,7 +202,7 @@ func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoutes(t *testing.T) {
 			UserID: "owner-uid",
 		},
 	}).Build()
-	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, false)
+	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
 	apiUser := &user.DefaultInfo{
 		Name:   "owner",
 		UID:    "owner-uid",
