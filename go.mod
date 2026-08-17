@@ -3,6 +3,11 @@ module github.com/obot-platform/obot
 go 1.26.5
 
 replace (
+	// Carries the Entra offline_access fix and forced-expiry refresh proof (VD-4128)
+	// on top of the pinned nanobot commit. Keep this owned fork pinned until an
+	// equivalent upstream release is available and verified.
+	github.com/obot-platform/nanobot => github.com/accelerate-data/nanobot v0.0.0-20260809055832-58d4794821ff
+
 	github.com/obot-platform/obot/apiclient => ./apiclient
 	github.com/obot-platform/obot/logger => ./logger
 )
@@ -91,6 +96,8 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/yaml v1.6.0
 )
+
+require github.com/coreos/go-oidc/v3 v3.18.0
 
 require (
 	cel.dev/expr v0.25.2 // indirect

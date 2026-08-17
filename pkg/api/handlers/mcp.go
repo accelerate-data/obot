@@ -1636,11 +1636,13 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 
 	var gitManagedEntry bool
 	var sourceCatalogEntryManifest *types.MCPServerCatalogEntryManifest
+	var catalogEntrySnapshot *v1.MCPServerCatalogEntry
 	if input.CatalogEntryID != "" {
 		var catalogEntry v1.MCPServerCatalogEntry
 		if err := req.Get(&catalogEntry, input.CatalogEntryID); err != nil {
 			return err
 		}
+		catalogEntrySnapshot = catalogEntry.DeepCopy()
 		sourceCatalogEntryManifest = catalogEntry.Spec.Manifest.DeepCopy()
 
 		// Validate that the catalog entry type is compatible with the route used.
@@ -1676,11 +1678,6 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 			if !hasAccess {
 				return types.NewErrForbidden("user does not have access to MCP server catalog entry")
 			}
-		}
-
-		// Block server creation if OAuth is required but not configured
-		if entryRequiresStaticOAuthCreds(catalogEntry) {
-			return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
 		}
 
 		// For multi-user catalog entries, preserve the catalog entry's runtime shape.
@@ -1734,7 +1731,29 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 	if err := mcp.ValidateTemplateReferences(server.Spec.Manifest); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
-	if err := req.Create(&server); err != nil {
+	if catalogEntrySnapshot != nil {
+		if err := func() error {
+			releaseOAuthCredential, currentEntry, oauthCredentialReady, err := lockStaticOAuthCredentialForCreate(
+				req.Context(),
+				req.GatewayClient,
+				req.Storage,
+				kclient.ObjectKey{Namespace: req.Namespace(), Name: catalogEntrySnapshot.Name},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to check static OAuth credential: %w", err)
+			}
+			defer releaseOAuthCredential()
+			if !oauthCredentialReady {
+				return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
+			}
+			if utils.Digest(currentEntry.Spec) != utils.Digest(catalogEntrySnapshot.Spec) {
+				return types.NewErrBadRequest("catalog entry changed while the server was being prepared; retry creation")
+			}
+			return req.Create(&server)
+		}(); err != nil {
+			return err
+		}
+	} else if err := req.Create(&server); err != nil {
 		return err
 	}
 
@@ -1764,6 +1783,42 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 	}
 
 	return req.WriteCreated(ConvertMCPServer(server, mergedEnv, m.serverURL, slug))
+}
+
+func lockStaticOAuthCredentialForCreate(ctx context.Context, gatewayClient *gateway.Client, reader kclient.Reader, entryKey kclient.ObjectKey) (func(), v1.MCPServerCatalogEntry, bool, error) {
+	var entry v1.MCPServerCatalogEntry
+	releaseCatalogMutation, err := gatewayClient.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return func() {}, entry, false, err
+	}
+	if err := reader.Get(ctx, entryKey, &entry); err != nil {
+		releaseCatalogMutation()
+		return func() {}, entry, false, err
+	}
+	if entry.Spec.Manifest.Runtime != types.RuntimeRemote ||
+		entry.Spec.Manifest.RemoteConfig == nil ||
+		!entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
+		return releaseCatalogMutation, entry, true, nil
+	}
+	credentialName := system.MCPOAuthCredentialName(entryKey.Name)
+	releaseCredential, err := gatewayClient.AcquireCredentialLock(ctx, credentialName)
+	if err != nil {
+		releaseCatalogMutation()
+		return func() {}, entry, false, err
+	}
+	release := func() {
+		releaseCredential()
+		releaseCatalogMutation()
+	}
+	credential, err := gatewayClient.RevealCredential(ctx, []string{credentialName}, "oauth")
+	if err != nil {
+		if errors.As(err, &gateway.CredentialNotFoundError{}) {
+			return release, entry, false, nil
+		}
+		release()
+		return func() {}, entry, false, err
+	}
+	return release, entry, gateway.MCPStaticOAuthCredentialReady(credential.Secrets, entry.Spec.Manifest.RemoteConfig.FixedURL), nil
 }
 
 // UpdateServer updates the manifest of an MCPServer.
@@ -1945,6 +2000,8 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 		return m.configureCompositeServer(req, mcpServer)
 	}
 
+	originalSpecDigest := utils.Digest(mcpServer.Spec)
+
 	// Add extracted env vars to the server definition
 	addExtractedEnvVars(&mcpServer)
 
@@ -1962,7 +2019,6 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 			return fmt.Errorf("failed to get catalog entry %s: %w", mcpServer.Spec.MCPServerCatalogEntryName, err)
 		}
 
-		var updateServer bool
 		if url := envVars[configURLKey]; url != "" {
 			validationOptions, err := ValidationOptionsWithResourceMaximums(req, m.mcpSessionManager)
 			if err != nil {
@@ -1974,7 +2030,6 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 
 			// The URL is part of user configuration, but it is stored on the MCPServer spec rather than in credentials.
 			delete(envVars, configURLKey)
-			updateServer = true
 		}
 
 		// Check if the catalog entry has a URL template for remote runtime
@@ -1994,37 +2049,66 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 				return types.NewErrBadRequest("validation failed: %v", err)
 			}
 
-			updateServer = updateServer || mcpServer.Spec.NeedsURL || mcpServer.Spec.Manifest.RemoteConfig.URL != ""
 			mcpServer.Spec.NeedsURL = false
 			mcpServer.Spec.PreviousURL = ""
 		}
-
-		if updateServer {
-			if err := req.Update(&mcpServer); err != nil {
-				return fmt.Errorf("failed to update server configuration: %w", err)
-			}
-		}
 	}
 
-	var credCtx string
+	credentialName := mcpServer.Name
+	var credentialContext string
 	if catalogID != "" {
-		credCtx = fmt.Sprintf("%s-%s", catalogID, mcpServer.Name)
+		credentialContext = fmt.Sprintf("%s-%s", catalogID, credentialName)
 	} else if workspaceID != "" {
-		credCtx = fmt.Sprintf("%s-%s", workspaceID, mcpServer.Name)
+		credentialContext = fmt.Sprintf("%s-%s", workspaceID, credentialName)
 	} else {
-		credCtx = fmt.Sprintf("%s-%s", req.User.GetUID(), mcpServer.Name)
+		credentialContext = fmt.Sprintf("%s-%s", req.User.GetUID(), credentialName)
+	}
+	credentialLockKey := credentialContext + "\x00" + credentialName
+	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credentialLockKey)
+	if err != nil {
+		return fmt.Errorf("failed to acquire server configuration lock: %w", err)
+	}
+	defer releaseCredentialLock()
+
+	configuredSpec := mcpServer.Spec
+	candidate := mcpServer
+	firstAttempt := true
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		if !firstAttempt {
+			var latest v1.MCPServer
+			if err := req.Get(&latest, mcpServer.Name); err != nil {
+				return err
+			}
+			if latest.Spec.MCPCatalogID != catalogID || latest.Spec.PowerUserWorkspaceID != workspaceID {
+				return types.NewErrNotFound("MCP server not found")
+			}
+			if utils.Digest(latest.Spec) != originalSpecDigest {
+				return types.NewErrHTTP(http.StatusConflict, "MCP server changed during configuration")
+			}
+			candidate = latest
+		}
+
+		candidate.Spec = configuredSpec
+		firstAttempt = false
+		if err := req.Update(&candidate); err != nil {
+			return err
+		}
+		mcpServer = candidate
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to update server configuration: %w", err)
 	}
 
 	// Allow for updating credentials. The only way to update a credential is to delete the existing one and recreate it.
-	if err := m.removeMCPServerAndCred(req.Context(), req.GatewayClient, mcpServer, []string{credCtx}); err != nil {
+	if err := m.removeMCPServerAndCred(req.Context(), req.GatewayClient, mcpServer, []string{credentialContext}); err != nil {
 		return err
 	}
 
 	sanitizeConfig(envVars, mcpServer.Spec.Manifest)
 
 	if err := req.GatewayClient.UpsertCredential(req.Context(), gatewaytypes.Credential{
-		Context: credCtx,
-		Name:    mcpServer.Name,
+		Context: credentialContext,
+		Name:    credentialName,
 		Secrets: envVars,
 	}); err != nil {
 		return fmt.Errorf("failed to create credential: %w", err)

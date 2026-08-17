@@ -44,6 +44,8 @@ const CatalogCredentialToolName = "catalog-source-tokens"
 
 const (
 	catalogReferenceSeparator = "::"
+	catalogSyncInterval       = time.Hour
+	catalogSyncFailureBackoff = 30 * time.Second
 
 	// These are used to force catalog sync on startup, used for times when changes are made to
 	// catalogs, and they must be synced on the next start.
@@ -97,8 +99,9 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	forceSync := mcpCatalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true" || mcpCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
 	if !forceSync && !mcpCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(mcpCatalog.Status.LastSyncTime.Time)
-		if timeSinceLastSync < time.Hour {
-			resp.RetryAfter(time.Hour - timeSinceLastSync)
+		syncInterval := catalogRetryInterval(mcpCatalog.Status.SyncErrors)
+		if timeSinceLastSync < syncInterval {
+			resp.RetryAfter(syncInterval - timeSinceLastSync)
 			return nil
 		}
 	}
@@ -176,9 +179,7 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 		}
 	}
 
-	// We want to refresh this every hour.
-	// TODO(g-linville): make this configurable.
-	resp.RetryAfter(time.Hour)
+	resp.RetryAfter(catalogRetryInterval(mcpCatalog.Status.SyncErrors))
 
 	// I know we don't want to do apply anymore. But we were doing it before in a different place.
 	// Now we're doing it here. It's not important enough to change right now.
@@ -197,6 +198,11 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	}
 
 	log.Infof("Applying MCP catalog entries without prune: catalog=%s entries=%d", mcpCatalog.Name, len(toAdd))
+	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog sync with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 	return app.Apply(req.Ctx, mcpCatalog, toAdd...)
 }
 
@@ -358,6 +364,13 @@ func detachCatalogEntry(ctx context.Context, c client.Client, catalog *v1.MCPCat
 	})
 }
 
+func catalogRetryInterval(syncErrors map[string]string) time.Duration {
+	if len(syncErrors) > 0 {
+		return catalogSyncFailureBackoff
+	}
+	return catalogSyncInterval
+}
+
 // resolveCompositeSourceRefs rewrites GitOps portable component refs to stored
 // catalog entry names and snapshots the target manifests. Entries with invalid
 // portable refs are skipped so bad composites do not get applied.
@@ -510,8 +523,9 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 	forceSync := systemCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] == "true" || systemCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
 	if !forceSync && !systemCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(systemCatalog.Status.LastSyncTime.Time)
-		if timeSinceLastSync < time.Hour {
-			resp.RetryAfter(time.Hour - timeSinceLastSync)
+		syncInterval := catalogRetryInterval(systemCatalog.Status.SyncErrors)
+		if timeSinceLastSync < syncInterval {
+			resp.RetryAfter(syncInterval - timeSinceLastSync)
 			return nil
 		}
 	}
@@ -575,7 +589,7 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 		}
 	}
 
-	resp.RetryAfter(time.Hour)
+	resp.RetryAfter(catalogRetryInterval(systemCatalog.Status.SyncErrors))
 
 	app := apply.New(req.Client).WithOwnerSubContext(fmt.Sprintf("system-catalog-%s", systemCatalog.Name))
 	if len(systemCatalog.Status.SyncErrors) > 0 {
@@ -610,7 +624,7 @@ func (h *Handler) readSystemMCPCatalog(ctx context.Context, catalogName, sourceU
 		}
 
 		catalogvalidation.NormalizeSystemManifest(&entry)
-		if err := mcp.ValidateSystemMCPServerCatalogEntryManifest(ctx, entry, mcp.ValidationOptions{}); err != nil {
+		if err := mcp.ValidateSystemMCPServerCatalogEntryManifest(ctx, entry, h.remoteURLValidationConfig); err != nil {
 			errs = append(errs, fmt.Errorf("failed to validate system catalog entry %s: %w", entry.Name, err))
 			continue
 		}
@@ -787,14 +801,18 @@ func readCatalogDirectory[T any](catalog string) ([]T, error) {
 	return entries, nil
 }
 
+// Defaults shipped by earlier builds. Only these may be replaced on start-up;
+// any other source was chosen by the operator. Add to it when the default moves.
+var retiredDefaultCatalogSource = regexp.MustCompile(
+	`^((\./)?/?catalog|https://github\.com/obot-platform/mcp-catalog(\.git)?/?)$`)
+
 func (h *Handler) SetUpDefaultMCPCatalog(ctx context.Context, c client.Client) error {
 	var existing v1.MCPCatalog
 	if err := c.Get(ctx, router.Key(system.DefaultNamespace, system.DefaultCatalog), &existing); err == nil {
-		// TODO: Remove this migration logic once we've migrated all Obot deployments to the new catalog path.
-		if i := slices.IndexFunc(existing.Spec.SourceURLs, func(url string) bool {
-			matched, _ := regexp.MatchString(`^(\./)?/?catalog$`, url)
-			return matched
-		}); i >= 0 {
+		// The configured default seeds the catalog only at creation, so without
+		// this an upgraded deployment keeps an outdated source forever.
+		if i := slices.IndexFunc(existing.Spec.SourceURLs, retiredDefaultCatalogSource.MatchString); i >= 0 &&
+			h.defaultCatalogPath != "" && existing.Spec.SourceURLs[i] != h.defaultCatalogPath {
 			existing.Spec.SourceURLs[i] = h.defaultCatalogPath
 			if err := c.Update(ctx, &existing); err != nil {
 				return fmt.Errorf("failed to migrate default catalog: %w", err)

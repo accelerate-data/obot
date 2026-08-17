@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
+	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
@@ -25,6 +28,7 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,6 +47,173 @@ func (s *consumeOAuthTokenAfterGetStorage) Get(ctx context.Context, key kclient.
 		return s.Delete(ctx, obj)
 	}
 	return nil
+}
+
+func TestRefreshOAuthTokenUsesRestrictedHTTPClient(t *testing.T) {
+	var requests atomic.Int32
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests.Add(1)
+	}))
+	t.Cleanup(tokenEndpoint.Close)
+
+	config := &oauth2.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		Endpoint:     oauth2.Endpoint{TokenURL: tokenEndpoint.URL},
+	}
+	token := &oauth2.Token{RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
+
+	_, err := refreshOAuthToken(
+		context.Background(),
+		safehttp.NewClient(safehttp.ClientOptions{
+			BlockLoopback:  true,
+			BlockPrivateIP: true,
+			BlockLinkLocal: true,
+		}),
+		config,
+		token,
+	)
+	require.Error(t, err)
+	require.Zero(t, requests.Load())
+}
+
+func TestTokenExchangeUsesUserSpecificOAuthForMCPServerInstance(t *testing.T) {
+	const (
+		baseURL         = "https://obot.example.test"
+		userID          = "42"
+		serverID        = "ms1server"
+		instanceID      = "msi1user-server"
+		otherInstanceID = "msi1user-other"
+		resource        = "https://linear.example.test/mcp"
+		accessToken     = "linear-user-token"
+	)
+
+	storage := clientfake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(
+			&v1.MCPServerInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: system.DefaultNamespace,
+					Name:      instanceID,
+				},
+				Spec: v1.MCPServerInstanceSpec{
+					UserID:        userID,
+					MCPServerName: serverID,
+				},
+			},
+			&v1.MCPServerInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: system.DefaultNamespace,
+					Name:      otherInstanceID,
+				},
+				Spec: v1.MCPServerInstanceSpec{
+					UserID:        userID,
+					MCPServerName: "ms1other",
+				},
+			},
+		).
+		Build()
+
+	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate())
+
+	gatewayClient := gatewayclient.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
+
+	_, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.JWKCredentialContext,
+		Name:    system.JWKCredentialContext,
+		Secrets: map[string]string{
+			"JWK_KEY": base64.StdEncoding.EncodeToString(privateKey),
+		},
+	}))
+
+	tokenService, err := persistent.NewTokenService(baseURL, gatewayClient)
+	require.NoError(t, err)
+	now := time.Now()
+	_, subjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
+		Audience:  baseURL + "/mcp-connect/" + serverID,
+		IssuedAt:  persistent.NewTime(now),
+		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
+		UserID:    userID,
+		MCPID:     instanceID,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(
+		t.Context(),
+		userID,
+		instanceID,
+		resource,
+		"",
+		&oauth2.Config{},
+		&oauth2.Token{
+			AccessToken: accessToken,
+			TokenType:   "Bearer",
+			Expiry:      now.Add(time.Hour),
+		},
+	))
+
+	recorder := httptest.NewRecorder()
+	req := api.Context{
+		ResponseWriter: recorder,
+		Request:        httptest.NewRequest("POST", "/oauth/token", nil),
+		Storage:        storage,
+		GatewayClient:  gatewayClient,
+	}
+	h := &handler{
+		tokenService: tokenService,
+		tokenStore:   mcp.NewGlobalTokenStore(gatewayClient),
+	}
+
+	err = h.doTokenExchange(req, v1.OAuthClient{}, resource, subjectToken, tokenTypeJWT, "")
+	require.NoError(t, err)
+
+	var response TokenExchangeResponse
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&response))
+	require.Equal(t, accessToken, response.AccessToken)
+
+	_, otherSubjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
+		Audience:  baseURL + "/mcp-connect/ms1other",
+		IssuedAt:  persistent.NewTime(now),
+		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
+		UserID:    userID,
+		MCPID:     otherInstanceID,
+	})
+	require.NoError(t, err)
+
+	otherRecorder := httptest.NewRecorder()
+	req.ResponseWriter = otherRecorder
+	err = h.doTokenExchange(req, v1.OAuthClient{}, resource, otherSubjectToken, tokenTypeJWT, "")
+	require.Error(t, err)
+	require.Empty(t, otherRecorder.Body.String())
+
+	_, otherUserSubjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
+		Audience:  baseURL + "/mcp-connect/" + serverID,
+		IssuedAt:  persistent.NewTime(now),
+		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
+		UserID:    "43",
+		MCPID:     instanceID,
+	})
+	require.NoError(t, err)
+
+	otherUserRecorder := httptest.NewRecorder()
+	req.ResponseWriter = otherUserRecorder
+	err = h.doTokenExchange(
+		req,
+		v1.OAuthClient{},
+		resource,
+		otherUserSubjectToken,
+		tokenTypeJWT,
+		"",
+	)
+	require.ErrorContains(t, err, "access_denied")
+	require.Empty(t, otherUserRecorder.Body.String())
 }
 
 func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {

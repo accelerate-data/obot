@@ -32,6 +32,33 @@ const (
 	ServerUserTypeMultiUser ServerUserType = "multiUser"
 )
 
+type MCPStaticOAuthTestStatus string
+
+const (
+	MCPStaticOAuthTestStatusPending   MCPStaticOAuthTestStatus = "pending"
+	MCPStaticOAuthTestStatusSucceeded MCPStaticOAuthTestStatus = "succeeded"
+	MCPStaticOAuthTestStatusFailed    MCPStaticOAuthTestStatus = "failed"
+)
+
+type MCPStaticOAuthTestFailureCategory string
+
+const (
+	MCPStaticOAuthTestFailureAuthorizationDenied MCPStaticOAuthTestFailureCategory = "authorization_denied"
+	MCPStaticOAuthTestFailureInvalidCallback     MCPStaticOAuthTestFailureCategory = "invalid_callback"
+	MCPStaticOAuthTestFailureTokenExchange       MCPStaticOAuthTestFailureCategory = "token_exchange_failed"
+	MCPStaticOAuthTestFailureExpired             MCPStaticOAuthTestFailureCategory = "expired"
+)
+
+// MCPStaticOAuthTestResult contains the non-secret state of one credential test.
+type MCPStaticOAuthTestResult struct {
+	Status          MCPStaticOAuthTestStatus          `json:"status"`
+	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
+	// Proof is returned only after a successful provider exchange and is consumed by Save.
+	Proof string `json:"proof,omitempty"`
+	// ExpiresAt is the server-authoritative time after which the proof cannot be saved.
+	ExpiresAt Time `json:"expiresAt"`
+}
+
 // IsSingleUser returns true if the type represents a single-user server.
 func (t ServerUserType) IsSingleUser() bool {
 	return t == ServerUserTypeSingleUser
@@ -58,15 +85,34 @@ type NPXRuntimeConfig struct {
 
 // ContainerizedRuntimeConfig represents configuration for containerized runtime (Docker containers)
 type ContainerizedRuntimeConfig struct {
-	Image                 string   `json:"image"`                           // Required: Docker image name
-	Command               string   `json:"command,omitempty"`               // Optional: Override container command
-	Args                  []string `json:"args,omitempty"`                  // Optional: Container arguments
-	Port                  int      `json:"port"`                            // Required: Container port
-	Path                  string   `json:"path"`                            // Required: HTTP path for MCP endpoint
-	HealthzPath           string   `json:"healthzPath,omitempty"`           // Optional: HTTP path to check for readiness instead of probing the MCP endpoint
-	EgressDomains         []string `json:"egressDomains,omitempty"`         // Optional: Empty means allow all, otherwise allow only the listed domains when network policy enforcement is enabled
-	DenyAllEgress         *bool    `json:"denyAllEgress,omitempty"`         // Optional: Deny all egress when network policy enforcement is enabled
-	StartupTimeoutSeconds int      `json:"startupTimeoutSeconds,omitempty"` // Optional: Timeout to start and connect to the MCP server, in seconds. Defaults to 60s, max 600s.
+	Image         string   `json:"image"`                   // Required: Docker image name
+	Command       string   `json:"command,omitempty"`       // Optional: Override container command
+	Args          []string `json:"args,omitempty"`          // Optional: Container arguments
+	Port          int      `json:"port"`                    // Required: Container port
+	Path          string   `json:"path"`                    // Required: HTTP path for MCP endpoint
+	HealthzPath   string   `json:"healthzPath,omitempty"`   // Optional: HTTP path to check for readiness instead of probing the MCP endpoint
+	EgressDomains []string `json:"egressDomains,omitempty"` // Optional: Empty means allow all, otherwise allow only the listed domains when network policy enforcement is enabled
+	DenyAllEgress *bool    `json:"denyAllEgress,omitempty"` // Optional: Deny all egress when network policy enforcement is enabled
+	// StartupTimeoutSeconds is the timeout to start and connect to the MCP server, in seconds. It defaults to 60 seconds and has a maximum of 600 seconds.
+	StartupTimeoutSeconds int `json:"startupTimeoutSeconds,omitempty"`
+	// OAuth configures Obot-managed per-user OAuth for the shared container.
+	OAuth *ContainerOAuthConfig `json:"oauth,omitempty"`
+}
+
+type ContainerOAuthProvider string
+
+const ContainerOAuthProviderMicrosoftEntra ContainerOAuthProvider = "microsoftEntra"
+
+// ContainerOAuthConfig describes a deployment-owned OAuth application whose
+// values are read from the container's encrypted organization configuration.
+// Access and refresh tokens remain user-scoped and are never added to Env.
+type ContainerOAuthConfig struct {
+	Provider        ContainerOAuthProvider `json:"provider"`
+	AuthorityEnv    string                 `json:"authorityEnv"`
+	TenantIDEnv     string                 `json:"tenantIDEnv"`
+	ClientIDEnv     string                 `json:"clientIDEnv"`
+	ClientSecretEnv string                 `json:"clientSecretEnv"`
+	Scopes          []string               `json:"scopes"`
 }
 
 // RemoteRuntimeConfig represents configuration for remote runtime (External MCP servers)
@@ -322,7 +368,7 @@ type MCPServer struct {
 	Configured              bool           `json:"configured"`
 	MissingRequiredEnvVars  []string       `json:"missingRequiredEnvVars,omitempty"`
 	MissingRequiredHeaders  []string       `json:"missingRequiredHeader,omitempty"`
-	MissingOAuthCredentials bool           `json:"missingOAuthCredentials,omitempty"`
+	MissingOAuthCredentials bool           `json:"missingOAuthCredentials"`
 	CatalogEntryID          string         `json:"catalogEntryID"`
 	PowerUserWorkspaceID    string         `json:"powerUserWorkspaceID"`
 	MCPCatalogID            string         `json:"mcpCatalogID,omitempty"`
@@ -621,6 +667,7 @@ func MapCatalogEntryToServer(catalogEntry MCPServerCatalogEntryManifest, userURL
 			EgressDomains:         catalogEntry.ContainerizedConfig.EgressDomains,
 			DenyAllEgress:         catalogEntry.ContainerizedConfig.DenyAllEgress,
 			StartupTimeoutSeconds: catalogEntry.ContainerizedConfig.StartupTimeoutSeconds,
+			OAuth:                 catalogEntry.ContainerizedConfig.OAuth.DeepCopy(),
 		}
 
 	case RuntimeRemote:
@@ -738,10 +785,19 @@ func ValidateURLHostname(u string, hostname string) error {
 	return nil
 }
 
-// MCPServerOAuthCredentialRequest represents a request to set OAuth credentials for an MCP server
+// MCPServerOAuthCredentialRequest sets the exact credentials authorized by a successful one-time proof.
+// Obot stores the credential and consumes the proof in one database transaction.
 type MCPServerOAuthCredentialRequest struct {
 	ClientID     string `json:"clientID"`
 	ClientSecret string `json:"clientSecret"`
+	// Proof is the opaque state returned by the successful test for these exact values.
+	Proof string `json:"proof"`
+}
+
+// MCPServerOAuthCredentialDeleteRequest protects Clear from deleting an app
+// that changed after the caller loaded its status.
+type MCPServerOAuthCredentialDeleteRequest struct {
+	ExpectedGeneration string `json:"expectedGeneration"`
 }
 
 // MCPServerOAuthCredentialStatus represents the status of OAuth credentials for an MCP server
@@ -750,4 +806,26 @@ type MCPServerOAuthCredentialStatus struct {
 	Configured bool `json:"configured"`
 	// ClientID is the configured client ID (never includes secret)
 	ClientID string `json:"clientID,omitempty"`
+	// Generation changes for every committed save, including same-value replacement.
+	Generation string `json:"generation,omitempty"`
+	// CallbackURL is the redirect URL to register with the OAuth provider.
+	CallbackURL string `json:"callbackURL"`
+}
+
+// MCPServerOAuthCredentialTestRequest contains candidate static OAuth credentials to verify.
+type MCPServerOAuthCredentialTestRequest struct {
+	ClientID     string `json:"clientID"`
+	ClientSecret string `json:"clientSecret"`
+}
+
+// MCPServerOAuthCredentialTestStatusRequest carries an opaque proof outside
+// the URL so access and audit logs cannot persist it.
+type MCPServerOAuthCredentialTestStatusRequest struct {
+	TestState string `json:"testState"`
+}
+
+// MCPServerOAuthCredentialTestStart identifies a pending static OAuth verification.
+type MCPServerOAuthCredentialTestStart struct {
+	TestState string `json:"testState"`
+	OAuthURL  string `json:"oauthURL"`
 }

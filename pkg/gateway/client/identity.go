@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +37,12 @@ var (
 	}
 )
 
-const userCreationAdvisoryLockID int64 = 0x6f626f7455736572 // "obotUser"
+const (
+	genericOAuthAuthProviderName           = "generic-oauth-auth-provider"
+	genericOAuthIssuerEnvVar               = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
+	genericOAuthTrustEmailLinkingVar       = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING"
+	userCreationAdvisoryLockID       int64 = 0x6f626f7455736572 // "obotUser"
+)
 
 // FindIdentitiesForUser finds all identities for the given user.
 func (c *Client) FindIdentitiesForUser(ctx context.Context, userID uint) ([]types.Identity, error) {
@@ -79,11 +85,12 @@ func (c *Client) EnsureIdentityWithRole(ctx context.Context, id *types.Identity,
 		user    *types.User
 		created bool
 	)
+	verified := c.identityCanLinkByVerifiedEmail(ctx, id)
 
 	// Transaction #1: ensure the identity + user rows exist / are corrected, and read what we need.
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
-		user, created, err = c.ensureIdentity(ctx, tx, id, timezone, role, userLimit)
+		user, created, err = c.ensureIdentity(ctx, tx, id, timezone, role, verified, userLimit)
 		return err
 	})
 	if err != nil {
@@ -150,9 +157,7 @@ func (c *Client) EncryptIdentities(ctx context.Context, force bool) error {
 }
 
 // ensureIdentity ensures that the given identity exists in the database, and returns the user associated with it.
-func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit) (*types.User, bool, error) {
-	verified := slices.Contains(verifiedAuthProviders, fmt.Sprintf("%s/%s", id.AuthProviderNamespace, id.AuthProviderName))
-
+func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Identity, timezone string, role types2.Role, verified bool, userLimit UserLimit) (*types.User, bool, error) {
 	email := id.Email
 	providerUserID := id.ProviderUserID
 	providerUsername := id.ProviderUsername
@@ -444,6 +449,47 @@ func (c *Client) ensureIdentityProviderData(ctx context.Context, id *types.Ident
 	}
 
 	return nil
+}
+
+func (c *Client) identityCanLinkByVerifiedEmail(ctx context.Context, id *types.Identity) bool {
+	if slices.Contains(verifiedAuthProviders, fmt.Sprintf("%s/%s", id.AuthProviderNamespace, id.AuthProviderName)) {
+		return true
+	}
+
+	if id.AuthProviderNamespace != system.DefaultNamespace || id.AuthProviderName != genericOAuthAuthProviderName {
+		return false
+	}
+	if id.ProviderEmailVerified != nil && !*id.ProviderEmailVerified {
+		return false
+	}
+	if id.ProviderIssuer == "" {
+		return false
+	}
+
+	return c.genericOAuthTrustEmailLinking(ctx, id.ProviderIssuer)
+}
+
+func (c *Client) genericOAuthTrustEmailLinking(ctx context.Context, issuer string) bool {
+	var authProvider v1.AuthProvider
+	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: genericOAuthAuthProviderName}, &authProvider); err != nil {
+		return false
+	}
+
+	cred, err := c.RevealCredential(ctx, []string{authProvider.Name, system.GenericAuthProviderCredentialContext}, authProvider.Name)
+	if err != nil || cred.Secrets == nil {
+		return false
+	}
+	if cred.Secrets[genericOAuthIssuerEnvVar] != issuer {
+		return false
+	}
+
+	rawTrust := cred.Secrets[genericOAuthTrustEmailLinkingVar]
+	if rawTrust == "" {
+		return true
+	}
+
+	trusted, err := strconv.ParseBool(rawTrust)
+	return err == nil && trusted
 }
 
 // fetchProviderGroupLookupID calls the auth provider's /obot-get-user-info endpoint

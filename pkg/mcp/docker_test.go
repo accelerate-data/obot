@@ -2,10 +2,24 @@ package mcp
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/moby/moby/api/types/container"
 )
+
+func TestNewMCPServerHostConfigMapsHostDockerInternal(t *testing.T) {
+	hc := newMCPServerHostConfig("8099/tcp", nil)
+
+	// The shim (and other MCP server containers) must be able to reach services
+	// published on the host via host.docker.internal, matching how Obot's own
+	// container is reached. Without this mapping, a remote MCP server whose URL
+	// resolves to host.docker.internal is unreachable from the shim on native
+	// Linux dockerd (Docker Desktop injects it automatically, masking the bug).
+	if !slices.Contains(hc.ExtraHosts, "host.docker.internal:host-gateway") {
+		t.Fatalf("ExtraHosts = %v, want it to contain host.docker.internal:host-gateway", hc.ExtraHosts)
+	}
+}
 
 func TestDockerTransformObotHostnameAlwaysRewritesHost(t *testing.T) {
 	d := &dockerBackend{hostBaseURLWithPort: "http://172.17.0.1:8080"}
@@ -23,6 +37,18 @@ func TestDockerTransformObotHostnameAlwaysRewritesHost(t *testing.T) {
 		if result := d.transformObotHostname(input); result != expected {
 			t.Fatalf("transformObotHostname(%q) = %q, want %q", input, result, expected)
 		}
+	}
+}
+
+func TestChooseMCPNetwork(t *testing.T) {
+	if got := chooseMCPNetwork("vibedata-local-default", "some-autodetected"); got != "vibedata-local-default" {
+		t.Fatalf("explicit option should win, got %q", got)
+	}
+	if got := chooseMCPNetwork("", "auto-net"); got != "auto-net" {
+		t.Fatalf("auto-detected should be used when option empty, got %q", got)
+	}
+	if got := chooseMCPNetwork("", ""); got != "bridge" {
+		t.Fatalf("default should be bridge, got %q", got)
 	}
 }
 

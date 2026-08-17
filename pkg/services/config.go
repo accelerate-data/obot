@@ -48,6 +48,7 @@ import (
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/messagepolicy"
 	"github.com/obot-platform/obot/pkg/modelaccesspolicy"
+	"github.com/obot-platform/obot/pkg/oidcjwt"
 	"github.com/obot-platform/obot/pkg/otel"
 	"github.com/obot-platform/obot/pkg/proxy"
 	"github.com/obot-platform/obot/pkg/serviceaccounts"
@@ -630,6 +631,9 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	if err := gatewayClient.MigrateToolReferenceCredentialContexts(ctx); err != nil {
 		return nil, fmt.Errorf("failed to migrate ToolReference credential contexts: %w", err)
 	}
+	if err := gatewayClient.MigrateUnencryptedCredentials(ctx); err != nil {
+		return nil, fmt.Errorf("failed to encrypt existing credentials: %w", err)
+	}
 
 	storageServices.Authn.SetServiceAccountValidator(func(ctx context.Context, token string) (string, error) {
 		apiKey, err := gatewayClient.ValidateStorageServiceAccountToken(ctx, token)
@@ -1076,8 +1080,22 @@ func New(ctx context.Context, config Config) (*Services, error) {
 
 		// Token Auth + OAuth auth
 		authenticators = union.NewFailOnError(authenticators, proxyManager)
+		oidcJWTCfg, err := oidcjwt.LoadConfigFromEnv(os.Getenv)
+		if err != nil {
+			return nil, fmt.Errorf("oidcjwt config: %w", err)
+		}
+		if oidcJWTCfg.Enabled() {
+			oidcVerifier, err := oidcjwt.NewVerifier(ctx, oidcJWTCfg)
+			if err != nil {
+				return nil, fmt.Errorf("oidcjwt verifier: %w", err)
+			}
+			authenticators = union.New(authenticators, oidcjwt.NewAuthenticator(oidcJWTCfg, oidcVerifier))
+		}
 		// Add gateway user info
 		authenticators = client.NewUserDecorator(authenticators, gatewayClient, licenseProvider)
+		if oidcJWTCfg.Enabled() {
+			authenticators = oidcjwt.NewRoleUplift(authenticators, oidcJWTCfg)
+		}
 		// Tunnel credentials are non-user principals and must be handled after
 		// the user decorator. Authorization restricts them to tunnel setup only.
 		authenticators = union.New(authenticators, tunnel.NewTunnelAuthenticator(storageClient))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/gateway/types"
@@ -33,35 +34,42 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		return nil, false, nil
 	}
 
-	var (
-		gatewayUser  *types.User
-		authGroupIDs []string
-	)
-	if authProviderNamespace, authProviderName := auth.FirstExtraValue(resp.User.GetExtra(), "auth_provider_namespace"), auth.FirstExtraValue(resp.User.GetExtra(), "auth_provider_name"); authProviderNamespace != "" && authProviderName != "" {
-		identity := &types.Identity{
-			Email:                 auth.FirstExtraValue(resp.User.GetExtra(), "email"),
-			AuthProviderName:      auth.FirstExtraValue(resp.User.GetExtra(), "auth_provider_name"),
-			AuthProviderNamespace: auth.FirstExtraValue(resp.User.GetExtra(), "auth_provider_namespace"),
-			ProviderUsername:      resp.User.GetName(),
-			ProviderUserID:        resp.User.GetUID(),
-		}
-
-		userLimit, err := u.resolveUserLimit(req.Context())
-		if err != nil {
-			return nil, false, err
-		}
-
-		gatewayUser, err = u.client.EnsureIdentity(req.Context(), identity, req.Header.Get("X-Obot-User-Timezone"), userLimit)
-		if err != nil {
-			return nil, false, err
-		}
-
-		authGroupIDs = identity.GetAuthProviderGroupIDs()
-	} else {
+	extra := resp.User.GetExtra()
+	authProviderNamespace := auth.FirstExtraValue(extra, "auth_provider_namespace")
+	authProviderName := auth.FirstExtraValue(extra, "auth_provider_name")
+	if authProviderNamespace == "" || authProviderName == "" {
 		return nil, false, nil
 	}
 
-	extra := resp.User.GetExtra()
+	var emailVerified *bool
+	if raw := auth.FirstExtraValue(extra, "auth_provider_email_verified"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, false, fmt.Errorf("invalid auth_provider_email_verified value %q: %w", raw, err)
+		}
+		emailVerified = &parsed
+	}
+
+	identity := &types.Identity{
+		Email:                 auth.FirstExtraValue(extra, "email"),
+		AuthProviderName:      authProviderName,
+		AuthProviderNamespace: authProviderNamespace,
+		ProviderUsername:      resp.User.GetName(),
+		ProviderUserID:        resp.User.GetUID(),
+		ProviderIssuer:        auth.FirstExtraValue(extra, "auth_provider_issuer"),
+		ProviderEmailVerified: emailVerified,
+	}
+	userLimit, err := u.resolveUserLimit(req.Context())
+	if err != nil {
+		return nil, false, err
+	}
+
+	gatewayUser, err := u.client.EnsureIdentity(req.Context(), identity, req.Header.Get("X-Obot-User-Timezone"), userLimit)
+	if err != nil {
+		return nil, false, err
+	}
+
+	authGroupIDs := identity.GetAuthProviderGroupIDs()
 	extra["auth_provider_groups"] = authGroupIDs
 
 	// Resolve effective role by merging individual + group roles

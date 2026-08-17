@@ -21,8 +21,10 @@ import (
 	ntypes "github.com/obot-platform/nanobot/pkg/types"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/controller/handlers/systemmcpserver"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
+	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -38,6 +40,8 @@ type Handler struct {
 	mcpSessionManager         *mcp.SessionManager
 	transport                 http.RoundTripper
 	nanobot                   http.Handler
+	mintToken                 func(context.Context, persistent.TokenContext) (string, error)
+	resolveServer             func(api.Context) (resolvedServer, error)
 	secretBindingAllowedLabel string
 	tunnelManager             *tunnel.Manager
 }
@@ -56,9 +60,16 @@ func auditLogMetadataForPrincipal(metadata map[string]string, user user.Info) ma
 	return result
 }
 
+type resolvedServer struct {
+	mcpID  string
+	config mcp.ServerConfig
+}
+
 var errMCPServerRequiresConfiguration = errors.New("mcp server requires configuration")
 
-func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, auditLogCollector auditlogs.Collector, serverURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager) (*Handler, error) {
+const gatewayTokenExpiration = 5 * time.Minute
+
+func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, tokenService *persistent.TokenService, auditLogCollector auditlogs.Collector, serverURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager) (*Handler, error) {
 	sessionStore, err := session.NewStoreFromDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session store: %w", err)
@@ -106,13 +117,19 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, audi
 		return nil, fmt.Errorf("failed to create HTTP server: %w", err)
 	}
 
-	return &Handler{
-		mcpSessionManager:         mcpSessionManager,
-		transport:                 otelhttp.NewTransport(http.DefaultTransport),
-		nanobot:                   nanobotHTTPServer,
+	handler := &Handler{
+		mcpSessionManager: mcpSessionManager,
+		transport:         otelhttp.NewTransport(http.DefaultTransport),
+		nanobot:           nanobotHTTPServer,
+		mintToken: func(ctx context.Context, tokenContext persistent.TokenContext) (string, error) {
+			_, token, err := tokenService.NewToken(ctx, tokenContext)
+			return token, err
+		},
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 		tunnelManager:             tunnelManager,
-	}, nil
+	}
+	handler.resolveServer = handler.ensureServerIsDeployed
+	return handler, nil
 }
 
 func (h *Handler) Proxy(req api.Context) error {
@@ -121,13 +138,14 @@ func (h *Handler) Proxy(req api.Context) error {
 		return nil
 	}
 
-	serverConfig, err := h.ensureServerIsDeployed(req)
+	resolved, err := h.resolveServer(req)
 	if err != nil {
 		if errors.Is(err, errMCPServerRequiresConfiguration) {
 			return nil
 		}
 		return fmt.Errorf("failed to ensure server is deployed: %v", err)
 	}
+	serverConfig := resolved.config
 
 	var bridgeAuthorizationName, bridgeAuthorizationValue string
 	if serverConfig.TunnelName != "" {
@@ -140,6 +158,11 @@ func (h *Handler) Proxy(req api.Context) error {
 		}
 		bridgeAuthorizationName, bridgeAuthorizationValue = h.tunnelManager.BridgeAuthorization()
 		serverConfig.Headers = append(serverConfig.Headers, fmt.Sprintf("%s=%s", bridgeAuthorizationName, bridgeAuthorizationValue))
+	}
+
+	gatewayToken, err := h.gatewayToken(req.Context(), req.User, resolved.mcpID, serverConfig)
+	if err != nil {
+		return fmt.Errorf("failed to mint MCP gateway token: %w", err)
 	}
 
 	if serverConfig.NanobotAgentName != "" {
@@ -163,6 +186,11 @@ func (h *Handler) Proxy(req api.Context) error {
 
 				if bridgeAuthorizationName != "" {
 					r.Out.Header.Set(bridgeAuthorizationName, bridgeAuthorizationValue)
+				}
+				if gatewayToken == "" {
+					r.Out.Header.Del("Authorization")
+				} else {
+					r.Out.Header.Set("Authorization", "Bearer "+gatewayToken)
 				}
 				r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
 				scheme := "https"
@@ -223,48 +251,101 @@ func (h *Handler) Proxy(req api.Context) error {
 	} else {
 		ctx = nmcp.WithAuditLogMetadata(ctx, auditLogMetadataForPrincipal(serverConfig.AuditLogMetadata, req.User))
 	}
-	ctx = nmcp.WithToken(ctx, strings.TrimPrefix(req.Request.Header.Get("Authorization"), "Bearer "))
+	ctx = withGatewayToken(ctx, req.Request, gatewayToken)
 
 	h.nanobot.ServeHTTP(req.ResponseWriter, req.WithContext(ctx))
 	return nil
 }
 
-func (h *Handler) ensureServerIsDeployed(req api.Context) (mcp.ServerConfig, error) {
+func (h *Handler) gatewayToken(ctx context.Context, authenticatedUser user.Info, mcpID string, server mcp.ServerConfig) (string, error) {
+	if len(server.Audiences) == 0 {
+		return "", nil
+	}
+	audience, err := gatewayAudience(server)
+	if err != nil {
+		return "", err
+	}
+	token, err := h.mintToken(ctx, gatewayTokenContext(authenticatedUser, mcpID, audience, time.Now()))
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func gatewayAudience(server mcp.ServerConfig) (string, error) {
+	expectedPath := "/mcp-connect/" + server.MCPServerName
+	for _, audience := range server.Audiences {
+		parsed, err := url.Parse(audience)
+		if err == nil && strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), expectedPath) {
+			return audience, nil
+		}
+	}
+	return "", fmt.Errorf("no exact audience for MCP server %s", server.MCPServerName)
+}
+
+func withGatewayToken(ctx context.Context, request *http.Request, gatewayToken string) context.Context {
+	if gatewayToken == "" {
+		request.Header.Del("Authorization")
+		return ctx
+	}
+	request.Header.Set("Authorization", "Bearer "+gatewayToken)
+	return nmcp.WithToken(ctx, gatewayToken)
+}
+
+func gatewayTokenContext(authenticatedUser user.Info, mcpID, audience string, now time.Time) persistent.TokenContext {
+	extra := authenticatedUser.GetExtra()
+	return persistent.TokenContext{
+		Audience:              audience,
+		IssuedAt:              persistent.NewTime(now),
+		ExpiresAt:             persistent.NewTime(now.Add(gatewayTokenExpiration)),
+		UserID:                authenticatedUser.GetUID(),
+		UserName:              authenticatedUser.GetName(),
+		UserEmail:             auth.FirstExtraValue(extra, "email"),
+		UserGroups:            []string{types.GroupMCP, types.GroupAuthenticated},
+		AuthProviderName:      auth.FirstExtraValue(extra, "auth_provider_name"),
+		AuthProviderNamespace: auth.FirstExtraValue(extra, "auth_provider_namespace"),
+		AuthProviderUserID:    auth.FirstExtraValue(extra, "auth_provider_user_id"),
+		MCPID:                 mcpID,
+	}
+}
+
+func (h *Handler) ensureServerIsDeployed(req api.Context) (resolvedServer, error) {
 	mcpID := req.PathValue("mcp_id")
 
 	if system.IsSystemMCPServerID(mcpID) {
-		return h.ensureSystemServerIsDeployed(req, mcpID)
+		config, err := h.ensureSystemServerIsDeployed(req, mcpID)
+		return resolvedServer{mcpID: mcpID, config: config}, err
 	}
 
 	mcpID, mcpServer, mcpServerConfig, missingConfig, err := h.mcpSessionManager.ServerForActionWithConnectIDAllowMissingConfig(req.Context(), mcpID, principal.ResourceOwnerID(req.User))
 	if err != nil {
-		return mcp.ServerConfig{}, fmt.Errorf("failed to get mcp server config: %w", err)
+		return resolvedServer{}, fmt.Errorf("failed to get mcp server config: %w", err)
 	}
 	if mcpServer.Spec.Template {
-		return mcp.ServerConfig{}, apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
+		return resolvedServer{}, apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
 	}
 	if len(missingConfig) > 0 {
 		writeMCPAuthRequired(req, true)
-		return mcp.ServerConfig{}, errMCPServerRequiresConfiguration
+		return resolvedServer{}, errMCPServerRequiresConfiguration
 	}
 
 	// Add-hoc authorization for nanobot agents
 	if mcpServerConfig.NanobotAgentName != "" {
 		var agent v1.NanobotAgent
 		if err = req.Get(&agent, mcpServerConfig.NanobotAgentName); err != nil {
-			return mcp.ServerConfig{}, fmt.Errorf("failed to get nanobot agent %q: %w", mcpServerConfig.NanobotAgentName, err)
+			return resolvedServer{}, fmt.Errorf("failed to get nanobot agent %q: %w", mcpServerConfig.NanobotAgentName, err)
 		}
 		if agent.Spec.UserID != req.User.GetUID() && (!req.UserCanImpersonate() || !req.UserIsAdmin()) {
-			return mcp.ServerConfig{}, types.NewErrForbidden("user is not authorized to access nanobot agent %q", mcpServerConfig.NanobotAgentName)
+			return resolvedServer{}, types.NewErrForbidden("user is not authorized to access nanobot agent %q", mcpServerConfig.NanobotAgentName)
 		}
 	}
 
 	mcpServerConfig, err = h.mcpSessionManager.LaunchServer(req.Context(), mcpServerConfig)
 	if err != nil {
-		return mcp.ServerConfig{}, fmt.Errorf("failed to launch mcp server: %w", err)
+		return resolvedServer{}, fmt.Errorf("failed to launch mcp server: %w", err)
 	}
 
-	return mcpServerConfig, nil
+	return resolvedServer{mcpID: mcpID, config: mcpServerConfig}, nil
 }
 
 func writeMCPAuthRequired(req api.Context, requiresConfig bool) {

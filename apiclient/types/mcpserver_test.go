@@ -1,6 +1,8 @@
 package types
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -181,6 +183,14 @@ func TestMapCatalogEntryToServer_Containerized(t *testing.T) {
 			HealthzPath:   "/healthz",
 			EgressDomains: []string{},
 			DenyAllEgress: new(true),
+			OAuth: &ContainerOAuthConfig{
+				Provider:        ContainerOAuthProviderMicrosoftEntra,
+				AuthorityEnv:    "INSTANCE",
+				TenantIDEnv:     "TENANT",
+				ClientIDEnv:     "CLIENT",
+				ClientSecretEnv: "SECRET",
+				Scopes:          []string{"scope"},
+			},
 		},
 	}
 
@@ -219,6 +229,10 @@ func TestMapCatalogEntryToServer_Containerized(t *testing.T) {
 
 	if result.ContainerizedConfig.DenyAllEgress == nil || !*result.ContainerizedConfig.DenyAllEgress {
 		t.Errorf("Expected denyAllEgress true, got %v", result.ContainerizedConfig.DenyAllEgress)
+	}
+
+	if result.ContainerizedConfig.OAuth == nil || result.ContainerizedConfig.OAuth.ClientIDEnv != "CLIENT" {
+		t.Errorf("Expected OAuth descriptor to be copied, got %#v", result.ContainerizedConfig.OAuth)
 	}
 }
 
@@ -323,6 +337,65 @@ func TestMapCatalogEntryToServer_RemoteFixedURL(t *testing.T) {
 	}
 	if result.RemoteConfig.TunnelName != "mcptunnel-office" {
 		t.Errorf("Expected tunnel name 'mcptunnel-office', got %q", result.RemoteConfig.TunnelName)
+	}
+}
+
+func TestMapCatalogEntryToServer_RemoteFixedURLKeepsRemoteHeadersAsServerConfig(t *testing.T) {
+	header := MCPHeader{Name: "API Key", Key: "X-API-Key", Required: true, Sensitive: true}
+	catalogEntry := MCPServerCatalogEntryManifest{
+		Name:    "Test Remote Server",
+		Runtime: RuntimeRemote,
+		RemoteConfig: &RemoteCatalogConfig{
+			FixedURL: "https://api.example.com/mcp",
+			Headers:  []MCPHeader{header},
+		},
+	}
+
+	result, err := MapCatalogEntryToServer(catalogEntry, "", false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if result.MultiUserConfig != nil {
+		t.Fatalf("Expected remote headers to remain server config, got multi-user config %#v", result.MultiUserConfig)
+	}
+	if result.RemoteConfig == nil || len(result.RemoteConfig.Headers) != 1 {
+		t.Fatalf("Expected one remote header, got %#v", result.RemoteConfig)
+	}
+	if result.RemoteConfig.Headers[0] != header {
+		t.Fatalf("Expected remote header %#v, got %#v", header, result.RemoteConfig.Headers[0])
+	}
+}
+
+func TestMapCatalogEntryToServer_RemoteFixedURLCopiesMultiUserHeadersSeparately(t *testing.T) {
+	header := MCPHeader{Name: "API Key", Key: "X-API-Key", Required: true, Sensitive: true}
+	catalogEntry := MCPServerCatalogEntryManifest{
+		Name:    "Test Remote Server",
+		Runtime: RuntimeRemote,
+		RemoteConfig: &RemoteCatalogConfig{
+			FixedURL: "https://api.example.com/mcp",
+		},
+		MultiUserConfig: &MultiUserConfig{
+			UserDefinedHeaders: []MCPHeader{header},
+		},
+	}
+
+	result, err := MapCatalogEntryToServer(catalogEntry, "", false)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+
+	if result.RemoteConfig == nil {
+		t.Fatal("Expected RemoteConfig to be populated")
+	}
+	if len(result.RemoteConfig.Headers) != 0 {
+		t.Fatalf("Expected no remote headers, got %#v", result.RemoteConfig.Headers)
+	}
+	if result.MultiUserConfig == nil || len(result.MultiUserConfig.UserDefinedHeaders) != 1 {
+		t.Fatalf("Expected one multi-user header, got %#v", result.MultiUserConfig)
+	}
+	if result.MultiUserConfig.UserDefinedHeaders[0] != header {
+		t.Fatalf("Expected multi-user header %#v, got %#v", header, result.MultiUserConfig.UserDefinedHeaders[0])
 	}
 }
 
@@ -752,5 +825,15 @@ func TestMCPServer_IsSingleUser(t *testing.T) {
 				t.Errorf("MCPServer.IsSingleUser() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMCPServerSerializesExplicitOAuthCredentialStatus(t *testing.T) {
+	encoded, err := json.Marshal(MCPServer{MissingOAuthCredentials: false})
+	if err != nil {
+		t.Fatalf("marshal MCP server: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"missingOAuthCredentials":false`) {
+		t.Fatalf("MCP server omitted explicit OAuth credential status: %s", encoded)
 	}
 }

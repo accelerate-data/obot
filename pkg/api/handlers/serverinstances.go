@@ -13,6 +13,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,15 +22,25 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-type ServerInstancesHandler struct {
-	acrHelper *accesscontrolrule.Helper
-	serverURL string
+// MCPInstanceResolver resolves an MCP server instance ID to the server and
+// config needed for an OAuth check. Satisfied by *mcp.SessionManager.
+type MCPInstanceResolver interface {
+	ServerForActionWithConnectIDAllowMissingConfig(ctx context.Context, id, userID string) (string, v1.MCPServer, mcp.ServerConfig, []string, error)
 }
 
-func NewServerInstancesHandler(acrHelper *accesscontrolrule.Helper, serverURL string) *ServerInstancesHandler {
+type ServerInstancesHandler struct {
+	acrHelper         *accesscontrolrule.Helper
+	mcpOAuthChecker   MCPOAuthChecker
+	mcpSessionManager MCPInstanceResolver
+	serverURL         string
+}
+
+func NewServerInstancesHandler(acrHelper *accesscontrolrule.Helper, mcpOAuthChecker MCPOAuthChecker, mcpSessionManager MCPInstanceResolver, serverURL string) *ServerInstancesHandler {
 	return &ServerInstancesHandler{
-		acrHelper: acrHelper,
-		serverURL: serverURL,
+		acrHelper:         acrHelper,
+		mcpOAuthChecker:   mcpOAuthChecker,
+		mcpSessionManager: mcpSessionManager,
+		serverURL:         serverURL,
 	}
 }
 
@@ -191,6 +202,55 @@ func (h *ServerInstancesHandler) ClearOAuthCredentials(req api.Context) error {
 
 	req.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+func (h *ServerInstancesHandler) GetOAuthURL(req api.Context) error {
+	u, err := h.oauthURLForInstance(req)
+	if err != nil {
+		return err
+	}
+
+	return req.Write(map[string]string{"oauthURL": u})
+}
+
+func (h *ServerInstancesHandler) RedirectOAuthURL(req api.Context) error {
+	u, err := h.oauthURLForInstance(req)
+	if err != nil {
+		return err
+	}
+	if u == "" {
+		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		return nil
+	}
+
+	http.Redirect(req.ResponseWriter, req.Request, u, http.StatusFound)
+	return nil
+}
+
+func (h *ServerInstancesHandler) oauthURLForInstance(req api.Context) (string, error) {
+	var instance v1.MCPServerInstance
+	if err := req.Get(&instance, req.PathValue("mcp_server_instance_id")); err != nil {
+		return "", err
+	}
+	if instance.Spec.UserID != req.User.GetUID() {
+		return "", types.NewErrNotFound("MCP server instance not found")
+	}
+
+	// allowMissingConfig: report OAuth state even when the instance is not yet
+	// fully configured (e.g. required headers unset) so the probe never 500s on
+	// a half-set-up instance. For remote catalog servers (NeedsURL=false) this
+	// is identical to the strict path.
+	_, server, serverConfig, _, err := h.mcpSessionManager.ServerForActionWithConnectIDAllowMissingConfig(req.Context(), instance.Name, req.User.GetUID())
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve MCP server instance: %w", err)
+	}
+
+	u, err := h.mcpOAuthChecker.CheckForMCPAuth(req, server, serverConfig, req.User.GetUID(), instance.Name, "")
+	if err != nil {
+		return "", fmt.Errorf("failed to get OAuth URL: %w", err)
+	}
+
+	return u, nil
 }
 
 func (h *ServerInstancesHandler) ConfigureServerInstance(req api.Context) error {

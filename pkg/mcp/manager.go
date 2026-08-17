@@ -32,6 +32,7 @@ type Options struct {
 	MCPBaseImage                      string   `usage:"The base image to use for MCP containers" default:"ghcr.io/obot-platform/mcp-images/stdio-wrapper:v0.24.2"`
 	MCPHTTPWebhookBaseImage           string   `usage:"The base image to use for HTTP-based MCP webhook containers" default:"ghcr.io/obot-platform/mcp-images/http-webhook-mcp-converter:v0.24.2"`
 	MCPNamespace                      string   `usage:"The namespace to use for MCP containers" default:"obot-mcp"`
+	MCPDockerNetwork                  string   `usage:"Docker network to attach MCP helper containers to; empty falls back to OBOT_CONTAINER_ENV auto-detection or the default bridge" default:"" name:"mcp-docker-network" env:"OBOT_MCP_DOCKER_NETWORK"`
 	MCPClusterDomain                  string   `usage:"The cluster domain to use for MCP containers" default:"cluster.local"`
 	DisallowLocalhostMCP              bool     `usage:"Disallow MCP containers from connecting to localhost" default:"true"`
 	DisallowPrivateIPMCP              bool     `usage:"Disallow MCP containers from connecting to private IPs" default:"true"`
@@ -414,13 +415,22 @@ func ValidateRemoteMCPURL(ctx context.Context, rawURL string, config RemoteMCPUR
 	if strings.TrimSpace(rawURL) == "" {
 		return nil
 	}
-	if config.AllowLocalhostMCP && config.AllowPrivateIPMCP && config.AllowLinkLocalMCP {
-		return nil
-	}
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("failed to parse MCP server URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("MCP server URL must use http or https: %s", rawURL)
+	}
+	if u.Hostname() == "" {
+		return fmt.Errorf("MCP server URL must include a hostname: %s", rawURL)
+	}
+	if u.User != nil {
+		return fmt.Errorf("MCP server URL must not include user information: %s", rawURL)
+	}
+	if config.AllowLocalhostMCP && config.AllowPrivateIPMCP && config.AllowLinkLocalMCP {
+		return nil
 	}
 
 	hostname := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")

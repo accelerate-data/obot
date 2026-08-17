@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
@@ -28,11 +30,16 @@ type MCPOAuthHandlerFactory struct {
 }
 
 func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManager, client kclient.Client, gatewayClient *client.Client, globalTokenStore mcp.GlobalTokenStore, secretBindingAllowedLabel string, forceDynamicClient bool) *MCPOAuthHandlerFactory {
+	remoteURLValidationConfig := sessionManager.RemoteMCPURLValidationConfig()
 	f := &MCPOAuthHandlerFactory{
-		baseURL:                   baseURL,
-		mcpSessionManager:         sessionManager,
-		client:                    client,
-		stateMgr:                  newStateManager(gatewayClient),
+		baseURL:           baseURL,
+		mcpSessionManager: sessionManager,
+		client:            client,
+		stateMgr: newStateManager(gatewayClient, safehttp.NewClient(safehttp.ClientOptions{
+			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
+			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
+			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
+		})),
 		tokenStore:                globalTokenStore,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 	}
@@ -99,6 +106,32 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 		// No component requires OAuth
 		log.Infof("Composite MCP server passed OAuth check with no pending component authentication: compositeMCPID=%s", mcpID)
 		return "", nil
+	} else if mcpServerConfig.Runtime == types.RuntimeContainerized && mcpServer.Spec.Manifest.ContainerizedConfig != nil && mcpServer.Spec.Manifest.ContainerizedConfig.OAuth != nil {
+		conf, resource, err := mcp.ResolveContainerOAuth(*mcpServer.Spec.Manifest.ContainerizedConfig, mcpServerConfig)
+		if err != nil {
+			return "", err
+		}
+		conf.RedirectURL = system.MCPOAuthCallbackURL(f.baseURL)
+		store := f.tokenStore.ForUserAndMCP(userID, mcpID, resource)
+		storedConf, token, err := store.GetTokenConfig(req.Context())
+		if err != nil {
+			return "", fmt.Errorf("failed to read container OAuth grant: %w", err)
+		}
+		if token != nil && mcp.ContainerOAuthConfigMatches(storedConf, conf) {
+			return "", nil
+		}
+		if token != nil {
+			if err := store.DeleteTokenConfig(req.Context()); err != nil {
+				return "", fmt.Errorf("failed to discard stale container OAuth grant: %w", err)
+			}
+		}
+
+		state := strings.ToLower(rand.Text())
+		verifier := oauth2.GenerateVerifier()
+		if err := f.stateMgr.store(req.Context(), userID, mcpID, resource, oauthAppAuthRequestID, "", state, verifier, conf); err != nil {
+			return "", fmt.Errorf("failed to start container OAuth: %w", err)
+		}
+		return conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier)), nil
 	} else if mcpServerConfig.Runtime != types.RuntimeRemote {
 		// Not a remote or composite server, no OAuth required
 		return "", nil
@@ -242,6 +275,8 @@ type mcpOAuthHandler struct {
 	userID             string
 	oauthAuthRequestID string
 	urlChan            chan string
+	catalogEntryMu     sync.RWMutex
+	catalogEntryName   string
 }
 
 func (f *MCPOAuthHandlerFactory) newMCPOAuthHandler(gatewayClient *client.Client, userID, mcpID, mcpURL, oauthAuthRequestID string) *mcpOAuthHandler {
@@ -280,27 +315,42 @@ func (m *mcpOAuthHandler) NewState(ctx context.Context, conf *oauth2.Config, ver
 	// callback arrives via a separate HTTP endpoint (oauthCallback) which looks up
 	// the pending state from the DB directly.
 	ch := make(chan mcp.CallbackPayload)
-	return state, ch, m.stateMgr.store(ctx, m.userID, m.mcpID, m.mcpURL, m.oauthAuthRequestID, state, verifier, conf)
+	m.catalogEntryMu.RLock()
+	catalogEntryName := m.catalogEntryName
+	m.catalogEntryMu.RUnlock()
+	return state, ch, m.stateMgr.store(ctx, m.userID, m.mcpID, m.mcpURL, m.oauthAuthRequestID, catalogEntryName, state, verifier, conf)
 }
 
 func (m *mcpOAuthHandler) Lookup(ctx context.Context, _ string) (string, string, error) {
 	if m.mcpID != "" {
-		var server v1.MCPServer
-		if err := m.client.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: m.mcpID}, &server); err == nil {
-			// If the server was created from a catalog entry, look up OAuth credentials by catalog entry name
-			if server.Spec.MCPServerCatalogEntryName != "" {
-				credName := system.MCPOAuthCredentialName(server.Spec.MCPServerCatalogEntryName)
-				cred, err := m.gatewayClient.RevealCredential(ctx, []string{credName}, "oauth")
-				if err == nil {
-					clientID := cred.Secrets["CLIENT_ID"]
-					clientSecret := cred.Secrets["CLIENT_SECRET"]
-					if clientID != "" && clientSecret != "" {
-						return clientID, clientSecret, nil
-					}
+		entryName := m.catalogEntryForMCP(ctx)
+		if entryName != "" {
+			credName := system.MCPOAuthCredentialName(entryName)
+			cred, err := m.gatewayClient.RevealCredential(ctx, []string{credName}, "oauth")
+			if err == nil {
+				clientID := cred.Secrets["CLIENT_ID"]
+				clientSecret := cred.Secrets["CLIENT_SECRET"]
+				if clientID != "" && clientSecret != "" {
+					m.catalogEntryMu.Lock()
+					m.catalogEntryName = entryName
+					m.catalogEntryMu.Unlock()
+					return clientID, clientSecret, nil
 				}
 			}
 		}
 	}
 
 	return "", "", fmt.Errorf("no credentials found for MCP server %s", m.mcpID)
+}
+
+func (m *mcpOAuthHandler) catalogEntryForMCP(ctx context.Context) string {
+	var server v1.MCPServer
+	if err := m.client.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: m.mcpID}, &server); err == nil {
+		return server.Spec.MCPServerCatalogEntryName
+	}
+	var instance v1.MCPServerInstance
+	if err := m.client.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: m.mcpID}, &instance); err == nil {
+		return instance.Spec.MCPServerCatalogEntryName
+	}
+	return ""
 }
