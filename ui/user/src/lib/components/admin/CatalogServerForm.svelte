@@ -55,6 +55,7 @@
 		hideTitle?: boolean;
 		readonlyMessage?: Snippet;
 		onConfigureOAuth?: () => void;
+		canConfigureOAuthCredentials?: boolean;
 	}
 
 	let {
@@ -66,7 +67,8 @@
 		onCancel,
 		onSubmit,
 		readonlyMessage,
-		onConfigureOAuth
+		onConfigureOAuth,
+		canConfigureOAuthCredentials = true
 	}: Props = $props();
 	function getType(entry?: MCPCatalogEntry | MCPCatalogServer) {
 		if (!entry) return undefined;
@@ -679,7 +681,10 @@
 				(rule) =>
 					rule.subjects?.some((s) => s.id === '*') && rule.resources?.some((r) => r.id === '*')
 			);
-			if (isAtLeastPowerUserPlus && !entry && !hasEverythingEveryoneRule) {
+			const showSetAccessPolicy = isAtLeastPowerUserPlus && !entry && !hasEverythingEveryoneRule;
+			const isSingleTenantCatalogEntry =
+				'isCatalogEntry' in savedEntry && savedEntry.manifest.serverUserType === 'singleUser';
+			if (showSetAccessPolicy && isSingleTenantCatalogEntry) {
 				await selectRulesDialog?.open();
 				loading = false;
 			} else {
@@ -982,6 +987,7 @@
 				onFieldChange={updateRequired}
 				isNewEntry={!entry}
 				{onConfigureOAuth}
+				{canConfigureOAuthCredentials}
 				secretBindingTargets={editableSecretBindingTargets}
 			>
 				{#snippet afterHeaders()}
@@ -1006,15 +1012,16 @@
 				onFieldChange={updateRequired}
 				isNewEntry={!entry}
 				{onConfigureOAuth}
+				{canConfigureOAuthCredentials}
 			>
 				{#snippet afterHeaders()}
-					{#if secretBoundHeaders.length > 0}
+					{#if formData.remoteConfig?.urlTemplate !== undefined}
 						<CustomConfigurationForm
 							bind:config={formData.env}
 							{readonly}
 							serverUserType={formData.serverUserType}
-							{secretBoundHeaders}
 							showRequired={showRequired.env}
+							urlTemplateVariables
 						/>
 					{/if}
 				{/snippet}

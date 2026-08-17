@@ -203,6 +203,7 @@ type MCPServerCatalogEntry struct {
 	Metadata
 	Manifest                  MCPServerCatalogEntryManifest `json:"manifest"`
 	Editable                  bool                          `json:"editable,omitempty"`
+	Detached                  bool                          `json:"detached,omitempty"`
 	CatalogName               string                        `json:"catalogName,omitempty"`
 	SourceURL                 string                        `json:"sourceURL,omitempty"`
 	UserCount                 int                           `json:"userCount,omitempty"`
@@ -392,7 +393,7 @@ type MCPServer struct {
 	// This is only set for multi-user servers.
 	MCPServerInstanceUserCount *int `json:"mcpServerInstanceUserCount,omitempty"`
 
-	// DeploymentStatus indicates the overall status of the MCP server deployment (Ready, Progressing, Failed).
+	// DeploymentStatus indicates the overall status of the MCP server deployment (Available, Progressing, Unavailable, Needs Attention, Shutdown, Unknown).
 	DeploymentStatus string `json:"deploymentStatus,omitempty"`
 
 	// DeploymentAvailableReplicas is the number of available replicas in the deployment.

@@ -673,16 +673,14 @@ func TestClaimMCPStaticOAuthTestEnforcesTTLAndExactlyOnce(t *testing.T) {
 		results := make(chan error, attempts)
 		var wg sync.WaitGroup
 		for range attempts {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				<-start
 				proof, err := c.ClaimMCPStaticOAuthTest(t.Context(), state.CallbackState)
 				if err == nil && (proof.ClientID != conf.ClientID || proof.ClientSecret != conf.ClientSecret) {
 					err = errors.New("claimed proof did not contain the candidate credentials")
 				}
 				results <- err
-			}()
+			})
 		}
 		close(start)
 		wg.Wait()
@@ -1045,9 +1043,7 @@ func TestCommitMCPStaticOAuthCredentialAllowsOneConcurrentWinner(t *testing.T) {
 	results := make(chan error, attempts)
 	var wg sync.WaitGroup
 	for range attempts {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			release, err := c.AcquireCredentialLock(t.Context(), credentialKey)
 			if err != nil {
@@ -1056,7 +1052,7 @@ func TestCommitMCPStaticOAuthCredentialAllowsOneConcurrentWinner(t *testing.T) {
 			}
 			defer release()
 			results <- c.commitMCPStaticOAuthCredential(t.Context(), proof, "user-1", "catalog-entry-1", "https://mcp.example/api", conf.ClientID, conf.ClientSecret, false)
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

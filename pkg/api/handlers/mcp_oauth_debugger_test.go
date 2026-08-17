@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -10,11 +11,12 @@ import (
 	"testing"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
-	"github.com/obot-platform/nanobot/pkg/safehttp"
+	"github.com/obot-platform/obot/apiclient/types"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -24,6 +26,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type oauthDebuggerRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f oauthDebuggerRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 func TestExchangeAndPersistOAuthDebuggerTokenForDirectDynamicAndCIMD(t *testing.T) {
 	const (
@@ -105,7 +113,11 @@ func TestExchangeOAuthDebuggerTokenBlocksStaticCatalogPrivateTokenEndpoint(t *te
 		newDirectOAuthDebuggerTestClient(t, "mcp-1"),
 		pending,
 		"code-1",
-		safehttp.NewClient(true, true, true),
+		safehttp.NewClient(safehttp.ClientOptions{
+			BlockLoopback:  true,
+			BlockPrivateIP: true,
+			BlockLinkLocal: true,
+		}),
 	)
 	if err == nil || !strings.Contains(err.Error(), "failed to exchange OAuth code") {
 		t.Fatalf("expected blocked private token exchange, got %v", err)
@@ -131,13 +143,13 @@ func newDirectOAuthDebuggerTestClient(t *testing.T, mcpID string) *gateway.Clien
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway DB: %v", err)
 	}
-	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, true)
+	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { _ = gatewayClient.Close() })
 	return gatewayClient
 }
 
 func TestOAuthDebuggerMetadata(t *testing.T) {
-	authServer := nmcp.AuthorizationServerMetadata{
+	authServer := mcp.AuthorizationServerMetadata{
 		Issuer:                            "https://auth.example.com",
 		AuthorizationEndpoint:             "https://auth.example.com/authorize",
 		TokenEndpoint:                     "https://auth.example.com/token",
@@ -148,7 +160,7 @@ func TestOAuthDebuggerMetadata(t *testing.T) {
 	}
 	authServerJSON := mustJSON(t, authServer)
 
-	registration := nmcp.ClientRegistrationMetadata{Scope: "read write"}
+	registration := mcp.ClientRegistrationMetadata{Scope: "read write"}
 	registrationJSON := mustJSON(t, registration)
 
 	m := &MCPHandler{serverURL: "https://obot.example.com"}
@@ -168,7 +180,7 @@ func TestOAuthDebuggerMetadata(t *testing.T) {
 		t.Fatalf("parsed auth server mismatch:\nexpected: %#v\nactual:   %#v", authServer, parsedAuthServer)
 	}
 
-	expectedRegistration := nmcp.ClientRegistrationMetadata{
+	expectedRegistration := mcp.ClientRegistrationMetadata{
 		RedirectURIs:            []string{"https://obot.example.com/oauth/mcp/callback"},
 		TokenEndpointAuthMethod: "client_secret_post",
 		GrantTypes:              []string{"authorization_code", "refresh_token"},
@@ -197,7 +209,7 @@ func TestOAuthDebuggerMetadataErrors(t *testing.T) {
 		{
 			name: "missing authorization endpoint",
 			oauthMetadata: &v1.OAuthMetadata{
-				AuthorizationServerMetadata: runtime.RawExtension{Raw: mustJSON(t, nmcp.AuthorizationServerMetadata{
+				AuthorizationServerMetadata: runtime.RawExtension{Raw: mustJSON(t, mcp.AuthorizationServerMetadata{
 					TokenEndpoint: "https://auth.example.com/token",
 				})},
 			},
@@ -206,7 +218,7 @@ func TestOAuthDebuggerMetadataErrors(t *testing.T) {
 		{
 			name: "missing token endpoint",
 			oauthMetadata: &v1.OAuthMetadata{
-				AuthorizationServerMetadata: runtime.RawExtension{Raw: mustJSON(t, nmcp.AuthorizationServerMetadata{
+				AuthorizationServerMetadata: runtime.RawExtension{Raw: mustJSON(t, mcp.AuthorizationServerMetadata{
 					AuthorizationEndpoint: "https://auth.example.com/authorize",
 				})},
 			},
@@ -215,7 +227,7 @@ func TestOAuthDebuggerMetadataErrors(t *testing.T) {
 		{
 			name: "invalid client registration metadata",
 			oauthMetadata: &v1.OAuthMetadata{
-				AuthorizationServerMetadata: runtime.RawExtension{Raw: mustJSON(t, nmcp.AuthorizationServerMetadata{
+				AuthorizationServerMetadata: runtime.RawExtension{Raw: mustJSON(t, mcp.AuthorizationServerMetadata{
 					AuthorizationEndpoint: "https://auth.example.com/authorize",
 					TokenEndpoint:         "https://auth.example.com/token",
 				})},
@@ -261,7 +273,7 @@ func TestOAuthDebuggerAuthStyle(t *testing.T) {
 }
 
 func TestOAuthDebuggerStaticClient(t *testing.T) {
-	authServer := nmcp.AuthorizationServerMetadata{
+	authServer := mcp.AuthorizationServerMetadata{
 		AuthorizationEndpoint: "https://auth.example.com/authorize",
 		TokenEndpoint:         "https://auth.example.com/token",
 	}
@@ -286,6 +298,7 @@ func TestOAuthDebuggerUsesCIMD(t *testing.T) {
 		oauthMeta    *v1.OAuthMetadata
 		clientID     string
 		clientSecret string
+		forceDynamic bool
 		expected     bool
 	}{
 		{
@@ -295,6 +308,14 @@ func TestOAuthDebuggerUsesCIMD(t *testing.T) {
 				ClientIDMetadataDocumentSupported: true,
 			},
 			expected: true,
+		},
+		{
+			name:         "dynamic client registration forced",
+			serverURL:    "https://obot.example.com",
+			forceDynamic: true,
+			oauthMeta: &v1.OAuthMetadata{
+				ClientIDMetadataDocumentSupported: true,
+			},
 		},
 		{
 			name:      "static credentials win",
@@ -330,7 +351,7 @@ func TestOAuthDebuggerUsesCIMD(t *testing.T) {
 			server := v1.MCPServer{
 				Status: v1.MCPServerStatus{OAuthMetadata: tt.oauthMeta},
 			}
-			got := (&MCPHandler{serverURL: tt.serverURL}).useOAuthDebuggerCIMD(server, tt.clientID, tt.clientSecret)
+			got := (&MCPHandler{serverURL: tt.serverURL, forceDynamicClient: tt.forceDynamic}).useOAuthDebuggerCIMD(server, tt.clientID, tt.clientSecret)
 			if got != tt.expected {
 				t.Fatalf("expected %v, got %v", tt.expected, got)
 			}
@@ -339,11 +360,11 @@ func TestOAuthDebuggerUsesCIMD(t *testing.T) {
 }
 
 func TestOAuthDebuggerCIMDClient(t *testing.T) {
-	authServer := nmcp.AuthorizationServerMetadata{
+	authServer := mcp.AuthorizationServerMetadata{
 		AuthorizationEndpoint: "https://auth.example.com/authorize",
 		TokenEndpoint:         "https://auth.example.com/token",
 	}
-	registration := nmcp.ClientRegistrationMetadata{
+	registration := mcp.ClientRegistrationMetadata{
 		RedirectURIs:  []string{"https://obot.example.com/oauth/mcp/callback"},
 		GrantTypes:    []string{"authorization_code", "refresh_token"},
 		ResponseTypes: []string{"code"},
@@ -367,6 +388,52 @@ func TestOAuthDebuggerCIMDClient(t *testing.T) {
 	}
 	if !reflect.DeepEqual(client.RedirectURIs, registration.RedirectURIs) {
 		t.Fatalf("expected redirect URIs %#v, got %#v", registration.RedirectURIs, client.RedirectURIs)
+	}
+}
+
+func TestRegisterOAuthDebuggerClientUsesProvidedHTTPClient(t *testing.T) {
+	registration := mcp.ClientRegistrationMetadata{
+		ClientName:   "Obot MCP OAuth Debugger",
+		RedirectURIs: []string{"https://obot.example.com/oauth/mcp/callback"},
+	}
+	expected := types.OAuthClient{
+		ClientID:     "registered-client",
+		ClientSecret: "registered-secret",
+	}
+	called := false
+	httpClient := &http.Client{Transport: oauthDebuggerRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		called = true
+		if request.Method != http.MethodPost || request.URL.String() != "https://auth.internal.test/register" {
+			t.Errorf("registration request = %s %s", request.Method, request.URL)
+		}
+		if request.Header.Get("Content-Type") != "application/json" || request.Header.Get("Accept") != "application/json" {
+			t.Errorf("registration request headers = %#v", request.Header)
+		}
+		var actual mcp.ClientRegistrationMetadata
+		if err := json.NewDecoder(request.Body).Decode(&actual); err != nil {
+			t.Errorf("decode registration request: %v", err)
+		} else if !reflect.DeepEqual(actual, registration) {
+			t.Errorf("registration request = %#v, want %#v", actual, registration)
+		}
+
+		body := strings.NewReader(string(mustJSON(t, expected)))
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(body),
+			Request:    request,
+		}, nil
+	})}
+
+	actual, err := registerOAuthDebuggerClient(t.Context(), httpClient, "https://auth.internal.test/register", registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("provided HTTP client was not used")
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("registered client = %#v, want %#v", actual, expected)
 	}
 }
 

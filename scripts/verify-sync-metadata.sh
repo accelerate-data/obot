@@ -38,6 +38,15 @@ printf '%s' "$HEAD_SHA"   | grep -qE '^[0-9a-f]{40}$' \
 printf '%s' "$MERGE_BASE" | grep -qE '^[0-9a-f]{40}$' \
   || fail "mergeBaseSha '${MERGE_BASE}' is not a 40-character commit sha"
 
+git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null \
+  || fail "upstreamHeadSha '${HEAD_SHA}' is not available locally"
+git cat-file -e "${MERGE_BASE}^{commit}" 2>/dev/null \
+  || fail "mergeBaseSha '${MERGE_BASE}' is not available locally"
+git merge-base --is-ancestor "$HEAD_SHA" HEAD \
+  || fail "upstreamHeadSha '${HEAD_SHA}' is not an ancestor of HEAD"
+git merge-base --is-ancestor "$MERGE_BASE" "$HEAD_SHA" \
+  || fail "mergeBaseSha '${MERGE_BASE}' is not an ancestor of upstreamHeadSha '${HEAD_SHA}'"
+
 # Highest stable vX.Y.Z tag whose commit is an ancestor of HEAD (excludes RC and
 # malformed tags such as v.0.23.2-rc1).
 ANCESTOR_LATEST="$(git tag --merged HEAD --sort=-v:refname 2>/dev/null \

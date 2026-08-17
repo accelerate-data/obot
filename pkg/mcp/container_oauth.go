@@ -111,8 +111,8 @@ func (sm *SessionManager) addContainerOAuthAuthorization(ctx context.Context, co
 	}
 	defer release()
 
-	store := sm.globalTokenStore.ForUserAndMCP(server.UserID, oauthID)
-	storedConf, token, err := store.GetTokenConfig(ctx, resource)
+	store := sm.globalTokenStore.ForUserAndMCP(server.UserID, oauthID, resource)
+	storedConf, token, err := store.GetTokenConfig(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to load container OAuth grant: %w", err)
 	}
@@ -120,7 +120,7 @@ func (sm *SessionManager) addContainerOAuthAuthorization(ctx context.Context, co
 		return types.NewErrBadRequest("MCP server requires OAuth authorization")
 	}
 	if !ContainerOAuthConfigMatches(storedConf, conf) {
-		if err := store.DeleteTokenConfig(ctx, resource); err != nil {
+		if err := store.DeleteTokenConfig(ctx); err != nil {
 			return fmt.Errorf("failed to discard stale container OAuth grant: %w", err)
 		}
 		return types.NewErrBadRequest("MCP server requires OAuth authorization")
@@ -128,13 +128,13 @@ func (sm *SessionManager) addContainerOAuthAuthorization(ctx context.Context, co
 
 	refreshed, err := conf.TokenSource(ctx, token).Token()
 	if err != nil {
-		if deleteErr := store.DeleteTokenConfig(ctx, resource); deleteErr != nil {
+		if deleteErr := store.DeleteTokenConfig(ctx); deleteErr != nil {
 			return fmt.Errorf("failed to discard invalid container OAuth grant after refresh failure: %w", deleteErr)
 		}
 		return types.NewErrBadRequest("MCP server OAuth grant must be reauthorized")
 	}
 	if refreshed.AccessToken != token.AccessToken || refreshed.RefreshToken != token.RefreshToken || !refreshed.Expiry.Equal(token.Expiry) {
-		if err := store.SetTokenConfig(ctx, resource, conf, refreshed); err != nil {
+		if err := store.SetTokenConfig(ctx, conf, refreshed); err != nil {
 			return fmt.Errorf("failed to persist refreshed container OAuth grant: %w", err)
 		}
 	}

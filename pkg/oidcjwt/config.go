@@ -52,7 +52,7 @@ func configuredRoles(value string, defaults []string) []string {
 		return defaults
 	}
 	var roles []string
-	for _, role := range strings.Split(value, ",") {
+	for role := range strings.SplitSeq(value, ",") {
 		if trimmed := strings.TrimSpace(role); trimmed != "" {
 			roles = append(roles, trimmed)
 		}

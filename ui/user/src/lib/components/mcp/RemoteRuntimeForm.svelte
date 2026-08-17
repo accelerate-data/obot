@@ -26,6 +26,7 @@
 		onFieldChange?: (field: string) => void;
 		isNewEntry?: boolean;
 		onConfigureOAuth?: () => void;
+		canConfigureOAuthCredentials?: boolean;
 		disableStaticOAuth?: boolean;
 		disableHostnameOption?: boolean;
 		secretBindingTargets?: MCPAllowedSecretBindingTarget[];
@@ -42,6 +43,7 @@
 		onFieldChange,
 		isNewEntry,
 		onConfigureOAuth,
+		canConfigureOAuthCredentials = true,
 		disableStaticOAuth,
 		disableHostnameOption,
 		secretBindingTargets,
@@ -134,7 +136,7 @@
 								</div>
 								<div class="flex w-full flex-col gap-1">
 									{#if variant === 'catalog'}
-										<label for={`env-type-${i}`} class="text-sm font-light">Value</label>
+										<label for={`header-value-type-${i}`} class="text-sm font-light">Value</label>
 										<Select
 											class="bg-base-100 dark:border-base-400 border border-transparent shadow-none"
 											classes={{
@@ -157,7 +159,7 @@
 												}
 												config.headers[i].value = '';
 											}}
-											id={`env-type-${i}`}
+											id={`header-value-type-${i}`}
 										/>
 									{/if}
 								</div>
@@ -333,6 +335,7 @@
 					'text-input-filled dark:bg-base-100 flex grow',
 					showRequired?.fixedURL && 'error'
 				)}
+				aria-required="true"
 				bind:value={remoteConfig.fixedURL}
 				disabled={readonly || showAdvanced}
 			/>
@@ -401,6 +404,7 @@
 						oninput={() => {
 							onFieldChange?.('fixedURL');
 						}}
+						aria-required="true"
 					/>
 				</div>
 			{:else if selectedType === 'hostname' && typeof (config as RemoteCatalogConfigAdmin).hostname !== 'undefined'}
@@ -422,6 +426,7 @@
 						oninput={() => {
 							onFieldChange?.('hostname');
 						}}
+						aria-required="true"
 					/>
 				</div>
 			{:else if selectedType === 'urlTemplate' && typeof (config as RemoteCatalogConfigAdmin).urlTemplate !== 'undefined'}
@@ -446,6 +451,7 @@
 							oninput={() => {
 								onFieldChange?.('urlTemplate');
 							}}
+							aria-required="true"
 						/>
 					</div>
 
@@ -457,8 +463,8 @@
 								<p class="font-semibold">Variable Interpolation</p>
 								<p>
 									Use <code class="rounded bg-base-300 px-1 py-0.5">${'{VARIABLE_NAME}'}</code> syntax
-									in your URL template. Variables can be populated from header values that users provide
-									during setup.
+									in your URL template. Declare each variable under URL Template Variables below. Users
+									provide the values during setup.
 								</p>
 								<p class="text-xs">
 									Example: <code class="rounded bg-base-300 px-1 py-0.5 text-xs"
@@ -583,7 +589,7 @@
 						<button
 							class="btn btn-secondary flex w-fit items-center gap-2 text-sm"
 							onclick={onConfigureOAuth}
-							disabled={readonly}
+							disabled={!canConfigureOAuthCredentials}
 							type="button"
 						>
 							<Settings class="size-4" />

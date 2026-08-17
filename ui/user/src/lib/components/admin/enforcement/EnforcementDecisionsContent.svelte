@@ -258,6 +258,11 @@
 		return deviceNames.get(deviceID) ?? deviceID;
 	}
 
+	function getDeviceHostname(deviceID?: string): string | undefined {
+		if (!deviceID) return undefined;
+		return deviceNames.get(deviceID);
+	}
+
 	const handleQueryChange = debounce((value: string) => {
 		query = value;
 
@@ -388,7 +393,9 @@
 			<TriangleAlert class="size-4 shrink-0" />
 			<span class="text-xs">
 				Enforcement is currently disabled, so no new decisions are being recorded.
-				<a class="text-link" href={resolve('/admin/devices')}>Enable it on the Devices page.</a>
+				<a class="text-link" href={resolve('/admin/devices?view=configuration')}
+					>Enable it on the Devices page.</a
+				>
 			</span>
 		</div>
 	{/if}
@@ -414,7 +421,7 @@
 	</div>
 {:else if displayTableData.length > 0}
 	<EnforcementDecisionsTable
-		{getDeviceDisplayName}
+		{getDeviceHostname}
 		onSelectRow={(decision) => {
 			showFilters = false;
 			selectedDecision = decision;

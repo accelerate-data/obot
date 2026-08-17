@@ -13,10 +13,10 @@ var _ fields.Fields = (*SkillRepository)(nil)
 
 type SkillRepository struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
+	metav1.ObjectMeta `json:"metadata"`
 
-	Spec   SkillRepositorySpec   `json:"spec,omitempty"`
-	Status SkillRepositoryStatus `json:"status,omitempty"`
+	Spec   SkillRepositorySpec   `json:"spec"`
+	Status SkillRepositoryStatus `json:"status"`
 }
 
 func (in *SkillRepository) Has(field string) (exists bool) {
@@ -25,6 +25,8 @@ func (in *SkillRepository) Has(field string) (exists bool) {
 
 func (in *SkillRepository) Get(field string) (value string) {
 	switch field {
+	case "spec.displayName":
+		return in.Spec.DisplayName
 	case "spec.repoURL":
 		return in.Spec.RepoURL
 	case "spec.ref":
@@ -37,7 +39,7 @@ func (in *SkillRepository) Get(field string) (value string) {
 }
 
 func (in *SkillRepository) FieldNames() []string {
-	return []string{"spec.repoURL", "spec.ref", "spec.gitCredentialID"}
+	return []string{"spec.displayName", "spec.repoURL", "spec.ref", "spec.gitCredentialID"}
 }
 
 func (in *SkillRepository) GetColumns() [][]string {
@@ -70,7 +72,7 @@ type SkillRepositoryStatus struct {
 
 type SkillRepositoryList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
+	metav1.ListMeta `json:"metadata"`
 
 	Items []SkillRepository `json:"items"`
 }

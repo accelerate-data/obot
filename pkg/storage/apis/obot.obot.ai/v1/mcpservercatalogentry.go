@@ -17,10 +17,10 @@ var (
 
 type MCPServerCatalogEntry struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
+	metav1.ObjectMeta `json:"metadata"`
 
-	Spec   MCPServerCatalogEntrySpec   `json:"spec,omitempty"`
-	Status MCPServerCatalogEntryStatus `json:"status,omitempty"`
+	Spec   MCPServerCatalogEntrySpec   `json:"spec"`
+	Status MCPServerCatalogEntryStatus `json:"status"`
 }
 
 func (in *MCPServerCatalogEntry) GetColumns() [][]string {
@@ -68,17 +68,18 @@ func (in *MCPServerCatalogEntry) DeleteRefs() []Ref {
 	}
 }
 
-// IsGitManaged mirrors the existing GitOps heuristic: sourced, non-editable
-// catalog entries are treated as git-managed
+// IsGitManaged mirrors the existing GitOps heuristic: sourced, non-editable,
+// non-detached catalog entries are treated as git-managed.
 func (in *MCPServerCatalogEntry) IsGitManaged() bool {
-	return !in.Spec.Editable && in.Spec.SourceURL != ""
+	return !in.Spec.Detached && !in.Spec.Editable && in.Spec.SourceURL != ""
 }
 
 type MCPServerCatalogEntrySpec struct {
-	Manifest         types.MCPServerCatalogEntryManifest `json:"manifest,omitempty"`
+	Manifest         types.MCPServerCatalogEntryManifest `json:"manifest"`
 	UnsupportedTools []string                            `json:"unsupportedTools,omitempty"`
 	MCPCatalogName   string                              `json:"mcpCatalogName,omitempty"`
 	Editable         bool                                `json:"editable,omitempty"`
+	Detached         bool                                `json:"detached"`
 	SourceURL        string                              `json:"sourceURL,omitempty"`
 	// PowerUserWorkspaceID contains the name of the PowerUserWorkspace that owns this catalog entry, if there is one.
 	PowerUserWorkspaceID string `json:"powerUserWorkspaceID,omitempty"`
@@ -105,7 +106,7 @@ type MCPServerCatalogEntryStatus struct {
 
 type MCPServerCatalogEntryList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
+	metav1.ListMeta `json:"metadata"`
 
 	Items []MCPServerCatalogEntry `json:"items"`
 }

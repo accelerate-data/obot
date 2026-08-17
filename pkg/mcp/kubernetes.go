@@ -60,7 +60,6 @@ type kubernetesBackend struct {
 	imagePullSecrets  []string
 	authEnabled       bool
 	obotClient        kclient.Client
-	resourceMaximums  ResourceMaximums
 	deploymentCacheMu sync.RWMutex
 	deploymentCache   map[string]*kubernetesDeploymentCacheEntry
 }
@@ -70,7 +69,15 @@ type kubernetesDeploymentCacheEntry struct {
 	podName string
 }
 
-func newKubernetesBackend(httpListenPort int, authEnabled bool, clientset *kubernetes.Clientset, client, cachedClient, obotClient kclient.WithWatch, opts Options, resourceMaximums ResourceMaximums) backend {
+func newKubernetesBackend(
+	httpListenPort int,
+	authEnabled bool,
+	clientset *kubernetes.Clientset,
+	client kclient.WithWatch,
+	cachedClient kclient.WithWatch,
+	obotClient kclient.WithWatch,
+	opts Options,
+) backend {
 	var serviceFQDN string
 	if opts.ServiceName != "" && opts.ServiceNamespace != "" {
 		serviceFQDN = fmt.Sprintf("%s.%s.svc.%s", opts.ServiceName, opts.ServiceNamespace, opts.MCPClusterDomain)
@@ -88,7 +95,6 @@ func newKubernetesBackend(httpListenPort int, authEnabled bool, clientset *kuber
 		authEnabled:      authEnabled,
 		imagePullSecrets: opts.MCPImagePullSecrets,
 		obotClient:       obotClient,
-		resourceMaximums: resourceMaximums,
 		deploymentCache:  map[string]*kubernetesDeploymentCacheEntry{},
 	}
 }
@@ -486,14 +492,25 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 	// Fetch K8s settings
 	k8sSettings := k.getK8sSettings(ctx)
 
-	mcpResources := mcpContainerResourcesWithMaximums(server.Resources, server.Runtime, server.NanobotAgentName != "", k8sSettings, k.resourceMaximums)
+	mcpResources := mcpContainerResources(
+		server.Resources,
+		server.Runtime,
+		server.NanobotAgentName != "",
+		k8sSettings,
+	)
 
 	effectiveImagePullSecrets, err := k.effectiveImagePullSecretNames(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get effective image pull secrets: %w", err)
 	}
 
-	annotations["obot.ai/k8s-settings-hash"] = ComputeK8sSettingsHash(k8sSettings, server.Resources, server.Runtime, server.NanobotAgentName != "", k.resourceMaximums, effectiveImagePullSecrets)
+	annotations["obot.ai/k8s-settings-hash"] = ComputeK8sSettingsHash(
+		k8sSettings,
+		server.Resources,
+		server.Runtime,
+		server.NanobotAgentName != "",
+		effectiveImagePullSecrets,
+	)
 
 	// Get PSA enforce level for security context decisions
 	psaLevel := GetPSAEnforceLevelFromSpec(k8sSettings)
@@ -984,7 +1001,8 @@ func (k *kubernetesBackend) deleteDeploymentCache(mcpServerName string) {
 }
 
 func mcpContainerResources(serverSpecificResources *corev1.ResourceRequirements, runtime types.Runtime, nanobotAgent bool, k8sSettings v1.K8sSettingsSpec) corev1.ResourceRequirements {
-	return mcpContainerResourcesWithMaximums(serverSpecificResources, runtime, nanobotAgent, k8sSettings, ResourceMaximums{})
+	maximums := EffectiveResourceMaximums(k8sSettings, ResourceMaximums{})
+	return mcpContainerResourcesWithMaximums(serverSpecificResources, runtime, nanobotAgent, k8sSettings, maximums)
 }
 
 func mcpContainerResourcesWithMaximums(serverSpecificResources *corev1.ResourceRequirements, runtime types.Runtime, nanobotAgent bool, k8sSettings v1.K8sSettingsSpec, maximums ResourceMaximums) corev1.ResourceRequirements {
@@ -1029,10 +1047,6 @@ func withImplicitResourceMaximums(resources corev1.ResourceRequirements, implici
 
 func EffectiveDefaultMCPResourceRequirements(k8sSettings v1.K8sSettingsSpec) corev1.ResourceRequirements {
 	return mcpContainerResources(nil, types.RuntimeNPX, false, k8sSettings)
-}
-
-func EffectiveDefaultMCPResourceRequirementsWithMaximums(k8sSettings v1.K8sSettingsSpec, maximums ResourceMaximums) corev1.ResourceRequirements {
-	return mcpContainerResourcesWithMaximums(nil, types.RuntimeNPX, false, k8sSettings, maximums)
 }
 
 func withServerResourceOverrides(defaults corev1.ResourceRequirements, overrides *corev1.ResourceRequirements) corev1.ResourceRequirements {
@@ -1094,8 +1108,19 @@ func (k *kubernetesBackend) restartServer(ctx context.Context, server ServerConf
 	}
 
 	// Compute K8s settings hash
-	k8sSettingsHash := ComputeK8sSettingsHash(k8sSettings, server.Resources, server.Runtime, server.NanobotAgentName != "", k.resourceMaximums, effectiveImagePullSecrets)
-	desiredResources := mcpContainerResourcesWithMaximums(server.Resources, server.Runtime, server.NanobotAgentName != "", k8sSettings, k.resourceMaximums)
+	k8sSettingsHash := ComputeK8sSettingsHash(
+		k8sSettings,
+		server.Resources,
+		server.Runtime,
+		server.NanobotAgentName != "",
+		effectiveImagePullSecrets,
+	)
+	desiredResources := mcpContainerResources(
+		server.Resources,
+		server.Runtime,
+		server.NanobotAgentName != "",
+		k8sSettings,
+	)
 
 	// Get PSA enforce level for security context decisions
 	psaLevel := GetPSAEnforceLevelFromSpec(k8sSettings)
@@ -1693,7 +1718,13 @@ func getPodSecurityContextPatch(psaLevel PSAEnforceLevel) map[string]any {
 // MCP Deployment needs to be updated. The API/status field is still named
 // K8sSettingsHash, but managed image pull secret names are part of the same
 // v1 drift path.
-func ComputeK8sSettingsHash(settings v1.K8sSettingsSpec, serverSpecificResources *corev1.ResourceRequirements, serverRuntime types.Runtime, nanobotAgentServer bool, maximums ResourceMaximums, imagePullSecretNames []string) string {
+func ComputeK8sSettingsHash(
+	settings v1.K8sSettingsSpec,
+	serverSpecificResources *corev1.ResourceRequirements,
+	serverRuntime types.Runtime,
+	nanobotAgentServer bool,
+	imagePullSecretNames []string,
+) string {
 	var buf bytes.Buffer
 
 	// Hash affinity
@@ -1709,10 +1740,10 @@ func ComputeK8sSettingsHash(settings v1.K8sSettingsSpec, serverSpecificResources
 	}
 
 	// Resources are server specific. Hash the same effective resources that are
-	// applied to the Deployment, including ResourceMaximums capping implicit
-	// built-in defaults.
+	// applied to the Deployment, including maximums from K8sSettings capping
+	// implicit built-in defaults.
 	// Ignoring errors from JSON encoding since the inputs are well-defined structs that should always marshal successfully
-	_ = json.NewEncoder(&buf).Encode(mcpContainerResourcesWithMaximums(serverSpecificResources, serverRuntime, nanobotAgentServer, settings, maximums))
+	_ = json.NewEncoder(&buf).Encode(mcpContainerResources(serverSpecificResources, serverRuntime, nanobotAgentServer, settings))
 
 	// Hash runtimeClassName
 	if settings.RuntimeClassName != nil && *settings.RuntimeClassName != "" {
@@ -1938,7 +1969,12 @@ func (k *kubernetesBackend) CheckCapacity(ctx context.Context, server ServerConf
 
 	memoryRequest := resource.MustParse("0")
 	cpuRequest := resource.MustParse("0")
-	resources := mcpContainerResourcesWithMaximums(server.Resources, server.Runtime, server.NanobotAgentName != "", k8sSettings, k.resourceMaximums)
+	resources := mcpContainerResources(
+		server.Resources,
+		server.Runtime,
+		server.NanobotAgentName != "",
+		k8sSettings,
+	)
 	if mem, ok := resources.Requests[corev1.ResourceMemory]; ok {
 		memoryRequest = mem
 	}
@@ -2009,17 +2045,31 @@ func (k *kubernetesBackend) checkResourceQuotaCapacity(ctx context.Context, memo
 // Used by the admin capacity endpoint.
 func (k *kubernetesBackend) GetCapacityInfo(ctx context.Context) types.MCPCapacityInfo {
 	// Try ResourceQuota first - this is the only accurate source
-	if info, ok := k.getResourceQuotaCapacity(ctx); ok {
+	if info, ok := k.getResourceQuotaCapacity(ctx, nil); ok {
 		return info
 	}
 
 	// Fallback to deployment aggregation only (no limits, just totals)
 	// Node metrics are intentionally not used because they don't account for
 	// taints, affinity, or other scheduling constraints.
-	return k.getDeploymentCapacity(ctx)
+	return k.getDeploymentCapacity(ctx, nil)
 }
 
-func (k *kubernetesBackend) getResourceQuotaCapacity(ctx context.Context) (types.MCPCapacityInfo, bool) {
+func (k *kubernetesBackend) GetCapacityInfoForServers(ctx context.Context, serverNames []string) types.MCPCapacityInfo {
+	allowed := make(map[string]struct{}, len(serverNames))
+	for _, name := range serverNames {
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+
+	if info, ok := k.getResourceQuotaCapacity(ctx, allowed); ok {
+		return info
+	}
+	return k.getDeploymentCapacity(ctx, allowed)
+}
+
+func (k *kubernetesBackend) getResourceQuotaCapacity(ctx context.Context, allowed map[string]struct{}) (types.MCPCapacityInfo, bool) {
 	quotas, err := k.clientset.CoreV1().ResourceQuotas(k.mcpNamespace).List(ctx, metav1.ListOptions{})
 	if err != nil || len(quotas.Items) == 0 {
 		return types.MCPCapacityInfo{}, false
@@ -2047,29 +2097,21 @@ func (k *kubernetesBackend) getResourceQuotaCapacity(ctx context.Context) (types
 	deployments, err := k.clientset.AppsV1().Deployments(k.mcpNamespace).List(ctx, metav1.ListOptions{})
 	if err == nil {
 		var totalCPU, totalMemory resource.Quantity
+		active := 0
 		for _, deployment := range deployments.Items {
-			replicas := int64(1)
-			if deployment.Spec.Replicas != nil {
-				replicas = int64(*deployment.Spec.Replicas)
-			}
-			for _, container := range deployment.Spec.Template.Spec.Containers {
-				if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
-					scaled := cpu.DeepCopy()
-					scaled.SetMilli(scaled.MilliValue() * replicas)
-					totalCPU.Add(scaled)
-				}
-				if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
-					scaled := mem.DeepCopy()
-					scaled.Set(scaled.Value() * replicas)
-					totalMemory.Add(scaled)
+			if allowed != nil {
+				if _, ok := allowed[deployment.Name]; !ok {
+					continue
 				}
 			}
+			addDeploymentResourceRequests(deployment, &totalCPU, &totalMemory)
+			active++
 		}
 		info.CPURequested = formatCPU(totalCPU)
 		info.MemoryRequested = formatMemory(totalMemory)
-		info.ActiveDeployments = len(deployments.Items)
-	} else {
-		// Fallback to ResourceQuota status if deployment list fails
+		info.ActiveDeployments = active
+	} else if allowed == nil {
+		// Fallback to ResourceQuota status if deployment list fails (namespace-wide only)
 		var totalCPUUsed, totalMemoryUsed resource.Quantity
 		for _, quota := range quotas.Items {
 			if used, ok := quota.Status.Used[corev1.ResourceRequestsCPU]; ok {
@@ -2082,12 +2124,14 @@ func (k *kubernetesBackend) getResourceQuotaCapacity(ctx context.Context) (types
 		info.CPURequested = formatCPU(totalCPUUsed)
 		info.MemoryRequested = formatMemory(totalMemoryUsed)
 		info.ActiveDeployments = k.countActiveDeployments(ctx)
+	} else {
+		info.Error = "failed to list deployments"
 	}
 
 	return info, true
 }
 
-func (k *kubernetesBackend) getDeploymentCapacity(ctx context.Context) types.MCPCapacityInfo {
+func (k *kubernetesBackend) getDeploymentCapacity(ctx context.Context, allowed map[string]struct{}) types.MCPCapacityInfo {
 	info := types.MCPCapacityInfo{
 		Source: types.CapacitySourceDeployments,
 	}
@@ -2099,30 +2143,41 @@ func (k *kubernetesBackend) getDeploymentCapacity(ctx context.Context) types.MCP
 	}
 
 	var totalCPU, totalMemory resource.Quantity
+	active := 0
 	for _, deployment := range deployments.Items {
-		replicas := int64(1)
-		if deployment.Spec.Replicas != nil {
-			replicas = int64(*deployment.Spec.Replicas)
-		}
-		for _, container := range deployment.Spec.Template.Spec.Containers {
-			if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
-				scaled := cpu.DeepCopy()
-				scaled.SetMilli(scaled.MilliValue() * replicas)
-				totalCPU.Add(scaled)
-			}
-			if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
-				scaled := mem.DeepCopy()
-				scaled.Set(scaled.Value() * replicas)
-				totalMemory.Add(scaled)
+		if allowed != nil {
+			if _, ok := allowed[deployment.Name]; !ok {
+				continue
 			}
 		}
+		addDeploymentResourceRequests(deployment, &totalCPU, &totalMemory)
+		active++
 	}
 
 	info.CPURequested = formatCPU(totalCPU)
 	info.MemoryRequested = formatMemory(totalMemory)
-	info.ActiveDeployments = len(deployments.Items)
+	info.ActiveDeployments = active
 
 	return info
+}
+
+func addDeploymentResourceRequests(deployment appsv1.Deployment, totalCPU, totalMemory *resource.Quantity) {
+	replicas := int64(1)
+	if deployment.Spec.Replicas != nil {
+		replicas = int64(*deployment.Spec.Replicas)
+	}
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
+			scaled := cpu.DeepCopy()
+			scaled.SetMilli(scaled.MilliValue() * replicas)
+			totalCPU.Add(scaled)
+		}
+		if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
+			scaled := mem.DeepCopy()
+			scaled.Set(scaled.Value() * replicas)
+			totalMemory.Add(scaled)
+		}
+	}
 }
 
 func (k *kubernetesBackend) countActiveDeployments(ctx context.Context) int {

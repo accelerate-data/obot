@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
@@ -24,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -32,6 +35,149 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestAcceptCatalogEntryOwnership(t *testing.T) {
+	entry := &v1.MCPServerCatalogEntry{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				"example.com/keep": "true",
+			},
+		},
+		Spec: v1.MCPServerCatalogEntrySpec{
+			Editable:  false,
+			Detached:  true,
+			SourceURL: "https://github.com/obot-platform/mcp-catalog",
+			Manifest: types.MCPServerCatalogEntryManifest{
+				EntryKey: "context7",
+			},
+		},
+	}
+
+	acceptCatalogEntryOwnership(entry)
+
+	assert.True(t, entry.Spec.Editable)
+	assert.Empty(t, entry.Spec.SourceURL)
+	assert.Empty(t, entry.Spec.Manifest.EntryKey)
+	assert.False(t, entry.Spec.Detached)
+	assert.Equal(t, "true", entry.Annotations["example.com/keep"])
+}
+
+type fakeCapacityInfoProvider struct {
+	serverNames []string
+	info        types.MCPCapacityInfo
+	err         error
+}
+
+func (f *fakeCapacityInfoProvider) GetCapacityInfoForServers(_ context.Context, serverNames []string) (types.MCPCapacityInfo, error) {
+	f.serverNames = slices.Clone(serverNames)
+	return f.info, f.err
+}
+
+func TestMCPCatalogHandlerGetEntryCapacity(t *testing.T) {
+	tests := []struct {
+		name             string
+		entryCatalogName string
+		entryRuntime     types.Runtime
+		servers          []v1.MCPServer
+		providerInfo     types.MCPCapacityInfo
+		providerErr      error
+		wantServerNames  []string
+		wantErr          string
+		wantResponse     types.MCPCapacityInfo
+	}{
+		{
+			name:             "returns capacity for matching deployments",
+			entryCatalogName: "catalog-1",
+			entryRuntime:     types.RuntimeContainerized,
+			servers: []v1.MCPServer{{
+				ObjectMeta: metav1.ObjectMeta{Name: "server-1", Namespace: system.DefaultNamespace},
+				Spec:       v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"},
+			}},
+			providerInfo:    types.MCPCapacityInfo{Source: types.CapacitySourceDeployments, ActiveDeployments: 1},
+			wantServerNames: []string{"server-1"},
+			wantResponse:    types.MCPCapacityInfo{Source: types.CapacitySourceDeployments, ActiveDeployments: 1},
+		},
+		{
+			name:             "excludes template deployments",
+			entryCatalogName: "catalog-1",
+			entryRuntime:     types.RuntimeContainerized,
+			servers: []v1.MCPServer{
+				{ObjectMeta: metav1.ObjectMeta{Name: "template-server", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1", Template: true}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "server-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"}},
+			},
+			providerInfo:    types.MCPCapacityInfo{ActiveDeployments: 1},
+			wantServerNames: []string{"server-1"},
+			wantResponse:    types.MCPCapacityInfo{ActiveDeployments: 1},
+		},
+		{
+			name:             "rejects composite catalog entry",
+			entryCatalogName: "catalog-1",
+			entryRuntime:     types.RuntimeComposite,
+			wantErr:          "capacity is only supported for hosted catalog entries",
+		},
+		{
+			name:             "rejects remote catalog entry",
+			entryCatalogName: "catalog-1",
+			entryRuntime:     types.RuntimeRemote,
+			wantErr:          "capacity is only supported for hosted catalog entries",
+		},
+		{
+			name:             "rejects entry from another catalog",
+			entryCatalogName: "catalog-2",
+			wantErr:          "entry does not belong to catalog",
+		},
+		{
+			name:             "rejects unsupported backend",
+			entryCatalogName: "catalog-1",
+			entryRuntime:     types.RuntimeContainerized,
+			providerErr:      &mcp.ErrNotSupportedByBackend{Feature: "capacity info", Backend: "docker"},
+			wantErr:          "feature capacity info is not supported by docker backend",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &fakeCapacityInfoProvider{info: tt.providerInfo, err: tt.providerErr}
+			objects := []client.Object{
+				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "catalog-1", Namespace: system.DefaultNamespace}},
+				&v1.MCPServerCatalogEntry{
+					ObjectMeta: metav1.ObjectMeta{Name: "entry-1", Namespace: system.DefaultNamespace},
+					Spec: v1.MCPServerCatalogEntrySpec{
+						MCPCatalogName: tt.entryCatalogName,
+						Manifest:       types.MCPServerCatalogEntryManifest{Runtime: tt.entryRuntime},
+					},
+				},
+			}
+			for i := range tt.servers {
+				server := tt.servers[i]
+				objects = append(objects, &server)
+			}
+
+			req := httptest.NewRequest(http.MethodGet, "/api/mcp-catalogs/catalog-1/entries/entry-1/mcp-capacity", nil)
+			req.SetPathValue("catalog_id", "catalog-1")
+			req.SetPathValue("entry_id", "entry-1")
+			rec := httptest.NewRecorder()
+			err := (&MCPCatalogHandler{capacityInfoProvider: provider}).GetEntryCapacity(api.Context{
+				ResponseWriter: rec,
+				Request:        req,
+				Storage:        newFakeStorage(t, objects...),
+			})
+
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				assert.Empty(t, provider.serverNames)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantServerNames, provider.serverNames)
+
+			var got types.MCPCapacityInfo
+			require.NoError(t, json.NewDecoder(rec.Body).Decode(&got))
+			assert.Equal(t, tt.wantResponse, got)
+		})
+	}
+}
 
 const testStaticOAuthCredentialGeneration = "test-generation"
 
@@ -311,6 +457,44 @@ func TestValidateEntryVisibleFromScope(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPrepareTempServerConfigDoesNotUseBoundSecretInURL(t *testing.T) {
+	const (
+		namespace = "obot-ns"
+		label     = "allowed-secret"
+		key       = "WORKSPACE"
+	)
+	localK8sClient := fake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote-secret", Namespace: namespace, Labels: map[string]string{label: "true"}},
+		Data:       map[string][]byte{"token": []byte("secret-value")},
+	}).Build()
+	manifest := types.MCPServerManifest{
+		Runtime: types.RuntimeRemote,
+		Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
+			Key: key, Required: true,
+		}}},
+		RemoteConfig: &types.RemoteRuntimeConfig{
+			IsTemplate:  true,
+			URLTemplate: "https://example.com/mcp/${WORKSPACE}",
+			Headers: []types.MCPHeader{{
+				Key: key, SecretBinding: &types.MCPSecretBinding{Name: "remote-secret", Key: "token"},
+			}},
+		},
+	}
+	input := map[string]string{key: "user-value"}
+	options := mcp.ValidationOptions{RemoteMCPURLValidationConfig: mcp.RemoteMCPURLValidationConfig{
+		AllowLocalhostMCP: true,
+		AllowPrivateIPMCP: true,
+		AllowLinkLocalMCP: true,
+	}}
+
+	merged, err := prepareTempServerConfig(t.Context(), localK8sClient, namespace, label, &manifest, input, false, options)
+	require.NoError(t, err)
+	require.Equal(t, "https://example.com/mcp/user-value", manifest.RemoteConfig.URL)
+	require.NotContains(t, manifest.RemoteConfig.URL, "secret-value")
+	require.Equal(t, "secret-value", merged[key])
+	require.Equal(t, "user-value", input[key])
 }
 
 func TestPopulateComponentManifestsHydratesMCPServerID(t *testing.T) {

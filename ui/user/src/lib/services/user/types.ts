@@ -64,11 +64,13 @@ export interface AppPreferences {
 		logoIconError: string;
 		logoIconWarning: string;
 		logoDefault: string;
-		logoEnterprise: string;
 		logoChat: string;
+		logoEnterprise: string;
+		logoCommunity: string;
 		darkLogoDefault: string;
 		darkLogoChat: string;
 		darkLogoEnterprise: string;
+		darkLogoCommunity: string;
 	};
 	theme: {
 		backgroundColor: string;
@@ -337,7 +339,13 @@ export interface BootstrapStatus {
 	setupEnabled: boolean;
 }
 
-// Devices
+// Device code
+
+export interface DeviceCodeVerificationResponse {
+	authorized: boolean;
+}
+
+// Device scans
 
 // Device scans — payload shape matches apiclient/types/devicescan.go.
 export interface DeviceScan {
@@ -873,6 +881,7 @@ export interface ToolReferenceList {
 // Version
 
 export interface Version {
+	latestVersion?: string;
 	sessionStore?: string;
 	obot?: string;
 	authEnabled?: boolean;
@@ -881,6 +890,8 @@ export interface Version {
 	licenseEntitlements?: string[];
 	userCount?: number;
 	userLimit?: number;
+	deviceCount?: number;
+	deviceLimit?: number;
 	licenseEntitlementViolations?: LicenseEntitlementViolation[];
 	missingLicenseEntitlements?: string[];
 	upgradeAvailable?: boolean;

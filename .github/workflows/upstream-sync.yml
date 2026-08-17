@@ -2,6 +2,7 @@ name: Upstream Sync
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 on:
@@ -34,6 +35,17 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Ensure sync labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # shellcheck disable=SC2129
+          set -euo pipefail
+          gh label create "upstream-sync" --color "1d76db" --description "Automated upstream synchronization" --force
+          gh label create "sync:clean" --color "0e8a16" --description "Upstream sync without customized-file overlap" --force
+          gh label create "sync:touches-customized-files" --color "fbca04" --description "Upstream sync touches fork-customized files" --force
+          gh label create "sync:conflicts" --color "d93f0b" --description "Upstream sync requires conflict resolution" --force
+
       - name: Fetch upstream
         run: |
           git remote add upstream "$UPSTREAM_REPO"
@@ -65,9 +77,11 @@ jobs:
         run: |
           set -euo pipefail
           REASON="Sync skipped: open sync PR already exists — ${OPEN_URL}"
-          echo "### :no_entry_sign: Upstream sync skipped" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "${REASON}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### :no_entry_sign: Upstream sync skipped"
+            echo ""
+            echo "${REASON}"
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "${REASON}"
           if [ -z "${SLACK_DEPS_WEBHOOK:-}" ]; then
             echo "::warning::SLACK_DEPS_WEBHOOK not set — skipping Slack notification"
@@ -83,12 +97,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          set_output() {
+            printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"
+          }
+
           OURS="origin/${BASE_BRANCH}"
           THEIRS="upstream/${UPSTREAM_BRANCH}"
           BASE="$(git merge-base "$OURS" "$THEIRS")"
+          RECORDED_HEAD="$(jq -r '.upstreamHeadSha // empty' .accelerate/upstream-sync.json 2>/dev/null || true)"
+          if printf '%s' "$RECORDED_HEAD" | grep -qE '^[0-9a-f]{40}$' \
+            && git cat-file -e "${RECORDED_HEAD}^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$RECORDED_HEAD" "$THEIRS"; then
+            BASE="$RECORDED_HEAD"
+          else
+            echo "::warning::Recorded upstream checkpoint is unavailable or invalid; using Git merge-base ${BASE}"
+          fi
 
           NEW_COMMITS="$(git rev-list --count "${OURS}..${THEIRS}")"
-          echo "new_commits=${NEW_COMMITS}" >> "$GITHUB_OUTPUT"
+          set_output new_commits "$NEW_COMMITS"
 
           if [ "$NEW_COMMITS" -eq 0 ]; then
             exit 0
@@ -97,28 +123,35 @@ jobs:
           DATE_TAG="$(date -u +%Y%m%d)"
           UPSTREAM_HEAD="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
           BRANCH="sync/upstream-${DATE_TAG}-${UPSTREAM_HEAD:0:7}"
-          echo "branch=${BRANCH}"       >> "$GITHUB_OUTPUT"
-          echo "date_tag=${DATE_TAG}"   >> "$GITHUB_OUTPUT"
-
-          echo "upstream_head=${UPSTREAM_HEAD}" >> "$GITHUB_OUTPUT"
-          echo "merge_base=${BASE}"             >> "$GITHUB_OUTPUT"
+          set_output branch "$BRANCH"
+          set_output date_tag "$DATE_TAG"
+          set_output upstream_head "$UPSTREAM_HEAD"
+          set_output merge_base "$BASE"
 
           # Resolve the upstream Obot version as the highest STABLE release tag
           # (vX.Y.Z — no pre-release/RC or malformed tags). `git describe --abbrev=0`
           # is avoided: it latches onto the nearest ancestor tag, which can be a
           # pre-release (e.g. v.0.23.2-rc1) and, because upstream cuts patch releases
           # on release branches, may also miss the latest stable tag entirely.
-          UPSTREAM_VERSION="$(git tag --list 'v[0-9]*' --sort=-v:refname \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-            | head -1)"
-          echo "upstream_version=${UPSTREAM_VERSION}" >> "$GITHUB_OUTPUT"
+          UPSTREAM_VERSION=""
+          while IFS= read -r tag; do
+            if printf '%s' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              UPSTREAM_VERSION="$tag"
+              break
+            fi
+          done < <(git tag --merged "upstream/${UPSTREAM_BRANCH}" --sort=-v:refname)
+          if [ -z "$UPSTREAM_VERSION" ]; then
+            echo "::error::No stable upstream version tag found"
+            exit 1
+          fi
+          set_output upstream_version "$UPSTREAM_VERSION"
 
           git diff --name-only "$BASE" "$OURS"    | sort -u > /tmp/ours.txt
           git diff --name-only "$BASE" "$THEIRS"  | sort -u > /tmp/theirs.txt
           comm -12 /tmp/ours.txt /tmp/theirs.txt  > /tmp/overlap.txt
 
           OVERLAP_COUNT="$(wc -l < /tmp/overlap.txt | tr -d ' ')"
-          echo "overlap_count=${OVERLAP_COUNT}" >> "$GITHUB_OUTPUT"
+          set_output overlap_count "$OVERLAP_COUNT"
 
           SCRATCH="__detect-conflicts-$$"
           git checkout -B "$SCRATCH" "$OURS" -q
@@ -132,7 +165,7 @@ jobs:
           git merge --abort 2>/dev/null || true
           git checkout "$OURS" -q 2>/dev/null || true
           git branch -D "$SCRATCH" 2>/dev/null || true
-          echo "conflict_count=${CONFLICT_COUNT}" >> "$GITHUB_OUTPUT"
+          set_output conflict_count "$CONFLICT_COUNT"
           printf '%s' "$CONFLICTS" > /tmp/conflicts.txt
 
           if [ "$CONFLICT_COUNT" -gt 0 ]; then
@@ -142,11 +175,12 @@ jobs:
           else
             BUCKET="clean"
           fi
-          echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+          set_output bucket "$BUCKET"
 
       - name: Skip — no new upstream commits
         if: steps.existing.outputs.found == 'false' && steps.analyze.outputs.new_commits == '0'
         run: |
+          # shellcheck disable=SC2129
           echo "### :white_check_mark: Upstream sync — nothing to do" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "No new upstream commits found." >> "$GITHUB_STEP_SUMMARY"
@@ -213,6 +247,7 @@ jobs:
           UPSTREAM_HEAD="${{ steps.analyze.outputs.upstream_head }}"
           MERGE_BASE="${{ steps.analyze.outputs.merge_base }}"
           UPSTREAM_VERSION="${{ steps.analyze.outputs.upstream_version }}"
+          BRANCH="${{ steps.analyze.outputs.branch }}"
 
           case "$BUCKET" in
             clean)               VERDICT=":white_check_mark: **Safe to merge.** No overlap and no textual conflicts." ;;
@@ -248,6 +283,18 @@ jobs:
               echo "### Conflicting files"
               echo '```'
               cat /tmp/conflicts.txt
+              echo '```'
+              echo
+              echo "### Resolve the sync branch"
+              echo '```bash'
+              echo "git fetch origin \"${BRANCH}\""
+              echo "git fetch upstream \"${UPSTREAM_BRANCH}\" --tags"
+              echo "git switch -C \"${BRANCH}\" \"origin/${BRANCH}\""
+              echo "git merge --no-ff \"upstream/${UPSTREAM_BRANCH}\""
+              echo "# Resolve conflicts, then:"
+              echo "git add <resolved-files>"
+              echo "git commit"
+              echo "git push origin \"${BRANCH}\""
               echo '```'
               echo
             fi

@@ -2,6 +2,7 @@ package v1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -9,10 +10,10 @@ import (
 
 type K8sSettings struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
+	metav1.ObjectMeta `json:"metadata"`
 
-	Spec   K8sSettingsSpec   `json:"spec,omitempty"`
-	Status K8sSettingsStatus `json:"status,omitempty"`
+	Spec   K8sSettingsSpec   `json:"spec"`
+	Status K8sSettingsStatus `json:"status"`
 }
 
 type K8sSettingsSpec struct {
@@ -27,6 +28,12 @@ type K8sSettingsSpec struct {
 	// Resource requests and limits
 	// +k8s:openapi-gen=false
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Maximum resource requests and limits for MCP server pods
+	MaxCPURequest    *resource.Quantity `json:"maxCPURequest,omitempty"`
+	MaxCPULimit      *resource.Quantity `json:"maxCPULimit,omitempty"`
+	MaxMemoryRequest *resource.Quantity `json:"maxMemoryRequest,omitempty"`
+	MaxMemoryLimit   *resource.Quantity `json:"maxMemoryLimit,omitempty"`
 
 	// Resource requests and limits for NanobotAgent pods
 	// +k8s:openapi-gen=false
@@ -48,6 +55,9 @@ type K8sSettingsSpec struct {
 
 	// SetViaHelm indicates if these settings came from Helm (cannot be updated via API)
 	SetViaHelm bool `json:"setViaHelm,omitempty"`
+
+	// MaximumsSetViaHelm indicates if resource maximums came from Helm (cannot be updated via API)
+	MaximumsSetViaHelm bool `json:"maximumsSetViaHelm,omitempty"`
 }
 
 // PodSecurityAdmissionSettings contains Pod Security Admission configuration
@@ -80,7 +90,7 @@ type K8sSettingsStatus struct{}
 
 type K8sSettingsList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
+	metav1.ListMeta `json:"metadata"`
 
 	Items []K8sSettings `json:"items"`
 }

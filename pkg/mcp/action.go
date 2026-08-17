@@ -169,10 +169,14 @@ func (sm *SessionManager) serverOrInstanceFromConnectURL(ctx context.Context, id
 			if err != nil {
 				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrBadRequest("catalog entry %s cannot be connected because it could not be converted to an MCP server: %v", id, err)
 			}
+			resourceMaximums, err := sm.EffectiveKubernetesResourceMaximums(ctx, sm.storageClient)
+			if err != nil {
+				return v1.MCPServer{}, v1.MCPServerInstance{}, err
+			}
 			if err := ValidateServerManifest(ctx, manifest, false, ValidationOptions{
 				AllowMissingURL:              allowMissingURL,
 				RemoteMCPURLValidationConfig: sm.remoteURLValidationConfig,
-				ResourceMaximums:             sm.resourceMaximums,
+				ResourceMaximums:             resourceMaximums,
 			}); err != nil {
 				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrBadRequest("catalog entry %s cannot be connected because its MCP server manifest is invalid: %v", id, err)
 			}
@@ -253,6 +257,14 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 		return server, ServerConfig{}, nil, fmt.Errorf("failed to find credential: %w", err)
 	}
 
+	var staticOauthCred gatewaytypes.Credential
+	if server.Spec.MCPServerCatalogEntryName != "" {
+		staticOauthCred, err = sm.gatewayClient.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(server.Spec.MCPServerCatalogEntryName)}, "oauth")
+		if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
+			return server, ServerConfig{}, nil, fmt.Errorf("failed to find static oauth credential: %w", err)
+		}
+	}
+
 	catalogName, err := sm.catalogNameForServer(ctx, server, true)
 	if err != nil {
 		return server, ServerConfig{}, nil, err
@@ -268,7 +280,7 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 		return server, ServerConfig{}, nil, fmt.Errorf("failed to resolve secret bindings: %w", err)
 	}
 
-	serverConfig, missingConfig, err := ServerToServerConfig(server, instance.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv, tokenExchangeCred.Secrets)
+	serverConfig, missingConfig, err := ServerToServerConfig(server, instance.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv, tokenExchangeCred.Secrets, staticOauthCred.Secrets)
 	if err != nil {
 		return server, ServerConfig{}, nil, err
 	}
@@ -343,8 +355,8 @@ func (sm *SessionManager) serverConfigForAction(ctx context.Context, server v1.M
 	}
 
 	var (
-		tokenExchangeCred gatewaytypes.Credential
-		tokenCredErr      error
+		tokenExchangeCred, staticOauthCred gatewaytypes.Credential
+		tokenCredErr                       error
 	)
 	if err = retry.OnError(kwait.Backoff{
 		Steps:    10,
@@ -358,6 +370,13 @@ func (sm *SessionManager) serverConfigForAction(ctx context.Context, server v1.M
 		return tokenCredErr
 	}); err != nil {
 		return ServerConfig{}, nil, fmt.Errorf("failed to find token exchange credential: %w", tokenCredErr)
+	}
+
+	if server.Spec.MCPServerCatalogEntryName != "" {
+		staticOauthCred, err = sm.gatewayClient.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(server.Spec.MCPServerCatalogEntryName)}, "oauth")
+		if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
+			return ServerConfig{}, nil, fmt.Errorf("failed to find static oauth credential: %w", err)
+		}
 	}
 
 	var (
@@ -388,7 +407,7 @@ func (sm *SessionManager) serverConfigForAction(ctx context.Context, server v1.M
 		}
 		missingConfig = append(missingConfig, componentMissingConfig...)
 	} else {
-		serverConfig, missingConfig, err = ServerToServerConfig(server, server.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv, tokenExchangeCred.Secrets)
+		serverConfig, missingConfig, err = ServerToServerConfig(server, server.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv, tokenExchangeCred.Secrets, staticOauthCred.Secrets)
 	}
 	if err != nil {
 		return ServerConfig{}, nil, err
@@ -742,19 +761,6 @@ func serverManifestFromCatalogEntryManifest(isAdmin, disableHostnameValidation b
 				inputComponent = inputComponents[entryComponent.ComponentID()]
 				userURL        string
 			)
-
-			entryHasStaticOAuth := entryComponent.Manifest.Runtime == types.RuntimeRemote &&
-				entryComponent.Manifest.RemoteConfig != nil &&
-				entryComponent.Manifest.RemoteConfig.StaticOAuthRequired
-			inputHasStaticOAuth := inputComponent.Manifest.Runtime == types.RuntimeRemote &&
-				inputComponent.Manifest.RemoteConfig != nil &&
-				inputComponent.Manifest.RemoteConfig.StaticOAuthRequired
-			if entryHasStaticOAuth && !inputHasStaticOAuth {
-				return types.MCPServerManifest{}, types.NewErrBadRequest(
-					"cannot update composite server: component %s has been updated to require static OAuth, which is not allowed in composite servers",
-					entryComponent.ComponentID(),
-				)
-			}
 
 			if entryComponent.Manifest.Runtime == types.RuntimeRemote &&
 				entryComponent.Manifest.RemoteConfig != nil &&

@@ -26,6 +26,7 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
+	"gorm.io/gorm"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -258,29 +259,48 @@ func (h *handler) doRefreshToken(req api.Context, oauthClient v1.OAuthClient, re
 
 	var oauthToken v1.OAuthToken
 	if err := req.Storage.Get(req.Context(), kclient.ObjectKey{Namespace: oauthClient.Namespace, Name: fmt.Sprintf("%x", sha256.Sum256([]byte(refreshToken)))}, &oauthToken); err != nil {
+		if apierrors.IsNotFound(err) {
+			return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
+		}
 		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "refresh_token is invalid", ""))
 	}
 	if oauthToken.Spec.ClientID != oauthClient.Name {
-		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "refresh_token is invalid", ""))
+		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
 	}
 
-	if err := req.Delete(&oauthToken); err != nil {
-		return fmt.Errorf("failed to refresh oauth token: %w", err)
+	// Consume terminally invalid grants so they cannot become usable again if the referenced resource is recreated.
+	invalidGrant := func(description string) error {
+		if err := req.Storage.Delete(req.Context(), &oauthToken); apierrors.IsNotFound(err) {
+			return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
+		} else if err != nil {
+			return fmt.Errorf("failed to invalidate oauth token: %w", err)
+		}
+		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, description, ""))
 	}
 
 	user, err := req.GatewayClient.UserInfoByID(req.Context(), oauthToken.Spec.UserID)
 	if err != nil {
-		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "invalid user", ""))
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return invalidGrant("invalid user")
+		}
+		return newOAuthError(ErrServerError, fmt.Sprintf("failed to retrieve user: %v", err), "")
 	}
 
 	allowed, err := authz.CheckMCPIDAccess(req.Context(), req.Storage, h.acrHelper, user, oauthToken.Spec.MCPID)
 	if apierrors.IsNotFound(err) {
-		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "invalid MCP server", ""))
+		return invalidGrant("invalid MCP server")
 	} else if err != nil {
 		return newOAuthError(ErrServerError, fmt.Sprintf("failed to check access to MCP server: %v", err), "")
 	}
 	if !allowed {
-		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "invalid MCP server", ""))
+		return invalidGrant("invalid MCP server")
+	}
+
+	if err := req.Storage.Delete(req.Context(), &oauthToken); err != nil {
+		if apierrors.IsNotFound(err) {
+			return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
+		}
+		return fmt.Errorf("failed to refresh oauth token: %w", err)
 	}
 
 	now := time.Now()
@@ -561,10 +581,10 @@ func (h *handler) doTokenExchange(req api.Context, oauthClient v1.OAuthClient, r
 	}
 
 	// Get the token store for this user and MCP
-	store := h.tokenStore.ForUserAndMCP(userID, mcpID)
+	store := h.tokenStore.ForUserAndMCP(userID, mcpID, resource)
 
 	// Retrieve the OAuth configuration and token
-	config, token, err := store.GetTokenConfig(req.Context(), resource)
+	config, token, err := store.GetTokenConfig(req.Context())
 	if err != nil {
 		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "failed to retrieve token configuration", ""))
 	}
@@ -581,7 +601,7 @@ func (h *handler) doTokenExchange(req api.Context, oauthClient v1.OAuthClient, r
 
 	// Store the refreshed token if it changed
 	if tok.AccessToken != token.AccessToken || tok.RefreshToken != token.RefreshToken || tok.Expiry.Unix() != token.Expiry.Unix() {
-		if err = store.SetTokenConfig(req.Context(), resource, config, tok); err != nil {
+		if err = store.SetTokenConfig(req.Context(), config, tok); err != nil {
 			return fmt.Errorf("failed to store token: %w", err)
 		}
 	}

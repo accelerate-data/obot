@@ -841,17 +841,6 @@ func (v CompositeValidator) ValidateConfig(_ context.Context, manifest types.MCP
 			}
 		}
 
-		// Prevent remote components with static OAuth from being included in composites
-		if component.Manifest.Runtime == types.RuntimeRemote &&
-			component.Manifest.RemoteConfig != nil &&
-			component.Manifest.RemoteConfig.StaticOAuthRequired {
-			return types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   fmt.Sprintf("compositeConfig.componentServers[%d]", i),
-				Message: "remote component with static OAuth cannot be included in a composite server",
-			}
-		}
-
 		// Validate the tool prefix
 		prefix := component.ToolPrefix
 		if prefix != "" {
@@ -1000,17 +989,6 @@ func (v CompositeValidator) ValidateCatalogConfig(_ context.Context, manifest ty
 				Runtime: types.RuntimeComposite,
 				Field:   fmt.Sprintf("compositeConfig.componentServers[%d].manifest.runtime", i),
 				Message: "runtime cannot be composite",
-			}
-		}
-
-		// Prevent remote components with static OAuth from being included in composites
-		if component.Manifest.Runtime == types.RuntimeRemote &&
-			component.Manifest.RemoteConfig != nil &&
-			component.Manifest.RemoteConfig.StaticOAuthRequired {
-			return types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   fmt.Sprintf("compositeConfig.componentServers[%d]", i),
-				Message: "remote component with static OAuth cannot be included in a composite server",
 			}
 		}
 

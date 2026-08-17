@@ -10,7 +10,7 @@
 	import SensitiveInput from '$lib/components/SensitiveInput.svelte';
 	import IconButton from '$lib/components/primitives/IconButton.svelte';
 	import Table from '$lib/components/table/Table.svelte';
-	import { HttpError } from '$lib/errors.js';
+	import { HttpError, parseErrorContent } from '$lib/errors.js';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { AdminService } from '$lib/services';
 	import type { GitCredential, SkillRepository } from '$lib/services/admin/types';
@@ -21,6 +21,7 @@
 		clearUrlParams,
 		getTableUrlParamsFilters,
 		goto,
+		isWebURL,
 		setFilterUrlParams,
 		setUrlParamAndUpdateUrl
 	} from '$lib/url';
@@ -528,7 +529,18 @@
 				{#snippet onRenderColumn(property, d)}
 					{#if property === 'repoURL'}
 						<div class="flex items-center gap-2">
-							<p>{d.repoURL}</p>
+							{#if isWebURL(d.repoURL)}
+								<a
+									href={d.repoURL}
+									target="_blank"
+									rel="noopener noreferrer external"
+									class="text-link"
+								>
+									{d.repoURL}
+								</a>
+							{:else}
+								<p>{d.repoURL}</p>
+							{/if}
 							{#if d.syncError}
 								<button
 									onclick={(e) => {
@@ -853,7 +865,7 @@
 							sync(response.id);
 							closeSourceDialog();
 						} catch (error) {
-							sourceError = error instanceof Error ? error.message : 'An unexpected error occurred';
+							sourceError = parseErrorContent(error).message;
 						} finally {
 							saving = false;
 						}

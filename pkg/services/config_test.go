@@ -1,13 +1,189 @@
 package services
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/obot-platform/obot/pkg/agentbackend"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/rest"
 )
+
+func TestNewAgentBackend(t *testing.T) {
+	tests := []struct {
+		name       string
+		kind       string
+		mcpBackend string
+		devMode    bool
+		wantKind   string
+		wantErr    bool
+		wantActive bool
+	}{
+		// Unset follows the MCP runtime rather than defaulting on its own, so a
+		// deployment names its backend once. There is no docker agent backend,
+		// so a docker MCP runtime lands on fake.
+		{name: "unset follows a docker MCP runtime", mcpBackend: "docker", wantKind: "fake", wantActive: true},
+		{name: "unset with no MCP runtime configured", wantKind: "fake", wantActive: true},
+		{name: "unset follows a kubernetes MCP runtime", mcpBackend: "kubernetes", wantErr: true},
+		{name: "unset follows the k8s alias", mcpBackend: "k8s", wantErr: true},
+		{name: "development defaults fake", devMode: true, wantKind: "fake", wantActive: true},
+		// An explicit value always wins over the MCP runtime, in both directions.
+		{name: "explicit disabled under a kubernetes MCP runtime", kind: "disabled", mcpBackend: "kubernetes", wantKind: "disabled"},
+		{name: "explicit disabled in development", kind: "disabled", devMode: true, wantKind: "disabled"},
+		{name: "explicit fake", kind: "FAKE", wantKind: "fake", wantActive: true},
+		// The Kubernetes backend needs a cluster, so selecting it without one
+		// has to fail at startup rather than at the first reconcile.
+		{name: "kubernetes without a cluster", kind: "kubernetes", wantErr: true},
+		{name: "explicit kubernetes under a docker MCP runtime", kind: "kubernetes", mcpBackend: "docker", wantErr: true},
+		{name: "discobox removed", kind: "discobox", wantErr: true},
+		{name: "unknown", kind: "other", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := Config{
+				HostedAgentsBackend: tt.kind,
+				DevMode:             tt.devMode,
+			}
+			config.MCPRuntimeBackend = tt.mcpBackend
+			kind, backend, err := newHostedAgentsBackend(config, nil, nil, nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind != tt.wantKind {
+				t.Fatalf("expected kind %q, got %q", tt.wantKind, kind)
+			}
+			_, err = backend.ObserveInstance(t.Context(), agentbackend.InstanceRef{ID: "test"})
+			if tt.wantActive && errors.Is(err, agentbackend.ErrDisabled) {
+				t.Fatal("expected an active backend")
+			}
+			if !tt.wantActive && !errors.Is(err, agentbackend.ErrDisabled) {
+				t.Fatalf("expected disabled backend, got %v", err)
+			}
+		})
+	}
+}
+
+func TestParseHostedAgentPodSchedulingSettings(t *testing.T) {
+	tests := []struct {
+		name          string
+		config        Config
+		errorContains string
+		validate      func(*testing.T, hostedAgentPodSchedulingSettings)
+	}{
+		{
+			name: "empty settings",
+			config: Config{
+				HostedAgentsAffinity:     "{}",
+				HostedAgentsTolerations:  "[]",
+				HostedAgentsNodeSelector: "{}",
+			},
+			validate: func(t *testing.T, settings hostedAgentPodSchedulingSettings) {
+				t.Helper()
+				if settings.Affinity != nil || len(settings.Tolerations) != 0 || len(settings.NodeSelector) != 0 {
+					t.Fatalf("expected empty scheduling settings, got %+v", settings)
+				}
+			},
+		},
+		{
+			name: "valid combined settings",
+			config: Config{
+				HostedAgentsAffinity:     `{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"workload","operator":"In","values":["hosted-agent"]}]}]}}}`,
+				HostedAgentsTolerations:  `[{"key":"workload","operator":"Equal","value":"hosted-agent","effect":"NoSchedule"}]`,
+				HostedAgentsNodeSelector: `{"node-pool":"agents"}`,
+			},
+			validate: func(t *testing.T, settings hostedAgentPodSchedulingSettings) {
+				t.Helper()
+				if settings.Affinity == nil || settings.Affinity.NodeAffinity == nil {
+					t.Fatal("expected node affinity")
+				}
+				if len(settings.Tolerations) != 1 || settings.Tolerations[0].Key != "workload" {
+					t.Fatalf("unexpected tolerations: %+v", settings.Tolerations)
+				}
+				if settings.NodeSelector["node-pool"] != "agents" {
+					t.Fatalf("unexpected node selector: %+v", settings.NodeSelector)
+				}
+			},
+		},
+		{
+			name:          "malformed affinity",
+			config:        Config{HostedAgentsAffinity: `{invalid`},
+			errorContains: "failed to parse hosted agent affinity",
+		},
+		{
+			name:          "unknown affinity field",
+			config:        Config{HostedAgentsAffinity: `{"unknownField":true}`},
+			errorContains: "unknown field",
+		},
+		{
+			name:          "tolerations have wrong type",
+			config:        Config{HostedAgentsTolerations: `{}`},
+			errorContains: "failed to parse hosted agent tolerations",
+		},
+		{
+			name:          "node selector has wrong value type",
+			config:        Config{HostedAgentsNodeSelector: `{"node-pool":1}`},
+			errorContains: "failed to parse hosted agent node selector",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings, err := parseHostedAgentPodSchedulingSettings(tt.config)
+			if tt.errorContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.errorContains) {
+					t.Fatalf("expected error containing %q, got %v", tt.errorContains, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.validate != nil {
+				tt.validate(t, settings)
+			}
+		})
+	}
+}
+
+func TestLeaderElectionRESTConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		timeout  time.Duration
+		expected time.Duration
+	}{
+		{name: "unset", expected: leaderElectionRequestTimeout},
+		{name: "longer", timeout: time.Minute, expected: leaderElectionRequestTimeout},
+		{name: "shorter", timeout: time.Second, expected: time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := &rest.Config{Timeout: tt.timeout}
+			result := leaderElectionRESTConfig(original)
+
+			if result == original {
+				t.Fatal("expected the REST config to be copied")
+			}
+			if result.Timeout != tt.expected {
+				t.Fatalf("expected timeout %s, got %s", tt.expected, result.Timeout)
+			}
+			if original.Timeout != tt.timeout {
+				t.Fatalf("original timeout changed from %s to %s", tt.timeout, original.Timeout)
+			}
+		})
+	}
+}
 
 func TestParsePodSchedulingSettingsFromHelm(t *testing.T) {
 	tests := []struct {
@@ -78,6 +254,30 @@ func TestParsePodSchedulingSettingsFromHelm(t *testing.T) {
 				cpuLimit := spec.Resources.Limits[corev1.ResourceCPU]
 				if cpuLimit.String() != "2" {
 					t.Errorf("expected cpu limit '2', got '%s'", cpuLimit.String())
+				}
+			},
+		},
+		{
+			name: "resource maximums are independently Helm managed",
+			opts: mcp.Options{
+				MCPK8sMaxCPURequest:    "500m",
+				MCPK8sMaxCPULimit:      "2",
+				MCPK8sMaxMemoryRequest: "512Mi",
+				MCPK8sMaxMemoryLimit:   "2Gi",
+			},
+			validateResult: func(t *testing.T, spec *v1.K8sSettingsSpec) {
+				t.Helper()
+				if spec.SetViaHelm {
+					t.Error("expected scheduling settings to remain UI managed")
+				}
+				if !spec.MaximumsSetViaHelm {
+					t.Error("expected resource maximums to be Helm managed")
+				}
+				if spec.MaxCPURequest == nil || spec.MaxCPURequest.String() != "500m" {
+					t.Errorf("expected max CPU request 500m, got %v", spec.MaxCPURequest)
+				}
+				if spec.MaxMemoryLimit == nil || spec.MaxMemoryLimit.String() != "2Gi" {
+					t.Errorf("expected max memory limit 2Gi, got %v", spec.MaxMemoryLimit)
 				}
 			},
 		},

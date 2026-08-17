@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -61,19 +62,35 @@ func New(services *services.Services) (*Controller, error) {
 }
 
 func (c *Controller) PreStart(ctx context.Context) error {
-	if err := data.Data(ctx, c.services.StorageClient, c.services.DefaultSkillRepoURL, c.services.DefaultSkillRepoRef); err != nil {
+	if err := data.Data(ctx, c.services.StorageClient, data.Defaults{
+		SkillRepoURL:           c.services.DefaultSkillRepoURL,
+		SkillRepoRef:           c.services.DefaultSkillRepoRef,
+		HostedAgentsCatalogURL: c.services.DefaultHostedAgentsCatalogURL,
+		HostedAgentsCatalogRef: c.services.DefaultHostedAgentsCatalogRef,
+		AllowLocalRepos:        c.services.DevMode,
+	}); err != nil {
 		return fmt.Errorf("failed to apply data: %w", err)
+	}
+
+	if err := migrateDefaultModelAccessPolicyModels(ctx, c.services.StorageClient); err != nil {
+		return fmt.Errorf("failed to migrate default model access policy models: %w", err)
 	}
 
 	if err := ensureDefaultUserRoleSetting(ctx, c.services.StorageClient); err != nil {
 		return fmt.Errorf("failed to ensure default user role setting: %w", err)
 	}
 
-	resourceMaximums := c.services.MCPSessionManager.KubernetesResourceMaximums()
+	if err := ensureHostedAgentPoolDefaults(ctx, c.services.StorageClient); err != nil {
+		return fmt.Errorf("failed to ensure hosted agent pool defaults: %w", err)
+	}
+
+	resourceMaximums, err := c.services.MCPSessionManager.StartupKubernetesResourceMaximums(ctx, c.services.StorageClient)
+	if err != nil {
+		return fmt.Errorf("failed to get effective K8s resource maximums: %w", err)
+	}
 	if err := ensureK8sSettings(ctx, c.services.StorageClient, c.services.PodSchedulingSettingsFromHelm, c.services.PSASettingsFromHelm, resourceMaximums); err != nil {
 		return fmt.Errorf("failed to ensure K8s settings: %w", err)
 	}
-
 	if err := ensureAppPreferences(ctx, c.services.StorageClient); err != nil {
 		return fmt.Errorf("failed to ensure app preferences: %w", err)
 	}
@@ -386,6 +403,40 @@ func ensureDefaultUserRoleSetting(ctx context.Context, client kclient.Client) er
 	return client.Update(ctx, &defaultRoleSetting)
 }
 
+func ensureHostedAgentPoolDefaults(ctx context.Context, client kclient.Client) error {
+	const gibibyte = int64(1024 * 1024 * 1024)
+
+	var defaults v1.HostedAgentPoolDefaults
+	key := kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: "default"}
+	if err := client.Get(ctx, key, &defaults); err == nil {
+		// Defaults are administrator-owned after creation.
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	return client.Create(ctx, &v1.HostedAgentPoolDefaults{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      key.Name,
+			Namespace: key.Namespace,
+		},
+		Spec: v1.HostedAgentPoolDefaultsSpec{
+			Manifest: types.HostedAgentPoolDefaultsManifest{
+				Capacity: types.HostedAgentResourceQuantity{
+					CPUVCPUs:     1,
+					MemoryBytes:  4 * gibibyte,
+					StorageBytes: 20 * gibibyte,
+				},
+				// Seeded explicitly rather than left to the fallback, so an
+				// administrator opening the defaults sees the number that is
+				// actually in force. With the capacity above this gives each
+				// sandbox 250m CPU and 1GiB guaranteed.
+				MaxSandboxes: 4,
+			},
+		},
+	})
+}
+
 // ensureK8sSettings ensures the K8sSettings resource exists with proper configuration.
 // podSchedulingSettings: affinity, tolerations, resources, runtimeClassName - can be managed via Helm OR UI.
 //
@@ -395,6 +446,9 @@ func ensureDefaultUserRoleSetting(ctx context.Context, client kclient.Client) er
 //
 //	These are always applied regardless of SetViaHelm flag and cannot be modified via UI.
 func ensureK8sSettings(ctx context.Context, client kclient.Client, podSchedulingSettings *v1.K8sSettingsSpec, psaSettings *v1.PodSecurityAdmissionSettings, resourceMaximums mcp.ResourceMaximums) error {
+	settingsSetViaHelm := hasHelmPodSchedulingSettings(podSchedulingSettings)
+	maximumsSetViaHelm := podSchedulingSettings != nil && podSchedulingSettings.MaximumsSetViaHelm
+
 	var k8sSettings v1.K8sSettings
 	if err := client.Get(ctx, kclient.ObjectKey{
 		Namespace: system.DefaultNamespace,
@@ -408,18 +462,21 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 				Namespace: system.DefaultNamespace,
 			},
 			Spec: v1.K8sSettingsSpec{
-				SetViaHelm: podSchedulingSettings != nil,
+				SetViaHelm:         settingsSetViaHelm,
+				MaximumsSetViaHelm: maximumsSetViaHelm,
 			},
 		}
 
-		// If pod scheduling settings provided via Helm, use them
-		if podSchedulingSettings != nil {
+		if settingsSetViaHelm {
 			k8sSettings.Spec.Affinity = podSchedulingSettings.Affinity
 			k8sSettings.Spec.Tolerations = podSchedulingSettings.Tolerations
 			k8sSettings.Spec.Resources = podSchedulingSettings.Resources
 			k8sSettings.Spec.RuntimeClassName = podSchedulingSettings.RuntimeClassName
 			k8sSettings.Spec.StorageClassName = podSchedulingSettings.StorageClassName
 			k8sSettings.Spec.NanobotWorkspaceSize = podSchedulingSettings.NanobotWorkspaceSize
+		}
+		if maximumsSetViaHelm {
+			setK8sSettingsMaximums(&k8sSettings.Spec, podSchedulingSettings)
 		}
 
 		// PSA settings are always applied from environment/Helm (independent of SetViaHelm)
@@ -437,8 +494,7 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 	// Determine if we need to update
 	needsUpdate := false
 
-	// Handle pod scheduling settings from Helm
-	if podSchedulingSettings != nil {
+	if settingsSetViaHelm {
 		// Pod scheduling settings provided via Helm - lock them
 		if !k8sSettings.Spec.SetViaHelm ||
 			!affinityEqual(k8sSettings.Spec.Affinity, podSchedulingSettings.Affinity) ||
@@ -466,6 +522,18 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 		k8sSettings.Spec.RuntimeClassName = nil
 		k8sSettings.Spec.StorageClassName = nil
 		k8sSettings.Spec.NanobotWorkspaceSize = ""
+		needsUpdate = true
+	}
+
+	if maximumsSetViaHelm {
+		if !k8sSettings.Spec.MaximumsSetViaHelm || !resourceMaximumsEqual(k8sSettings.Spec, *podSchedulingSettings) {
+			k8sSettings.Spec.MaximumsSetViaHelm = true
+			setK8sSettingsMaximums(&k8sSettings.Spec, podSchedulingSettings)
+			needsUpdate = true
+		}
+	} else if k8sSettings.Spec.MaximumsSetViaHelm {
+		k8sSettings.Spec.MaximumsSetViaHelm = false
+		setK8sSettingsMaximums(&k8sSettings.Spec, nil)
 		needsUpdate = true
 	}
 
@@ -521,6 +589,44 @@ func resourcesEqual(a, b *corev1.ResourceRequirements) bool {
 	return equality.Semantic.DeepEqual(a, b)
 }
 
+func quantityEqual(a, b *resource.Quantity) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Cmp(*b) == 0
+}
+
+func hasHelmPodSchedulingSettings(settings *v1.K8sSettingsSpec) bool {
+	if settings == nil {
+		return false
+	}
+	return settings.SetViaHelm || settings.Affinity != nil || len(settings.Tolerations) > 0 ||
+		settings.Resources != nil || settings.NanobotAgentResources != nil ||
+		settings.RuntimeClassName != nil || settings.StorageClassName != nil ||
+		settings.NanobotWorkspaceSize != ""
+}
+
+func resourceMaximumsEqual(a, b v1.K8sSettingsSpec) bool {
+	return quantityEqual(a.MaxCPURequest, b.MaxCPURequest) &&
+		quantityEqual(a.MaxCPULimit, b.MaxCPULimit) &&
+		quantityEqual(a.MaxMemoryRequest, b.MaxMemoryRequest) &&
+		quantityEqual(a.MaxMemoryLimit, b.MaxMemoryLimit)
+}
+
+func setK8sSettingsMaximums(settings *v1.K8sSettingsSpec, maximums *v1.K8sSettingsSpec) {
+	if maximums == nil {
+		settings.MaxCPURequest = nil
+		settings.MaxCPULimit = nil
+		settings.MaxMemoryRequest = nil
+		settings.MaxMemoryLimit = nil
+		return
+	}
+	settings.MaxCPURequest = maximums.MaxCPURequest
+	settings.MaxCPULimit = maximums.MaxCPULimit
+	settings.MaxMemoryRequest = maximums.MaxMemoryRequest
+	settings.MaxMemoryLimit = maximums.MaxMemoryLimit
+}
+
 func classNameEqual(a, b *string) bool {
 	if a == nil && b == nil {
 		return true
@@ -572,9 +678,16 @@ func ensureAppPreferences(ctx context.Context, client kclient.Client) error {
 
 // setupLocalK8sRoutes sets up routes for the local Kubernetes router
 func (c *Controller) setupLocalK8sRoutes() {
-	if c.services.LocalRouter != nil {
-		resourceMaximums := c.services.MCPSessionManager.KubernetesResourceMaximums()
-		deploymentHandler := deployment.New(c.services.MCPServerNamespace, c.services.Router.Backend(), c.services.MCPRuntimeBackend, resourceMaximums, c.services.MCPImagePullSecrets)
+	// The local router now also exists when only hosted agents run on
+	// Kubernetes, so these are gated on the MCP backend rather than on the
+	// router: every one of them reconciles MCP state from cluster objects.
+	if c.services.LocalRouter != nil && mcp.IsKubernetesBackend(c.services.MCPRuntimeBackend) {
+		deploymentHandler := deployment.New(
+			c.services.MCPServerNamespace,
+			c.services.Router.Backend(),
+			c.services.MCPSessionManager,
+			c.services.MCPImagePullSecrets,
+		)
 		c.services.LocalRouter.Type(&appsv1.Deployment{}).IncludeRemoved().HandlerFunc(deploymentHandler.UpdateMCPServerStatus)
 		c.services.LocalRouter.Type(&appsv1.Deployment{}).HandlerFunc(deploymentHandler.CleanupOldIDs)
 
@@ -584,7 +697,6 @@ func (c *Controller) setupLocalK8sRoutes() {
 		// instead of waiting for the periodic service-account key rotation loop.
 		c.services.LocalRouter.Type(&corev1.Secret{}).Namespace(c.services.ServiceNamespace).Name(serviceaccounts.NetworkPolicySecretName).IncludeRemoved().HandlerFunc(c.reconcileServiceAccountSecretChange)
 	}
-
 	if c.services.EveryReplicaRouter != nil {
 		peerHandler := tunnelpeer.New(c.services.TunnelManager.ID, c.services.TunnelManager)
 		c.services.EveryReplicaRouter.Type(&corev1.Service{}).Namespace(c.services.TunnelManager.ServiceNamespace).Name(c.services.TunnelManager.ServiceName).HandlerFunc(peerHandler.Reconcile)

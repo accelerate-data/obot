@@ -418,6 +418,7 @@ export const MCP_ACCESS_POLICY_FIELD_IDS = {
 
 export const MDM_DEVICES_CONFIGURATION_FIELD_IDS = {
 	devicesLink: 'sidebar-link-devices',
+	enforcementDecisionsLink: 'sidebar-link-enforcement-decisions',
 	configurationTab: 'devices-tab-configuration',
 	configurationDetails: 'devices-configuration-details',
 	getStartedButton: 'devices-configuration-get-started',
@@ -433,7 +434,8 @@ export const MDM_DEVICES_CONFIGURATION_FIELD_IDS = {
 	agentSettingsButton: 'devices-agent-settings',
 	checkForUpdatesButton: 'devices-check-for-updates-button',
 	devicesTabOverview: 'devices-tab-overview',
-	devicesTabDevices: 'devices-tab-devices'
+	devicesTabDevices: 'devices-tab-devices',
+	toolCallEnforcementSection: 'tool-call-enforcement-section'
 };
 
 export const MCP_FILTERS_FIELD_IDS = {
@@ -447,3 +449,7 @@ export const MCP_FILTERS_FIELD_IDS = {
 	runtimeSelector: 'filter-runtime-selector',
 	saveBtn: 'filter-save-btn'
 };
+
+export const COMMUNITY_ENTITLEMENT = 'OBOT_COMMUNITY';
+export const ENTERPRISE_ENTITLEMENT = 'OBOT_ENTERPRISE';
+export const MODEL_PROVIDERS_ENTITLEMENT = 'OBOT_ENTERPRISE_MODEL_PROVIDERS';

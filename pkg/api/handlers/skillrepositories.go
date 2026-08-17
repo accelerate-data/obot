@@ -14,6 +14,7 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type SkillRepositoryHandler struct{}
@@ -58,6 +59,9 @@ func (*SkillRepositoryHandler) Create(req api.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := validateUniqueSkillRepository(req, manifest, ""); err != nil {
+		return err
+	}
 	if err := validateSharedGitCredential(req, manifest.GitCredentialID, manifest.RepoURL); err != nil {
 		return err
 	}
@@ -95,13 +99,16 @@ func (*SkillRepositoryHandler) Update(req api.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := validateSharedGitCredential(req, manifest.GitCredentialID, manifest.RepoURL); err != nil {
-		return err
-	}
 
 	var repo v1.SkillRepository
 	if err := req.Get(&repo, req.PathValue("skill_repository_id")); err != nil {
 		return fmt.Errorf("failed to get skill repository: %w", err)
+	}
+	if err := validateUniqueSkillRepository(req, manifest, repo.Name); err != nil {
+		return err
+	}
+	if err := validateSharedGitCredential(req, manifest.GitCredentialID, manifest.RepoURL); err != nil {
+		return err
 	}
 
 	existingCred, err := revealRepositoryTokens(req, repo.Name)
@@ -202,6 +209,30 @@ func parseSkillRepositoryRequest(req api.Context) (*types.SkillRepositoryManifes
 	}
 
 	return &manifest, sourceURLCredentials, nil
+}
+
+func validateUniqueSkillRepository(req api.Context, manifest *types.SkillRepositoryManifest, excludedName string) error {
+	var repositories v1.SkillRepositoryList
+	if err := req.List(&repositories, kclient.MatchingFields{"spec.displayName": manifest.DisplayName}); err != nil {
+		return fmt.Errorf("failed to find skill sources by name: %w", err)
+	}
+	for _, repository := range repositories.Items {
+		if repository.Name != excludedName {
+			return types.NewErrAlreadyExists("a skill source named %q already exists", manifest.DisplayName)
+		}
+	}
+
+	repositories.Items = nil
+	if err := req.List(&repositories, kclient.MatchingFields{"spec.repoURL": manifest.RepoURL}); err != nil {
+		return fmt.Errorf("failed to find skill sources by repository URL: %w", err)
+	}
+	for _, repository := range repositories.Items {
+		if repository.Name != excludedName {
+			return types.NewErrAlreadyExists("a skill source with repository URL %q already exists", manifest.RepoURL)
+		}
+	}
+
+	return nil
 }
 
 func storeRepositoryTokens(req api.Context, repoName string, tokens, existing map[string]string) error {

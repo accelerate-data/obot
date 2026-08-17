@@ -20,6 +20,7 @@
 		'agent-management': true,
 		'mcp-server-management': true,
 		'skills-management': true,
+		'hosted-agent-management': true,
 		'device-management': true,
 		'user-management': true,
 		'llm-gateway': true,
@@ -52,6 +53,7 @@
 	import { page } from '$app/state';
 	import { columnResize } from '$lib/actions/resize';
 	import Navbar from '$lib/components/Navbar.svelte';
+	import { COMMUNITY_ENTITLEMENT } from '$lib/constants';
 	import { ADMIN_AGENT_DISABLED_MESSAGE, USER_AGENT_DISABLED_MESSAGE } from '$lib/constants';
 	import {
 		initLayout as defaultInitLayout,
@@ -70,7 +72,7 @@
 		appNotification as appNotificationStore
 	} from '$lib/stores';
 	import { adminConfigStore } from '$lib/stores/adminConfig.svelte';
-	import { isAgentEnabled } from '$lib/utils';
+	import { isAgentEnabled, validateVersionUserLimit } from '$lib/utils';
 	import AppNotificationBanner from './AppNotificationBanner.svelte';
 	import InfoTooltip from './InfoTooltip.svelte';
 	import ConfigureBanner from './admin/ConfigureBanner.svelte';
@@ -101,8 +103,11 @@
 		Settings,
 		PanelLeftClose,
 		Brain,
+		Container,
 		LayoutGrid,
-		KeyRound
+		KeyRound,
+		Menu,
+		X
 	} from '@lucide/svelte';
 	import { tick, untrack } from 'svelte';
 	import { fade, slide, type TransitionConfig } from 'svelte/transition';
@@ -242,6 +247,10 @@
 	let isAtLeastPowerUserPlus = $derived(profile.current.groups.includes(Group.POWERUSER_PLUS));
 
 	let hasAccessibleModels = $derived(accessibleModels.current.length > 0);
+	let hasLicenseEntitlementViolations = $derived(
+		(version.current.licenseEntitlementViolations?.length ?? 0) > 0
+	);
+	const isNearUserLimit = $derived(validateVersionUserLimit(version.current));
 
 	let defaultLinks = $derived<NavLink[]>([
 		{
@@ -255,6 +264,12 @@
 			icon: PencilRuler,
 			label: 'Skills',
 			href: '/skills'
+		},
+		{
+			id: 'hosted-agents',
+			icon: Container,
+			label: 'Hosted Agents',
+			href: '/hosted-agents'
 		},
 		...(hasAccessibleModels
 			? [
@@ -420,6 +435,29 @@
 						]
 					},
 					{
+						id: 'hosted-agent-management',
+						icon: Container,
+						// "Management" is dropped deliberately: the section's items already
+						// say what they are, and the longer label wrapped to two lines in a
+						// narrow sidebar.
+						label: 'Hosted Agents',
+						collapsible: true,
+						items: [
+							{
+								id: 'hosted-agents',
+								href: '/admin/hosted-agents',
+								label: 'Templates',
+								collapsible: false
+							},
+							{
+								id: 'hosted-agent-access-policies',
+								href: '/admin/hosted-agent-access-policies',
+								label: 'Access Policies',
+								collapsible: false
+							}
+						]
+					},
+					{
 						id: 'device-management',
 						icon: Laptop,
 						label: 'Device Management',
@@ -566,7 +604,18 @@
 								label: 'App Notification',
 								disabled: false,
 								collapsible: false
-							}
+							},
+							...(version.current.engine === 'kubernetes' && !version.current.hideK8sDetails
+								? [
+										{
+											id: 'app-scheduling',
+											href: '/admin/app-scheduling',
+											label: 'App Scheduling',
+											disabled: false,
+											collapsible: false
+										}
+									]
+								: [])
 						]
 					}
 				]
@@ -632,7 +681,12 @@
 	let isBetaRoute = $derived(
 		betaRoutes.some((href) => pathname === href || pathname.startsWith(`${href}/`))
 	);
-
+	let logoVariant = $derived.by(() => {
+		if (version.current.licenseEntitlements?.includes(COMMUNITY_ENTITLEMENT))
+			return 'community' as const;
+		if (version.current.enterprise) return 'enterprise' as const;
+		return 'default' as const;
+	});
 	$effect(() => {
 		if (responsive.isMobile) {
 			layout.sidebarOpen = false;
@@ -744,8 +798,16 @@
 				transition:slide={{ axis: 'x' }}
 				bind:this={nav}
 			>
-				<div class="flex h-16 shrink-0 items-center px-2">
-					<BetaLogo enterprise={version.current.enterprise} />
+				<div class="flex h-16 shrink-0 items-center justify-between px-2">
+					<BetaLogo variant={logoVariant} />
+					{#if responsive.isMobile}
+						<IconButton
+							tooltip={{ text: 'Close Menu', placement: 'left' }}
+							onclick={() => (layout.sidebarOpen = false)}
+						>
+							<X class="size-6" />
+						</IconButton>
+					{/if}
 				</div>
 
 				<div
@@ -782,7 +844,7 @@
 							{#if managementLinks.length > 0}
 								<button
 									id="advanced-pane-btn"
-									class="sidebar-link"
+									class="sidebar-link mb-2 md:mb-0"
 									onclick={() => (showAdvancedPane = true)}
 								>
 									<Settings class="size-5 text-muted-content" />
@@ -795,14 +857,16 @@
 					{/if}
 				</div>
 
-				<div class="flex justify-end px-3 py-2">
-					<IconButton
-						tooltip={{ text: 'Close Sidebar' }}
-						onclick={() => (layout.sidebarOpen = false)}
-					>
-						<PanelLeftClose class="size-6" />
-					</IconButton>
-				</div>
+				{#if !responsive.isMobile}
+					<div class="flex justify-end px-3 py-2">
+						<IconButton
+							tooltip={{ text: 'Close Sidebar' }}
+							onclick={() => (layout.sidebarOpen = false)}
+						>
+							<PanelLeftClose class="size-6" />
+						</IconButton>
+					</div>
+				{/if}
 			</div>
 			{#if !responsive.isMobile && !disableResize}
 				<div
@@ -825,8 +889,17 @@
 			<div class="sticky top-0 left-0 z-50 w-full">
 				{#if banner}
 					{@render banner()}
-				{:else if (version.current.licenseEntitlementViolations?.length ?? 0) > 0}
-					<LicenseViolationBanner />
+				{:else if hasLicenseEntitlementViolations || isNearUserLimit}
+					<LicenseViolationBanner warnUserLimit={isNearUserLimit}>
+						{#snippet fallback()}
+							{#if showAppNotificationBanner}
+								<AppNotificationBanner
+									data={appNotificationStore.current?.banner}
+									onDismiss={handleDismissBanner}
+								/>
+							{/if}
+						{/snippet}
+					</LicenseViolationBanner>
 				{:else if showAppNotificationBanner}
 					<AppNotificationBanner
 						data={appNotificationStore.current?.banner}
@@ -838,7 +911,18 @@
 						{#if overrideLeftMenu}
 							{@render overrideLeftMenu()}
 						{:else if (!layout.sidebarOpen || hideSidebar) && !leftSidebar}
-							<BetaLogo />
+							<div class="flex items-center gap-1.5">
+								{#if responsive.isMobile}
+									<IconButton
+										class="w-fit"
+										tooltip={{ text: 'Open Menu', placement: 'right' }}
+										onclick={() => (layout.sidebarOpen = true)}
+									>
+										<Menu class="size-6" />
+									</IconButton>
+								{/if}
+								<BetaLogo variant={logoVariant} />
+							</div>
 						{/if}
 					{/snippet}
 					{#snippet centerContent()}
@@ -914,7 +998,7 @@
 		{/if}
 	</div>
 
-	{#if !layout.sidebarOpen && !hideSidebar && !leftSidebar}
+	{#if !layout.sidebarOpen && !hideSidebar && !leftSidebar && !responsive.isMobile}
 		<div class="fixed bottom-2 left-2 z-30" in:fade={{ delay: 300 }}>
 			<IconButton onclick={() => (layout.sidebarOpen = true)} tooltip={{ text: 'Open Sidebar' }}>
 				<PanelLeftOpen class="size-6" />
@@ -989,46 +1073,26 @@
 {/snippet}
 
 {#snippet navLink(link: NavLink)}
-	{@const isActive = link.href && (link.href === pathname || pathname.startsWith(`${link.href}/`))}
 	<div class="flex">
-		<div class="flex w-full items-center" id={link.id}>
-			{#if link.disabled}
-				<div class="sidebar-link disabled">
-					{@render linkContent(link)}
-				</div>
-			{:else if link.href}
-				<a
-					id={`sidebar-link-${link.id}`}
-					href={resolve(link.href as `/${string}`)}
-					class={twMerge('sidebar-link', isActive && 'bg-base-300')}
-					onclick={saveSidebarScroll}
-				>
-					{@render linkContent(link)}
-				</a>
-			{:else}
-				<div class="sidebar-link no-link">
-					{@render linkContent(link)}
-				</div>
-			{/if}
-
-			{#if link.noteIcon && link.note}
-				<InfoTooltip icon={link.noteIcon} interactive>
-					{@render link.note()}
-				</InfoTooltip>
-			{/if}
-		</div>
-		{#if link.collapsible}
+		{#if link.collapsible && !link.href}
 			<button
-				id={`sidebar-collapse-${link.id}`}
-				class="px-2"
+				class="flex w-full items-center"
 				onclick={() => toggleNavCollapsed(link.id)}
+				id={`sidebar-collapse-${link.id}`}
 			>
-				{#if isNavCollapsed(link.id)}
-					<ChevronDown class="size-5" />
-				{:else}
-					<ChevronUp class="size-5" />
-				{/if}
+				{@render rootLinkContent(link)}
+				<div class="px-2">
+					{#if isNavCollapsed(link.id)}
+						<ChevronDown class="size-5" />
+					{:else}
+						<ChevronUp class="size-5" />
+					{/if}
+				</div>
 			</button>
+		{:else}
+			<div class="flex w-full items-center" id={link.id}>
+				{@render rootLinkContent(link)}
+			</div>
 		{/if}
 	</div>
 	{#if !isNavCollapsed(link.id)}
@@ -1084,6 +1148,34 @@
 	{/if}
 {/snippet}
 
+{#snippet rootLinkContent(link: NavLink)}
+	{@const isActive = link.href && (link.href === pathname || pathname.startsWith(`${link.href}/`))}
+	{#if link.disabled}
+		<div class="sidebar-link disabled">
+			{@render linkContent(link)}
+		</div>
+	{:else if link.href}
+		<a
+			id={`sidebar-link-${link.id}`}
+			href={resolve(link.href as `/${string}`)}
+			class={twMerge('sidebar-link', isActive && 'bg-base-300')}
+			onclick={saveSidebarScroll}
+		>
+			{@render linkContent(link)}
+		</a>
+	{:else}
+		<div class="sidebar-link no-link">
+			{@render linkContent(link)}
+		</div>
+	{/if}
+
+	{#if link.noteIcon && link.note}
+		<InfoTooltip icon={link.noteIcon} interactive>
+			{@render link.note()}
+		</InfoTooltip>
+	{/if}
+{/snippet}
+
 {#snippet linkContent(link: NavLink)}
 	{#if link.icon}
 		<link.icon class="size-5" />
@@ -1110,6 +1202,7 @@
 		&.disabled {
 			opacity: 0.5;
 			cursor: default;
+			width: fit-content;
 			&:hover {
 				background-color: transparent;
 			}

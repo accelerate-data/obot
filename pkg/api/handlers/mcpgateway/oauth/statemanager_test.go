@@ -10,15 +10,13 @@ import (
 	"testing"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
-	"github.com/obot-platform/nanobot/pkg/safehttp"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
-	mcpgateway "github.com/obot-platform/obot/pkg/api/handlers/mcpgateway"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -33,19 +31,19 @@ import (
 
 type emptyContainerOAuthTokenStore struct{}
 
-func (emptyContainerOAuthTokenStore) ForUserAndMCP(string, string) nmcp.TokenStorage {
+func (emptyContainerOAuthTokenStore) ForUserAndMCP(string, string, string) mcp.TokenStorage {
 	return emptyContainerOAuthUserStore{}
 }
 
 type emptyContainerOAuthUserStore struct{}
 
-func (emptyContainerOAuthUserStore) GetTokenConfig(context.Context, string) (*oauth2.Config, *oauth2.Token, error) {
+func (emptyContainerOAuthUserStore) GetTokenConfig(context.Context) (*oauth2.Config, *oauth2.Token, error) {
 	return nil, nil, nil
 }
-func (emptyContainerOAuthUserStore) SetTokenConfig(context.Context, string, *oauth2.Config, *oauth2.Token) error {
+func (emptyContainerOAuthUserStore) SetTokenConfig(context.Context, *oauth2.Config, *oauth2.Token) error {
 	return nil
 }
-func (emptyContainerOAuthUserStore) DeleteTokenConfig(context.Context, string) error { return nil }
+func (emptyContainerOAuthUserStore) DeleteTokenConfig(context.Context) error { return nil }
 
 func TestContainerOAuthCheckStartsEntraAuthorizationWithPKCE(t *testing.T) {
 	const instanceID = "mcp-server-instance-user-1"
@@ -117,10 +115,10 @@ func TestContainerOAuthCallbacksStoreSeparateGrantsForTwoUsers(t *testing.T) {
 		require.Equal(t, mcpID, gotMCPID)
 	}
 
-	store := mcpgateway.NewGlobalTokenStore(gateway)
-	_, tokenA, err := store.ForUserAndMCP("user-a", mcpID).GetTokenConfig(t.Context(), resource)
+	store := mcp.NewGlobalTokenStore(gateway)
+	_, tokenA, err := store.ForUserAndMCP("user-a", mcpID, resource).GetTokenConfig(t.Context())
 	require.NoError(t, err)
-	_, tokenB, err := store.ForUserAndMCP("user-b", mcpID).GetTokenConfig(t.Context(), resource)
+	_, tokenB, err := store.ForUserAndMCP("user-b", mcpID, resource).GetTokenConfig(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "user-a-code-access", tokenA.AccessToken)
 	require.Equal(t, "user-b-code-access", tokenB.AccessToken)
@@ -146,7 +144,11 @@ func TestStateManagerBlocksStaticCatalogTokenExchangeToPrivateAddress(t *testing
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(provider.Close)
-	manager := newStateManager(client, safehttp.NewClient(true, true, true))
+	manager := newStateManager(client, safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback:  true,
+		BlockPrivateIP: true,
+		BlockLinkLocal: true,
+	}))
 	config := &oauth2.Config{
 		ClientID: "client-1", ClientSecret: "secret-1",
 		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
@@ -449,7 +451,7 @@ func newStateManagerTestClientWithStaticRequirement(t *testing.T, entryName, mcp
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	client := gateway.New(t.Context(), db, storage, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 90, 90, true)
+	client := gateway.New(t.Context(), db, storage, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	return client
 }
@@ -468,7 +470,7 @@ func newDirectStateManagerTestClient(t *testing.T, mcpID string) (*gateway.Clien
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, true)
+	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
 	return gatewayClient, storageClient
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -102,17 +103,12 @@ func readEligibility(mc jwt.MapClaims, name string) bool {
 	case string:
 		return isTruthyEligibilityString(v)
 	case []any:
-		for _, item := range v {
-			if s, ok := item.(string); ok && isTruthyEligibilityString(s) {
-				return true
-			}
-		}
+		return slices.ContainsFunc(v, func(item any) bool {
+			s, ok := item.(string)
+			return ok && isTruthyEligibilityString(s)
+		})
 	case []string:
-		for _, item := range v {
-			if isTruthyEligibilityString(item) {
-				return true
-			}
-		}
+		return slices.ContainsFunc(v, isTruthyEligibilityString)
 	}
 	return false
 }

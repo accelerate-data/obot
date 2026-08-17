@@ -81,8 +81,7 @@ func TestTunnelClosesWebSocketNormallyOnContextCancellation(t *testing.T) {
 		return nil
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
 	clientError := make(chan error, 1)
 	go func() {
 		clientError <- serveConnection(ctx, connection, "test")
@@ -506,9 +505,16 @@ func TestTunnelRoutesRequestsByName(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	manager, server := newManagerTestServer(ctx, t)
 	errorsByClient := make(chan error, 2)
+	sessionKeys := make(map[string]string, 2)
 
 	for name, responseBody := range map[string]string{"office": "from-office", "lab": "from-lab"} {
-		connection, _, err := dial(ctx, server.URL, testTunnelToken(name))
+		token := testTunnelToken(name)
+		matcher, ok := newCredentialMatcher(token)
+		if !ok {
+			t.Fatalf("test tunnel token for %q is invalid", name)
+		}
+		sessionKeys[name] = tunnelSessionKey(name, matcher.credentialID)
+		connection, _, err := dial(ctx, server.URL, token)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -525,13 +531,13 @@ func TestTunnelRoutesRequestsByName(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		connected := localTunnelConnectionCount(manager, "office") > 0 &&
-			localTunnelConnectionCount(manager, "lab") > 0
+		connected := manager.remoteDialer.HasSession(sessionKeys["office"]) &&
+			manager.remoteDialer.HasSession(sessionKeys["lab"])
 		if connected {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("named tunnels did not register")
+			t.Fatal("named tunnel sessions did not become ready")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -567,6 +573,138 @@ func TestTunnelRoutesRequestsByName(t *testing.T) {
 	}
 }
 
+func TestHTTPClientRoutesRequestsAndRedirectsThroughBridge(t *testing.T) {
+	const (
+		tunnelName    = "office"
+		initialTarget = "https://oauth.internal.test/start"
+		finalTarget   = "https://oauth.internal.test/finish"
+	)
+
+	var (
+		manager     *Manager
+		seenTargets []string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		name, value := manager.BridgeAuthorization()
+		if request.Header.Get(name) != value {
+			t.Errorf("bridge authorization header = %q, want %q", request.Header.Get(name), value)
+		}
+		if request.Header.Get("X-Test") != "preserved" {
+			t.Errorf("original request header was not preserved: %#v", request.Header)
+		}
+		if request.Header.Get("X-Injected") != "configured" {
+			t.Errorf("injected header = %q, want configured", request.Header.Get("X-Injected"))
+		}
+		if request.Header.Get("X-Override") != "configured" {
+			t.Errorf("overridden header = %q, want configured", request.Header.Get("X-Override"))
+		}
+		if !strings.HasPrefix(request.URL.Path, bridgePathPrefix) {
+			t.Errorf("request path = %q, want bridge path", request.URL.Path)
+			http.Error(w, "not a bridge request", http.StatusBadRequest)
+			return
+		}
+
+		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(request.URL.Path, bridgePathPrefix))
+		if err != nil {
+			t.Errorf("decode bridge target: %v", err)
+			http.Error(w, "invalid bridge target", http.StatusBadRequest)
+			return
+		}
+		var target bridgeTarget
+		if err := json.Unmarshal(payload, &target); err != nil {
+			t.Errorf("unmarshal bridge target: %v", err)
+			http.Error(w, "invalid bridge target", http.StatusBadRequest)
+			return
+		}
+		if target.TunnelName != tunnelName {
+			t.Errorf("tunnel name = %q, want %q", target.TunnelName, tunnelName)
+		}
+		seenTargets = append(seenTargets, target.URL)
+
+		switch target.URL {
+		case initialTarget:
+			redirectURL, err := manager.BridgeURL(tunnelName, finalTarget)
+			if err != nil {
+				t.Errorf("build redirect bridge URL: %v", err)
+				http.Error(w, "failed to redirect", http.StatusInternalServerError)
+				return
+			}
+			http.Redirect(w, request, redirectURL, http.StatusFound)
+		case finalTarget:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected target", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	var err error
+	manager, err = NewManager(t.Context(), server.URL, allowAllTunnelReader{}, PeerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	httpClient, err := manager.HTTPClient(tunnelName, http.Header{
+		"X-Injected": {"configured"},
+		"X-Override": {"configured"},
+	}, 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if httpClient.Timeout != 3*time.Second {
+		t.Fatalf("client timeout = %v, want %v", httpClient.Timeout, 3*time.Second)
+	}
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, initialTarget, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Test", "preserved")
+	request.Header.Set("X-Override", "request")
+	response, err := httpClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("response status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	if !slices.Equal(seenTargets, []string{initialTarget, finalTarget}) {
+		t.Fatalf("bridge targets = %#v, want initial and final targets", seenTargets)
+	}
+	if request.URL.String() != initialTarget {
+		t.Fatalf("original request URL mutated to %q", request.URL)
+	}
+	name, _ := manager.BridgeAuthorization()
+	if request.Header.Get(name) != "" {
+		t.Fatal("bridge authorization was added to original request")
+	}
+	if request.Header.Get("X-Injected") != "" {
+		t.Fatal("configured header was added to original request")
+	}
+	if request.Header.Get("X-Override") != "request" {
+		t.Fatalf("original request header = %q, want request", request.Header.Get("X-Override"))
+	}
+}
+
+func TestHTTPClientRejectsInvalidConfiguration(t *testing.T) {
+	var manager *Manager
+	if _, err := manager.HTTPClient("office", nil, time.Second); err == nil {
+		t.Fatal("nil manager returned no error")
+	}
+
+	validManager, err := NewManager(t.Context(), "http://127.0.0.1:8080", allowAllTunnelReader{}, PeerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer validManager.Close()
+	if _, err := validManager.HTTPClient("Office", nil, time.Second); err == nil {
+		t.Fatal("invalid tunnel name returned no error")
+	}
+}
+
 func TestTunnelRoutesThroughPeerReplicaAndDisconnectsRemotely(t *testing.T) {
 	const (
 		tunnelName = "office"
@@ -577,8 +715,7 @@ func TestTunnelRoutesThroughPeerReplicaAndDisconnectsRemotely(t *testing.T) {
 		tunnelName: configuredTunnel,
 	}}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	first, firstServer := newManagerTestServer(ctx, t, reader)
 	defer firstServer.Close()
 	defer first.Close()
@@ -672,8 +809,7 @@ func TestBridgeEnforcesCurrentAllowedURLs(t *testing.T) {
 		tunnels: map[string]v1.MCPTunnel{tunnelName: configuredTunnel},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	manager, server := newManagerTestServer(ctx, t, reader)
 	defer manager.Close()
 	defer server.Close()
@@ -716,8 +852,7 @@ func TestBridgeEnforcesCurrentAllowedURLs(t *testing.T) {
 }
 
 func TestBridgeRequiresCapability(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	manager, server := newManagerTestServer(ctx, t)
 	defer manager.Close()
 	defer server.Close()
@@ -913,8 +1048,7 @@ func TestReconcilePeersClosesRemovedIncomingConnection(t *testing.T) {
 }
 
 func TestBridgeURLIsStableAcrossManagerRestarts(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	first, err := NewManager(ctx, "http://127.0.0.1:8080/", allowAllTunnelReader{}, PeerConfig{})
 	if err != nil {

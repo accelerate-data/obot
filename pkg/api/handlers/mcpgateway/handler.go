@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/tunnel"
@@ -42,6 +44,20 @@ type Handler struct {
 	resolveServer             func(api.Context) (resolvedServer, error)
 	secretBindingAllowedLabel string
 	tunnelManager             *tunnel.Manager
+}
+
+func auditLogMetadataForPrincipal(metadata map[string]string, user user.Info) map[string]string {
+	result := maps.Clone(metadata)
+	attribution, ok := principal.APIKeyAttributionFromUser(user)
+	if !ok {
+		return result
+	}
+	if result == nil {
+		result = map[string]string{}
+	}
+	result[principal.APIKeyIDExtra] = strconv.FormatUint(uint64(attribution.ID), 10)
+	result[principal.APIKeyNameExtra] = attribution.Name
+	return result
 }
 
 type resolvedServer struct {
@@ -157,14 +173,54 @@ func (h *Handler) Proxy(req api.Context) error {
 			return nil
 		}
 
-		director := nanobotProxyDirector(u, gatewayToken)
 		(&httputil.ReverseProxy{
 			Transport: h.transport,
-			Director: func(r *http.Request) {
+			Rewrite: func(r *httputil.ProxyRequest) {
+				// SetXForwarded preserves the X-Forwarded-For handling that
+				// ReverseProxy applied automatically under the deprecated Director.
+				// It also writes X-Forwarded-Host and X-Forwarded-Proto, so the
+				// values this handler cares about are re-applied afterwards: the
+				// scheme is derived from the inbound host rather than from whether
+				// this hop happens to be TLS.
+				r.SetXForwarded()
+
 				if bridgeAuthorizationName != "" {
-					r.Header.Set(bridgeAuthorizationName, bridgeAuthorizationValue)
+					r.Out.Header.Set(bridgeAuthorizationName, bridgeAuthorizationValue)
 				}
-				director(r)
+				if gatewayToken == "" {
+					r.Out.Header.Del("Authorization")
+				} else {
+					r.Out.Header.Set("Authorization", "Bearer "+gatewayToken)
+				}
+				r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
+				scheme := "https"
+				if strings.HasPrefix(r.In.Host, "localhost") || strings.HasPrefix(r.In.Host, "127.0.0.1") || strings.HasPrefix(r.In.Host, "[::1]") {
+					scheme = "http"
+				}
+				r.Out.Header.Set("X-Forwarded-Proto", scheme)
+
+				r.Out.Host = u.Host
+				r.Out.URL.Scheme = u.Scheme
+				r.Out.URL.Host = u.Host
+				r.Out.URL.Path = u.Path
+				if rest := r.In.PathValue("rest"); rest != "" {
+					if strings.HasPrefix(rest, "/") {
+						r.Out.URL.Path = rest
+					} else {
+						r.Out.URL.Path = "/" + rest
+					}
+				}
+
+				// Merge query parameters from the incoming request and the upstream URL.
+				// Preserve all values; if a key exists in both, both values will be present.
+				upstreamQuery := u.Query()
+				origQuery := r.In.URL.Query()
+				for k, vs := range origQuery {
+					for _, v := range vs {
+						upstreamQuery.Add(k, v)
+					}
+				}
+				r.Out.URL.RawQuery = upstreamQuery.Encode()
 			},
 			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 				http.Error(w, fmt.Sprintf("failed to proxy request to Nanobot agent %s: %v", serverConfig.NanobotAgentName, err), http.StatusBadGateway)
@@ -193,7 +249,7 @@ func (h *Handler) Proxy(req api.Context) error {
 		// Don't audit log composite loopback requests, they are internal to the MCP gateway
 		ctx = nmcp.WithAuditLogMetadata(ctx, map[string]string{mcp.AuditLogIgnore: "true"})
 	} else {
-		ctx = nmcp.WithAuditLogMetadata(ctx, serverConfig.AuditLogMetadata)
+		ctx = nmcp.WithAuditLogMetadata(ctx, auditLogMetadataForPrincipal(serverConfig.AuditLogMetadata, req.User))
 	}
 	ctx = withGatewayToken(ctx, req.Request, gatewayToken)
 
@@ -253,45 +309,6 @@ func gatewayTokenContext(authenticatedUser user.Info, mcpID, audience string, no
 	}
 }
 
-func nanobotProxyDirector(target *url.URL, gatewayToken string) func(*http.Request) {
-	return func(request *http.Request) {
-		if gatewayToken == "" {
-			request.Header.Del("Authorization")
-		} else {
-			request.Header.Set("Authorization", "Bearer "+gatewayToken)
-		}
-		request.Header.Set("X-Forwarded-Host", request.Host)
-		scheme := "https"
-		if strings.HasPrefix(request.Host, "localhost") || strings.HasPrefix(request.Host, "127.0.0.1") {
-			scheme = "http"
-		}
-		request.Header.Set("X-Forwarded-Proto", scheme)
-
-		request.Host = target.Host
-		request.URL.Scheme = target.Scheme
-		request.URL.Host = target.Host
-		request.URL.Path = target.Path
-		if rest := request.PathValue("rest"); rest != "" {
-			if strings.HasPrefix(rest, "/") {
-				request.URL.Path = rest
-			} else {
-				request.URL.Path = "/" + rest
-			}
-		}
-
-		// Merge query parameters from the incoming request and the upstream URL.
-		// Preserve all values; if a key exists in both, both values will be present.
-		upstreamQuery := target.Query()
-		origQuery := request.URL.Query()
-		for key, values := range origQuery {
-			for _, value := range values {
-				upstreamQuery.Add(key, value)
-			}
-		}
-		request.URL.RawQuery = upstreamQuery.Encode()
-	}
-}
-
 func (h *Handler) ensureServerIsDeployed(req api.Context) (resolvedServer, error) {
 	mcpID := req.PathValue("mcp_id")
 
@@ -300,7 +317,7 @@ func (h *Handler) ensureServerIsDeployed(req api.Context) (resolvedServer, error
 		return resolvedServer{mcpID: mcpID, config: config}, err
 	}
 
-	mcpID, mcpServer, mcpServerConfig, missingConfig, err := h.mcpSessionManager.ServerForActionWithConnectIDAllowMissingConfig(req.Context(), mcpID, req.User.GetUID())
+	mcpID, mcpServer, mcpServerConfig, missingConfig, err := h.mcpSessionManager.ServerForActionWithConnectIDAllowMissingConfig(req.Context(), mcpID, principal.ResourceOwnerID(req.User))
 	if err != nil {
 		return resolvedServer{}, fmt.Errorf("failed to get mcp server config: %w", err)
 	}
@@ -406,7 +423,9 @@ func (h *Handler) ensureSystemServerIsDeployed(req api.Context, mcpID string) (m
 	baseURL := strings.TrimSuffix(req.APIBaseURL, "/api")
 	audiences := systemServer.ValidConnectURLs(baseURL)
 
-	serverConfig, _, err := mcp.SystemServerToServerConfig(systemServer, audiences, req.User.GetUID(), credEnv, secretsCred)
+	// Ownership, not the acting identity: a system server deployed for an agent
+	// belongs to the person who created that agent.
+	serverConfig, _, err := mcp.SystemServerToServerConfig(systemServer, audiences, principal.ResourceOwnerID(req.User), credEnv, secretsCred)
 	if err != nil {
 		return mcp.ServerConfig{}, fmt.Errorf("failed to convert system server to config: %w", err)
 	}

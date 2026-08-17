@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,7 +540,7 @@ func newTestLicenseGatewayClient(t *testing.T) *gatewayclient.Client {
 		t.Fatalf("failed to migrate gateway database: %v", err)
 	}
 
-	gatewayClient := gatewayclient.New(t.Context(), database, nil, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	gatewayClient := gatewayclient.New(t.Context(), database, nil, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
 	t.Cleanup(func() {
 		if err := gatewayClient.Close(); err != nil {
 			t.Errorf("failed to close gateway client: %v", err)
@@ -682,12 +683,12 @@ func decodeRequestBody(t *testing.T, r *http.Request) map[string]any {
 }
 
 func entitlementsResponse(codes ...string) string {
-	data := ""
+	var data strings.Builder
 	for i, code := range codes {
 		if i > 0 {
-			data += ","
+			data.WriteByte(',')
 		}
-		data += fmt.Sprintf(`{
+		_, _ = fmt.Fprintf(&data, `{
   "id": "entitlement-%d",
   "type": "entitlements",
   "attributes": {
@@ -698,5 +699,5 @@ func entitlementsResponse(codes ...string) string {
   }
 }`, i, code)
 	}
-	return fmt.Sprintf(`{"data":[%s]}`, data)
+	return fmt.Sprintf(`{"data":[%s]}`, data.String())
 }

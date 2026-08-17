@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -17,14 +19,93 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+const appContainerName = "obot"
+
 type K8sSettingsHandler struct {
 	mcpSessionManager *mcp.SessionManager
+	mcpRuntimeBackend string
+	serviceName       string
+	serviceNamespace  string
+	localK8sClient    client.Client
 }
 
-func NewK8sSettingsHandler(mcpSessionManager *mcp.SessionManager) *K8sSettingsHandler {
+func NewK8sSettingsHandler(
+	mcpSessionManager *mcp.SessionManager,
+	mcpRuntimeBackend string,
+	serviceName string,
+	serviceNamespace string,
+	localK8sClient client.Client,
+) *K8sSettingsHandler {
 	return &K8sSettingsHandler{
 		mcpSessionManager: mcpSessionManager,
+		mcpRuntimeBackend: mcpRuntimeBackend,
+		serviceName:       serviceName,
+		serviceNamespace:  serviceNamespace,
+		localK8sClient:    localK8sClient,
 	}
+}
+
+func (h *K8sSettingsHandler) GetApp(req api.Context) error {
+	if !mcp.IsKubernetesBackend(h.mcpRuntimeBackend) {
+		return req.Write(types.AppK8sSettings{})
+	}
+
+	settings, err := appK8sSettingsFromDeployment(
+		req.Context(),
+		h.localK8sClient,
+		h.serviceNamespace,
+		h.serviceName,
+		appContainerName,
+	)
+	if err != nil {
+		return err
+	}
+
+	return req.Write(settings)
+}
+
+func appK8sSettingsFromDeployment(ctx context.Context, k8sClient client.Client, namespace, deploymentName, containerName string) (types.AppK8sSettings, error) {
+	if k8sClient == nil || namespace == "" || deploymentName == "" {
+		return types.AppK8sSettings{}, nil
+	}
+	if containerName == "" {
+		containerName = appContainerName
+	}
+
+	var deployment appsv1.Deployment
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: deploymentName}, &deployment); err != nil {
+		if apierrors.IsNotFound(err) || apierrors.IsForbidden(err) {
+			return types.AppK8sSettings{}, err
+		}
+		return types.AppK8sSettings{}, fmt.Errorf("failed to get deployment %s/%s: %w", namespace, deploymentName, err)
+	}
+
+	podSpec := deployment.Spec.Template.Spec
+
+	var resources *corev1.ResourceRequirements
+	for i := range podSpec.Containers {
+		if podSpec.Containers[i].Name == containerName {
+			containerResources := podSpec.Containers[i].Resources
+			if len(containerResources.Requests) > 0 || len(containerResources.Limits) > 0 {
+				resources = &containerResources
+			}
+			break
+		}
+	}
+
+	runtimeClassName := podSpec.RuntimeClassName
+
+	formatted, err := FormatPodSchedulingYAML(podSpec.Affinity, podSpec.Tolerations, resources, runtimeClassName)
+	if err != nil {
+		return types.AppK8sSettings{}, err
+	}
+
+	return types.AppK8sSettings{
+		Affinity:         formatted.Affinity,
+		Tolerations:      formatted.Tolerations,
+		Resources:        formatted.Resources,
+		RuntimeClassName: formatted.RuntimeClassName,
+	}, nil
 }
 
 func (h *K8sSettingsHandler) Get(req api.Context) error {
@@ -55,7 +136,7 @@ func (h *K8sSettingsHandler) Defaults(req api.Context) error {
 
 	// Match the resources the Kubernetes backend will actually use when no
 	// explicit defaults are configured. Resource maximums cap implicit fallbacks.
-	return req.Write(convertResourceRequirements(mcp.EffectiveDefaultMCPResourceRequirementsWithMaximums(settings.Spec, h.mcpSessionManager.KubernetesResourceMaximums())))
+	return req.Write(convertResourceRequirements(mcp.EffectiveDefaultMCPResourceRequirements(settings.Spec)))
 }
 
 func (h *K8sSettingsHandler) Update(req api.Context) error {
@@ -71,6 +152,23 @@ func (h *K8sSettingsHandler) Update(req api.Context) error {
 		nanobotAgentResources corev1.ResourceRequirements
 		errs                  []error
 	)
+
+	maxCPURequest, err := parseResourceMaximumField("maxCpuRequest", input.MaxCPURequest)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	maxCPULimit, err := parseResourceMaximumField("maxCpuLimit", input.MaxCPULimit)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	maxMemoryRequest, err := parseResourceMaximumField("maxMemoryRequest", input.MaxMemoryRequest)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	maxMemoryLimit, err := parseResourceMaximumField("maxMemoryLimit", input.MaxMemoryLimit)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	if input.Affinity != "" {
 		if err := yaml.UnmarshalStrict([]byte(input.Affinity), &affinity); err != nil {
@@ -119,8 +217,8 @@ func (h *K8sSettingsHandler) Update(req api.Context) error {
 			return err
 		}
 
-		// Don't allow updates if set via Helm
-		if settings.Spec.SetViaHelm {
+		// Don't allow updates when every editable group is managed via Helm.
+		if settings.Spec.SetViaHelm && settings.Spec.MaximumsSetViaHelm {
 			return types.NewErrBadRequest("K8s settings are managed via Helm and cannot be updated through the API")
 		}
 
@@ -134,47 +232,56 @@ func (h *K8sSettingsHandler) Update(req api.Context) error {
 		// unchanged and continue to be enforced by the system.
 		// Note: input.PodSecurityAdmission is intentionally not processed here.
 
-		// Update the settings object
-		if input.Affinity != "" {
-			settings.Spec.Affinity = &affinity
-		} else {
-			settings.Spec.Affinity = nil
+		// Update only groups that are not managed via Helm.
+		if !settings.Spec.SetViaHelm {
+			if input.Affinity != "" {
+				settings.Spec.Affinity = &affinity
+			} else {
+				settings.Spec.Affinity = nil
+			}
+
+			if input.Tolerations != "" {
+				settings.Spec.Tolerations = tolerations
+			} else {
+				settings.Spec.Tolerations = nil
+			}
+
+			if input.Resources != "" {
+				settings.Spec.Resources = &resources
+			} else {
+				settings.Spec.Resources = nil
+			}
+
+			if input.RuntimeClassName != "" {
+				settings.Spec.RuntimeClassName = &input.RuntimeClassName
+			} else {
+				settings.Spec.RuntimeClassName = nil
+			}
+
+			if input.StorageClassName != "" {
+				settings.Spec.StorageClassName = &input.StorageClassName
+			} else {
+				settings.Spec.StorageClassName = nil
+			}
+
+			if input.NanobotWorkspaceSize != "" {
+				settings.Spec.NanobotWorkspaceSize = input.NanobotWorkspaceSize
+			} else {
+				settings.Spec.NanobotWorkspaceSize = ""
+			}
+
+			if input.NanobotAgentResources != "" {
+				settings.Spec.NanobotAgentResources = &nanobotAgentResources
+			} else {
+				settings.Spec.NanobotAgentResources = nil
+			}
 		}
 
-		if input.Tolerations != "" {
-			settings.Spec.Tolerations = tolerations
-		} else {
-			settings.Spec.Tolerations = nil
-		}
-
-		if input.Resources != "" {
-			settings.Spec.Resources = &resources
-		} else {
-			settings.Spec.Resources = nil
-		}
-
-		if input.RuntimeClassName != "" {
-			settings.Spec.RuntimeClassName = &input.RuntimeClassName
-		} else {
-			settings.Spec.RuntimeClassName = nil
-		}
-
-		if input.StorageClassName != "" {
-			settings.Spec.StorageClassName = &input.StorageClassName
-		} else {
-			settings.Spec.StorageClassName = nil
-		}
-
-		if input.NanobotWorkspaceSize != "" {
-			settings.Spec.NanobotWorkspaceSize = input.NanobotWorkspaceSize
-		} else {
-			settings.Spec.NanobotWorkspaceSize = ""
-		}
-
-		if input.NanobotAgentResources != "" {
-			settings.Spec.NanobotAgentResources = &nanobotAgentResources
-		} else {
-			settings.Spec.NanobotAgentResources = nil
+		if !settings.Spec.MaximumsSetViaHelm {
+			settings.Spec.MaxCPURequest = maxCPURequest
+			settings.Spec.MaxCPULimit = maxCPULimit
+			settings.Spec.MaxMemoryRequest = maxMemoryRequest
+			settings.Spec.MaxMemoryLimit = maxMemoryLimit
 		}
 
 		if err := validateK8sSettingsResourceMaximums(h.mcpSessionManager, settings.Spec); err != nil {
@@ -213,37 +320,28 @@ func convertResourceRequirements(resources corev1.ResourceRequirements) *types.M
 
 func convertK8sSettings(settings v1.K8sSettings) (types.K8sSettings, error) {
 	result := types.K8sSettings{
-		SetViaHelm: settings.Spec.SetViaHelm,
-		Metadata:   MetadataFrom(&settings),
+		SetViaHelm:         settings.Spec.SetViaHelm,
+		MaximumsSetViaHelm: settings.Spec.MaximumsSetViaHelm,
+		Metadata:           MetadataFrom(&settings),
 	}
 
-	if settings.Spec.Affinity != nil {
-		affinityYAML, err := yaml.Marshal(settings.Spec.Affinity)
-		if err != nil {
-			return types.K8sSettings{}, err
-		}
-		result.Affinity = string(affinityYAML)
+	formatted, err := FormatPodSchedulingYAML(
+		settings.Spec.Affinity,
+		settings.Spec.Tolerations,
+		settings.Spec.Resources,
+		settings.Spec.RuntimeClassName,
+	)
+	if err != nil {
+		return types.K8sSettings{}, err
 	}
-
-	if len(settings.Spec.Tolerations) > 0 {
-		tolerationsYAML, err := yaml.Marshal(settings.Spec.Tolerations)
-		if err != nil {
-			return types.K8sSettings{}, err
-		}
-		result.Tolerations = string(tolerationsYAML)
-	}
-
-	if settings.Spec.Resources != nil {
-		resourcesYAML, err := yaml.Marshal(settings.Spec.Resources)
-		if err != nil {
-			return types.K8sSettings{}, err
-		}
-		result.Resources = string(resourcesYAML)
-	}
-
-	if settings.Spec.RuntimeClassName != nil {
-		result.RuntimeClassName = *settings.Spec.RuntimeClassName
-	}
+	result.Affinity = formatted.Affinity
+	result.Tolerations = formatted.Tolerations
+	result.Resources = formatted.Resources
+	result.RuntimeClassName = formatted.RuntimeClassName
+	result.MaxCPURequest = resourceMaximumString(settings.Spec.MaxCPURequest)
+	result.MaxCPULimit = resourceMaximumString(settings.Spec.MaxCPULimit)
+	result.MaxMemoryRequest = resourceMaximumString(settings.Spec.MaxMemoryRequest)
+	result.MaxMemoryLimit = resourceMaximumString(settings.Spec.MaxMemoryLimit)
 
 	if settings.Spec.StorageClassName != nil {
 		result.StorageClassName = *settings.Spec.StorageClassName
@@ -275,4 +373,73 @@ func convertK8sSettings(settings v1.K8sSettings) (types.K8sSettings, error) {
 	}
 
 	return result, nil
+}
+
+// PodSchedulingYAML contains the shared pod scheduling fields returned by the API.
+type PodSchedulingYAML struct {
+	Affinity         string
+	Tolerations      string
+	Resources        string
+	RuntimeClassName string
+}
+
+// FormatPodSchedulingYAML converts parsed pod scheduling fields into API YAML strings.
+func FormatPodSchedulingYAML(
+	affinity *corev1.Affinity,
+	tolerations []corev1.Toleration,
+	resources *corev1.ResourceRequirements,
+	runtimeClassName *string,
+) (PodSchedulingYAML, error) {
+	var result PodSchedulingYAML
+
+	if affinity != nil {
+		affinityYAML, err := yaml.Marshal(affinity)
+		if err != nil {
+			return PodSchedulingYAML{}, err
+		}
+		result.Affinity = string(affinityYAML)
+	}
+
+	if len(tolerations) > 0 {
+		tolerationsYAML, err := yaml.Marshal(tolerations)
+		if err != nil {
+			return PodSchedulingYAML{}, err
+		}
+		result.Tolerations = string(tolerationsYAML)
+	}
+
+	if resources != nil {
+		resourcesYAML, err := yaml.Marshal(resources)
+		if err != nil {
+			return PodSchedulingYAML{}, err
+		}
+		result.Resources = string(resourcesYAML)
+	}
+
+	if runtimeClassName != nil {
+		result.RuntimeClassName = *runtimeClassName
+	}
+
+	return result, nil
+}
+
+func parseResourceMaximumField(name, value string) (*resource.Quantity, error) {
+	if value == "" {
+		return nil, nil
+	}
+	quantity, err := resource.ParseQuantity(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	if quantity.Sign() < 0 {
+		return nil, fmt.Errorf("invalid %s: must be non-negative", name)
+	}
+	return &quantity, nil
+}
+
+func resourceMaximumString(maximum *resource.Quantity) string {
+	if maximum == nil {
+		return ""
+	}
+	return maximum.String()
 }

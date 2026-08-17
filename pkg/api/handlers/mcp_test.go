@@ -34,6 +34,51 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+func TestServerNeedsOAuthForPendingStaticOAuth(t *testing.T) {
+	handler := MCPHandler{}
+	server := v1.MCPServer{
+		Spec: v1.MCPServerSpec{
+			Manifest: types.MCPServerManifest{
+				Runtime: types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{
+					StaticOAuthRequired: true,
+				},
+			},
+		},
+	}
+
+	needsOAuth, err := handler.serverNeedsOAuth(t.Context(), &server, mcp.ServerConfig{Runtime: types.RuntimeRemote})
+	require.NoError(t, err)
+	require.True(t, needsOAuth)
+
+	server.Status.UserHasAuthenticated = true
+	needsOAuth, err = handler.serverNeedsOAuth(t.Context(), &server, mcp.ServerConfig{Runtime: types.RuntimeUVX})
+	require.NoError(t, err)
+	require.False(t, needsOAuth)
+}
+
+func TestConvertMCPServer_StaticEnvIsConfigured(t *testing.T) {
+	server := v1.MCPServer{
+		Spec: v1.MCPServerSpec{
+			Manifest: types.MCPServerManifest{
+				Runtime: types.RuntimeNPX,
+				Env: []types.MCPEnv{{
+					MCPHeader: types.MCPHeader{
+						Key:      "CATALOG_TOKEN",
+						Value:    "catalog-value",
+						Required: true,
+					},
+				}},
+			},
+		},
+	}
+
+	converted := ConvertMCPServer(server, nil, "", "")
+
+	assert.True(t, converted.Configured)
+	assert.Empty(t, converted.MissingRequiredEnvVars)
+}
+
 type conflictOnceStorage struct {
 	kclient.WithWatch
 	updates       int
@@ -127,6 +172,47 @@ func TestConvertMCPResources(t *testing.T) {
 		},
 	}, nil, "", "")
 	assert.Equal(t, resources, server.MCPServerManifest.Resources)
+}
+
+func TestConvertMCPServerCatalogEntryDetached(t *testing.T) {
+	entry := ConvertMCPServerCatalogEntry(v1.MCPServerCatalogEntry{
+		ObjectMeta: metav1.ObjectMeta{Name: "entry"},
+		Spec: v1.MCPServerCatalogEntrySpec{
+			Editable:  true,
+			Detached:  true,
+			SourceURL: "https://github.com/obot-platform/mcp-catalog",
+		},
+	}, "https://example.com")
+
+	assert.True(t, entry.Detached)
+	assert.True(t, entry.Editable)
+	assert.Equal(t, "https://github.com/obot-platform/mcp-catalog", entry.SourceURL)
+}
+
+func TestValidationOptionsWithResourceMaximumsIgnoresPersistedMaximumForNonKubernetesBackend(t *testing.T) {
+	maximum := resource.MustParse("500m")
+	req := api.Context{
+		Request: httptest.NewRequest(http.MethodGet, "/", nil),
+		Storage: newFakeStorage(t, &v1.K8sSettings{
+			ObjectMeta: metav1.ObjectMeta{Name: system.K8sSettingsName, Namespace: system.DefaultNamespace},
+			Spec:       v1.K8sSettingsSpec{MaxCPURequest: &maximum},
+		}),
+	}
+
+	options, err := ValidationOptionsWithResourceMaximums(req, &mcp.SessionManager{})
+	require.NoError(t, err)
+	require.Nil(t, options.ResourceMaximums.CPURequest)
+
+	err = mcp.ValidateServerManifest(t.Context(), types.MCPServerManifest{
+		Runtime: types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{
+			Package: "example",
+		},
+		Resources: &types.MCPResourceRequirements{
+			Requests: types.MCPResourceRequests{CPU: "1"},
+		},
+	}, false, options)
+	require.NoError(t, err)
 }
 
 func TestHideMultiUserCatalogEntry(t *testing.T) {
@@ -835,6 +921,53 @@ func TestApplyURLTemplate(t *testing.T) {
 	}
 }
 
+func TestApplyRemoteURLTemplate(t *testing.T) {
+	manifest := types.MCPServerManifest{
+		Name:    "OAuth Remote",
+		Runtime: types.RuntimeRemote,
+		RemoteConfig: &types.RemoteRuntimeConfig{
+			IsTemplate:          true,
+			URLTemplate:         "https://${HOST}/mcp/projects/${PROJECT_ID}",
+			StaticOAuthRequired: true,
+		},
+	}
+	options := mcp.ValidationOptions{
+		RemoteMCPURLValidationConfig: mcp.RemoteMCPURLValidationConfig{
+			AllowLocalhostMCP: true,
+			AllowPrivateIPMCP: true,
+			AllowLinkLocalMCP: true,
+		},
+	}
+
+	err := applyRemoteURLTemplate(t.Context(), &manifest, map[string]string{
+		"HOST":       "remote.example.com",
+		"PROJECT_ID": "project-123",
+	}, false, options)
+	require.NoError(t, err)
+	require.Equal(t, "https://remote.example.com/mcp/projects/project-123", manifest.RemoteConfig.URL)
+	require.True(t, manifest.RemoteConfig.StaticOAuthRequired)
+
+	server := v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "tool-preview"}, Spec: v1.MCPServerSpec{Manifest: manifest}}
+	serverConfig, missing, err := mcp.ServerToServerConfig(server, nil, "system", "temp", "default", nil, nil, nil)
+	require.NoError(t, err)
+	require.Empty(t, missing)
+	require.Equal(t, manifest.RemoteConfig.URL, serverConfig.URL)
+}
+
+func TestApplyRemoteURLTemplateRejectsInvalidRenderedURL(t *testing.T) {
+	manifest := types.MCPServerManifest{
+		Runtime: types.RuntimeRemote,
+		RemoteConfig: &types.RemoteRuntimeConfig{
+			IsTemplate:  true,
+			URLTemplate: "${SCHEME}://remote.example.com/mcp",
+		},
+	}
+
+	err := applyRemoteURLTemplate(t.Context(), &manifest, map[string]string{"SCHEME": "ftp"}, false, mcp.ValidationOptions{})
+	require.Error(t, err)
+	require.ErrorContains(t, err, "URL scheme must be either https or http")
+}
+
 func TestApplyURLTemplateEdgeCases(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -878,19 +1011,20 @@ func TestApplyURLTemplateEdgeCases(t *testing.T) {
 func TestApplyURLTemplatePerformance(t *testing.T) {
 	// Test with a large number of variables
 	largeEnvVars := make(map[string]string, 1000)
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		key := fmt.Sprintf("VAR_%d", i)
 		value := fmt.Sprintf("value_%d", i)
 		largeEnvVars[key] = value
 	}
 
-	template := "https://example.com/api"
-	for i := 0; i < 100; i++ {
-		template += fmt.Sprintf("/${VAR_%d}", i)
+	var template strings.Builder
+	template.WriteString("https://example.com/api")
+	for i := range 100 {
+		_, _ = fmt.Fprintf(&template, "/${VAR_%d}", i)
 	}
 
 	start := time.Now()
-	result, err := applyURLTemplate(template, largeEnvVars)
+	result, err := applyURLTemplate(template.String(), largeEnvVars)
 	duration := time.Since(start)
 
 	if err != nil {

@@ -23,13 +23,15 @@
 		getMcpServerDeploymentStatus,
 		getServerTypeLabel,
 		getServerUrl,
+		hasEditableConfiguration,
 		hasMissingSecretBindingConfig,
 		isMultiUserServer,
 		supportsMCPBackendDetails
 	} from '$lib/services/user/mcp';
 	import {
 		getMcpTunnelConnectionsKey,
-		isMcpTunnelDisconnected
+		isMcpTunnelDisconnected,
+		shouldShowMcpTunnelDisconnectedBadge
 	} from '$lib/services/user/mcpTunnel';
 	import { profile, mcpServersAndEntries, mcpTunnelConnections, version } from '$lib/stores';
 	import { formatTimeAgo } from '$lib/time';
@@ -74,6 +76,7 @@
 		servers?: MCPCatalogServer[];
 		skipLoadOnMount?: boolean;
 		serverPrefixPath?: string;
+		entry?: MCPCatalogEntry | MCPCatalogServer;
 	}
 
 	let {
@@ -93,10 +96,21 @@
 		onlyMyServers,
 		servers: initialServers,
 		skipLoadOnMount,
-		serverPrefixPath
+		serverPrefixPath,
+		entry
 	}: Props = $props();
 
 	const doesSupportK8sUpdates = $derived(version.current.engine === 'kubernetes');
+	const supportsCapacity = $derived.by(() => {
+		if (entity !== 'catalog' || !doesSupportK8sUpdates || !profile.current.hasAdminAccess?.())
+			return false;
+
+		return entry
+			? 'isCatalogEntry' in entry &&
+					entry.manifest.runtime !== 'composite' &&
+					entry.manifest.runtime !== 'remote'
+			: true;
+	});
 
 	const hasAdminAccess = $derived(profile.current.hasAdminAccess?.() ?? false);
 
@@ -580,6 +594,15 @@
 	function isRestartableServer(d: MCPCatalogServer) {
 		return d.manifest.runtime !== 'remote' && d.manifest.runtime !== 'composite';
 	}
+
+	function canEditDeploymentConfiguration(d: MCPCatalogServer) {
+		return !d.compositeName && d.manifest.runtime !== 'composite';
+	}
+
+	function hasEditableDeploymentConfiguration(d: MCPCatalogServer) {
+		const entry = d.catalogEntryID ? entriesMap[d.catalogEntryID] : undefined;
+		return hasEditableConfiguration(entry ?? d);
+	}
 </script>
 
 <div class="flex flex-col gap-0.5">
@@ -588,8 +611,8 @@
 			<Loading class="size-6" />
 		</div>
 	{:else}
-		{#if entity === 'catalog' && profile.current.hasAdminAccess?.()}
-			<CapacityBanner bind:this={capacityBanner} />
+		{#if supportsCapacity}
+			<CapacityBanner bind:this={capacityBanner} catalogId={id} catalogEntryId={entry?.id} />
 		{/if}
 		{#if tableData.length > 0}
 			<Table
@@ -645,10 +668,6 @@
 					thead: classes?.tableHeader
 				}}
 				setRowClasses={(d) => {
-					if (d.tunnelDisconnected) {
-						return 'bg-error/5 hover:bg-error/10 border-error/20';
-					}
-
 					if (d.needsUpdate && d.needsK8sUpdate) {
 						return 'bg-orange-500/5 hover:bg-orange-500/10 border-orange-500/20';
 					}
@@ -683,7 +702,7 @@
 								{/if}
 							</p>
 							<McpDeprecatedNotice item={d} />
-							{#if d.tunnelDisconnected}
+							{#if shouldShowMcpTunnelDisconnectedBadge(d.tunnelDisconnected, doesSupportK8sUpdates)}
 								<McpTunnelDisconnectedStatus />
 							{/if}
 							{#if 'missingKubernetesSecret' in d && d.missingKubernetesSecret}
@@ -759,7 +778,7 @@
 										{/if}
 									</span>
 								</a>
-								{#if (d.isMyServer || (hasAdminAccess && !readonly)) && supportsMCPBackendDetails(d)}
+								{#if (d.isMyServer || (hasAdminAccess && !readonly)) && canEditDeploymentConfiguration(d) && hasEditableDeploymentConfiguration(d)}
 									<button
 										class="menu-button"
 										onclick={(e) => {

@@ -558,9 +558,10 @@
 	</div>
 	{#if hasFilterPills || showAuditExportActions}
 		<div
-			class="{showAuditExportActions
-				? 'mt-4'
-				: ''} flex flex-col flex-nowrap gap-4 @min-[768px]:flex-row"
+			class={twMerge(
+				showAuditExportActions && '@min-[768px]:mt-4',
+				'flex flex-col flex-nowrap gap-4 @min-[768px]:flex-row'
+			)}
 		>
 			<div class="min-w-0 grow hidden @min-[768px]:block">
 				{@render filters()}
@@ -711,8 +712,11 @@
 <div
 	bind:this={rightSidebar}
 	popover
-	class={twMerge('drawer-legacy', selectedAuditLog ? 'max-w-[85vw] min-w-lg' : 'md:w-lg lg:w-xl')}
-	style={selectedAuditLog ? 'width: 32rem' : ''}
+	class={twMerge(
+		'drawer-legacy',
+		selectedAuditLog ? 'md:max-w-[85vw] md:min-w-lg min-w-full max-w-full' : 'md:w-lg lg:w-xl'
+	)}
+	style={selectedAuditLog && !responsive.isMobile ? 'width: 32rem' : ''}
 	id="mcp-audit-logs-details-sidebar"
 >
 	{#if selectedAuditLog}

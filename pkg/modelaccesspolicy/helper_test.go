@@ -101,7 +101,7 @@ func TestGetUserAllowedTargetModels(t *testing.T) {
 		}
 	}
 
-	// wildcardPolicy grants every model to every user.
+	// wildcardPolicy grants every eligible model to every user.
 	wildcardPolicy := &v1.ModelAccessPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: "p-wildcard", Namespace: "default"},
 		Spec: v1.ModelAccessPolicySpec{Manifest: types2.ModelAccessPolicyManifest{
@@ -140,14 +140,23 @@ func TestGetUserAllowedTargetModels(t *testing.T) {
 			want:     map[string]bool{"gpt-4o": true},
 		},
 		{
-			name: "wildcard policy reports allowAll without enumerating",
+			name: "wildcard policy enumerates only eligible model usages",
 			models: []*v1.Model{
 				newModel("m1-gpt-4o", provider, "gpt-4o", true),
 				newModel("m1-gpt-4o-mini", provider, "gpt-4o-mini", true),
+				newModel(
+					"m1-text-embedding",
+					provider,
+					"text-embedding-3-small",
+					true,
+					withUsage(types2.ModelUsageEmbedding),
+				),
 			},
-			policies:     []*v1.ModelAccessPolicy{wildcardPolicy},
-			want:         nil,
-			wantAllowAll: true,
+			policies: []*v1.ModelAccessPolicy{wildcardPolicy},
+			want: map[string]bool{
+				"gpt-4o":      true,
+				"gpt-4o-mini": true,
+			},
 		},
 		{
 			name: "filters allowed models by dialect",
@@ -182,9 +191,30 @@ func TestGetUserAllowedTargetModels(t *testing.T) {
 				newModel("m1-gpt-4o", provider, "gpt-4o", true),
 				newModel("m1-gpt-4o-mini", provider, "gpt-4o-mini", true),
 				newModel("m1-gpt-5", provider, "gpt-5", true),
+				newModel(
+					"m1-gpt-4o-embedding",
+					provider,
+					"gpt-4o-embedding",
+					true,
+					withUsage(types2.ModelUsageEmbedding),
+				),
 			},
 			policies: []*v1.ModelAccessPolicy{userPolicy("gpt-4o*")},
 			want:     map[string]bool{"gpt-4o": true, "gpt-4o-mini": true},
+		},
+		{
+			name: "legacy explicit non-llm model grants no access",
+			models: []*v1.Model{
+				newModel(
+					"m1-text-embedding",
+					provider,
+					"text-embedding-3-small",
+					true,
+					withUsage(types2.ModelUsageEmbedding),
+				),
+			},
+			policies: []*v1.ModelAccessPolicy{userPolicy("m1-text-embedding")},
+			want:     map[string]bool{},
 		},
 		{
 			name: "wildcard suffix pattern is case-sensitive",
@@ -309,6 +339,12 @@ func withDialect(dialect string) modelOpt {
 	}
 }
 
+func withUsage(usage types2.ModelUsage) modelOpt {
+	return func(m *v1.Model) {
+		m.Spec.Manifest.Usage = usage
+	}
+}
+
 func newModel(name, provider, targetModel string, active bool, opts ...modelOpt) *v1.Model {
 	m := &v1.Model{
 		ObjectMeta: metav1.ObjectMeta{
@@ -319,10 +355,77 @@ func newModel(name, provider, targetModel string, active bool, opts ...modelOpt)
 			TargetModel:   targetModel,
 			ModelProvider: provider,
 			Active:        active,
+			Usage:         types2.ModelUsageLLM,
 		}},
 	}
 	for _, opt := range opts {
 		opt(m)
 	}
 	return m
+}
+
+// A hosted agent's model list has to describe the requests it can actually
+// make. Enumerating from the owner's policies instead reports a set the agent's
+// own calls do not obey -- an agent told it may use nothing while every request
+// succeeds -- and a client that picks its model by listing then refuses to run.
+func TestGetAgentAllowedTargetModels(t *testing.T) {
+	const provider = "anthropic-model-provider"
+
+	models := []*v1.Model{
+		newModel("m1-haiku", provider, "claude-haiku-4-5-20251001", true),
+		newModel("m1-opus", provider, "claude-opus-4-8", true),
+		newModel("m1-gpt", "openai-model-provider", "gpt-4o", true),
+	}
+
+	// The owner is granted nothing, so any result drawn from policy is empty.
+	// That is what makes these cases prove the agent is not evaluated that way.
+	restrictive := &v1.ModelAccessPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-none", Namespace: "default"},
+		Spec: v1.ModelAccessPolicySpec{Manifest: types2.ModelAccessPolicyManifest{
+			Subjects: []types2.Subject{{Type: types2.SubjectTypeUser, ID: "someone-else"}},
+			Models:   []types2.ModelResource{},
+		}},
+	}
+
+	tests := []struct {
+		name         string
+		modelIDs     []string
+		dialect      string
+		want         map[string]bool
+		wantAllowAll bool
+	}{
+		{
+			name:         "wildcard allows every model without enumerating",
+			modelIDs:     []string{"*"},
+			wantAllowAll: true,
+		},
+		{
+			name:     "configured models are reported for this provider",
+			modelIDs: []string{"m1-haiku"},
+			want:     map[string]bool{"claude-haiku-4-5-20251001": true},
+		},
+		{
+			name:     "a model on another provider is not reported here",
+			modelIDs: []string{"m1-gpt"},
+			want:     map[string]bool{},
+		},
+		{
+			// An agent authorized for nothing may use nothing. This must be an
+			// empty set, not the nil that means "skip filtering".
+			name:     "an agent with no models is allowed none",
+			modelIDs: nil,
+			want:     map[string]bool{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newModelHelper(t, models, restrictive)
+
+			got, allowAll, err := h.GetAgentAllowedTargetModels(tt.modelIDs, provider, tt.dialect)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantAllowAll, allowAll)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

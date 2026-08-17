@@ -5,6 +5,7 @@
 	import IconButton from '$lib/components/primitives/IconButton.svelte';
 	import Table from '$lib/components/table/Table.svelte';
 	import { AdminService, type MCPCatalog } from '$lib/services';
+	import { isWebURL } from '$lib/url';
 	import { TriangleAlert, Link2, Pencil, Trash2 } from '@lucide/svelte';
 
 	interface Props {
@@ -80,7 +81,13 @@
 			{#snippet onRenderColumn(property, d)}
 				{#if property === 'url'}
 					<div class="flex items-center gap-2">
-						<p>{d.url}</p>
+						{#if isWebURL(d.url)}
+							<a href={d.url} target="_blank" rel="noopener noreferrer external" class="text-link">
+								{d.url}
+							</a>
+						{:else}
+							<p>{d.url}</p>
+						{/if}
 						{#if catalog?.syncErrors?.[d.url]}
 							<button
 								onclick={() => {
@@ -132,6 +139,9 @@
 	msg={deletingSource?.type === 'single'
 		? 'Delete this Git Source URL?'
 		: 'Delete selected Git Source URLs?'}
+	note={deletingSource?.type === 'single'
+		? 'This action is permanent and cannot be undone. All catalog entries from this source and their deployed MCP servers, including those currently in use, will be deleted. Are you sure you wish to continue?'
+		: 'This action is permanent and cannot be undone. All catalog entries from these sources and their deployed MCP servers, including those currently in use, will be deleted. Are you sure you wish to continue?'}
 	show={Boolean(deletingSource)}
 	onsuccess={async () => {
 		if (!deletingSource || !catalog) {

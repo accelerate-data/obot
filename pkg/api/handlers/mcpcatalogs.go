@@ -36,11 +36,16 @@ type MCPCatalogHandler struct {
 	serverURL                 string
 	mcpBackend                string
 	sessionManager            *mcp.SessionManager
+	capacityInfoProvider      capacityInfoProvider
 	oauthChecker              MCPOAuthChecker
 	gatewayClient             *gclient.Client
 	acrHelper                 *accesscontrolrule.Helper
 	secretBindingAllowedLabel string
 	remoteURLValidationConfig mcp.RemoteMCPURLValidationConfig
+}
+
+type capacityInfoProvider interface {
+	GetCapacityInfoForServers(context.Context, []string) (types.MCPCapacityInfo, error)
 }
 
 func NewMCPCatalogHandler(defaultCatalogPath string, serverURL string, mcpBackend string, sessionManager *mcp.SessionManager, oauthChecker MCPOAuthChecker, gatewayClient *gclient.Client, acrHelper *accesscontrolrule.Helper, secretBindingAllowedLabel string) *MCPCatalogHandler {
@@ -53,6 +58,7 @@ func NewMCPCatalogHandler(defaultCatalogPath string, serverURL string, mcpBacken
 		serverURL:                 serverURL,
 		mcpBackend:                mcpBackend,
 		sessionManager:            sessionManager,
+		capacityInfoProvider:      sessionManager,
 		oauthChecker:              oauthChecker,
 		gatewayClient:             gatewayClient,
 		acrHelper:                 acrHelper,
@@ -333,7 +339,7 @@ func (h *MCPCatalogHandler) CreateEntry(req api.Context) error {
 			return err
 		}
 	}
-	if err := mcp.ValidateCatalogEntryManifest(req.Context(), manifest, false, ValidationOptionsWithResourceMaximums(h.sessionManager)); err != nil {
+	if err := validateCatalogEntryManifestWithResourceMaximums(req, manifest, false, h.sessionManager); err != nil {
 		return types.NewErrBadRequest("failed to validate entry manifest: %v", err)
 	}
 	if err := tunnel.ValidateCatalogEntryTunnelReferences(req.Context(), req.Storage, manifest); err != nil {
@@ -415,7 +421,7 @@ func (h *MCPCatalogHandler) UpdateEntry(req api.Context) error {
 	if manifest.ServerUserType == "" {
 		manifest.ServerUserType = types.ServerUserTypeSingleUser
 	}
-	if err := mcp.ValidateCatalogEntryManifest(req.Context(), manifest, false, ValidationOptionsWithResourceMaximums(h.sessionManager)); err != nil {
+	if err := validateCatalogEntryManifestWithResourceMaximums(req, manifest, false, h.sessionManager); err != nil {
 		return types.NewErrBadRequest("failed to validate entry manifest: %v", err)
 	}
 	if err := tunnel.ValidateCatalogEntryTunnelReferences(req.Context(), req.Storage, manifest); err != nil {
@@ -448,6 +454,40 @@ func (h *MCPCatalogHandler) UpdateEntry(req api.Context) error {
 	}
 
 	return req.Write(ConvertMCPServerCatalogEntry(entry, h.serverURL))
+}
+
+func (h *MCPCatalogHandler) AcceptEntryOwnership(req api.Context) error {
+	catalogName := req.PathValue("catalog_id")
+	entryName := req.PathValue("entry_id")
+
+	if err := req.Get(&v1.MCPCatalog{}, catalogName); err != nil {
+		return fmt.Errorf("failed to get catalog: %w", err)
+	}
+
+	var entry v1.MCPServerCatalogEntry
+	if err := req.Get(&entry, entryName); err != nil {
+		return fmt.Errorf("failed to get entry: %w", err)
+	}
+	if err := validateEntryScope(entry, catalogName, ""); err != nil {
+		return err
+	}
+	if !entry.Spec.Detached {
+		return types.NewErrBadRequest("entry is not detached")
+	}
+
+	acceptCatalogEntryOwnership(&entry)
+	if err := req.Update(&entry); err != nil {
+		return fmt.Errorf("failed to accept ownership of entry: %w", err)
+	}
+
+	return req.Write(ConvertMCPServerCatalogEntry(entry, h.serverURL))
+}
+
+func acceptCatalogEntryOwnership(entry *v1.MCPServerCatalogEntry) {
+	entry.Spec.Editable = true
+	entry.Spec.Detached = false
+	entry.Spec.SourceURL = ""
+	entry.Spec.Manifest.EntryKey = ""
 }
 
 func (h *MCPCatalogHandler) DeleteEntry(req api.Context) error {
@@ -559,6 +599,55 @@ func (h *MCPCatalogHandler) AdminListServersForEntryInCatalog(req api.Context) e
 	}
 
 	return req.Write(types.MCPServerList{Items: items})
+}
+
+// GetEntryCapacity returns MCP capacity info for deployments tied to a catalog entry.
+func (h *MCPCatalogHandler) GetEntryCapacity(req api.Context) error {
+	catalogName := req.PathValue("catalog_id")
+	entryName := req.PathValue("entry_id")
+
+	var catalog v1.MCPCatalog
+	if err := req.Get(&catalog, catalogName); err != nil {
+		return fmt.Errorf("failed to get catalog: %w", err)
+	}
+
+	var entry v1.MCPServerCatalogEntry
+	if err := req.Get(&entry, entryName); err != nil {
+		return fmt.Errorf("failed to get entry: %w", err)
+	}
+
+	if entry.Spec.MCPCatalogName != catalogName {
+		return types.NewErrBadRequest("entry does not belong to catalog")
+	}
+	if entry.Spec.Manifest.Runtime == types.RuntimeRemote || entry.Spec.Manifest.Runtime == types.RuntimeComposite {
+		return types.NewErrBadRequest("capacity is only supported for hosted catalog entries")
+	}
+
+	var list v1.MCPServerList
+	if err := req.List(&list, client.MatchingFields{
+		"spec.mcpServerCatalogEntryName": entryName,
+	}); err != nil {
+		return fmt.Errorf("failed to list servers: %w", err)
+	}
+
+	serverNames := make([]string, 0, len(list.Items))
+	for _, server := range list.Items {
+		if server.Spec.Template {
+			continue
+		}
+		serverNames = append(serverNames, server.Name)
+	}
+
+	info, err := h.capacityInfoProvider.GetCapacityInfoForServers(req.Context(), serverNames)
+	if err != nil {
+		var notSupported *mcp.ErrNotSupportedByBackend
+		if errors.As(err, &notSupported) {
+			return types.NewErrBadRequest("%s", notSupported.Error())
+		}
+		return err
+	}
+
+	return req.Write(info)
 }
 
 // AdminListServersForAllEntriesInCatalog returns all servers for all entries in a catalog.
@@ -847,6 +936,10 @@ func (h *MCPCatalogHandler) GenerateToolPreviews(req api.Context) error {
 	if catalogName == "" {
 		catalogName = entry.Spec.PowerUserWorkspaceID
 	}
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, h.sessionManager)
+	if err != nil {
+		return err
+	}
 	server, serverConfig, err := tempServerAndConfig(
 		req.Context(),
 		req.GatewayClient,
@@ -855,11 +948,13 @@ func (h *MCPCatalogHandler) GenerateToolPreviews(req api.Context) error {
 		req.ObotNamespace,
 		h.secretBindingAllowedLabel,
 		entry.Namespace,
+		entry.Name,
 		catalogName,
 		entry.Spec.Manifest,
 		configRequest.Config,
 		configRequest.URL,
 		h.serverURL,
+		validationOptions,
 	)
 	if err != nil {
 		return types.NewErrBadRequest("failed to create temporary server and config: %v", err)
@@ -929,6 +1024,10 @@ func (h *MCPCatalogHandler) generateCompositeToolPreviews(req api.Context, entry
 	if catalogName == "" {
 		catalogName = entry.Spec.PowerUserWorkspaceID
 	}
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, h.sessionManager)
+	if err != nil {
+		return err
+	}
 
 	compositeToolPreviews := make([]types.MCPServerTool, 0, len(compositeConfig.ComponentServers))
 	for _, componentEntry := range compositeConfig.ComponentServers {
@@ -980,11 +1079,13 @@ func (h *MCPCatalogHandler) generateCompositeToolPreviews(req api.Context, entry
 			req.ObotNamespace,
 			h.secretBindingAllowedLabel,
 			entry.Namespace,
+			entry.Name,
 			catalogName,
 			componentEntry.Manifest,
 			config.Config,
 			config.URL,
 			h.serverURL,
+			validationOptions,
 		)
 		if err != nil {
 			return err
@@ -1104,7 +1205,11 @@ func (h *MCPCatalogHandler) GenerateToolPreviewsOAuthURL(req api.Context) error 
 	if catalogName == "" {
 		catalogName = entry.Spec.PowerUserWorkspaceID
 	}
-	server, serverConfig, err := tempServerAndConfig(req.Context(), req.GatewayClient, req.Storage, req.LocalK8sClient, req.ObotNamespace, h.secretBindingAllowedLabel, entry.Namespace, catalogName, entry.Spec.Manifest, configRequest.Config, configRequest.URL, h.serverURL)
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, h.sessionManager)
+	if err != nil {
+		return err
+	}
+	server, serverConfig, err := tempServerAndConfig(req.Context(), req.GatewayClient, req.Storage, req.LocalK8sClient, req.ObotNamespace, h.secretBindingAllowedLabel, entry.Namespace, entry.Name, catalogName, entry.Spec.Manifest, configRequest.Config, configRequest.URL, h.serverURL, validationOptions)
 	if err != nil {
 		return types.NewErrBadRequest("failed to create temporary server and config: %v", err)
 	}
@@ -1187,6 +1292,10 @@ func (h *MCPCatalogHandler) GenerateComponentToolPreviews(req api.Context) error
 	if catalogName == "" {
 		catalogName = composite.Spec.PowerUserWorkspaceID
 	}
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, h.sessionManager)
+	if err != nil {
+		return err
+	}
 
 	// Use the manifest snapshot embedded in the composite entry for this component.
 	server, serverConfig, err := tempServerAndConfig(
@@ -1197,11 +1306,13 @@ func (h *MCPCatalogHandler) GenerateComponentToolPreviews(req api.Context) error
 		req.ObotNamespace,
 		h.secretBindingAllowedLabel,
 		composite.Namespace,
+		composite.Name,
 		catalogName,
 		component.Manifest,
 		configRequest.Config,
 		configRequest.URL,
 		h.serverURL,
+		validationOptions,
 	)
 	if err != nil {
 		return types.NewErrBadRequest("failed to create temporary server and config: %v", err)
@@ -1313,6 +1424,10 @@ func (h *MCPCatalogHandler) GenerateComponentToolPreviewsOAuthURL(req api.Contex
 	if catalogName == "" {
 		catalogName = composite.Spec.PowerUserWorkspaceID
 	}
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, h.sessionManager)
+	if err != nil {
+		return err
+	}
 
 	server, serverConfig, err := tempServerAndConfig(
 		req.Context(),
@@ -1322,11 +1437,13 @@ func (h *MCPCatalogHandler) GenerateComponentToolPreviewsOAuthURL(req api.Contex
 		req.ObotNamespace,
 		h.secretBindingAllowedLabel,
 		composite.Namespace,
+		composite.Name,
 		catalogName,
 		component.Manifest,
 		configRequest.Config,
 		configRequest.URL,
 		h.serverURL,
+		validationOptions,
 	)
 	if err != nil {
 		return types.NewErrBadRequest("failed to create temporary server and config: %v", err)
@@ -1369,6 +1486,10 @@ func (h *MCPCatalogHandler) generateCompositeOAuthURLs(req api.Context, entry v1
 	if catalogName == "" {
 		catalogName = entry.Spec.PowerUserWorkspaceID
 	}
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, h.sessionManager)
+	if err != nil {
+		return err
+	}
 
 	for _, componentEntry := range compositeConfig.ComponentServers {
 		if componentEntry.MCPServerID != "" {
@@ -1406,11 +1527,13 @@ func (h *MCPCatalogHandler) generateCompositeOAuthURLs(req api.Context, entry v1
 			req.ObotNamespace,
 			h.secretBindingAllowedLabel,
 			entry.Namespace,
+			entry.Name,
 			catalogName,
 			componentEntry.Manifest,
 			config.Config,
 			config.URL,
 			h.serverURL,
+			validationOptions,
 		)
 		if err != nil {
 			// If we can't create server config, skip this component
@@ -1433,19 +1556,19 @@ func (h *MCPCatalogHandler) generateCompositeOAuthURLs(req api.Context, entry v1
 	return req.Write(oauthURLs)
 }
 
-func tempServerAndConfig(ctx context.Context, gatewayClient *gclient.Client, client client.Client, localK8sClient client.Client, obotNamespace, secretBindingAllowedLabel, namespace, catalogName string, entryManifest types.MCPServerCatalogEntryManifest, config map[string]string, url, baseURL string) (v1.MCPServer, mcp.ServerConfig, error) {
+func tempServerAndConfig(ctx context.Context, gatewayClient *gclient.Client, client client.Client, localK8sClient client.Client, obotNamespace, secretBindingAllowedLabel, namespace, entryName, catalogName string, entryManifest types.MCPServerCatalogEntryManifest, config map[string]string, url, baseURL string, validationOptions mcp.ValidationOptions) (v1.MCPServer, mcp.ServerConfig, error) {
 	// Convert catalog entry to server manifest
 	serverManifest, err := types.MapCatalogEntryToServer(entryManifest, url, false)
 	if err != nil {
 		return v1.MCPServer{}, mcp.ServerConfig{}, fmt.Errorf("failed to convert catalog entry to server config: %w", err)
 	}
 
-	// Merge any secretBinding-resolved values into the user-supplied
-	// config so URL-template substitution and ServerToServerConfig see
-	// them. The caller's config map is not mutated.
-	config, err = mcp.MergeBoundCreds(ctx, localK8sClient, obotNamespace, serverManifest.Env, serverManifest.RemoteConfig, config, secretBindingAllowedLabel)
+	config, err = prepareTempServerConfig(ctx, localK8sClient, obotNamespace, secretBindingAllowedLabel, &serverManifest, config, !entryManifest.ServerUserType.IsSingleUser(), validationOptions)
 	if err != nil {
-		return v1.MCPServer{}, mcp.ServerConfig{}, fmt.Errorf("failed to resolve secret bindings: %w", err)
+		return v1.MCPServer{}, mcp.ServerConfig{}, err
+	}
+	if err := tunnel.ValidateServerTunnelReferences(ctx, client, serverManifest); err != nil {
+		return v1.MCPServer{}, mcp.ServerConfig{}, types.NewErrBadRequest("validation failed: %v", err)
 	}
 
 	// Create temporary MCPServer object to use existing conversion logic
@@ -1498,7 +1621,12 @@ func tempServerAndConfig(ctx context.Context, gatewayClient *gclient.Client, cli
 		return v1.MCPServer{}, mcp.ServerConfig{}, fmt.Errorf("failed to create OAuth client: %w", err)
 	}
 
-	serverConfig, missingFields, err := mcp.ServerToServerConfig(tempMCPServer, tempMCPServer.ValidConnectURLs(baseURL), "temp", "temp", catalogName, config, tokenExchangeEnv)
+	staticOAuthCred, err := gatewayClient.RevealCredential(ctx, []string{system.MCPOAuthCredentialName(entryName)}, entryName)
+	if err != nil && !errors.As(err, &gclient.CredentialNotFoundError{}) {
+		return v1.MCPServer{}, mcp.ServerConfig{}, fmt.Errorf("failed to reveal credential: %w", err)
+	}
+
+	serverConfig, missingFields, err := mcp.ServerToServerConfig(tempMCPServer, tempMCPServer.ValidConnectURLs(baseURL), "temp", "temp", catalogName, config, tokenExchangeEnv, staticOAuthCred.Secrets)
 	if err != nil {
 		return v1.MCPServer{}, mcp.ServerConfig{}, fmt.Errorf("failed to create server config: %w", err)
 	}
@@ -1508,6 +1636,20 @@ func tempServerAndConfig(ctx context.Context, gatewayClient *gclient.Client, cli
 	}
 
 	return tempMCPServer, serverConfig, nil
+}
+
+func prepareTempServerConfig(ctx context.Context, localK8sClient client.Client, obotNamespace, secretBindingAllowedLabel string, serverManifest *types.MCPServerManifest, config map[string]string, isMultiUser bool, validationOptions mcp.ValidationOptions) (map[string]string, error) {
+	// Render templates before resolving bindings so Secret values can only be
+	// used by runtime fields such as headers, never embedded in the URL.
+	if err := applyRemoteURLTemplate(ctx, serverManifest, config, isMultiUser, validationOptions); err != nil {
+		return nil, err
+	}
+
+	mergedConfig, err := mcp.MergeBoundCreds(ctx, localK8sClient, obotNamespace, serverManifest.Env, serverManifest.RemoteConfig, config, secretBindingAllowedLabel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve secret bindings: %w", err)
+	}
+	return mergedConfig, nil
 }
 
 // ListCategoriesForCatalog returns all unique categories from entries in a catalog
@@ -1657,13 +1799,6 @@ func (h *MCPCatalogHandler) populateComponentManifests(req api.Context, manifest
 				return types.NewErrBadRequest("multi-user catalog entry %s cannot be included in a composite server; use the multi-user MCP server instead", component.CatalogEntryID)
 			}
 
-			// Reject remote entries with static OAuth from being included in composites
-			if entry.Spec.Manifest.Runtime == types.RuntimeRemote &&
-				entry.Spec.Manifest.RemoteConfig != nil &&
-				entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
-				return types.NewErrBadRequest("remote catalog entry %s with static OAuth cannot be included in a composite server", component.CatalogEntryID)
-			}
-
 			// Populate the manifest
 			component.Manifest = entry.Spec.Manifest
 			// Keep this component
@@ -1723,7 +1858,7 @@ func (h *MCPCatalogHandler) RefreshCompositeComponents(req api.Context) error {
 
 	// Validate the refreshed manifest to ensure it's still valid
 	entryGitManaged := entry.IsGitManaged()
-	if err := mcp.ValidateCatalogEntryManifest(req.Context(), entry.Spec.Manifest, entryGitManaged, ValidationOptionsWithResourceMaximums(h.sessionManager)); err != nil {
+	if err := validateCatalogEntryManifestWithResourceMaximums(req, entry.Spec.Manifest, entryGitManaged, h.sessionManager); err != nil {
 		return types.NewErrBadRequest("failed to validate entry manifest: %v", err)
 	}
 	if err := tunnel.ValidateCatalogEntryTunnelReferences(req.Context(), req.Storage, entry.Spec.Manifest); err != nil {

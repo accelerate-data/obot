@@ -403,7 +403,7 @@ func lockUserCreation(tx *gorm.DB) error {
 
 func newUserLimitError() error {
 	return types2.NewErrHTTP(
-		http.StatusPaymentRequired,
+		http.StatusForbidden,
 		"Unable to provision your account. Please contact your administrator.",
 	)
 }

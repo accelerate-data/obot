@@ -13,7 +13,6 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
-	"github.com/obot-platform/obot/pkg/api/handlers/mcpgateway"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -162,7 +161,7 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, false)
+	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
 	t.Cleanup(func() { _ = gateway.Close() })
 	credentialKey := system.MCPOAuthCredentialName(entryName)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
@@ -205,8 +204,8 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 		t.Fatalf("failed Clear removed active token before retry: %v", err)
 	}
 
-	store := mcpgateway.NewGlobalTokenStore(gateway).ForUserAndMCP("user-1", mcpID)
-	if _, _, err := store.GetTokenConfig(t.Context(), mcpURL); err != nil {
+	store := mcp.NewGlobalTokenStore(gateway).ForUserAndMCP("user-1", mcpID, mcpURL)
+	if _, _, err := store.GetTokenConfig(t.Context()); err != nil {
 		t.Fatalf("refresh after failed Clear: %v", err)
 	}
 	refreshStarted := make(chan struct{})
@@ -215,7 +214,7 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 	go func() {
 		close(refreshStarted)
 		<-writeRefresh
-		refreshResult <- store.SetTokenConfig(t.Context(), mcpURL, config, &oauth2.Token{AccessToken: "resurrected-access"})
+		refreshResult <- store.SetTokenConfig(t.Context(), config, &oauth2.Token{AccessToken: "resurrected-access"})
 	}()
 	<-refreshStarted
 	if err := handler.DeleteOAuthCredentials(newDeleteRequest(storage.Client(storageClient))); err != nil {
@@ -541,7 +540,7 @@ func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptio
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, false), services.DB.DB
+	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
 }
 
 func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {

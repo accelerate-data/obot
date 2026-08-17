@@ -22,6 +22,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: https://github.com/obot-platform/obot.git
+  UPSTREAM_BRANCH: main
 
 jobs:
   verify:
@@ -33,11 +34,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch upstream release tags
+      - name: Fetch upstream branch and release tags
         run: |
           git remote add upstream "$UPSTREAM_REPO"
-          # Only the version tags are needed for the ancestry/version comparison.
-          git fetch --no-tags upstream 'refs/tags/v*:refs/tags/v*'
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
 
       - name: Verify upstream-sync metadata
         run: bash scripts/verify-sync-metadata.sh

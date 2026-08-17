@@ -6,6 +6,7 @@
 	import DiffDialog from '$lib/components/admin/DiffDialog.svelte';
 	import McpServerEntryForm from '$lib/components/admin/McpServerEntryForm.svelte';
 	import McpDeprecatedNotice from '$lib/components/mcp/McpDeprecatedNotice.svelte';
+	import McpDetachedNotice from '$lib/components/mcp/McpDetachedNotice.svelte';
 	import McpServerActions from '$lib/components/mcp/McpServerActions.svelte';
 	import { VirtualPageViewport } from '$lib/components/ui/virtual-page';
 	import { DEFAULT_MCP_CATALOG_ID, PAGE_TRANSITION_DURATION } from '$lib/constants';
@@ -177,6 +178,14 @@
 		}
 	}
 
+	async function acceptOwnership() {
+		if (!catalogEntry) return;
+		catalogEntry = await AdminService.acceptMCPCatalogEntryOwnership(
+			DEFAULT_MCP_CATALOG_ID,
+			catalogEntry.id
+		);
+	}
+
 	let title = $derived(catalogEntry?.manifest?.name ?? 'MCP Server');
 	let promptInitialLaunch = $derived(page.url.searchParams.get('launch') === 'true');
 	let promptOAuthConfig = $derived(page.url.searchParams.get('configure-oauth') === 'true');
@@ -221,6 +230,14 @@
 	{/snippet}
 	<div class="flex h-full flex-col gap-6" in:fly={{ x: 100, delay: duration, duration }}>
 		<McpDeprecatedNotice {deprecated} variant="notification" />
+		{#if profile.current.hasAdminAccess?.()}
+			<McpDetachedNotice
+				detached={catalogEntry?.detached}
+				sourceURL={catalogEntry?.sourceURL}
+				variant="notification"
+				onAcceptOwnership={isAdminReadonly ? undefined : acceptOwnership}
+			/>
+		{/if}
 
 		{#if showUpgradeNotification}
 			<div class="border-primary bg-primary/10 flex items-center gap-3 rounded-lg border p-4">

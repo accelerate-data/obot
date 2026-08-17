@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/obot-platform/nanobot/pkg/safehttp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authn"
@@ -24,6 +23,7 @@ import (
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/license"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
 	"golang.org/x/oauth2"
@@ -192,7 +192,7 @@ func newUnauthenticatedStaticOAuthCallbackServer(t *testing.T, gateway *gatewayc
 		storage,
 		"default",
 		authn.NewAuthenticator(authn.Anonymous{}),
-		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, false),
+		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, nil, false),
 		nil,
 		auditLogger,
 		limiter,
@@ -282,8 +282,12 @@ func TestStaticOAuthCallbackBlocksPrivateTokenEndpoint(t *testing.T) {
 		ResponseWriter: recorder,
 	}
 	h := &handler{
-		oauthChecker:          &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)},
-		staticOAuthHTTPClient: safehttp.NewClient(true, true, true),
+		oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)},
+		staticOAuthHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
+			BlockLoopback:  true,
+			BlockPrivateIP: true,
+			BlockLinkLocal: true,
+		}),
 	}
 	if err := h.oauthCallback(req); err != nil {
 		t.Fatalf("handle static OAuth callback: %v", err)
@@ -445,7 +449,7 @@ func newStaticOAuthCallbackGatewayWithDB(t *testing.T) (*gatewayclient.Client, *
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 0, 0, false), services.DB.DB
+	return gatewayclient.New(t.Context(), database, nil, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
 }
 
 func staticOAuthTestEncryptionConfig() *encryptionconfig.EncryptionConfiguration {

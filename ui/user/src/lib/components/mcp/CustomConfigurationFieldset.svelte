@@ -18,6 +18,7 @@
 			input?: string;
 		};
 		showRequired?: boolean;
+		urlTemplateVariable?: boolean;
 	}
 
 	let {
@@ -28,7 +29,8 @@
 		isPrebuiltEntry,
 		secretBindingTargets,
 		classes,
-		showRequired
+		showRequired,
+		urlTemplateVariable = false
 	}: Props = $props();
 
 	function usesSecretBindingSource(field: {
@@ -40,7 +42,11 @@
 
 	let selectedType = $state(
 		untrack(() =>
-			(data.value?.length ?? 0) > 0 || usesSecretBindingSource(data) ? 'static' : 'user_supplied'
+			urlTemplateVariable
+				? 'user_supplied'
+				: (data.value?.length ?? 0) > 0 || usesSecretBindingSource(data)
+					? 'static'
+					: 'user_supplied'
 		)
 	);
 
@@ -49,7 +55,13 @@
 	let missingValue = $derived(showRequired && !data.value?.trim());
 
 	$effect(() => {
-		if (data && usesSecretBindingSource(data)) {
+		if (urlTemplateVariable) {
+			data.secretBinding = undefined;
+			data.secretBindingSource = 'value';
+			data.required = true;
+			data.sensitive = false;
+			data.file = false;
+		} else if (data && usesSecretBindingSource(data)) {
 			data.sensitive = true;
 		}
 	});
@@ -63,16 +75,26 @@
 
 	{@render keyInput()}
 	{@render nameAndDescriptionInputs()}
-	<div class="flex gap-8">
-		<label class="flex items-center gap-2">
-			<input type="checkbox" bind:checked={data.sensitive} disabled={readonly || isPrebuiltEntry} />
-			<span class="text-sm">Sensitive</span>
-		</label>
-		<label class="flex items-center gap-2">
-			<input type="checkbox" bind:checked={data.required} disabled={readonly || isPrebuiltEntry} />
-			<span class="text-sm">Required</span>
-		</label>
-	</div>
+	{#if !urlTemplateVariable}
+		<div class="flex gap-8">
+			<label class="flex items-center gap-2">
+				<input
+					type="checkbox"
+					bind:checked={data.sensitive}
+					disabled={readonly || isPrebuiltEntry}
+				/>
+				<span class="text-sm">Sensitive</span>
+			</label>
+			<label class="flex items-center gap-2">
+				<input
+					type="checkbox"
+					bind:checked={data.required}
+					disabled={readonly || isPrebuiltEntry}
+				/>
+				<span class="text-sm">Required</span>
+			</label>
+		</div>
+	{/if}
 {:else}
 	<div class="flex w-full flex-col gap-1">
 		{@render keyInput()}
@@ -84,38 +106,40 @@
 		{/if}
 	</div>
 
-	<div class="flex w-full flex-col gap-1" id={`${id}-value-type-container`}>
-		{@render label('Value', `env-value-type-${id}`)}
-		<Select
-			class="bg-base-100 dark:border-base-400 border border-transparent shadow-none"
-			classes={{
-				root: 'flex grow'
-			}}
-			options={[
-				{ label: 'Static', id: 'static' },
-				{ label: 'User-Supplied', id: 'user_supplied' }
-			]}
-			selected={selectedType}
-			onSelect={(option) => {
-				if (!data) return;
-				selectedType = option.id;
+	{#if !urlTemplateVariable}
+		<div class="flex w-full flex-col gap-1" id={`${id}-value-type-container`}>
+			{@render label('Value', `env-value-type-${id}`)}
+			<Select
+				class="bg-base-100 dark:border-base-400 border border-transparent shadow-none"
+				classes={{
+					root: 'flex grow'
+				}}
+				options={[
+					{ label: 'Static', id: 'static' },
+					{ label: 'User-Supplied', id: 'user_supplied' }
+				]}
+				selected={selectedType}
+				onSelect={(option) => {
+					if (!data) return;
+					selectedType = option.id;
 
-				// Reset state when switching between static and user-supplied modes.
-				data.required = option.id === 'static';
-				data.name = '';
-				data.value = '';
-				data.description = '';
-				data.sensitive = false;
+					// Reset state when switching between static and user-supplied modes.
+					data.required = option.id === 'static';
+					data.name = '';
+					data.value = '';
+					data.description = '';
+					data.sensitive = false;
 
-				if (option.id === 'user_supplied') {
-					data.secretBinding = undefined;
-					data.secretBindingSource = 'value';
-				}
-			}}
-			readonly={readonly || isPrebuiltEntry}
-			id={`env-value-type-${id}`}
-		/>
-	</div>
+					if (option.id === 'user_supplied') {
+						data.secretBinding = undefined;
+						data.secretBindingSource = 'value';
+					}
+				}}
+				readonly={readonly || isPrebuiltEntry}
+				id={`env-value-type-${id}`}
+			/>
+		</div>
+	{/if}
 
 	{#if !isPrebuiltEntry && selectedType === 'user_supplied'}
 		{@render nameAndDescriptionInputs()}
@@ -140,6 +164,8 @@
 						bind:value={data.value}
 						disabled={readonly}
 						rows={(data.value ?? '').split('\n').length + 1}
+						aria-required={!readonly ? 'true' : undefined}
+						aria-invalid={missingValue}
 					></textarea>
 				{:else}
 					<input
@@ -150,44 +176,48 @@
 						placeholder="e.g. 123abcdef456"
 						disabled={readonly}
 						type={data.sensitive ? 'password' : 'text'}
+						aria-required={!readonly ? 'true' : undefined}
+						aria-invalid={missingValue}
 					/>
 				{/if}
 			</div>
 		{/if}
 	{/if}
-	<div class="flex w-full">
-		{#if !usesSecretBindingSource(data)}
-			<Toggle
-				classes={{ label: 'text-sm text-inherit' }}
-				disabled={readonly || isPrebuiltEntry}
-				label="Sensitive"
-				labelInline
-				checked={!!data.sensitive}
-				onChange={(checked) => {
-					if (data) {
-						data.sensitive = checked;
-					}
-				}}
-			/>
-			{#if selectedType !== 'static'}
-				<div class="divider divider-horizontal"></div>
+	{#if !urlTemplateVariable}
+		<div class="flex w-full">
+			{#if !usesSecretBindingSource(data)}
+				<Toggle
+					classes={{ label: 'text-sm text-inherit' }}
+					disabled={readonly || isPrebuiltEntry}
+					label="Sensitive"
+					labelInline
+					checked={!!data.sensitive}
+					onChange={(checked) => {
+						if (data) {
+							data.sensitive = checked;
+						}
+					}}
+				/>
+				{#if selectedType !== 'static'}
+					<div class="divider divider-horizontal"></div>
+				{/if}
 			{/if}
-		{/if}
-		{#if selectedType !== 'static'}
-			<Toggle
-				classes={{ label: 'text-sm text-inherit' }}
-				disabled={readonly || isPrebuiltEntry}
-				label="Required"
-				labelInline
-				checked={!!data.required}
-				onChange={(checked) => {
-					if (data) {
-						data.required = checked;
-					}
-				}}
-			/>
-		{/if}
-	</div>
+			{#if selectedType !== 'static'}
+				<Toggle
+					classes={{ label: 'text-sm text-inherit' }}
+					disabled={readonly || isPrebuiltEntry}
+					label="Required"
+					labelInline
+					checked={!!data.required}
+					onChange={(checked) => {
+						if (data) {
+							data.required = checked;
+						}
+					}}
+				/>
+			{/if}
+		</div>
+	{/if}
 {/if}
 
 {#snippet label(title: string, forInput: string, required?: boolean, showError?: boolean)}
@@ -210,6 +240,8 @@
 			bind:value={data.key}
 			placeholder="e.g. CUSTOM_API_KEY"
 			disabled={readonly || isPrebuiltEntry}
+			aria-required={!readonly ? 'true' : undefined}
+			aria-invalid={missingKey}
 		/>
 	</div>
 {/snippet}
@@ -223,6 +255,8 @@
 			class:error={missingName}
 			bind:value={data.name}
 			disabled={readonly || isPrebuiltEntry}
+			aria-required={!readonly ? 'true' : undefined}
+			aria-invalid={missingName}
 		/>
 	</div>
 	<div class="flex w-full flex-col gap-1" id={`${id}-description-container`}>

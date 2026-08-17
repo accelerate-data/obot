@@ -6,12 +6,22 @@
 	import { Info } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
+	interface Props {
+		catalogId?: string;
+		catalogEntryId?: string;
+	}
+
+	let { catalogId, catalogEntryId }: Props = $props();
 	let capacityInfo = $state<MCPCapacityInfo | null>(null);
 	let loading = $state(true);
 
 	async function fetchCapacity() {
+		const opts = { dontLogErrors: true };
 		try {
-			capacityInfo = await AdminService.getMCPCapacity();
+			capacityInfo =
+				catalogId && catalogEntryId
+					? await AdminService.getMCPCatalogEntryCapacity(catalogId, catalogEntryId, opts)
+					: await AdminService.getMCPCapacity(opts);
 		} catch {
 			// Silently fail - banner just won't show
 			capacityInfo = null;

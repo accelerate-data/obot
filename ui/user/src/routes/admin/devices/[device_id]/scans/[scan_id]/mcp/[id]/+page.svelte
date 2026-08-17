@@ -174,11 +174,11 @@
 			<div class="flex flex-col gap-2">
 				<div class="flex items-center justify-between">
 					<h3 class="text-base font-semibold">Configuration</h3>
-					<CopyButton text={renderConfig(server)} />
+					<CopyButton showTextLeft text={renderConfig(server)} />
 				</div>
 				<div class="dark:bg-base-300 bg-base-100 flex flex-col gap-2 rounded-md p-3 shadow-sm">
 					<pre
-						class="dark:bg-base-400 bg-base-200 text-base-content max-h-96 overflow-auto rounded p-2 font-mono text-xs mb-0 mt-2">{renderConfig(
+						class="dark:bg-base-400 bg-base-200 max-h-96 overflow-auto rounded p-2 font-mono text-xs mb-0 mt-2">{renderConfig(
 							server
 						)}</pre>
 					<p class="text-muted-content text-xs">

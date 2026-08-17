@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -148,14 +149,9 @@ func newGatewayTestClient(t *testing.T) *gatewayclient.Client {
 			Role: apitypes.RoleBasic,
 		},
 	}).Build()
-	return gatewayclient.New(context.Background(), db, storageClient, nil, nil, nil, nil, time.Hour, 100, 1, 1, true)
+	return gatewayclient.New(context.Background(), db, storageClient, nil, nil, nil, nil, time.Hour, 100, 1, 1, 1, true)
 }
 
 func contains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, target)
 }

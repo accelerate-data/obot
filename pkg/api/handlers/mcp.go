@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
@@ -22,6 +23,7 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	obottunnel "github.com/obot-platform/obot/pkg/tunnel"
@@ -56,12 +58,13 @@ type MCPHandler struct {
 	mcpRuntimeBackend         string
 	serverURL                 string
 	secretBindingAllowedLabel string
+	forceDynamicClient        bool
 
 	// shutdownMCPServer is only injected for testing
 	shutdownMCPServer func(string) error
 }
 
-func NewMCPHandler(mcpLoader *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, mcpOAuthChecker MCPOAuthChecker, controllerBackend nahbackend.Trigger, mcpImagePullSecrets []string, serverURL, secretBindingAllowedLabel string) *MCPHandler {
+func NewMCPHandler(mcpLoader *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, mcpOAuthChecker MCPOAuthChecker, controllerBackend nahbackend.Trigger, mcpImagePullSecrets []string, serverURL, secretBindingAllowedLabel string, forceDynamicClient bool) *MCPHandler {
 	return &MCPHandler{
 		mcpSessionManager:         mcpLoader,
 		mcpOAuthChecker:           mcpOAuthChecker,
@@ -71,6 +74,7 @@ func NewMCPHandler(mcpLoader *mcp.SessionManager, acrHelper *accesscontrolrule.H
 		mcpRuntimeBackend:         mcpLoader.MCPRuntimeBackend(),
 		serverURL:                 serverURL,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
+		forceDynamicClient:        forceDynamicClient,
 	}
 }
 
@@ -80,14 +84,34 @@ func validationOptions(remoteValidationConfig mcp.RemoteMCPURLValidationConfig) 
 	}
 }
 
-// ValidationOptionsWithResourceMaximums builds MCP manifest validation options from the active MCP session manager.
-func ValidationOptionsWithResourceMaximums(sessionManager *mcp.SessionManager) mcp.ValidationOptions {
+// ValidationOptionsWithResourceMaximums builds MCP manifest validation options from startup and persisted settings.
+func ValidationOptionsWithResourceMaximums(req api.Context, sessionManager *mcp.SessionManager) (mcp.ValidationOptions, error) {
 	if sessionManager == nil {
-		return mcp.ValidationOptions{}
+		return mcp.ValidationOptions{}, nil
 	}
 	options := validationOptions(sessionManager.RemoteMCPURLValidationConfig())
-	options.ResourceMaximums = sessionManager.KubernetesResourceMaximums()
-	return options
+	maximums, err := sessionManager.EffectiveKubernetesResourceMaximums(req.Context(), req.Storage)
+	if err != nil {
+		return mcp.ValidationOptions{}, err
+	}
+	options.ResourceMaximums = maximums
+	return options, nil
+}
+
+func validateServerManifestWithResourceMaximums(req api.Context, manifest types.MCPServerManifest, isMultiUser bool, sessionManager *mcp.SessionManager) error {
+	options, err := ValidationOptionsWithResourceMaximums(req, sessionManager)
+	if err != nil {
+		return err
+	}
+	return mcp.ValidateServerManifest(req.Context(), manifest, isMultiUser, options)
+}
+
+func validateCatalogEntryManifestWithResourceMaximums(req api.Context, manifest types.MCPServerCatalogEntryManifest, gitManaged bool, sessionManager *mcp.SessionManager) error {
+	options, err := ValidationOptionsWithResourceMaximums(req, sessionManager)
+	if err != nil {
+		return err
+	}
+	return mcp.ValidateCatalogEntryManifest(req.Context(), manifest, gitManaged, options)
 }
 
 func (m *MCPHandler) currentImagePullSecretNames(req api.Context) ([]string, error) {
@@ -107,7 +131,13 @@ func (m *MCPHandler) currentK8sSettingsHashWithImagePullSecrets(settings v1.K8sS
 	if err != nil {
 		return "", fmt.Errorf("failed to compute core resource requirements: %w", err)
 	}
-	return mcp.ComputeK8sSettingsHash(settings, resources, mcpServer.Spec.Manifest.Runtime, mcpServer.Spec.NanobotAgentID != "", m.mcpSessionManager.KubernetesResourceMaximums(), imagePullSecretNames), nil
+	return mcp.ComputeK8sSettingsHash(
+		settings,
+		resources,
+		mcpServer.Spec.Manifest.Runtime,
+		mcpServer.Spec.NanobotAgentID != "",
+		imagePullSecretNames,
+	), nil
 }
 
 func (m *MCPHandler) GetEntryFromAllSources(req api.Context) error {
@@ -206,6 +236,7 @@ func ConvertMCPServerCatalogEntryWithWorkspace(entry v1.MCPServerCatalogEntry, p
 		Metadata:                  MetadataFrom(&entry),
 		Manifest:                  entry.Spec.Manifest,
 		Editable:                  entry.Spec.Editable,
+		Detached:                  entry.Spec.Detached,
 		CatalogName:               entry.Spec.MCPCatalogName,
 		SourceURL:                 entry.Spec.SourceURL,
 		UserCount:                 entry.Status.UserCount,
@@ -669,17 +700,66 @@ func (m *MCPHandler) CheckOAuth(req api.Context) error {
 		return types.NewErrNotFound("MCP server not found")
 	}
 
-	if serverConfig.Runtime == types.RuntimeRemote {
-		var are nmcp.AuthRequiredErr
-		if _, err = m.mcpSessionManager.PingServer(req.Context(), serverConfig); err != nil {
-			if !errors.As(err, &are) {
-				return fmt.Errorf("failed to ping MCP server: %w", err)
-			}
-			req.WriteHeader(http.StatusPreconditionFailed)
+	needsOAuth, err := m.serverNeedsOAuth(req.Context(), &server, serverConfig)
+	if err != nil {
+		return err
+	}
+	if !needsOAuth && server.Spec.Manifest.Runtime == types.RuntimeComposite {
+		var componentServers v1.MCPServerList
+		if err := req.Storage.List(req.Context(), &componentServers, &kclient.ListOptions{
+			Namespace:     server.Namespace,
+			FieldSelector: fields.OneTermEqualSelector("spec.compositeName", server.Name),
+		}); err != nil {
+			return fmt.Errorf("failed to list composite MCP component servers: %w", err)
 		}
+
+		disabled := make(map[string]bool)
+		if server.Spec.Manifest.CompositeConfig != nil {
+			for _, component := range server.Spec.Manifest.CompositeConfig.ComponentServers {
+				disabled[component.CatalogEntryID] = component.Disabled
+			}
+		}
+		for i := range componentServers.Items {
+			component := &componentServers.Items[i]
+			if disabled[component.Spec.MCPServerCatalogEntryName] || component.Spec.Manifest.Runtime != types.RuntimeRemote {
+				continue
+			}
+			_, componentConfig, err := m.mcpSessionManager.ServerForAction(req.Context(), component.Name, req.User.GetUID())
+			if err != nil {
+				return fmt.Errorf("failed to load composite MCP component server %s: %w", component.Name, err)
+			}
+			needsOAuth, err = m.serverNeedsOAuth(req.Context(), component, componentConfig)
+			if err != nil {
+				return err
+			}
+			if needsOAuth {
+				break
+			}
+		}
+	}
+	if needsOAuth {
+		req.WriteHeader(http.StatusPreconditionFailed)
 	}
 
 	return nil
+}
+
+func (m *MCPHandler) serverNeedsOAuth(ctx context.Context, server *v1.MCPServer, serverConfig mcp.ServerConfig) (bool, error) {
+	if mcp.RequiresStaticOAuth(*server) {
+		return true, nil
+	}
+	if serverConfig.Runtime != types.RuntimeRemote {
+		return false, nil
+	}
+
+	var authRequired nmcp.AuthRequiredErr
+	if err := m.mcpSessionManager.PingServer(ctx, serverConfig); err != nil {
+		if errors.As(err, &authRequired) {
+			return true, nil
+		}
+		return false, fmt.Errorf("failed to ping MCP server %s: %w", server.Name, err)
+	}
+	return false, nil
 }
 
 func (m *MCPHandler) GetOAuthURL(req api.Context) error {
@@ -959,7 +1039,7 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id, secretBindingAllowed
 						MCPCatalogName:            server.Spec.MCPCatalogID,
 						MCPServerCatalogEntryName: server.Spec.MCPServerCatalogEntryName,
 						PowerUserWorkspaceID:      server.Spec.PowerUserWorkspaceID,
-						UserID:                    req.User.GetUID(),
+						UserID:                    principal.ResourceOwnerID(req.User),
 						MultiUserConfig:           server.Spec.Manifest.MultiUserConfig,
 					},
 				}
@@ -1225,10 +1305,10 @@ func validateServerScope(req api.Context, server v1.MCPServer) error {
 	return nil
 }
 
-func serverForActionWithCapabilities(req api.Context, mcpSessionManager *mcp.SessionManager) (v1.MCPServer, mcp.ServerConfig, nmcp.ServerCapabilities, error) {
+func serverForActionWithCapabilities(req api.Context, mcpSessionManager *mcp.SessionManager) (v1.MCPServer, mcp.ServerConfig, *gomcp.ServerCapabilities, error) {
 	server, serverConfig, err := mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User.GetUID())
 	if err != nil {
-		return server, serverConfig, nmcp.ServerCapabilities{}, err
+		return server, serverConfig, nil, err
 	}
 
 	caps, err := mcpSessionManager.ServerCapabilities(req.Context(), serverConfig)
@@ -1277,23 +1357,6 @@ func serverManifestFromCatalogEntryManifest(
 				inputComponent = inputComponents[entryComponent.ComponentID()]
 				userURL        string
 			)
-
-			// Check if the component has gained static OAuth.
-			// If so, reject the update - static OAuth components cannot be part of composites.
-			entryHasStaticOAuth := entryComponent.Manifest.Runtime == types.RuntimeRemote &&
-				entryComponent.Manifest.RemoteConfig != nil &&
-				entryComponent.Manifest.RemoteConfig.StaticOAuthRequired
-			inputHasStaticOAuth := inputComponent.Manifest.Runtime == types.RuntimeRemote &&
-				inputComponent.Manifest.RemoteConfig != nil &&
-				inputComponent.Manifest.RemoteConfig.StaticOAuthRequired
-
-			if entryHasStaticOAuth && !inputHasStaticOAuth {
-				// The component has gained static OAuth - reject the update.
-				return types.MCPServerManifest{}, types.NewErrBadRequest(
-					"cannot update composite server: component %s has been updated to require static OAuth, which is not allowed in composite servers",
-					entryComponent.ComponentID(),
-				)
-			}
 
 			if entryComponent.Manifest.Runtime == types.RuntimeRemote &&
 				entryComponent.Manifest.RemoteConfig != nil &&
@@ -1642,7 +1705,7 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 		return types.NewErrBadRequest("catalogEntryID is required")
 	}
 
-	if err := mcp.ValidateServerManifest(req.Context(), server.Spec.Manifest, !server.Spec.IsSingleUser(), ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+	if err := validateServerManifestWithResourceMaximums(req, server.Spec.Manifest, !server.Spec.IsSingleUser(), m.mcpSessionManager); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
 	if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, server.Spec.Manifest); err != nil {
@@ -1801,7 +1864,7 @@ func (m *MCPHandler) UpdateServer(req api.Context) error {
 		return fmt.Errorf("failed to find credential: %w", err)
 	}
 
-	if err := mcp.ValidateServerManifest(req.Context(), updated, !existing.Spec.IsSingleUser(), ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+	if err := validateServerManifestWithResourceMaximums(req, updated, !existing.Spec.IsSingleUser(), m.mcpSessionManager); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
 	if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, updated); err != nil {
@@ -1957,7 +2020,11 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 		}
 
 		if url := envVars[configURLKey]; url != "" {
-			if err := updateMCPServerURLFromCatalogEntry(req.Context(), req.Storage, &mcpServer, catalogEntry, url, ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+			validationOptions, err := ValidationOptionsWithResourceMaximums(req, m.mcpSessionManager)
+			if err != nil {
+				return err
+			}
+			if err := updateMCPServerURLFromCatalogEntry(req.Context(), req.Storage, &mcpServer, catalogEntry, url, validationOptions); err != nil {
 				return err
 			}
 
@@ -1971,20 +2038,12 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 		if catalogEntry.Spec.Manifest.Runtime == types.RuntimeRemote &&
 			catalogEntry.Spec.Manifest.RemoteConfig != nil &&
 			catalogEntry.Spec.Manifest.RemoteConfig.URLTemplate != "" {
-			// Apply the URL template with environment variables
-			finalURL, err := applyURLTemplate(catalogEntry.Spec.Manifest.RemoteConfig.URLTemplate, envVars)
+			validationOptions, err := ValidationOptionsWithResourceMaximums(req, m.mcpSessionManager)
 			if err != nil {
-				return fmt.Errorf("failed to apply URL template: %w", err)
+				return err
 			}
-
-			// Update the server's remote config URL with the processed template
-			if mcpServer.Spec.Manifest.RemoteConfig == nil {
-				mcpServer.Spec.Manifest.RemoteConfig = &types.RemoteRuntimeConfig{}
-			}
-			mcpServer.Spec.Manifest.RemoteConfig.URL = finalURL
-
-			if err := mcp.ValidateServerManifest(req.Context(), mcpServer.Spec.Manifest, !mcpServer.Spec.IsSingleUser(), ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
-				return types.NewErrBadRequest("validation failed: %v", err)
+			if err := applyRemoteURLTemplate(req.Context(), &mcpServer.Spec.Manifest, envVars, !mcpServer.Spec.IsSingleUser(), validationOptions); err != nil {
+				return err
 			}
 			if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, mcpServer.Spec.Manifest); err != nil {
 				return types.NewErrBadRequest("validation failed: %v", err)
@@ -2180,7 +2239,7 @@ func (m *MCPHandler) configureCompositeServer(req api.Context, compositeServer v
 				if remoteConfig.URL != originalURL {
 					// Capture and validate the changes
 					component.Manifest.RemoteConfig = remoteConfig
-					if err := mcp.ValidateServerManifest(req.Context(), component.Manifest, false, ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+					if err := validateServerManifestWithResourceMaximums(req, component.Manifest, false, m.mcpSessionManager); err != nil {
 						return fmt.Errorf("failed to validate server manifest %w", err)
 					}
 					if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, component.Manifest); err != nil {
@@ -2215,7 +2274,6 @@ func (m *MCPHandler) configureCompositeServer(req api.Context, compositeServer v
 	// We do this in parallel because shutting down servers can take some time
 	g, ctx := errgroup.WithContext(req.Context())
 	for id, cred := range componentCreds {
-		id, cred := id, cred // Rescope variables for closure
 		g.Go(func() error {
 			modified, err := ensureCredential(ctx, req.GatewayClient, cred)
 			if err != nil {
@@ -2342,6 +2400,25 @@ func applyURLTemplate(templateStr string, envVars map[string]string) (string, er
 	}
 
 	return result, nil
+}
+
+// applyRemoteURLTemplate renders and validates a remote URL template before the server is used.
+func applyRemoteURLTemplate(ctx context.Context, manifest *types.MCPServerManifest, envVars map[string]string, isMultiUser bool, options mcp.ValidationOptions) error {
+	if manifest.Runtime != types.RuntimeRemote || manifest.RemoteConfig == nil || manifest.RemoteConfig.URLTemplate == "" {
+		return nil
+	}
+
+	finalURL, err := applyURLTemplate(manifest.RemoteConfig.URLTemplate, envVars)
+	if err != nil {
+		return fmt.Errorf("failed to apply URL template: %w", err)
+	}
+
+	manifest.RemoteConfig.URL = finalURL
+	if err := mcp.ValidateServerManifest(ctx, *manifest, isMultiUser, options); err != nil {
+		return types.NewErrBadRequest("validation failed: %v", err)
+	}
+
+	return nil
 }
 
 func (m *MCPHandler) DeconfigureServer(req api.Context) error {
@@ -2788,8 +2865,10 @@ func ConvertMCPServer(server v1.MCPServer, credEnv map[string]string, serverURL,
 			continue
 		}
 
-		if _, ok := credEnv[env.Key]; !ok {
-			missingEnvVars = append(missingEnvVars, env.Key)
+		if env.Value == "" {
+			if _, ok := credEnv[env.Key]; !ok {
+				missingEnvVars = append(missingEnvVars, env.Key)
+			}
 		}
 	}
 
@@ -3873,7 +3952,11 @@ func (m *MCPHandler) UpdateURL(req api.Context) error {
 		return fmt.Errorf("failed to read input: %w", err)
 	}
 
-	if err := updateMCPServerURLFromCatalogEntry(req.Context(), req.Storage, &mcpServer, entry, input.URL, ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+	validationOptions, err := ValidationOptionsWithResourceMaximums(req, m.mcpSessionManager)
+	if err != nil {
+		return err
+	}
+	if err := updateMCPServerURLFromCatalogEntry(req.Context(), req.Storage, &mcpServer, entry, input.URL, validationOptions); err != nil {
 		return err
 	}
 
@@ -3991,7 +4074,7 @@ func (m *MCPHandler) TriggerUpdate(req api.Context) error {
 
 	candidate := server.DeepCopy()
 	updateServerFromCatalogEntry(candidate, entry)
-	if err := mcp.ValidateServerManifest(req.Context(), candidate.Spec.Manifest, !candidate.Spec.IsSingleUser(), ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+	if err := validateServerManifestWithResourceMaximums(req, candidate.Spec.Manifest, !candidate.Spec.IsSingleUser(), m.mcpSessionManager); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
 	if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, candidate.Spec.Manifest); err != nil {
@@ -4020,7 +4103,7 @@ func (m *MCPHandler) TriggerUpdate(req api.Context) error {
 		updateServerFromCatalogEntry(&latest, entry)
 
 		// Validate again in case the catalog entry changed between retries.
-		if err := mcp.ValidateServerManifest(req.Context(), latest.Spec.Manifest, !latest.Spec.IsSingleUser(), ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+		if err := validateServerManifestWithResourceMaximums(req, latest.Spec.Manifest, !latest.Spec.IsSingleUser(), m.mcpSessionManager); err != nil {
 			return types.NewErrBadRequest("validation failed: %v", err)
 		}
 		if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, latest.Spec.Manifest); err != nil {
@@ -4120,7 +4203,7 @@ func (m *MCPHandler) triggerCompositeUpdate(req api.Context, compositeServer v1.
 	if err != nil {
 		return err
 	}
-	if err := mcp.ValidateServerManifest(req.Context(), updatedManifest, !compositeServer.Spec.IsSingleUser(), ValidationOptionsWithResourceMaximums(m.mcpSessionManager)); err != nil {
+	if err := validateServerManifestWithResourceMaximums(req, updatedManifest, !compositeServer.Spec.IsSingleUser(), m.mcpSessionManager); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
 	if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, updatedManifest); err != nil {

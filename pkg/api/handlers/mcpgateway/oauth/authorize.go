@@ -31,6 +31,7 @@ type ErrorCode string
 
 const (
 	ErrInvalidClient           ErrorCode = "invalid_client"
+	ErrInvalidGrant            ErrorCode = "invalid_grant"
 	ErrInvalidRequest          ErrorCode = "invalid_request"
 	ErrUnauthorizedClient      ErrorCode = "unauthorized_client"
 	ErrAccessDenied            ErrorCode = "access_denied"
@@ -78,13 +79,29 @@ func newInvalidClientErr(statusCode int, description string) *types.ErrHTTP {
 func (e oauthError) toQuery() url.Values {
 	q := url.Values{}
 	q.Set("error", string(e.Code))
-	if e.Description != "" {
-		q.Set("error_description", e.Description)
+	if description := sanitizeOAuthErrorDescription(e.Description); description != "" {
+		q.Set("error_description", description)
 	}
 	if e.State != "" {
 		q.Set("state", e.State)
 	}
 	return q
+}
+
+func sanitizeOAuthErrorDescription(description string) string {
+	description = strings.Map(func(r rune) rune {
+		switch {
+		case r == '"':
+			return '\''
+		case r == '\\':
+			return '/'
+		case r == 0x20 || r == 0x21 || r >= 0x23 && r <= 0x5B || r >= 0x5D && r <= 0x7E:
+			return r
+		default:
+			return ' '
+		}
+	}, description)
+	return strings.Join(strings.Fields(description), " ")
 }
 
 func (h *handler) authorize(req api.Context) error {
@@ -169,7 +186,13 @@ func (h *handler) authorize(req api.Context) error {
 		}
 
 		if mcpID == "" {
-			mcpID = strings.TrimPrefix(u.Path, "/mcp-connect/")
+			mcpID = strings.TrimPrefix(u.Path, "/mcp-connect")
+			mcpID = strings.TrimPrefix(mcpID, "/")
+			// If the mcpID is "" or "/", then it's not a valid mcpID
+			if len(mcpID) == 0 {
+				redirectWithAuthorizeError(req, redirectURI, newOAuthError(ErrInvalidRequest, "mcp_id parameter required", state))
+				return nil
+			}
 		} else if !strings.HasSuffix(u.Path, "/"+mcpID) {
 			redirectWithAuthorizeError(req, redirectURI, newOAuthError(ErrInvalidRequest, fmt.Sprintf("resource doesn't match mcp_id: %s", mcpID), state))
 			return nil
@@ -352,7 +375,12 @@ func (h *handler) consent(req api.Context) error {
 		mcpServer         *types.MCPServer
 		mcpServerInstance *types.MCPServerInstance
 	)
-	mcpServer, mcpServerInstance, err = handlers.ConfigurationTargetForConnectID(req, oauthAppAuthRequest.Spec.MCPID, h.baseURL, h.oauthChecker.secretBindingAllowedLabel, handlers.ValidationOptionsWithResourceMaximums(h.oauthChecker.mcpSessionManager))
+	validationOptions, err := handlers.ValidationOptionsWithResourceMaximums(req, h.oauthChecker.mcpSessionManager)
+	if err != nil {
+		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
+		return nil
+	}
+	mcpServer, mcpServerInstance, err = handlers.ConfigurationTargetForConnectID(req, oauthAppAuthRequest.Spec.MCPID, h.baseURL, h.oauthChecker.secretBindingAllowedLabel, validationOptions)
 	if err != nil {
 		if oauthAppAuthRequest.Spec.ConsentMCPConfigRequired {
 			redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))

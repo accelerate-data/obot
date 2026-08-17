@@ -14,7 +14,6 @@ import (
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/nah/pkg/untriggered"
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/logger"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
@@ -248,8 +247,13 @@ func (h *Handler) DetectK8sSettingsDrift(req router.Request, _ router.Response) 
 		return fmt.Errorf("failed to compute core resource requirements: %w", err)
 	}
 
-	resourceMaximums := h.mcpSessionManager.KubernetesResourceMaximums()
-	currentHash := mcp.ComputeK8sSettingsHash(k8sSettings.Spec, resources, server.Spec.Manifest.Runtime, server.Spec.NanobotAgentID != "", resourceMaximums, imagePullSecretNames)
+	currentHash := mcp.ComputeK8sSettingsHash(
+		k8sSettings.Spec,
+		resources,
+		server.Spec.Manifest.Runtime,
+		server.Spec.NanobotAgentID != "",
+		imagePullSecretNames,
+	)
 	shouldSetNeedsK8sUpdate := server.Status.K8sSettingsHash != currentHash && !server.Status.NeedsK8sUpdate
 
 	if shouldSetNeedsK8sUpdate {
@@ -1064,20 +1068,15 @@ func (h *Handler) SyncOAuthMetadata(req router.Request, _ router.Response) error
 	if server.Spec.Manifest.Runtime != types.RuntimeRemote || server.Spec.Manifest.RemoteConfig == nil {
 		return setOAuthMetadata(req, server, new(v1.OAuthMetadata), nil)
 	}
-	// OAuth metadata URLs can point back at the private target and bypass the
-	// tunnel. Leave discovery disabled for tunneled servers; ordinary MCP
-	// requests (including servers that do not require OAuth) still use the
-	// tunnel bridge.
-	if server.Spec.Manifest.RemoteConfig.TunnelName != "" {
-		return setOAuthMetadata(req, server, new(v1.OAuthMetadata), nil)
-	}
 
 	blockingConfig := h.mcpSessionManager.RemoteMCPURLValidationConfig()
 
-	if err := mcp.ValidateRemoteMCPURL(req.Ctx, server.Spec.Manifest.RemoteConfig.URL, blockingConfig); err != nil {
-		// If the URL doesn't pass validation, then don't do anything so that we sync as soon as the configuration is updated.
-		log.Infof("Remote MCP URL validation failed, not checking OAuth metadata: server=%s error=%v", server.Name, err)
-		return nil
+	if server.Spec.Manifest.RemoteConfig.TunnelName == "" {
+		if err := mcp.ValidateRemoteMCPURL(req.Ctx, server.Spec.Manifest.RemoteConfig.URL, blockingConfig); err != nil {
+			// If the URL doesn't pass validation, then don't do anything so that we sync as soon as the configuration is updated.
+			log.Infof("Remote MCP URL validation failed, not checking OAuth metadata: server=%s error=%v", server.Name, err)
+			return nil
+		}
 	}
 
 	if !shouldSyncOAuthMetadata(server, time.Now()) {
@@ -1097,19 +1096,23 @@ func (h *Handler) SyncOAuthMetadata(req router.Request, _ router.Response) error
 		return fmt.Errorf("failed to reveal credential: %w", err)
 	}
 
-	serverConfig, missingConfig, err := mcp.ServerToServerConfig(*server, server.ValidConnectURLs(h.baseURL), server.Spec.UserID, server.Name, server.Status.MCPCatalogID, cred.Secrets, nil)
+	var staticOAuthCred gatewaytypes.Credential
+	if server.Spec.MCPServerCatalogEntryName != "" {
+		staticOAuthCred, err = h.gatewayClient.RevealCredential(req.Ctx, []string{system.MCPOAuthCredentialName(server.Spec.MCPServerCatalogEntryName)}, server.Spec.MCPServerCatalogEntryName)
+		if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
+			return fmt.Errorf("failed to reveal credential: %w", err)
+		}
+	}
+
+	serverConfig, missingConfig, err := mcp.ServerToServerConfig(*server, server.ValidConnectURLs(h.baseURL), server.Spec.UserID, server.Name, server.Status.MCPCatalogID, cred.Secrets, nil, staticOAuthCred.Secrets)
 	if err != nil {
 		return fmt.Errorf("failed to convert MCP server to server config: %w", err)
 	} else if len(missingConfig) > 0 {
 		return nil
 	}
 
-	metadata, err := nmcp.GetOAuthMetadataWithBlockingConfig(req.Ctx, nmcp.Server{
-		BaseURL: serverConfig.URL,
-		Headers: serverConfigHeaders(serverConfig),
-	}, "Obot Test MCP OAuth Client", system.MCPOAuthCallbackURL(h.baseURL),
-		!blockingConfig.AllowLocalhostMCP, !blockingConfig.AllowPrivateIPMCP, !blockingConfig.AllowLinkLocalMCP,
-	)
+	metadata, err := h.mcpSessionManager.GetOAuthMetadata(req.Ctx, serverConfig,
+		"Obot Test MCP OAuth Client", system.MCPOAuthCallbackURL(h.baseURL), mcp.RequiresStaticOAuth(*server))
 	if err != nil {
 		return fmt.Errorf("failed to get OAuth metadata: %w", err)
 	}
@@ -1169,22 +1172,6 @@ func setOAuthMetadata(req router.Request, server *v1.MCPServer, statusMetadata *
 	}
 
 	return nil
-}
-
-func serverConfigHeaders(serverConfig mcp.ServerConfig) map[string]string {
-	result := make(map[string]string, len(serverConfig.PassthroughHeaderNames)+len(serverConfig.Headers))
-	for i, key := range serverConfig.PassthroughHeaderNames {
-		if i < len(serverConfig.PassthroughHeaderValues) {
-			result[key] = serverConfig.PassthroughHeaderValues[i]
-		}
-	}
-	for _, header := range serverConfig.Headers {
-		key, value, ok := strings.Cut(header, "=")
-		if ok {
-			result[key] = value
-		}
-	}
-	return result
 }
 
 func (h *Handler) ShutdownIdleServers(req router.Request, resp router.Response) error {

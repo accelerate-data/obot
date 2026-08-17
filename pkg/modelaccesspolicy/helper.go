@@ -105,42 +105,59 @@ func (h *Helper) UserHasAccessToModel(user kuser.Info, modelID string) (bool, er
 	return allowAll || allowedModels[modelID], err
 }
 
-// getUserAllowedModels returns a set of model IDs that a user can access.
-// If a user is an owner/admin or has been granted access to all models via a wildcard model selector, this method returns nil and true.
+// GetUserAllowedModels returns the model IDs that a user can access.
+// Model access policies only grant models with an allowed usage, including when
+// a policy contains a wildcard or suffix selector.
 func (h *Helper) GetUserAllowedModels(user kuser.Info) (map[string]bool, bool, error) {
 	var (
-		allowedModels = make(map[string]bool)
-		aliasModels   = h.getAliasModels()
+		allowedModels  = make(map[string]bool)
+		aliasModels    = h.getAliasModels()
+		eligibleModels = make(map[string]*v1.Model)
+	)
 
-		addAllowedModel = func(model types.ModelResource) bool {
-			if model.IsWildcard() {
-				return true
-			}
+	for _, obj := range h.modelIndexer.List() {
+		model, ok := obj.(*v1.Model)
+		if !ok || !IsAllowedModelUsage(model.Spec.Manifest.Usage) {
+			continue
+		}
+		eligibleModels[model.Name] = model
+	}
 
-			modelID := model.ID
-			if alias, isAlias := model.IsDefaultModelAliasRef(); isAlias {
-				// The model ID is a default model alias reference (e.g. 'obot://llm')
-				// Look up the current model ID and swap it out
-				// If we can't find it, modelID will be an empty string, which is handled by the model ID check below
-				modelID = aliasModels[alias]
-			} else if _, isPattern := model.IsWildcardSuffix(); isPattern {
-				// The model ID is a wildcard suffix pattern (e.g. 'claude-haiku-4-5*')
-				// Allow every model, from any provider, whose target model matches it
-				for _, obj := range h.modelIndexer.List() {
-					if m, ok := obj.(*v1.Model); ok && model.MatchesTargetModel(m.Spec.Manifest.TargetModel) {
-						allowedModels[m.Name] = true
-					}
-				}
-				return false
-			}
-
-			if system.IsModelID(modelID) {
+	addAllowedModel := func(resource types.ModelResource) {
+		if resource.IsWildcard() {
+			for modelID := range eligibleModels {
 				allowedModels[modelID] = true
 			}
-
-			return false
+			return
 		}
-	)
+
+		modelID := resource.ID
+		if alias, isAlias := resource.IsDefaultModelAliasRef(); isAlias {
+			if !IsAllowedDefaultModelAlias(alias) {
+				return
+			}
+			// Resolve allowed aliases to their current model. The eligibility
+			// check below also protects against a misconfigured alias.
+			modelID = aliasModels[alias]
+		} else if _, isPattern := resource.IsWildcardSuffix(); isPattern {
+			for id, model := range eligibleModels {
+				if resource.MatchesTargetModel(model.Spec.Manifest.TargetModel) {
+					allowedModels[id] = true
+				}
+			}
+			return
+		}
+
+		if system.IsModelID(modelID) && eligibleModels[modelID] != nil {
+			allowedModels[modelID] = true
+		}
+	}
+
+	addResources := func(resources []types.ModelResource) {
+		for _, resource := range resources {
+			addAllowedModel(resource)
+		}
+	}
 
 	// Check policies with wildcard subject selector (*)
 	wildcardUserPolicies, err := h.getWildcardUserPolicies()
@@ -148,9 +165,7 @@ func (h *Helper) GetUserAllowedModels(user kuser.Info) (map[string]bool, bool, e
 		return nil, false, err
 	}
 	for _, policy := range wildcardUserPolicies {
-		if slices.ContainsFunc(policy.Spec.Manifest.Models, addAllowedModel) {
-			return nil, true, nil
-		}
+		addResources(policy.Spec.Manifest.Models)
 	}
 
 	// Check policies that the user is directly included in
@@ -160,9 +175,7 @@ func (h *Helper) GetUserAllowedModels(user kuser.Info) (map[string]bool, bool, e
 	}
 
 	for _, policy := range userPolicies {
-		if slices.ContainsFunc(policy.Spec.Manifest.Models, addAllowedModel) {
-			return nil, true, nil
-		}
+		addResources(policy.Spec.Manifest.Models)
 	}
 
 	// Check policies based on group membership
@@ -173,9 +186,7 @@ func (h *Helper) GetUserAllowedModels(user kuser.Info) (map[string]bool, bool, e
 		}
 
 		for _, policy := range groupPolicies {
-			if slices.ContainsFunc(policy.Spec.Manifest.Models, addAllowedModel) {
-				return nil, true, nil
-			}
+			addResources(policy.Spec.Manifest.Models)
 		}
 	}
 
@@ -189,11 +200,12 @@ func (h *Helper) GetUserAllowedModels(user kuser.Info) (map[string]bool, bool, e
 // the user is allowed that model. This mirrors the access check enforced by the
 // LLM passthrough: a target appears here iff a request for it would succeed.
 //
-// allowAll reports that the user may use every model (admin/owner or a wildcard
-// model selector). When dialect is empty, there is nothing to enumerate, so the
-// returned map is nil and callers should skip filtering entirely rather than
-// treat the nil map as "allow nothing". A dialect filter always returns an
-// enumerated target set and allowAll=false.
+// allowAll reports that the user may use every model without a usage
+// restriction. Policy wildcards are enumerated by GetUserAllowedModels instead,
+// so they only include eligible usages. When dialect is empty and allowAll is
+// true, there is nothing to enumerate, so the returned map is nil and callers
+// should skip filtering rather than treat the nil map as "allow nothing". A
+// dialect filter always returns an enumerated target set and allowAll=false.
 func (h *Helper) GetUserAllowedTargetModels(user kuser.Info, provider, dialect string) (allowed map[string]bool, allowAll bool, _ error) {
 	allowedModels, allowAll, err := h.GetUserAllowedModels(user)
 	if err != nil {
@@ -220,6 +232,51 @@ func (h *Helper) GetUserAllowedTargetModels(user kuser.Info, provider, dialect s
 			continue
 		}
 		if allowAll || allowedModels[m.Name] {
+			allowed[m.Spec.Manifest.TargetModel] = true
+		}
+	}
+
+	return allowed, false, nil
+}
+
+// GetAgentAllowedTargetModels enumerates the targets a hosted agent may use,
+// for the same passthrough list endpoint GetUserAllowedTargetModels serves.
+//
+// An agent's authority was fixed when its instance was created, so it is drawn
+// from the models configured on it rather than from access policies, which
+// describe people and would not match a principal that is not one. This mirrors
+// what the inference path already does; enumerating from policy here instead
+// would report a set the agent's own requests do not obey -- an agent told it
+// may use nothing, while every call it makes succeeds.
+//
+// modelIDs holds Model resource names, or "*" for every model.
+func (h *Helper) GetAgentAllowedTargetModels(modelIDs []string, provider, dialect string) (allowed map[string]bool, allowAll bool, _ error) {
+	allowAll = slices.Contains(modelIDs, "*")
+	if allowAll && dialect == "" {
+		// Nothing to filter, and the nil map must not be read as "allow
+		// nothing" -- the same contract GetUserAllowedTargetModels documents.
+		return nil, true, nil
+	}
+
+	// The provider index already drops deleted, inactive and unconfigured
+	// models, so every entry has a usable target.
+	objs, err := h.modelIndexer.ByIndex(modelProviderIndex, provider)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to get models for provider %q: %w", provider, err)
+	}
+
+	configured := make(map[string]bool, len(modelIDs))
+	for _, id := range modelIDs {
+		configured[id] = true
+	}
+
+	allowed = make(map[string]bool, len(objs))
+	for _, obj := range objs {
+		m, ok := obj.(*v1.Model)
+		if !ok || (dialect != "" && m.Spec.Manifest.Dialect != dialect) {
+			continue
+		}
+		if allowAll || configured[m.Name] {
 			allowed[m.Spec.Manifest.TargetModel] = true
 		}
 	}

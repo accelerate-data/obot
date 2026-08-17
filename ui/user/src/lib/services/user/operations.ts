@@ -39,6 +39,7 @@ import {
 	type McpAuditLogUsageStats,
 	type BootstrapStatus,
 	type DefaultModelAlias,
+	type DeviceCodeVerificationResponse,
 	type DeviceScan,
 	type DeviceScanListFilters,
 	type DeviceScanResponse,
@@ -272,6 +273,16 @@ export async function listDefaultModelAliases(opts?: {
 		opts
 	)) as ItemsResponse<DefaultModelAlias>;
 	return response.items ?? [];
+}
+
+// Device login
+
+export async function verifyDeviceCode(code: string): Promise<DeviceCodeVerificationResponse> {
+	return (await doPost(
+		'/token-request/verify',
+		{ code },
+		{ dontLogErrors: true }
+	)) as DeviceCodeVerificationResponse;
 }
 
 // Device scans

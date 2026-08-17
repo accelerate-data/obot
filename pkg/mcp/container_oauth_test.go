@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -13,23 +12,23 @@ import (
 
 type perUserContainerTokenStore map[string]*oauth2.Token
 
-func (p perUserContainerTokenStore) ForUserAndMCP(userID, _ string) nmcp.TokenStorage {
+func (p perUserContainerTokenStore) ForUserAndMCP(userID, _, _ string) TokenStorage {
 	return fixedContainerTokenStore{token: p[userID]}
 }
 
 type fixedContainerTokenStore struct{ token *oauth2.Token }
 
-func (f fixedContainerTokenStore) GetTokenConfig(context.Context, string) (*oauth2.Config, *oauth2.Token, error) {
+func (f fixedContainerTokenStore) GetTokenConfig(context.Context) (*oauth2.Config, *oauth2.Token, error) {
 	return &oauth2.Config{
 		ClientID: "client", ClientSecret: "secret",
 		Endpoint: oauth2.Endpoint{TokenURL: "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"},
 		Scopes:   []string{"api://client/Mcp.Tools.ReadWrite", "offline_access"},
 	}, f.token, nil
 }
-func (fixedContainerTokenStore) SetTokenConfig(context.Context, string, *oauth2.Config, *oauth2.Token) error {
+func (fixedContainerTokenStore) SetTokenConfig(context.Context, *oauth2.Config, *oauth2.Token) error {
 	return nil
 }
-func (fixedContainerTokenStore) DeleteTokenConfig(context.Context, string) error { return nil }
+func (fixedContainerTokenStore) DeleteTokenConfig(context.Context) error { return nil }
 
 func TestResolveMicrosoftEntraContainerOAuth(t *testing.T) {
 	config, resource, err := ResolveContainerOAuth(types.ContainerizedRuntimeConfig{OAuth: &types.ContainerOAuthConfig{

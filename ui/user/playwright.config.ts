@@ -7,6 +7,7 @@ const baseURL = process.env.BASE_URL ?? `http://127.0.0.1:${uiPort}`;
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const userUIRoot = fileURLToPath(new URL('.', import.meta.url));
 const recordVideo = process.env.OBOT_E2E_RECORD_VIDEO === 'true';
+const obotStartupTimeout = 300_000;
 
 export default defineConfig({
 	testDir: './e2e',
@@ -45,7 +46,8 @@ export default defineConfig({
 				`go run main.go server --http-listen-port ${obotPort} --dev-mode`
 			].join(' '),
 			url: `http://127.0.0.1:${obotPort}/api/bootstrap`,
-			timeout: 120_000,
+			// The first CI run may download and compile the full Go module graph.
+			timeout: obotStartupTimeout,
 			reuseExistingServer: !process.env.CI && !recordVideo
 		},
 		{

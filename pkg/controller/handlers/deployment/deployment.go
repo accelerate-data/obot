@@ -16,22 +16,31 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+type sessionManager interface {
+	MCPRuntimeBackend() string
+}
+
 type Handler struct {
 	mcpDeploymentNamespace string
 	mcpNamespace           string
 	storageClient          kclient.Client
 	mcpRuntimeBackend      string
-	resourceMaximums       mcp.ResourceMaximums
+	mcpSessionManager      sessionManager
 	mcpImagePullSecrets    []string
 }
 
-func New(mcpNamespace string, storageClient kclient.Client, mcpRuntimeBackend string, resourceMaximums mcp.ResourceMaximums, mcpImagePullSecrets []string) *Handler {
+func New(
+	mcpNamespace string,
+	storageClient kclient.Client,
+	mcpSessionManager *mcp.SessionManager,
+	mcpImagePullSecrets []string,
+) *Handler {
 	return &Handler{
 		mcpDeploymentNamespace: mcpNamespace,
 		mcpNamespace:           system.DefaultNamespace,
 		storageClient:          storageClient,
-		mcpRuntimeBackend:      mcpRuntimeBackend,
-		resourceMaximums:       resourceMaximums,
+		mcpRuntimeBackend:      mcpSessionManager.MCPRuntimeBackend(),
+		mcpSessionManager:      mcpSessionManager,
 		mcpImagePullSecrets:    mcpImagePullSecrets,
 	}
 }
@@ -134,7 +143,13 @@ func (h *Handler) UpdateMCPServerStatus(req router.Request, _ router.Response) e
 			return fmt.Errorf("failed to compute core resource requirements: %w", err)
 		}
 
-		currentHash := mcp.ComputeK8sSettingsHash(k8sSettings.Spec, resources, mcpServer.Spec.Manifest.Runtime, mcpServer.Spec.NanobotAgentID != "", h.resourceMaximums, imagePullSecretNames)
+		currentHash := mcp.ComputeK8sSettingsHash(
+			k8sSettings.Spec,
+			resources,
+			mcpServer.Spec.Manifest.Runtime,
+			mcpServer.Spec.NanobotAgentID != "",
+			imagePullSecretNames,
+		)
 
 		if k8sUpdateNeeded := mcpServer.Status.K8sSettingsHash != currentHash; k8sUpdateNeeded != mcpServer.Status.NeedsK8sUpdate {
 			mcpServer.Status.NeedsK8sUpdate = k8sUpdateNeeded

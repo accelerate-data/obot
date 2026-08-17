@@ -1,14 +1,20 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI agents when working with code in this repository.
 
 ## Project Overview
 
-Obot is an open-source platform for implementing Model Context Protocol (MCP) technologies. It provides MCP hosting (Docker/Kubernetes), an MCP registry, an MCP gateway, and Obot Chat (a built-in chat client supporting OpenAI and Anthropic models).
+Obot is an open source AI governance platform with the following features:
+
+- MCP registry
+- MCP server hosting and management
+- LLM gateway and audit logs
+- Agent Skills registry
+- Device Management for scanning, auditing, and enforcing policies on local AI agents
 
 ## Tech Stack
 
-- **Backend**: Go 1.26.0 with PostgreSQL (pgx), MCP protocol (`github.com/modelcontextprotocol/go-sdk`), Kubernetes client libraries
+- **Backend**: Go with PostgreSQL (pgx), MCP protocol (`github.com/modelcontextprotocol/go-sdk`), Kubernetes client libraries
 - **Frontend**: SvelteKit 5 with Vite, Tailwind CSS 4, TypeScript, CodeMirror 6, Milkdown (markdown editor)
 - **Documentation**: Docusaurus 3 (in `/docs`)
 
@@ -48,12 +54,19 @@ pnpm run check        # TypeScript type checking
 pnpm run lint         # ESLint + Prettier check
 pnpm run format       # Auto-format code
 pnpm run ci           # Run format, lint, and check
+pnpm run test         # Run UI integration tests
 ```
 
 ### Documentation (in docs/)
 ```bash
 make serve-docs       # Start local docs server
 ```
+
+## Design Proposals and Architecture Decisions
+
+- Design significant or architecturally important changes first in the [Obot Design Proposals repository](https://github.com/obot-platform/obot-design-proposals). A merged ODP is the signal that implementation may proceed.
+- When an implementation introduces a meaningful architectural decision, include an ADR in the implementation pull request and follow the [`adr/README.md`](adr/README.md) guidance. The ADR records the decision that shipped and links to its related issues and ODP when applicable.
+- If implementation differs materially from the accepted ODP, resolve the change through a follow-up ODP rather than documenting the surprise only in the ADR.
 
 ## Architecture
 
@@ -70,8 +83,7 @@ make serve-docs       # Start local docs server
   - `controller/` - Kubernetes-style controllers and data handlers
   - `mcp/` - MCP protocol implementation (Docker and Kubernetes runners)
   - `storage/` - CRD-style storage layer with resource types in `apis/obot.obot.ai/v1/`
-  - `gateway/` - MCP gateway for proxying and access control
-  - `invoke/` - Agent/workflow invocation engine (integrates with GPTScript)
+  - `gateway/` - APIs whose primary responsibility is to access or store types directly in the database with GORM
   - `services/` - Dependency injection container (`config.go` has all service dependencies)
   - `cli/` - CLI command implementations
   - `auth/`, `oauth/`, `jwt/` - Authentication/authorization
@@ -79,11 +91,11 @@ make serve-docs       # Start local docs server
   - `src/lib/components/` - Reusable Svelte components organized by feature
   - `src/lib/services/` - HTTP client and API interaction logic
   - `src/routes/` - SvelteKit file-based routing
+  - `src/tests/` - Mock data and helpers for testing via vitest-browser-svelte
 - `/apiclient` - Go module for API client code
 - `/logger` - Go module for logging utilities
 - `/tools` - Development scripts (`dev.sh`, `devmode-kubeconfig`)
 - `/chart` - Helm chart for Kubernetes deployment
-- `/tests/integration` - Integration tests
 
 ### MCP Server Types and Runtimes
 

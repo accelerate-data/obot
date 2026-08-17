@@ -10,7 +10,6 @@ replace (
 
 	github.com/obot-platform/obot/apiclient => ./apiclient
 	github.com/obot-platform/obot/logger => ./logger
-	github.com/rancher/remotedialer => github.com/thedadams/remotedialer v0.0.0-20260723172339-49a97825a059
 )
 
 require (
@@ -29,12 +28,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ecr v1.57.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.97.3
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10
+	github.com/coder/websocket v1.8.15
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/go-connections v0.6.0
 	github.com/fatih/color v1.19.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/go-git/go-billy/v5 v5.9.0
-	github.com/go-git/go-git/v5 v5.19.1
+	github.com/go-git/go-git/v5 v5.19.2
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/jsonschema-go v0.4.3
@@ -42,19 +42,21 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/keygen-sh/keygen-go/v3 v3.3.0
+	github.com/klauspost/compress v1.18.6
 	github.com/moby/moby/api v1.52.0-alpha.1
 	github.com/moby/moby/client v0.1.0-alpha.0
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037
 	github.com/obot-platform/chat-completion-client v0.0.0-20260529163740-88dd50945c18
 	github.com/obot-platform/cmd v0.0.0-20260707150346-5103d461ab67
 	github.com/obot-platform/kinm v0.0.0-20260717005812-cd2688a2a64e
 	github.com/obot-platform/nah v0.0.0-20260707163210-8bdf0035e79f
-	github.com/obot-platform/nanobot v0.0.92-0.20260727163144-fd3660343e64
+	github.com/obot-platform/nanobot v0.0.92
 	github.com/obot-platform/obot/apiclient v0.0.0-20250813183905-ade719c1e8bf
 	github.com/obot-platform/obot/logger v0.0.0-20241217130503-4004a5c69f32
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c
 	github.com/prometheus/client_golang v1.23.2
-	github.com/rancher/remotedialer v0.6.2-0.20260710094027-c230dff32648
+	github.com/rancher/remotedialer v0.6.2-0.20260812153830-1c09457bfdb3
 	github.com/rs/cors v1.11.1
 	github.com/sethvargo/go-limiter v1.0.0
 	github.com/sirupsen/logrus v1.9.4
@@ -90,7 +92,7 @@ require (
 	k8s.io/component-base v0.36.2
 	k8s.io/gengo/v2 v2.0.0-20250922181213-ec3ebc5fd46b
 	k8s.io/kube-openapi v0.0.0-20260706235625-cdb1db5517a0
-	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
+	k8s.io/streaming v0.36.2
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/yaml v1.6.0
 )
@@ -240,6 +242,7 @@ require (
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/locker v1.0.1 // indirect
+	github.com/moby/spdystream v0.5.1 // indirect
 	github.com/moby/term v0.5.2 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
@@ -266,6 +269,8 @@ require (
 	github.com/rubenv/sql-migrate v1.8.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
+	github.com/segmentio/asm v1.1.3 // indirect
+	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/skeema/knownhosts v1.3.1 // indirect
@@ -277,6 +282,7 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	github.com/xlab/treeprint v1.2.0 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.etcd.io/etcd/api/v3 v3.6.13 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.6.13 // indirect
 	go.etcd.io/etcd/client/v3 v3.6.13 // indirect
@@ -323,7 +329,7 @@ require (
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kms v0.36.2 // indirect
 	k8s.io/kubectl v0.36.2 // indirect
-	k8s.io/streaming v0.36.2 // indirect
+	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3 // indirect
 	modernc.org/libc v1.74.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

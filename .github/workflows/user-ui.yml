@@ -1,5 +1,8 @@
 name: user
 
+permissions:
+  contents: read
+
 on:
   push:
     branches:
@@ -7,6 +10,7 @@ on:
   pull_request:
     branches:
       - main
+      - 'feat/*'
     paths:
       - ui/user/**
       - apiclient/types/mcpserver.go
@@ -32,6 +36,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Detect static OAuth changes
@@ -94,3 +99,28 @@ jobs:
 
       - name: Verify no changes
         run: make no-changes
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.3
+
+      - name: Run UI Tests
+        run: | 
+          cd ui/user
+          pnpm install
+          pnpm exec playwright install --with-deps chromium
+          pnpm run test

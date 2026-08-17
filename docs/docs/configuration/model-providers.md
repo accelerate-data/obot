@@ -19,7 +19,7 @@ Obot supports a variety of model providers, including:
 The UI will indicate whether each provider has been configured. If a provider is configured you will have the ability to modify or deconfigure it.
 
 :::note
-Our Enterprise release adds support for additional Enterprise-grade model providers. [See here](/enterprise/overview/) for more details.
+Our Enterprise release adds support for additional Enterprise-grade model providers. [See here](../enterprise/overview.md) for more details.
 :::
 
 #### Configuring and enabling a provider
@@ -53,12 +53,12 @@ The "Set Default Models" feature allows you to configure default models for vari
 - **Language Model (Chat)** - Primary conversational model
 - **Language Model (Chat - Fast)** - Optimized for quick responses
 
-These defaults determine which specific model is used when a [Model Access Policy](/functionality/model-access-policies/) grants access to a default model alias (such as "Language Model (Chat)"). When you change a default here, any user with access to that alias automatically gains access to the new model.
+These defaults determine which specific model is used when a [Model Access Policy](../functionality/model-access-policies.md) grants access to a default model alias (such as "Language Model (Chat)"). When you change a default here, any user with access to that alias automatically gains access to the new model.
 
 After selecting the desired defaults, click "Save Changes" to confirm your configurations.
 
 :::note
-Setting a default model here does not automatically grant users access to it. Users must be included in a Model Access Policy that grants access to the corresponding alias. See [Model Access Policies](/functionality/model-access-policies/) for details.
+Setting a default model here does not automatically grant users access to it. Users must be included in a Model Access Policy that grants access to the corresponding alias. See [Model Access Policies](../functionality/model-access-policies.md) for details.
 :::
 
 ### Instructions for configuring specific providers
@@ -74,6 +74,10 @@ Use the **Azure** provider for API key-based authentication.
 In the Azure portal, find your API key and endpoint URL after setting up at least one deployment — both are required.
 
 You must also specify deployment names as a comma-separated list using `deployment[:usage[:dialect]]`. Usage defaults to `llm`. Dialect defaults to `openai`; specify `anthropic` for Claude deployments. For example: `my-gpt-deployment,my-claude-deployment:llm:anthropic`.
+
+:::note
+Obot reports token counts for the Azure API key provider and estimates spend when a deployment name exactly matches a model in its pricing catalog. Azure API key requests use deployment names, so deployments with different names cannot be reliably mapped to an underlying model and do not have estimated spend.
+:::
 
 ##### Microsoft Entra ID Authentication
 

@@ -57,6 +57,7 @@ func (s *Server) AddRoutes(mux *server.Server, tunnelBridge http.Handler) {
 	mux.HandleFunc("POST /api/token-request", s.tokenRequest)
 	mux.HandleFunc("GET /api/token-request/{id}", s.checkForToken)
 	mux.HandleFunc("GET /api/token-request/{id}/{namespace}/{name}", s.redirectForTokenRequest)
+	mux.HandleFunc("POST /api/token-request/verify", wrap(s.verifyDeviceCode))
 
 	mux.HandleFunc("GET /api/tokens", wrap(s.getTokens))
 	mux.HandleFunc("DELETE /api/tokens/{id}", wrap(s.deleteToken))
@@ -77,7 +78,7 @@ func (s *Server) AddRoutes(mux *server.Server, tunnelBridge http.Handler) {
 	mux.HandleFunc("POST /api/api-keys", wrap(s.createAPIKey))
 	mux.HandleFunc("GET /api/api-keys", wrap(s.listAPIKeys))
 	mux.HandleFunc("GET /api/api-keys/{id}", wrap(s.getAPIKey))
-	mux.HandleFunc("DELETE /api/api-keys/{id}", wrap(s.deleteAPIKey))
+	mux.HandleFunc("DELETE /api/api-keys/{id}", wrap(s.revokeAPIKey))
 
 	// API Keys admin endpoints - for managing any user's keys (admin/owner only)
 	mux.HandleFunc("GET /api/admin-api-keys", wrap(s.listAllAPIKeys))

@@ -153,14 +153,14 @@ jobs:
           VERSIONED_TAG: ${{ needs.resolve.outputs.versioned_tag }}
         run: |
           set -euo pipefail
-          SRCS=""
+          SRCS=()
           for f in /tmp/digests/*; do
-            SRCS="$SRCS ${IMAGE}@$(cat "$f")"
+            SRCS+=("${IMAGE}@$(cat "$f")")
           done
           docker buildx imagetools create \
             -t "${IMAGE}:${VERSIONED_TAG}" \
             -t "${IMAGE}:latest" \
-            $SRCS
+            "${SRCS[@]}"
           DIGEST="$(docker buildx imagetools inspect "${IMAGE}:latest" \
             --format '{{println .Manifest.Digest}}' | head -1 | tr -d '[:space:]')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"

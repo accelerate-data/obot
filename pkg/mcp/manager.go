@@ -9,15 +9,17 @@ import (
 	"sync"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/logger"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/tunnel"
 	"github.com/obot-platform/obot/pkg/utils"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -168,7 +170,15 @@ func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore G
 			return nil, err
 		}
 
-		backend = newKubernetesBackend(httpListenPort, authEnabled, clientset, client, cachedClient, obotStorageClient, opts, resourceMaximums)
+		backend = newKubernetesBackend(
+			httpListenPort,
+			authEnabled,
+			clientset,
+			client,
+			cachedClient,
+			obotStorageClient,
+			opts,
+		)
 	default:
 		return nil, fmt.Errorf("unknown runtime backend: %s", opts.MCPRuntimeBackend)
 	}
@@ -211,11 +221,53 @@ func (sm *SessionManager) ResourceMaximums() ResourceMaximums {
 	return sm.resourceMaximums
 }
 
-func (sm *SessionManager) KubernetesResourceMaximums() ResourceMaximums {
+func (sm *SessionManager) EffectiveKubernetesResourceMaximums(
+	ctx context.Context,
+	storageClient kclient.Client,
+) (ResourceMaximums, error) {
+	return sm.kubernetesResourceMaximums(ctx, storageClient, ResourceMaximums{})
+}
+
+func (sm *SessionManager) StartupKubernetesResourceMaximums(
+	ctx context.Context,
+	storageClient kclient.Client,
+) (ResourceMaximums, error) {
+	if sm == nil {
+		return ResourceMaximums{}, nil
+	}
+	return sm.kubernetesResourceMaximums(ctx, storageClient, sm.resourceMaximums)
+}
+
+func (sm *SessionManager) kubernetesResourceMaximums(
+	ctx context.Context,
+	storageClient kclient.Client,
+	fallback ResourceMaximums,
+) (ResourceMaximums, error) {
+	if sm == nil || !IsKubernetesBackend(sm.runtimeBackend) {
+		return ResourceMaximums{}, nil
+	}
+
+	var settings v1.K8sSettings
+	if err := storageClient.Get(ctx, kclient.ObjectKey{
+		Namespace: system.DefaultNamespace,
+		Name:      system.K8sSettingsName,
+	}, &settings); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fallback, nil
+		}
+		return ResourceMaximums{}, fmt.Errorf("failed to get Kubernetes settings: %w", err)
+	}
+
+	return EffectiveResourceMaximums(settings.Spec, fallback), nil
+}
+
+func (sm *SessionManager) EffectiveKubernetesResourceMaximumsForSettings(
+	settings v1.K8sSettingsSpec,
+) ResourceMaximums {
 	if sm == nil || !IsKubernetesBackend(sm.runtimeBackend) {
 		return ResourceMaximums{}
 	}
-	return sm.resourceMaximums
+	return EffectiveResourceMaximums(settings, ResourceMaximums{})
 }
 
 func (sm *SessionManager) TransformObotHostname(hostname string) string {
@@ -244,10 +296,10 @@ func (sm *SessionManager) Close() {
 
 	sm.sessions.Range(func(id, value any) bool {
 		value.(*sync.Map).Range(func(clientScope, session any) bool {
-			if s, ok := session.(*Client); ok && s.Client != nil {
+			if s, ok := session.(*Client); ok && s.ClientSession != nil {
 				log.Infof("closing MCP session %s, %s", id, clientScope)
-				s.Session.Close(false)
-				s.Session.Wait()
+				s.Close()
+				_ = s.Wait()
 			}
 			return true
 		})
@@ -279,9 +331,9 @@ func (sm *SessionManager) CloseClient(server ServerConfig, clientScope string) {
 		return
 	}
 
-	if s, ok := sess.(*Client); ok && s.Client != nil {
-		s.Close(false)
-		s.Session.Wait()
+	if s, ok := sess.(*Client); ok && s.ClientSession != nil {
+		s.Close()
+		_ = s.Wait()
 	}
 }
 
@@ -325,9 +377,9 @@ func (sm *SessionManager) closeClients(serverName string) {
 	}
 
 	clientSessions.Range(func(_, session any) bool {
-		if s, ok := session.(*Client); ok && s.Client != nil {
-			s.Close(true)
-			s.Session.Wait()
+		if s, ok := session.(*Client); ok && s.ClientSession != nil {
+			s.Close()
+			_ = s.Wait()
 		}
 		return true
 	})
@@ -462,17 +514,15 @@ func (sm *SessionManager) GenerateToolPreviews(ctx context.Context, tempMCPServe
 	serverConfig.UserID = "system"
 
 	// Create MCP client and list tools
-	client, err := sm.clientForServerWithOptions(ctx, "default", serverConfig, nmcp.ClientOption{
-		ClientName: "Obot Tool Preview",
-		HTTPClientOptions: nmcp.HTTPClientOptions{
-			TokenStorage: sm.globalTokenStore.ForUserAndMCP(serverConfig.UserID, serverConfig.MCPServerName),
-		},
+	client, err := sm.clientForServerWithOptions(ctx, "default", serverConfig, ClientOption{
+		ClientName:   "Obot Tool Preview",
+		TokenStorage: sm.globalTokenStore.ForUserAndMCP(serverConfig.UserID, serverConfig.MCPServerName, serverConfig.URL),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	tools, err := client.ListTools(ctx)
+	tools, err := client.ListTools(ctx, &gomcp.ListToolsParams{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list tools: %w", err)
 	}
@@ -483,8 +533,17 @@ func (sm *SessionManager) GenerateToolPreviews(ctx context.Context, tempMCPServe
 // GetCapacityInfo returns capacity information for the MCP namespace.
 // Only available when using the Kubernetes backend.
 func (sm *SessionManager) GetCapacityInfo(ctx context.Context) (types.MCPCapacityInfo, error) {
-	if k8sBackend, ok := sm.backend.(*kubernetesBackend); ok {
-		return k8sBackend.GetCapacityInfo(ctx), nil
+	if sm == nil || !IsKubernetesBackend(sm.runtimeBackend) {
+		return types.MCPCapacityInfo{}, &ErrNotSupportedByBackend{Feature: "capacity info", Backend: "docker"}
 	}
-	return types.MCPCapacityInfo{}, &ErrNotSupportedByBackend{Feature: "capacity info", Backend: "docker"}
+	return sm.backend.(*kubernetesBackend).GetCapacityInfo(ctx), nil
+}
+
+// GetCapacityInfoForServers returns capacity information for the given MCP server deployments.
+// Only available when using the Kubernetes backend.
+func (sm *SessionManager) GetCapacityInfoForServers(ctx context.Context, serverNames []string) (types.MCPCapacityInfo, error) {
+	if sm == nil || !IsKubernetesBackend(sm.runtimeBackend) {
+		return types.MCPCapacityInfo{}, &ErrNotSupportedByBackend{Feature: "capacity info", Backend: "docker"}
+	}
+	return sm.backend.(*kubernetesBackend).GetCapacityInfoForServers(ctx, serverNames), nil
 }

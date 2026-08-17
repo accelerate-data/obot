@@ -5,6 +5,43 @@
 	import Search from '$lib/components/Search.svelte';
 	import Select from '$lib/components/Select.svelte';
 	import AuditLogCalendar from '$lib/components/admin/audit-logs/AuditLogCalendar.svelte';
+	import TokenUsageTimelineCard from '$lib/components/admin/token-usage/TokenUsageTimelineCard.svelte';
+	import {
+		ALL_API_KEYS,
+		ALL_MODELS,
+		ALL_USERS,
+		CHART_LABEL,
+		DEFAULT_TOKEN_GROUP_BY,
+		DEFAULT_TOKEN_TYPE,
+		DEFAULT_USAGE_SUBVIEW,
+		DEFAULT_USAGE_SUBVIEW_SORT_BY,
+		GRAPH_METRIC,
+		GRAPH_MODE,
+		TOKEN_USAGE_CATEGORY,
+		TOKEN_USAGE_PARAMS,
+		USAGE_BUCKET_LABEL,
+		USAGE_SUBVIEW,
+		USAGE_SUBVIEW_SORT_BY,
+		USAGE_SUBVIEW_SORT_BY_SPEND_OPTIONS,
+		USAGE_SUBVIEW_SORT_BY_TOKEN_OPTIONS,
+		usageSubViewSortByForView,
+		type GraphMetric,
+		type GraphMode,
+		type TokenGroupBy,
+		type TokenType,
+		type UsageSubView,
+		type UsageSubViewSortBy
+	} from '$lib/components/admin/token-usage/constants';
+	import {
+		toBucketTimelineItems,
+		toTimelineItem,
+		timelineDataForChartWithRange,
+		formatTokenUsageUSD as formatUSD,
+		bucketTooltipValueKeys,
+		TIMELINE_AGGREGATE_THRESHOLD,
+		type TokenUsageTimelineItem
+	} from '$lib/components/admin/token-usage/tokenUsageTimeline';
+	import { getAPIKeyFilterOptions, getUserLabels } from '$lib/components/admin/token-usage/utils';
 	import StackedTimeline from '$lib/components/graph/StackedTimeline.svelte';
 	import { PAGE_TRANSITION_DURATION } from '$lib/constants';
 	import Loading from '$lib/icons/Loading.svelte';
@@ -14,17 +51,14 @@
 		type OrgUser,
 		type TokenUsage,
 		type TotalTokenUsage,
-		type TokenUsageWithCategory,
 		UserService
 	} from '$lib/services';
-	import { errors } from '$lib/stores';
+	import { errors, responsive } from '$lib/stores';
 	import { goto } from '$lib/url';
 	import { getUserDisplayName } from '$lib/utils';
-	import { aggregateTimelineDataByBucket, getUserLabels } from './utils';
 	import { X } from '@lucide/svelte';
 	import { subDays } from 'date-fns';
 	import { onMount } from 'svelte';
-	import { SvelteMap } from 'svelte/reactivity';
 	import { fade } from 'svelte/transition';
 	import { slide } from 'svelte/transition';
 	import { twMerge } from 'tailwind-merge';
@@ -34,30 +68,34 @@
 	let usersData = $state<OrgUser[]>([]);
 	let modelsData = $state<Model[]>([]);
 
-	let end = $derived(page.url.searchParams.get('end'));
-	let start = $derived(page.url.searchParams.get('start'));
+	let end = $derived(page.url.searchParams.get(TOKEN_USAGE_PARAMS.END));
+	let start = $derived(page.url.searchParams.get(TOKEN_USAGE_PARAMS.START));
 	let lastStart = $state<string | null>(null);
 	let lastEnd = $state<string | null>(null);
 
 	let endDate = $derived(end ? new Date(end) : new Date());
 	let startDate = $derived(start ? new Date(start) : subDays(endDate, 7));
 
-	const selectedModelIds = $derived(page.url.searchParams.getAll('model'));
+	const selectedModelIds = $derived(page.url.searchParams.getAll(TOKEN_USAGE_PARAMS.MODEL));
 	let filteredByModel = $derived(
-		selectedModelIds.length > 0 ? selectedModelIds.join(',') : 'all_models'
+		selectedModelIds.length > 0 ? selectedModelIds.join(',') : ALL_MODELS
 	);
-	const selectedUserIds = $derived(page.url.searchParams.getAll('user'));
+	const selectedUserIds = $derived(page.url.searchParams.getAll(TOKEN_USAGE_PARAMS.USER));
 	const selectedUserIdsForSelect = $derived(
-		selectedUserIds.length > 0 ? selectedUserIds.join(',') : 'all_users'
+		selectedUserIds.length > 0 ? selectedUserIds.join(',') : ALL_USERS
+	);
+	const selectedAPIKeyIDs = $derived(page.url.searchParams.getAll(TOKEN_USAGE_PARAMS.API_KEY));
+	const selectedAPIKeyIDsForSelect = $derived(
+		selectedAPIKeyIDs.length > 0 ? selectedAPIKeyIDs.join(',') : ALL_API_KEYS
 	);
 	let selectedTokenType = $derived(
-		(page.url.searchParams.get('token_type') as 'input' | 'output') ?? 'input'
+		(page.url.searchParams.get(TOKEN_USAGE_PARAMS.TOKEN_TYPE) as TokenType) ?? DEFAULT_TOKEN_TYPE
 	);
 
 	let totalTokensData = $state<TotalTokenUsage>();
 	let data = $state<TokenUsage[]>([]);
 	const selectedTargetModels = $derived.by(() => {
-		const ids = selectedModelIds.filter((id) => id !== 'all_models');
+		const ids = selectedModelIds.filter((id) => id !== ALL_MODELS);
 		if (ids.length === 0) return null;
 		// eslint-disable-next-line svelte/prefer-svelte-reactivity
 		const targetModels = new Set<string>();
@@ -70,7 +108,7 @@
 
 	const filteredData = $derived.by(() => {
 		let result = data;
-		const userIdsToFilter = selectedUserIds.filter((id) => id !== 'all_users');
+		const userIdsToFilter = selectedUserIds.filter((id) => id !== ALL_USERS);
 		if (userIdsToFilter.length > 0) {
 			const userSet = new Set(userIdsToFilter);
 			result = result.filter((row) => row.userID != null && userSet.has(row.userID));
@@ -78,21 +116,29 @@
 		if (selectedTargetModels) {
 			result = result.filter((row) => row.model != null && selectedTargetModels.has(row.model));
 		}
+		const apiKeyIDsToFilter = selectedAPIKeyIDs.filter((id) => id !== ALL_API_KEYS);
+		if (apiKeyIDsToFilter.length > 0) {
+			const apiKeySet = new Set(apiKeyIDsToFilter);
+			result = result.filter(
+				(row) => row.apiKeyID != null && apiKeySet.has(row.apiKeyID.toString())
+			);
+		}
 		return result;
 	});
 	let groupBy = $derived(
-		(page.url.searchParams.get('group_by') as 'group_by_users' | 'group_by_models' | null) ??
-			'group_by_default'
+		(page.url.searchParams.get(TOKEN_USAGE_PARAMS.GROUP_BY) as TokenGroupBy) ??
+			DEFAULT_TOKEN_GROUP_BY
 	);
 
-	let selectedSubview = $state<'models' | 'users'>('models');
-	type SubViewSortBy =
-		| 'sort_by_name'
-		| 'sort_by_name_reverse'
-		| 'sort_by_total_tokens'
-		| 'sort_by_total_tokens_reverse';
-	let subViewSortBy = $state<SubViewSortBy>('sort_by_total_tokens');
+	let selectedSubview = $state<UsageSubView>(DEFAULT_USAGE_SUBVIEW);
+	let subViewSortBy = $state<UsageSubViewSortBy>(DEFAULT_USAGE_SUBVIEW_SORT_BY);
 	let subViewSearchQuery = $state('');
+
+	function selectSubview(view: UsageSubView) {
+		selectedSubview = view;
+		subViewSearchQuery = '';
+		subViewSortBy = usageSubViewSortByForView(subViewSortBy, view);
+	}
 
 	const usersMap = $derived(new Map(usersData.map((u) => [u.id, u])));
 	const modelsToDisplayName = $derived(new Map(modelsData.map((m) => [m.id, m])));
@@ -172,114 +218,6 @@
 		new Map(modelsData.map((m) => [m.targetModel, m.displayName || m.name]))
 	);
 
-	type TokenUsageTimelineItem = TokenUsageWithCategory & {
-		bucketTokens?: number;
-		bucketSpend?: number;
-	};
-
-	type UsageBucket = {
-		label: string;
-		tokens: number;
-		spend: number;
-		thinkingTokens?: number;
-	};
-
-	const bucketTooltipValueKeys: (keyof TokenUsageTimelineItem)[] = [
-		'bucketSpend',
-		'cacheReadTokens',
-		'cacheWriteTokens',
-		'cacheReadSpend',
-		'cacheWriteSpend',
-		'thinkingTokens'
-	];
-	const mainTooltipValueKeys: (keyof TokenUsageTimelineItem)[] = [
-		'inputSpend',
-		'outputSpend',
-		'cacheReadTokens',
-		'cacheWriteTokens',
-		'cacheReadSpend',
-		'cacheWriteSpend',
-		'thinkingTokens'
-	];
-
-	function toTimelineItem(r: TokenUsage, category: string): TokenUsageTimelineItem {
-		return {
-			...r,
-			date: r.date,
-			inputTokens: r.inputTokens ?? 0,
-			cacheReadTokens: r.cacheReadTokens ?? 0,
-			cacheWriteTokens: r.cacheWriteTokens ?? 0,
-			outputTokens: r.outputTokens ?? 0,
-			thinkingTokens: r.thinkingTokens ?? 0,
-			totalTokens: r.totalTokens ?? (r.inputTokens ?? 0) + (r.outputTokens ?? 0),
-			inputSpend: r.inputSpend ?? 0,
-			cacheReadSpend: r.cacheReadSpend ?? 0,
-			cacheWriteSpend: r.cacheWriteSpend ?? 0,
-			outputSpend: r.outputSpend ?? 0,
-			totalSpend: r.totalSpend ?? 0,
-			category
-		};
-	}
-
-	function positive(value: number | undefined): number {
-		return Math.max(value ?? 0, 0);
-	}
-
-	function tokenBuckets(r: TokenUsage): UsageBucket[] {
-		const inputTokens = positive(r.inputTokens);
-		const outputTokens = positive(r.outputTokens);
-
-		return [
-			{ label: 'Input', tokens: inputTokens, spend: positive(r.inputSpend) },
-			{
-				label: 'Output',
-				tokens: outputTokens,
-				spend: positive(r.outputSpend),
-				thinkingTokens: positive(r.thinkingTokens)
-			}
-		].filter((bucket) => bucket.tokens > 0 || bucket.spend > 0);
-	}
-
-	function toBucketTimelineItems(r: TokenUsage): TokenUsageTimelineItem[] {
-		return tokenBuckets(r).map((bucket) => ({
-			...toTimelineItem(r, bucket.label),
-			bucketTokens: bucket.tokens,
-			bucketSpend: bucket.spend,
-			thinkingTokens: bucket.thinkingTokens ?? 0
-		}));
-	}
-
-	function formatUSD(value: number): string {
-		const fractionDigits = value !== 0 && Math.abs(value) < 0.01 ? 4 : 2;
-		return value.toLocaleString(undefined, {
-			style: 'currency',
-			currency: 'USD',
-			minimumFractionDigits: 2,
-			maximumFractionDigits: fractionDigits
-		});
-	}
-
-	function computeMainTimelineData(
-		filtered: TokenUsage[],
-		group: string,
-		users: Map<string, OrgUser>,
-		modelToName: Map<string, string>
-	): TokenUsageWithCategory[] {
-		if (group === 'group_by_users') {
-			const userKeys = [...new Set(filtered.map((r) => r.userID ?? 'Unknown'))].sort();
-			const userKeyToLabel = getUserLabels(users, userKeys);
-			return filtered.map((r) =>
-				toTimelineItem(r, userKeyToLabel.get(r.userID ?? 'Unknown') ?? r.userID ?? 'Unknown')
-			);
-		}
-		if (group === 'group_by_models') {
-			return filtered.map((r) =>
-				toTimelineItem(r, modelToName.get(r.model ?? '') ?? r.model ?? 'Unknown')
-			);
-		}
-		return filtered.map((r) => toTimelineItem(r, 'Token usage'));
-	}
-
 	type PerModelRow = {
 		modelKey: string;
 		modelLabel: string;
@@ -290,11 +228,15 @@
 		userLabel: string;
 		timelineData: TokenUsageTimelineItem[];
 	};
+	type PerAPIKeyRow = {
+		apiKeyID: string;
+		apiKeyLabel: string;
+		timelineData: TokenUsageTimelineItem[];
+	};
 
 	let perModelPromptData = $state<PerModelRow[]>([]);
 	let perUserPromptData = $state<PerUserRow[]>([]);
-
-	const TIMELINE_AGGREGATE_THRESHOLD = 500;
+	let perAPIKeyPromptData = $state<PerAPIKeyRow[]>([]);
 
 	$effect(() => {
 		const filtered = filteredData;
@@ -304,7 +246,8 @@
 
 		function computePerModel(): PerModelRow[] {
 			if (!filtered.length) return [];
-			const byModel = new SvelteMap<string, TokenUsage[]>();
+			// eslint-disable-next-line svelte/prefer-svelte-reactivity
+			const byModel = new Map<string, TokenUsage[]>();
 			for (const r of filtered) {
 				const model = r.model;
 				if (!model) continue;
@@ -327,9 +270,10 @@
 
 		function computePerUser(): PerUserRow[] {
 			if (!filtered.length) return [];
-			const byUser = new SvelteMap<string, TokenUsage[]>();
+			// eslint-disable-next-line svelte/prefer-svelte-reactivity
+			const byUser = new Map<string, TokenUsage[]>();
 			for (const r of filtered) {
-				const userKey = r.userID ?? 'Unknown';
+				const userKey = r.userID ?? TOKEN_USAGE_CATEGORY.UNKNOWN;
 				let rows = byUser.get(userKey);
 				if (!rows) {
 					rows = [];
@@ -350,14 +294,43 @@
 			});
 		}
 
+		function computePerAPIKey(): PerAPIKeyRow[] {
+			if (!filtered.length) return [];
+			// eslint-disable-next-line svelte/prefer-svelte-reactivity
+			const byAPIKey = new Map<string, TokenUsage[]>();
+			for (const row of filtered) {
+				if (row.apiKeyID == null) continue;
+				const apiKeyID = row.apiKeyID.toString();
+				let rows = byAPIKey.get(apiKeyID);
+				if (!rows) {
+					rows = [];
+					byAPIKey.set(apiKeyID, rows);
+				}
+				rows.push(row);
+			}
+			const labels = new Map(
+				getAPIKeyFilterOptions(filtered, users).map((option) => [option.id, option.label])
+			);
+			return [...byAPIKey.entries()].map(([apiKeyID, rows]) => {
+				const apiKeyLabel = labels.get(apiKeyID) ?? `API key #${apiKeyID}`;
+				return {
+					apiKeyID,
+					apiKeyLabel,
+					timelineData: rows.map((row) => toTimelineItem(row, apiKeyLabel))
+				};
+			});
+		}
+
 		if (filtered.length <= threshold) {
 			perModelPromptData = computePerModel();
 			perUserPromptData = computePerUser();
+			perAPIKeyPromptData = computePerAPIKey();
 			return;
 		}
 
 		perModelPromptData = [];
 		perUserPromptData = [];
+		perAPIKeyPromptData = [];
 		const ac = new AbortController();
 		const signal = ac.signal;
 		const schedule =
@@ -368,60 +341,45 @@
 			if (signal.aborted) return;
 			perModelPromptData = computePerModel();
 			perUserPromptData = computePerUser();
+			perAPIKeyPromptData = computePerAPIKey();
 		});
 		return () => ac.abort();
 	});
 
-	function timelineDataForChartWithRange(
-		items: TokenUsageTimelineItem[],
-		start: Date,
-		end: Date
-	): TokenUsageTimelineItem[] {
-		if (items.length <= TIMELINE_AGGREGATE_THRESHOLD) return items;
-		return aggregateTimelineDataByBucket(items, start, end) as TokenUsageTimelineItem[];
-	}
-
-	let mainChartData = $state<TokenUsageTimelineItem[]>([]);
-
-	$effect(() => {
-		const filtered = filteredData;
-		const group = groupBy;
-		const start = startDate;
-		const end = endDate;
-		const users = usersMap;
-		const modelToName = targetModelToDisplayName;
-		const threshold = TIMELINE_AGGREGATE_THRESHOLD;
-
-		if (filtered.length <= threshold) {
-			const timeline = computeMainTimelineData(filtered, group, users, modelToName);
-			mainChartData = timeline;
-			return;
-		}
-
-		const schedule =
-			typeof requestIdleCallback !== 'undefined'
-				? (fn: () => void) => requestIdleCallback(fn, { timeout: 150 })
-				: (fn: () => void) => setTimeout(fn, 0);
-		schedule(() => {
-			const timeline = computeMainTimelineData(filtered, group, users, modelToName);
-			mainChartData = timelineDataForChartWithRange(timeline, start, end);
-		});
-	});
-
-	type GraphMode = 'bucket' | 'input_output';
-	type GraphItem = { label: string; timelineData: TokenUsageTimelineItem[]; mode: GraphMode };
+	type GraphItem = {
+		key: string;
+		label: string;
+		timelineData: TokenUsageTimelineItem[];
+		mode: GraphMode;
+		metric: GraphMetric;
+	};
 	const graphItems = $derived.by((): GraphItem[] => {
-		if (selectedSubview === 'models') {
-			return perModelPromptData.map(({ modelLabel, timelineData }) => ({
+		if (selectedSubview === USAGE_SUBVIEW.MODELS || selectedSubview === USAGE_SUBVIEW.SPEND) {
+			const metric: GraphMetric =
+				selectedSubview === USAGE_SUBVIEW.SPEND ? GRAPH_METRIC.SPEND : GRAPH_METRIC.TOKENS;
+			return perModelPromptData.map(({ modelKey, modelLabel, timelineData }) => ({
+				key: modelKey,
 				label: modelLabel,
 				timelineData,
-				mode: 'bucket'
+				mode: GRAPH_MODE.BUCKET,
+				metric
 			}));
 		}
-		return perUserPromptData.map(({ userLabel, timelineData }) => ({
+		if (selectedSubview === USAGE_SUBVIEW.API_KEYS) {
+			return perAPIKeyPromptData.map(({ apiKeyID, apiKeyLabel, timelineData }) => ({
+				key: apiKeyID,
+				label: apiKeyLabel,
+				timelineData,
+				mode: GRAPH_MODE.INPUT_OUTPUT,
+				metric: GRAPH_METRIC.TOKENS
+			}));
+		}
+		return perUserPromptData.map(({ userKey, userLabel, timelineData }) => ({
+			key: userKey,
 			label: userLabel,
 			timelineData,
-			mode: 'input_output'
+			mode: GRAPH_MODE.INPUT_OUTPUT,
+			metric: GRAPH_METRIC.TOKENS
 		}));
 	});
 
@@ -436,29 +394,41 @@
 	function graphItemTokens(item: GraphItem): number {
 		return item.timelineData.reduce((sum, r) => {
 			const rowTokens =
-				item.mode === 'bucket'
+				item.mode === GRAPH_MODE.BUCKET
 					? (r.bucketTokens ?? 0)
 					: (r.totalTokens ?? (r.inputTokens ?? 0) + (r.outputTokens ?? 0));
 			return sum + rowTokens;
 		}, 0);
 	}
 
-	function sortGraphItems(items: GraphItem[], sortBy: SubViewSortBy): GraphItem[] {
+	function graphItemSpend(item: GraphItem): number {
+		return item.timelineData.reduce((sum, r) => {
+			const rowSpend =
+				item.mode === GRAPH_MODE.BUCKET
+					? (r.bucketSpend ?? 0)
+					: (r.totalSpend ?? (r.inputSpend ?? 0) + (r.outputSpend ?? 0));
+			return sum + rowSpend;
+		}, 0);
+	}
+
+	function sortGraphItems(items: GraphItem[], sortBy: UsageSubViewSortBy): GraphItem[] {
 		const byNameAsc = (a: GraphItem, b: GraphItem) => a.label.localeCompare(b.label);
 		const byNameDesc = (a: GraphItem, b: GraphItem) => b.label.localeCompare(a.label);
 		const byTotalTokensDesc = (a: GraphItem, b: GraphItem) =>
 			graphItemTokens(b) - graphItemTokens(a);
 		const byTotalTokensAsc = (a: GraphItem, b: GraphItem) =>
 			graphItemTokens(a) - graphItemTokens(b);
-		const cmp =
-			sortBy === 'sort_by_name'
-				? byNameAsc
-				: sortBy === 'sort_by_name_reverse'
-					? byNameDesc
-					: sortBy === 'sort_by_total_tokens'
-						? byTotalTokensDesc
-						: byTotalTokensAsc;
-		return [...items].sort(cmp);
+		const byTotalSpendDesc = (a: GraphItem, b: GraphItem) => graphItemSpend(b) - graphItemSpend(a);
+		const byTotalSpendAsc = (a: GraphItem, b: GraphItem) => graphItemSpend(a) - graphItemSpend(b);
+		const sortByFn = {
+			[USAGE_SUBVIEW_SORT_BY.NAME]: byNameAsc,
+			[USAGE_SUBVIEW_SORT_BY.NAME_REVERSE]: byNameDesc,
+			[USAGE_SUBVIEW_SORT_BY.TOTAL_TOKENS]: byTotalTokensDesc,
+			[USAGE_SUBVIEW_SORT_BY.TOTAL_TOKENS_REVERSE]: byTotalTokensAsc,
+			[USAGE_SUBVIEW_SORT_BY.TOTAL_SPEND]: byTotalSpendDesc,
+			[USAGE_SUBVIEW_SORT_BY.TOTAL_SPEND_REVERSE]: byTotalSpendAsc
+		};
+		return [...items].sort(sortByFn[sortBy]);
 	}
 
 	function filterGraphItemsBySearch(items: GraphItem[], query: string): GraphItem[] {
@@ -467,8 +437,10 @@
 		return items.filter((item) => item.label.toLowerCase().includes(q));
 	}
 
-	function hasTokenData(item: GraphItem): boolean {
-		return graphItemTokens(item) > 0;
+	function hasGraphData(item: GraphItem): boolean {
+		return item.metric === GRAPH_METRIC.SPEND
+			? graphItemSpend(item) > 0
+			: graphItemTokens(item) > 0;
 	}
 
 	$effect(() => {
@@ -486,11 +458,13 @@
 		if (!shouldDefer) {
 			gridDataReady = true;
 			const mapped = items.map((item) => ({
+				key: item.key,
 				label: item.label,
 				timelineData: timelineDataForChartWithRange(item.timelineData, start, end),
-				mode: item.mode
+				mode: item.mode,
+				metric: item.metric
 			}));
-			const sorted = sortGraphItems(mapped, sortBy).filter(hasTokenData);
+			const sorted = sortGraphItems(mapped, sortBy).filter(hasGraphData);
 			displayGraphItems = filterGraphItemsBySearch(sorted, searchQuery);
 			return;
 		}
@@ -506,9 +480,11 @@
 			const chunk = items.slice(fromIndex, fromIndex + GRID_CHUNK_SIZE);
 			for (const item of chunk) {
 				accumulated.push({
+					key: item.key,
 					label: item.label,
 					timelineData: timelineDataForChartWithRange(item.timelineData, start, end),
-					mode: item.mode
+					mode: item.mode,
+					metric: item.metric
 				});
 			}
 			const nextIndex = fromIndex + GRID_CHUNK_SIZE;
@@ -516,7 +492,7 @@
 				requestAnimationFrame(() => processChunk(nextIndex));
 			} else {
 				if (signal.aborted) return;
-				const sorted = sortGraphItems(accumulated, sortBy).filter(hasTokenData);
+				const sorted = sortGraphItems(accumulated, sortBy).filter(hasGraphData);
 				displayGraphItems = filterGraphItemsBySearch(sorted, searchQuery);
 				gridDataReady = true;
 			}
@@ -550,43 +526,82 @@
 
 	function handleDateRangeChange(range: DateRange) {
 		const currentUrl = new URL(page.url);
-		currentUrl.searchParams.set('start', range.start?.toISOString() ?? '');
-		currentUrl.searchParams.set('end', range.end?.toISOString() ?? '');
+		currentUrl.searchParams.set(TOKEN_USAGE_PARAMS.START, range.start?.toISOString() ?? '');
+		currentUrl.searchParams.set(TOKEN_USAGE_PARAMS.END, range.end?.toISOString() ?? '');
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
 	function handleRemoveUserFilter(userId: string) {
 		const currentUrl = new URL(page.url);
-		const users = currentUrl.searchParams.getAll('user').filter((id) => id !== userId);
-		currentUrl.searchParams.delete('user');
+		const users = currentUrl.searchParams
+			.getAll(TOKEN_USAGE_PARAMS.USER)
+			.filter((id) => id !== userId);
+		currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.USER);
 		for (const id of users) {
-			currentUrl.searchParams.append('user', id);
+			currentUrl.searchParams.append(TOKEN_USAGE_PARAMS.USER, id);
 		}
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
 	function handleRemoveAllUserFilters() {
 		const currentUrl = new URL(page.url);
-		currentUrl.searchParams.delete('user');
+		currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.USER);
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
 	function handleToggleUserFilter(userId: string) {
-		if (userId === 'all_users') {
+		if (userId === ALL_USERS) {
 			const currentUrl = new URL(page.url);
-			currentUrl.searchParams.delete('user');
+			currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.USER);
 			goto(currentUrl, { noScroll: true, keepFocus: true });
 			return;
 		}
 		const currentUrl = new URL(page.url);
-		const users = currentUrl.searchParams.getAll('user');
+		const users = currentUrl.searchParams.getAll(TOKEN_USAGE_PARAMS.USER);
 		if (users.includes(userId)) {
 			handleRemoveUserFilter(userId);
 		} else {
 			users.push(userId);
-			currentUrl.searchParams.delete('user');
+			currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.USER);
 			for (const id of users) {
-				currentUrl.searchParams.append('user', id);
+				currentUrl.searchParams.append(TOKEN_USAGE_PARAMS.USER, id);
+			}
+			goto(currentUrl, { noScroll: true, keepFocus: true });
+		}
+	}
+
+	function handleRemoveAPIKeyFilter(apiKeyID: string) {
+		const currentUrl = new URL(page.url);
+		const apiKeyIDs = currentUrl.searchParams
+			.getAll(TOKEN_USAGE_PARAMS.API_KEY)
+			.filter((id) => id !== apiKeyID);
+		currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.API_KEY);
+		for (const id of apiKeyIDs) {
+			currentUrl.searchParams.append(TOKEN_USAGE_PARAMS.API_KEY, id);
+		}
+		goto(currentUrl, { noScroll: true, keepFocus: true });
+	}
+
+	function handleRemoveAllAPIKeyFilters() {
+		const currentUrl = new URL(page.url);
+		currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.API_KEY);
+		goto(currentUrl, { noScroll: true, keepFocus: true });
+	}
+
+	function handleToggleAPIKeyFilter(apiKeyID: string) {
+		if (apiKeyID === ALL_API_KEYS) {
+			handleRemoveAllAPIKeyFilters();
+			return;
+		}
+		const currentUrl = new URL(page.url);
+		const apiKeyIDs = currentUrl.searchParams.getAll(TOKEN_USAGE_PARAMS.API_KEY);
+		if (apiKeyIDs.includes(apiKeyID)) {
+			handleRemoveAPIKeyFilter(apiKeyID);
+		} else {
+			apiKeyIDs.push(apiKeyID);
+			currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.API_KEY);
+			for (const id of apiKeyIDs) {
+				currentUrl.searchParams.append(TOKEN_USAGE_PARAMS.API_KEY, id);
 			}
 			goto(currentUrl, { noScroll: true, keepFocus: true });
 		}
@@ -594,36 +609,38 @@
 
 	function handleRemoveModelFilter(modelId: string) {
 		const currentUrl = new URL(page.url);
-		const models = currentUrl.searchParams.getAll('model').filter((id) => id !== modelId);
-		currentUrl.searchParams.delete('model');
+		const models = currentUrl.searchParams
+			.getAll(TOKEN_USAGE_PARAMS.MODEL)
+			.filter((id) => id !== modelId);
+		currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.MODEL);
 		for (const id of models) {
-			currentUrl.searchParams.append('model', id);
+			currentUrl.searchParams.append(TOKEN_USAGE_PARAMS.MODEL, id);
 		}
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
 	function handleRemoveAllModelFilters() {
 		const currentUrl = new URL(page.url);
-		currentUrl.searchParams.delete('model');
+		currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.MODEL);
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
 	function handleToggleModelFilter(modelId: string) {
-		if (modelId === 'all_models') {
+		if (modelId === ALL_MODELS) {
 			const currentUrl = new URL(page.url);
-			currentUrl.searchParams.delete('model');
+			currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.MODEL);
 			goto(currentUrl, { noScroll: true, keepFocus: true });
 			return;
 		}
 		const currentUrl = new URL(page.url);
-		const models = currentUrl.searchParams.getAll('model');
+		const models = currentUrl.searchParams.getAll(TOKEN_USAGE_PARAMS.MODEL);
 		if (models.includes(modelId)) {
 			handleRemoveModelFilter(modelId);
 		} else {
 			models.push(modelId);
-			currentUrl.searchParams.delete('model');
+			currentUrl.searchParams.delete(TOKEN_USAGE_PARAMS.MODEL);
 			for (const id of models) {
-				currentUrl.searchParams.append('model', id);
+				currentUrl.searchParams.append(TOKEN_USAGE_PARAMS.MODEL, id);
 			}
 			goto(currentUrl, { noScroll: true, keepFocus: true });
 		}
@@ -631,30 +648,39 @@
 
 	function handleGroupByChange(groupBy: string) {
 		const currentUrl = new URL(page.url);
-		currentUrl.searchParams.set('group_by', groupBy);
-		if (groupBy !== 'group_by_default') {
-			currentUrl.searchParams.set('token_type', 'input');
-		} else {
-			currentUrl.searchParams.delete('token_type');
-		}
+		currentUrl.searchParams.set(TOKEN_USAGE_PARAMS.GROUP_BY, groupBy);
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
-	function handleTokenTypeChange(tokenType: 'input' | 'output') {
+	function handleTokenTypeChange(tokenType: TokenType) {
 		const currentUrl = new URL(page.url);
-		currentUrl.searchParams.set('token_type', tokenType);
+		currentUrl.searchParams.set(TOKEN_USAGE_PARAMS.TOKEN_TYPE, tokenType);
 		goto(currentUrl, { noScroll: true, keepFocus: true });
 	}
 
 	const usersOptions = $derived([
-		{ label: 'All Users', id: 'all_users' },
+		{ label: 'All Users', id: ALL_USERS },
 		...usersData.map((user) => ({ label: getUserDisplayName(usersMap, user.id), id: user.id }))
 	]);
 
 	const modelsOptions = $derived([
-		{ label: 'All Models', id: 'all_models' },
+		{ label: 'All Models', id: ALL_MODELS },
 		...modelsData.map((model) => ({ label: model.name, id: model.id }))
 	]);
+
+	const apiKeyOptions = $derived([
+		{ label: 'All API Keys', id: ALL_API_KEYS },
+		...getAPIKeyFilterOptions(data, usersMap)
+	]);
+	const apiKeyOptionsMap = $derived(
+		new Map(apiKeyOptions.map((option) => [option.id, option.label]))
+	);
+
+	const subViewSortByOptions = $derived(
+		selectedSubview === USAGE_SUBVIEW.SPEND
+			? USAGE_SUBVIEW_SORT_BY_SPEND_OPTIONS
+			: USAGE_SUBVIEW_SORT_BY_TOKEN_OPTIONS
+	);
 </script>
 
 <Layout
@@ -708,13 +734,33 @@
 				<Select
 					class="dark:border-base-400 border border-transparent"
 					classes={{
+						root: 'w-full md:min-w-72 md:flex-[2] dark:border-base-400'
+					}}
+					options={apiKeyOptions}
+					selected={selectedAPIKeyIDsForSelect}
+					onSelect={(option) => handleToggleAPIKeyFilter(option.id)}
+					onClear={(option) => option && handleRemoveAPIKeyFilter(option.id)}
+					onClearAll={selectedAPIKeyIDsForSelect !== ALL_API_KEYS
+						? () => handleRemoveAllAPIKeyFilters()
+						: undefined}
+					id="api-key-select"
+					multiple
+					searchInDropdown
+					placeholder="Filter by API key..."
+					buttonReadOnly
+					buttonTitle="API Keys"
+					displayCount={!!selectedAPIKeyIDsForSelect && selectedAPIKeyIDsForSelect !== ALL_API_KEYS}
+				/>
+				<Select
+					class="dark:border-base-400 border border-transparent"
+					classes={{
 						root: 'w-full md:flex-1 dark:border-base-400'
 					}}
 					options={usersOptions}
 					selected={selectedUserIdsForSelect}
 					onSelect={(option) => handleToggleUserFilter(option.id)}
 					onClear={(option) => option && handleRemoveUserFilter(option.id)}
-					onClearAll={selectedUserIdsForSelect !== 'all_users'
+					onClearAll={selectedUserIdsForSelect !== ALL_USERS
 						? () => handleRemoveAllUserFilters()
 						: undefined}
 					id="user-select"
@@ -723,7 +769,7 @@
 					placeholder="Filter by user..."
 					buttonReadOnly
 					buttonTitle="Users"
-					displayCount={!!selectedUserIdsForSelect && selectedUserIdsForSelect !== 'all_users'}
+					displayCount={!!selectedUserIdsForSelect && selectedUserIdsForSelect !== ALL_USERS}
 				/>
 				<Select
 					class="dark:border-base-400 border border-transparent"
@@ -734,7 +780,7 @@
 					selected={filteredByModel}
 					onSelect={(option) => handleToggleModelFilter(option.id)}
 					onClear={(option) => option && handleRemoveModelFilter(option.id)}
-					onClearAll={filteredByModel !== 'all_models'
+					onClearAll={filteredByModel !== ALL_MODELS
 						? () => handleRemoveAllModelFilters()
 						: undefined}
 					id="model-select"
@@ -743,14 +789,14 @@
 					placeholder="Filter by model..."
 					buttonReadOnly
 					buttonTitle="Models"
-					displayCount={!!filteredByModel && filteredByModel !== 'all_models'}
+					displayCount={!!filteredByModel && filteredByModel !== ALL_MODELS}
 				/>
 				<div class="bg-base-400 hidden h-8 w-0.5 md:block"></div>
 				<AuditLogCalendar start={startDate} end={endDate} onChange={handleDateRangeChange} />
 			</div>
-			{#if filteredByModel !== 'all_models' || selectedUserIdsForSelect !== 'all_users'}
+			{#if filteredByModel !== ALL_MODELS || selectedUserIdsForSelect !== ALL_USERS || selectedAPIKeyIDsForSelect !== ALL_API_KEYS}
 				<div class="flex flex-wrap items-center gap-2" in:slide={{ axis: 'y', duration: 100 }}>
-					{#if selectedUserIdsForSelect !== 'all_users'}
+					{#if selectedUserIdsForSelect !== ALL_USERS}
 						{@const userPills = selectedUserIds.map((selectedUser) => ({
 							id: selectedUser,
 							label: getUserDisplayName(usersMap, selectedUser)
@@ -764,7 +810,18 @@
 							</div>
 						{/each}
 					{/if}
-					{#if filteredByModel !== 'all_models'}
+					{#if selectedAPIKeyIDsForSelect !== ALL_API_KEYS}
+						{#each selectedAPIKeyIDs as apiKeyID (apiKeyID)}
+							<div class="filter-primary">
+								<span class="font-semibold">API Key:</span>{apiKeyOptionsMap.get(apiKeyID) ??
+									`API key #${apiKeyID}`}
+								<button class="ml-1" onclick={() => handleRemoveAPIKeyFilter(apiKeyID)}>
+									<X class="size-3" />
+								</button>
+							</div>
+						{/each}
+					{/if}
+					{#if filteredByModel !== ALL_MODELS}
 						{@const modelPills = selectedModelIds.map((selectedModel) => ({
 							id: selectedModel,
 							label: modelsToDisplayName.get(selectedModel)?.name ?? selectedModel
@@ -780,171 +837,88 @@
 					{/if}
 				</div>
 			{/if}
-			<div class="paper w-full gap-0 pt-4">
-				<div class="mb-1 flex flex-wrap justify-between gap-2">
-					<div class="flex flex-wrap items-center gap-4">
-						<h4 class="flex items-center gap-2 font-semibold">
-							Input & Output Tokens
-							{#if loadingTableData}
-								<Loading class="size-4 animate-spin" />
-							{/if}
-						</h4>
-
-						<div class="flex shrink-0">
-							<button
-								class={twMerge(
-									'btn btn-secondary bg-base-300 dark:hover:bg-base-400 border-base-300 rounded-r-none! border border-r-0 text-xs',
-									selectedTokenType !== 'input' && 'bg-base-100 dark:bg-base-200 hover:bg-base-400 '
-								)}
-								onclick={() => handleTokenTypeChange('input')}
-							>
-								Input Tokens
-							</button>
-							<button
-								class={twMerge(
-									'btn btn-secondary bg-base-300 dark:hover:bg-base-400 border-base-300 rounded-l-none! border text-xs',
-									selectedTokenType !== 'output' && 'bg-base-100 dark:bg-base-200 hover:bg-base-400'
-								)}
-								onclick={() => handleTokenTypeChange('output')}
-							>
-								Output Tokens
-							</button>
-						</div>
-					</div>
-					<Select
-						class="bg-base-300 dark:bg-base-100 dark:border-base-400 w-[50dvw] border border-transparent shadow-inner md:w-64"
-						options={[
-							{ label: 'Group by Token Type', id: 'group_by_default' },
-							{ label: 'Group by Users', id: 'group_by_users' },
-							{ label: 'Group by Models', id: 'group_by_models' }
-						]}
-						selected={groupBy}
-						onSelect={(option) => handleGroupByChange(option.id)}
-					/>
-				</div>
-				<div class="w-full pt-2">
-					{#key groupBy}
-						<StackedTimeline
-							start={startDate}
-							end={endDate}
-							data={mainChartData}
-							dateKey="date"
-							primaryValueKey={selectedTokenType === 'input' ? 'inputTokens' : 'outputTokens'}
-							tooltipValueKeys={mainTooltipValueKeys}
-							categoryKey="category"
-							class="h-96"
-							legend={{
-								showSecondaryLabel: false,
-								primaryLabel:
-									groupBy === 'group_by_default'
-										? selectedTokenType === 'input'
-											? 'input tokens'
-											: 'output tokens'
-										: '',
-								hideCategoryLabel: groupBy === 'group_by_default'
-							}}
-						>
-							{#snippet tooltipContent(item)}
-								{@const value = item.primaryTotal ?? 0}
-								{@const spend =
-									selectedTokenType === 'input'
-										? (item.details?.inputSpend ?? 0)
-										: (item.details?.outputSpend ?? 0)}
-								<div class="flex flex-col gap-0 text-xs">
-									<div class="text-sm font-light">{item.key}</div>
-									<div class="text-muted-content">{item.date}</div>
-									<div class="tooltip-divider"></div>
-								</div>
-								<div class="flex flex-col gap-1">
-									<div class="text-base-content flex flex-col">
-										<div class="text-xl font-bold">{value.toLocaleString()}</div>
-										<div class="text-muted-content text-xs">{formatUSD(spend)}</div>
-										{#if selectedTokenType === 'input'}
-											<div class="text-muted-content mt-1 text-xs">
-												Cache read: {(item.details?.cacheReadTokens ?? 0).toLocaleString()} tokens,
-												{formatUSD(item.details?.cacheReadSpend ?? 0)}
-											</div>
-											<div class="text-muted-content text-xs">
-												Cache write: {(item.details?.cacheWriteTokens ?? 0).toLocaleString()} tokens,
-												{formatUSD(item.details?.cacheWriteSpend ?? 0)}
-											</div>
-										{:else if (item.details?.thinkingTokens ?? 0) > 0}
-											<div class="text-muted-content mt-1 text-xs">
-												Thinking: {(item.details?.thinkingTokens ?? 0).toLocaleString()} tokens
-											</div>
-										{/if}
-									</div>
-								</div>
-							{/snippet}
-						</StackedTimeline>
-					{/key}
-				</div>
-			</div>
+			<TokenUsageTimelineCard
+				{startDate}
+				{endDate}
+				data={filteredData}
+				loading={loadingTableData}
+				users={usersData}
+				models={modelsData}
+				{selectedTokenType}
+				{groupBy}
+				onTokenTypeChange={handleTokenTypeChange}
+				onGroupByChange={handleGroupByChange}
+			/>
 
 			<div class="relative mt-2 flex flex-col">
 				<div class="relative z-10 flex shrink-0 items-center justify-between">
-					<div class="flex shrink-0">
+					<div class="flex shrink-0 min-h-12">
 						<button
 							class={twMerge(
-								'w-24 border-b-2 border-transparent px-4 py-2 transition-colors duration-400',
-								selectedSubview === 'models'
+								'w-28 whitespace-nowrap border-b-2 border-transparent px-4 py-2 transition-colors duration-400',
+								selectedSubview === USAGE_SUBVIEW.API_KEYS
 									? 'border-primary'
 									: 'hover:border-primary/25 text-muted-content hover:text-base-content'
 							)}
-							onclick={() => {
-								selectedSubview = 'models';
-								subViewSearchQuery = '';
-							}}
+							onclick={() => selectSubview(USAGE_SUBVIEW.API_KEYS)}
+						>
+							API Keys
+						</button>
+						<button
+							class={twMerge(
+								'w-24 border-b-2 border-transparent px-4 py-2 transition-colors duration-400',
+								selectedSubview === USAGE_SUBVIEW.MODELS
+									? 'border-primary'
+									: 'hover:border-primary/25 text-muted-content hover:text-base-content'
+							)}
+							onclick={() => selectSubview(USAGE_SUBVIEW.MODELS)}
 						>
 							Models
 						</button>
 						<button
 							class={twMerge(
 								'w-24 border-b-2 border-transparent px-4 py-2 transition-colors duration-400',
-								selectedSubview === 'users'
+								selectedSubview === USAGE_SUBVIEW.USERS
 									? 'border-primary'
 									: 'hover:border-primary/25 text-muted-content hover:text-base-content'
 							)}
-							onclick={() => {
-								selectedSubview = 'users';
-								subViewSearchQuery = '';
-							}}
+							onclick={() => selectSubview(USAGE_SUBVIEW.USERS)}
 						>
 							Users
 						</button>
+						<button
+							class={twMerge(
+								'w-24 border-b-2 border-transparent px-4 py-2 transition-colors duration-400',
+								selectedSubview === USAGE_SUBVIEW.SPEND
+									? 'border-primary'
+									: 'hover:border-primary/25 text-muted-content hover:text-base-content'
+							)}
+							onclick={() => selectSubview(USAGE_SUBVIEW.SPEND)}
+						>
+							Spend
+						</button>
 					</div>
-					<Select
-						class="bg-base-200 hover:bg-base-300 dark:bg-base-100 dark:hover:bg-base-200 mb-1.5 border border-transparent shadow-none md:w-64"
-						options={[
-							{ label: 'Sort by Name (A-Z)', id: 'sort_by_name' },
-							{ label: 'Sort by Name (Z-A)', id: 'sort_by_name_reverse' },
-							{
-								label: 'Sort by Total Tokens (Highest to Lower)',
-								id: 'sort_by_total_tokens'
-							},
-							{
-								label: 'Sort by Total Tokens (Lowest to Highest)',
-								id: 'sort_by_total_tokens_reverse'
-							}
-						]}
-						selected={subViewSortBy}
-						onSelect={(option) => {
-							subViewSortBy = option.id as SubViewSortBy;
-						}}
-						id="sub-view-sort-by-select"
+					{#if !responsive.isMobile}
+						{@render subViewSortBySelect()}
+					{/if}
+				</div>
+				<div class="bg-base-400 h-0.5 w-full shrink-0 -translate-y-0.5"></div>
+
+				<div class="flex flex-col gap-1 mt-2 mb-3">
+					{#if responsive.isMobile}
+						{@render subViewSortBySelect()}
+					{/if}
+
+					<Search
+						class="bg-base-100 dark:border-base-400 border border-transparent"
+						value={subViewSearchQuery}
+						onChange={(value) => (subViewSearchQuery = value)}
+						placeholder={`Search ${selectedSubview === USAGE_SUBVIEW.USERS ? 'users' : selectedSubview === USAGE_SUBVIEW.API_KEYS ? 'API keys' : 'models'}...`}
 					/>
 				</div>
-				<div class="bg-base-400 h-0.5 w-full shrink-0 -translate-y-1"></div>
-
-				<Search
-					class="bg-base-100 dark:border-base-400 mt-2 mb-3 border border-transparent"
-					value={subViewSearchQuery}
-					onChange={(value) => (subViewSearchQuery = value)}
-					placeholder={`Search ${selectedSubview === 'models' ? 'models' : 'users'}...`}
-				/>
 
 				{#if graphItems.length > 0}
-					<div class="min-h-[300px]">
+					<div class="min-h-75">
 						{#if !gridDataReady}
 							<div
 								class="text-muted-content flex items-center justify-center gap-2 py-12 text-sm"
@@ -955,7 +929,7 @@
 							</div>
 						{:else if displayGraphItems.length > 0}
 							<div class="grid grid-cols-1 gap-4 md:grid-cols-2">
-								{#each displayGraphItems.slice(0, visibleChartCount) as item (item.label)}
+								{#each displayGraphItems.slice(0, visibleChartCount) as item (`${item.metric}-${item.key}`)}
 									<div class="paper p-0 flex min-h-0 flex-col overflow-hidden">
 										<h5
 											class="shrink-0 text-xs font-medium uppercase border-b dark:border-base-400 border-base-300 px-4 py-2 rounded-t-md"
@@ -963,19 +937,20 @@
 											{item.label}
 										</h5>
 										<div class="w-full shrink-0 p-4">
-											{#if item.mode === 'bucket'}
+											{#if item.mode === GRAPH_MODE.BUCKET}
+												{@const isSpend = item.metric === GRAPH_METRIC.SPEND}
 												<StackedTimeline
 													start={startDate}
 													end={endDate}
 													data={item.timelineData}
 													categoryKey="category"
 													dateKey="date"
-													primaryValueKey="bucketTokens"
+													primaryValueKey={isSpend ? 'bucketSpend' : 'bucketTokens'}
 													tooltipValueKeys={bucketTooltipValueKeys}
 													class="h-48"
 													legend={{
 														showSecondaryLabel: false,
-														primaryLabel: 'tokens'
+														primaryLabel: isSpend ? CHART_LABEL.SPEND : CHART_LABEL.TOKENS
 													}}
 													classes={{
 														legend: 'pt-4 justify-start'
@@ -983,7 +958,6 @@
 												>
 													{#snippet tooltipContent(item)}
 														{@const value = item.primaryTotal ?? 0}
-														{@const spend = item.details?.bucketSpend ?? 0}
 														<div class="flex flex-col gap-0 text-xs">
 															<div class="text-sm font-light">{item.key}</div>
 															<div class="text-muted-content">{item.date}</div>
@@ -991,26 +965,41 @@
 														</div>
 														<div class="flex flex-col gap-1">
 															<div class="text-base-content flex flex-col">
-																<div class="text-xl font-bold">{value.toLocaleString()}</div>
-																<div class="text-muted-content text-xs">{formatUSD(spend)}</div>
-																{#if item.key === 'Input'}
-																	<div class="text-muted-content mt-1 text-xs">
-																		Cache read: {(
-																			item.details?.cacheReadTokens ?? 0
-																		).toLocaleString()}
-																		tokens, {formatUSD(item.details?.cacheReadSpend ?? 0)}
-																	</div>
-																	<div class="text-muted-content text-xs">
-																		Cache write: {(
-																			item.details?.cacheWriteTokens ?? 0
-																		).toLocaleString()}
-																		tokens, {formatUSD(item.details?.cacheWriteSpend ?? 0)}
-																	</div>
-																{:else if item.key === 'Output' && (item.details?.thinkingTokens ?? 0) > 0}
-																	<div class="text-muted-content mt-1 text-xs">
-																		Thinking: {(item.details?.thinkingTokens ?? 0).toLocaleString()}
-																		tokens
-																	</div>
+																{#if isSpend}
+																	<div class="text-xl font-bold">{formatUSD(value)}</div>
+																	{#if item.key === USAGE_BUCKET_LABEL.INPUT}
+																		<div class="text-muted-content mt-1 text-xs">
+																			Cache read: {formatUSD(item.details?.cacheReadSpend ?? 0)}
+																		</div>
+																		<div class="text-muted-content text-xs">
+																			Cache write: {formatUSD(item.details?.cacheWriteSpend ?? 0)}
+																		</div>
+																	{/if}
+																{:else}
+																	{@const spend = item.details?.bucketSpend ?? 0}
+																	<div class="text-xl font-bold">{value.toLocaleString()}</div>
+																	<div class="text-muted-content text-xs">{formatUSD(spend)}</div>
+																	{#if item.key === USAGE_BUCKET_LABEL.INPUT}
+																		<div class="text-muted-content mt-1 text-xs">
+																			Cache read: {(
+																				item.details?.cacheReadTokens ?? 0
+																			).toLocaleString()}
+																			tokens, {formatUSD(item.details?.cacheReadSpend ?? 0)}
+																		</div>
+																		<div class="text-muted-content text-xs">
+																			Cache write: {(
+																				item.details?.cacheWriteTokens ?? 0
+																			).toLocaleString()}
+																			tokens, {formatUSD(item.details?.cacheWriteSpend ?? 0)}
+																		</div>
+																	{:else if item.key === USAGE_BUCKET_LABEL.OUTPUT && (item.details?.thinkingTokens ?? 0) > 0}
+																		<div class="text-muted-content mt-1 text-xs">
+																			Thinking: {(
+																				item.details?.thinkingTokens ?? 0
+																			).toLocaleString()}
+																			tokens
+																		</div>
+																	{/if}
 																{/if}
 															</div>
 														</div>
@@ -1029,8 +1018,8 @@
 													legend={{
 														hideCategoryLabel: true,
 														showSecondaryLabel: true,
-														primaryLabel: 'input tokens',
-														secondaryLabel: 'output tokens'
+														primaryLabel: CHART_LABEL.INPUT_TOKENS,
+														secondaryLabel: CHART_LABEL.OUTPUT_TOKENS
 													}}
 													classes={{
 														legend: 'pt-4 justify-start'
@@ -1082,6 +1071,18 @@
 		</div>
 	</div>
 </Layout>
+
+{#snippet subViewSortBySelect()}
+	<Select
+		class="md:bg-base-200 md:hover:bg-base-300 md:dark:bg-base-100 md:dark:hover:bg-base-200 mb-1.5 md:border md:border-transparent md:shadow-none md:w-64!"
+		options={subViewSortByOptions}
+		selected={subViewSortBy}
+		onSelect={(option) => {
+			subViewSortBy = option.id as UsageSubViewSortBy;
+		}}
+		id="sub-view-sort-by-select"
+	/>
+{/snippet}
 
 {#snippet summary(title: string, value: number)}
 	<div class="flex min-w-0 flex-1 flex-col gap-1 py-2">

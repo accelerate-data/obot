@@ -19,23 +19,26 @@ func Handler(devPort, userOnlyPort int) http.Handler {
 	server := &uiServer{}
 
 	if userOnlyPort != 0 {
-		server.rp = &httputil.ReverseProxy{
-			Director: func(r *http.Request) {
-				r.URL.Scheme = "http"
-				r.URL.Host = fmt.Sprintf("localhost:%d", userOnlyPort)
-			},
-		}
+		server.rp = newUIProxy(userOnlyPort)
 		server.userOnly = true
 	} else if devPort != 0 {
-		server.rp = &httputil.ReverseProxy{
-			Director: func(r *http.Request) {
-				r.URL.Scheme = "http"
-				r.URL.Host = fmt.Sprintf("localhost:%d", devPort)
-			},
-		}
+		server.rp = newUIProxy(devPort)
 	}
 
 	return server
+}
+
+// newUIProxy proxies to a UI server on localhost. SetXForwarded keeps the
+// X-Forwarded-For behavior that ReverseProxy used to apply automatically under
+// the deprecated Director.
+func newUIProxy(port int) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetXForwarded()
+			r.Out.URL.Scheme = "http"
+			r.Out.URL.Host = fmt.Sprintf("localhost:%d", port)
+		},
+	}
 }
 
 type uiServer struct {
@@ -74,9 +77,9 @@ func (s *uiServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/mcp-servers", http.StatusFound)
 	} else if r.URL.Path == "/mcp-servers" {
 		http.ServeFileFS(w, r, embedded, "user/build/mcp-servers.html")
-	} else if strings.HasSuffix(r.URL.Path, "/") {
+	} else if pathWithoutTrailingSlash, ok := strings.CutSuffix(r.URL.Path, "/"); ok {
 		// Paths with trailing slashes should redirect to without slash to avoid directory listings
-		http.Redirect(w, r, strings.TrimSuffix(r.URL.Path, "/"), http.StatusFound)
+		http.Redirect(w, r, pathWithoutTrailingSlash, http.StatusFound)
 	} else if _, err := fs.Stat(embedded, userPath+".html"); err == nil {
 		// Try .html version first (for SvelteKit prerendered pages)
 		http.ServeFileFS(w, r, embedded, userPath+".html")

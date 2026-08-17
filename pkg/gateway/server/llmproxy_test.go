@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -15,15 +16,46 @@ import (
 	nanobottypes "github.com/obot-platform/nanobot/pkg/types"
 	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/bedrock"
+	"github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/messagepolicy"
+	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/tidwall/gjson"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/user"
 )
 
 type captureRoundTripper struct {
 	req *http.Request
+}
+
+func TestNewRunTokenActivityCapturesOwnerAndAPIKey(t *testing.T) {
+	requestUser := &user.DefaultInfo{
+		UID: "hosted-agent:hai1abc",
+		Extra: map[string][]string{
+			principal.HostedAgentOwnerExtra: {"7"},
+			principal.APIKeyIDExtra:         {"42"},
+			principal.APIKeyNameExtra:       {"CLI token"},
+		},
+	}
+	usage := types.TokenUsage{InputTokens: 10, OutputTokens: 5, TotalSpend: 0.25}
+
+	activity := newRunTokenActivity(requestUser, "gpt-5", usage)
+
+	if activity.UserID != "7" || activity.Model != "gpt-5" || activity.Usage != usage {
+		t.Fatalf("activity identity or usage = %#v", activity)
+	}
+	if activity.APIKeyID == nil || *activity.APIKeyID != 42 || activity.APIKeyName != "CLI token" {
+		t.Fatalf("API key attribution = ID %v, name %q; want ID 42, name %q", activity.APIKeyID, activity.APIKeyName, "CLI token")
+	}
+}
+
+func TestNewRunTokenActivityLeavesDirectUserUnattributed(t *testing.T) {
+	activity := newRunTokenActivity(&user.DefaultInfo{UID: "7"}, "gpt-5", types.TokenUsage{})
+	if activity.APIKeyID != nil || activity.APIKeyName != "" {
+		t.Fatalf("direct user gained API key attribution: %#v", activity)
+	}
 }
 
 func (c *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -176,6 +208,62 @@ func TestResponseModifier_OpenAIResponsesAPI(t *testing.T) {
 	}
 }
 
+func TestResponseModifier_NonStreamingPrettyPrintedResponseTracksUsage(t *testing.T) {
+	tracker := newTokenUsageTracker(v1.Model{
+		Spec: v1.ModelSpec{Manifest: types2.ModelManifest{
+			Dialect: string(nanobottypes.DialectOpenAIResponses),
+		}},
+	})
+	recorder := newLLMAuditRecorder(
+		httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+		nil,
+		5<<20,
+	)
+	body := `{
+  "id": "resp_1",
+  "object": "response",
+  "status": "completed",
+  "model": "gpt-5.4-2026-03-05",
+  "usage": {
+    "input_tokens": 7,
+    "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 0
+    },
+    "output_tokens": 11,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 18
+  }
+}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+	}
+	r := &responseModifier{
+		tokenUsageTracker: tracker,
+		audit:             recorder,
+	}
+
+	if err := r.modifyResponse(resp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := recorder.responseStream.String(); got != body {
+		t.Fatalf("audit response = %q, want %q", got, body)
+	}
+	usage := tracker.getTokenUsage()
+	if usage.InputTokens != 7 || usage.OutputTokens != 11 || usage.TotalTokens != 18 {
+		t.Fatalf("token usage = %+v, want 7 input, 11 output, 18 total", usage)
+	}
+}
+
 func TestResponseModifier_NonStreamingResponse(t *testing.T) {
 	body := "{\"model\":\"gpt-4o\",\"usage\":{\"input_tokens\":5,\"output_tokens\":10,\"total_tokens\":15}}\n"
 
@@ -186,8 +274,7 @@ func TestResponseModifier_NonStreamingResponse(t *testing.T) {
 		c:                 io.NopCloser(strings.NewReader("")),
 	}
 
-	buf := make([]byte, 4096)
-	if _, err := r.Read(buf); err != nil {
+	if _, err := io.ReadAll(r); err != nil {
 		t.Fatal(err)
 	}
 
@@ -424,30 +511,32 @@ func TestRewriteModelInBody(t *testing.T) {
 	}
 }
 
-func TestLLMTransformRequest_RemovesAcceptEncoding(t *testing.T) {
+func TestLLMRewriteRequest_RemovesAcceptEncoding(t *testing.T) {
 	u := mustParseURL("https://api.example.com/v1")
-	director := llmTransformRequest(*u)
 
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.local/v1/responses", nil)
 	req.SetPathValue("path", "responses")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	director(req)
+	proxyReq := &httputil.ProxyRequest{In: req, Out: req.Clone(req.Context())}
+	llmRewriteRequest(*u)(proxyReq)
+	req = proxyReq.Out
 
 	if got := req.Header.Get("Accept-Encoding"); got != "" {
 		t.Fatalf("Accept-Encoding = %q, want empty", got)
 	}
 }
 
-func TestLLMTransformRequest_RemovesInternalRequestTypeHeader(t *testing.T) {
+func TestLLMRewriteRequest_RemovesInternalRequestTypeHeader(t *testing.T) {
 	u := mustParseURL("https://api.example.com/v1")
-	director := llmTransformRequest(*u)
 
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.local/v1/responses", nil)
 	req.SetPathValue("path", "responses")
 	req.Header.Set(internalRequestTypeHeader, threadTitleRequestType)
 
-	director(req)
+	proxyReq := &httputil.ProxyRequest{In: req, Out: req.Clone(req.Context())}
+	llmRewriteRequest(*u)(proxyReq)
+	req = proxyReq.Out
 
 	if got := req.Header.Get(internalRequestTypeHeader); got != "" {
 		t.Fatalf("%s = %q, want empty", internalRequestTypeHeader, got)
@@ -614,15 +703,15 @@ func TestGenericResponsesTransportHeaders(t *testing.T) {
 	}
 }
 
-// TestLLMTransformRequest_UpstreamPath asserts the upstream URL.Path produced
-// by llmTransformRequest for every (base URL, reqPath) combination the proxy
+// TestLLMRewriteRequest_UpstreamPath asserts the upstream URL.Path produced by
+// llmRewriteRequest for every (base URL, reqPath) combination the proxy
 // should support. Every reqPath is grounded in real source — either nanobot
 // (nanobot/pkg/llm/{anthropic,responses}/client.go) or the
 // official SDK each documented external coding tool uses.
 //
 // The expected paths are also what modifyResponse in llmproxy.go checks against
 // (/v1/messages and /v1/responses) for token counting and policy enforcement.
-func TestLLMTransformRequest_UpstreamPath(t *testing.T) {
+func TestLLMRewriteRequest_UpstreamPath(t *testing.T) {
 	tests := []struct {
 		name    string
 		baseURL string
@@ -729,12 +818,13 @@ func TestLLMTransformRequest_UpstreamPath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			u := mustParseURL(tt.baseURL)
-			director := llmTransformRequest(*u)
 
 			req := httptest.NewRequest(http.MethodPost, "http://gateway.local/", nil)
 			req.SetPathValue("path", tt.reqPath)
 
-			director(req)
+			proxyReq := &httputil.ProxyRequest{In: req, Out: req.Clone(req.Context())}
+			llmRewriteRequest(*u)(proxyReq)
+			req = proxyReq.Out
 
 			if got := req.URL.Path; got != tt.want {
 				t.Fatalf("URL.Path = %q, want %q", got, tt.want)
@@ -920,7 +1010,9 @@ func TestBedrockRequestUpstreamPath(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			llmTransformRequest(u)(req)
+			proxyReq := &httputil.ProxyRequest{In: req, Out: req.Clone(req.Context())}
+			llmRewriteRequest(u)(proxyReq)
+			req = proxyReq.Out
 
 			if got := req.URL.Path; got != tt.want {
 				t.Fatalf("upstream path = %q, want %q", got, tt.want)
@@ -1034,13 +1126,13 @@ func TestBedrockMantleTransformAndSign(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	director := llmTransformRequest(base)
-
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.local/", strings.NewReader(`{"model":"anthropic.claude-sonnet-4-6"}`))
 	req.SetPathValue("path", "v1/messages")
 	req.Header.Set("Authorization", "Bearer client-token")
 	req.Header.Set("X-Forwarded-For", "::1")
-	director(req)
+	proxyReq := &httputil.ProxyRequest{In: req, Out: req.Clone(req.Context())}
+	llmRewriteRequest(base)(proxyReq)
+	req = proxyReq.Out
 
 	if got := req.URL.String(); got != "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages" {
 		t.Fatalf("URL = %q, want Bedrock Mantle messages URL", got)

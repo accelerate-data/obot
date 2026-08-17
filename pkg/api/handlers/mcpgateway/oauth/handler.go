@@ -5,12 +5,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/obot-platform/nanobot/pkg/safehttp"
 	"github.com/obot-platform/obot/pkg/accesscontrolrule"
 	"github.com/obot-platform/obot/pkg/api/handlers"
 	"github.com/obot-platform/obot/pkg/api/server"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	"github.com/obot-platform/obot/pkg/system"
 )
 
@@ -32,16 +32,25 @@ type handler struct {
 func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, oauthConfig handlers.OAuthAuthorizationServerConfig, mcpSessionManager *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, baseURL string, clientSecretExpiration time.Duration, mux *server.Server) {
 	remoteURLValidationConfig := mcpSessionManager.RemoteMCPURLValidationConfig()
 	h := &handler{
-		tokenStore:               tokenStore,
-		tokenService:             tokenService,
-		oauthConfig:              oauthConfig,
-		clientMetadataHTTPClient: safehttp.NewClientWithTimeout(!remoteURLValidationConfig.AllowLocalhostMCP, !remoteURLValidationConfig.AllowPrivateIPMCP, !remoteURLValidationConfig.AllowLinkLocalMCP, clientMetadataFetchTimeout),
-		staticOAuthHTTPClient:    safehttp.NewClient(!remoteURLValidationConfig.AllowLocalhostMCP, !remoteURLValidationConfig.AllowPrivateIPMCP, !remoteURLValidationConfig.AllowLinkLocalMCP),
-		baseURL:                  baseURL,
-		oauthChecker:             oauthChecker,
-		acrHelper:                acrHelper,
-		clientExpiration:         clientSecretExpiration,
-		clientMetadataCache:      map[string]clientMetadataCacheEntry{},
+		tokenStore:   tokenStore,
+		tokenService: tokenService,
+		oauthConfig:  oauthConfig,
+		clientMetadataHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
+			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
+			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
+			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
+			Timeout:        clientMetadataFetchTimeout,
+		}),
+		staticOAuthHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
+			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
+			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
+			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
+		}),
+		baseURL:             baseURL,
+		oauthChecker:        oauthChecker,
+		acrHelper:           acrHelper,
+		clientExpiration:    clientSecretExpiration,
+		clientMetadataCache: map[string]clientMetadataCacheEntry{},
 	}
 
 	// Expose two sets of endpoints: one for clients that look at the oauth-protected-resource metadata and one for clients that don't.

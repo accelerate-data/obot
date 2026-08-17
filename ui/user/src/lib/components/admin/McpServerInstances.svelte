@@ -108,6 +108,7 @@
 			{usersMap}
 			{onReload}
 			skipLoadOnMount
+			{entry}
 		/>
 	{:else}
 		{@render emptyInstancesContent()}

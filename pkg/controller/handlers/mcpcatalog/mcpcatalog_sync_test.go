@@ -43,7 +43,7 @@ func TestSyncSkipsRecentCatalogAndForceSyncPrunesRemovedEntries(t *testing.T) {
 			SourceURLs:  []string{catalogDir},
 		},
 	}
-	storageClient := newCatalogFakeClient(catalog)
+	storageClient := newCatalogSyncFakeClient(catalog)
 	gatewayClient := newCatalogGatewayClient(t, storageClient)
 	handler := &Handler{gatewayClient: gatewayClient}
 
@@ -91,7 +91,7 @@ func TestSyncRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testing.T) 
 			SourceURLs:  []string{catalogDir},
 		},
 	}
-	storageClient := newCatalogFakeClient(catalog)
+	storageClient := newCatalogSyncFakeClient(catalog)
 	handler := &Handler{gatewayClient: newCatalogGatewayClient(t, storageClient)}
 
 	resp := &router.ResponseWrapper{}
@@ -134,7 +134,7 @@ func TestSyncSystemRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testi
 			SourceURLs:  []string{catalogDir},
 		},
 	}
-	storageClient := newCatalogFakeClient(catalog)
+	storageClient := newCatalogSyncFakeClient(catalog)
 	handler := &Handler{gatewayClient: newCatalogGatewayClient(t, storageClient)}
 
 	resp := &router.ResponseWrapper{}
@@ -158,7 +158,7 @@ func TestSyncSystemRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testi
 	require.True(t, resp.Delay > 0 && resp.Delay <= 30*time.Second)
 }
 
-func newCatalogFakeClient(objects ...kclient.Object) kclient.WithWatch {
+func newCatalogSyncFakeClient(objects ...kclient.Object) kclient.WithWatch {
 	restMapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{v1.SchemeGroupVersion})
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("MCPCatalog"), meta.RESTScopeNamespace)
 	restMapper.Add(v1.SchemeGroupVersion.WithKind("MCPServerCatalogEntry"), meta.RESTScopeNamespace)
@@ -168,6 +168,20 @@ func newCatalogFakeClient(objects ...kclient.Object) kclient.WithWatch {
 	return fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
 		WithRESTMapper(restMapper).
+		WithIndex(&v1.MCPServerCatalogEntry{}, "spec.mcpCatalogName", func(obj kclient.Object) []string {
+			entry := obj.(*v1.MCPServerCatalogEntry)
+			if entry.Spec.MCPCatalogName == "" {
+				return nil
+			}
+			return []string{entry.Spec.MCPCatalogName}
+		}).
+		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(obj kclient.Object) []string {
+			server := obj.(*v1.MCPServer)
+			if server.Spec.MCPServerCatalogEntryName == "" {
+				return nil
+			}
+			return []string{server.Spec.MCPServerCatalogEntryName}
+		}).
 		WithStatusSubresource(&v1.MCPCatalog{}, &v1.MCPServerCatalogEntry{}, &v1.SystemMCPCatalog{}, &v1.SystemMCPServerCatalogEntry{}).
 		WithObjects(objects...).
 		Build()
@@ -183,7 +197,7 @@ func newCatalogGatewayClient(t *testing.T, storageClient kclient.WithWatch) *gat
 	require.NoError(t, db.AutoMigrate())
 
 	ctx, cancel := context.WithCancel(context.Background())
-	client := gatewayclient.New(ctx, db, storageClient, nil, nil, nil, nil, time.Hour, 100, 1, 1, true)
+	client := gatewayclient.New(ctx, db, storageClient, nil, nil, nil, nil, time.Hour, 100, 1, 1, 1, true)
 	t.Cleanup(func() {
 		cancel()
 		require.NoError(t, client.Close())
