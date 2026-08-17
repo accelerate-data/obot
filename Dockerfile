@@ -6,7 +6,7 @@ ARG BASE_IMAGE=cgr.dev/chainguard/wolfi-base
 FROM ${BASE_IMAGE} AS base
 ARG BASE_IMAGE
 RUN if [ "${BASE_IMAGE}" = "cgr.dev/chainguard/wolfi-base" ]; then \
-  apk add --no-cache gcc go make git nodejs npm pnpm; \
+  apk add --no-cache gcc go make git nodejs-24 npm pnpm; \
   fi
 
 FROM base AS bin
@@ -14,6 +14,7 @@ WORKDIR /app
 COPY . .
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
   --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/uv \
   --mount=type=cache,target=/root/go/pkg/mod \
   make all
 
@@ -31,12 +32,34 @@ RUN apk add --no-cache postgresql-17 postgresql-17-oci-entrypoint postgresql-17-
 
 ENTRYPOINT [ "/usr/bin/docker-entrypoint.sh", "postgres" ]
 
+FROM final-base AS build-pgvector
+RUN apk add --no-cache build-base git postgresql-17-dev clang-19
+RUN git clone --branch v0.8.1 https://github.com/pgvector/pgvector.git && \
+  cd pgvector && \
+  make clean && \
+  make OPTFLAGS="" && \
+  PG_MAJOR=17 make install && \
+  cd .. && \
+  rm -rf pgvector
+
 FROM ${PROVIDERS_IMAGE} AS providers
 FROM ${ENTERPRISE_PROVIDERS_IMAGE} AS enterprise-providers
+RUN mkdir -p /obot-providers
 FROM ${ENCRYPTION_BINS_IMAGE} AS encryption-bins
 
 FROM final-base AS final
-RUN apk add --no-cache bash tini procps curl kubectl jq
+ENV POSTGRES_USER=obot
+ENV POSTGRES_PASSWORD=obot
+ENV POSTGRES_DB=obot
+ENV PGDATA=/data/postgresql
+
+COPY --from=build-pgvector /usr/lib/postgresql17/vector.so /usr/lib/postgresql17/
+COPY --from=build-pgvector /usr/share/postgresql17/extension/vector* /usr/share/postgresql17/extension/
+
+RUN apk add --no-cache git npm nodejs-24 bash tini procps libreoffice docker perl-utils sqlite sqlite-dev curl kubectl jq
+
+ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/accelerate-data/mcp-catalog
+ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog
 
 COPY aws-encryption.yaml /
 COPY azure-encryption.yaml /
@@ -51,7 +74,10 @@ RUN /combine-envrc.sh && rm /combine-envrc.sh
 COPY --from=encryption-bins /bin/*-encryption-provider /bin/
 COPY --from=bin /app/bin/obot /bin/
 
-ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/obot-platform/mcp-catalog
+ENV PATH=$PATH:/usr/lib/libreoffice/program
+ENV PATH=$PATH:/usr/bin
+
+ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/accelerate-data/mcp-catalog
 ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog
 
 ENV POSTGRES_USER=obot
@@ -62,7 +88,7 @@ ENV PGDATA=/data/postgresql
 ENV HOME=/data
 ENV XDG_CACHE_HOME=/data/cache
 ENV TERM=vt100
-
+ENV OBOT_CONTAINER_ENV=true
 WORKDIR /data
 VOLUME /data
 ENTRYPOINT ["run.sh"]

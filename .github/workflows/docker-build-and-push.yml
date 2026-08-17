@@ -1,5 +1,12 @@
 name: Build and Push Docker Image
 
+# PUBLISHING DISABLED. The canonical obot-vibedata image is built and pushed by
+# build-vibedata-image.yml (auto on push to main, multi-arch, signed, version-
+# resolved). This workflow is retained for reference only: it builds the image
+# to validate the Dockerfile but does NOT push, sign, tag, or scan a registry
+# image. A past manual dispatch of this workflow is what left the stale
+# obot-vibedata:main tag in the registry.
+
 permissions:
   id-token: write
   contents: read
@@ -7,17 +14,15 @@ permissions:
   actions: read
   security-events: write
 
+env:
+  OBOT_IMAGE: ghcr.io/accelerate-data/obot-vibedata
+  BASE_IMAGE: ghcr.io/accelerate-data/obot/base:latest
+  PROVIDERS_IMAGE: ghcr.io/accelerate-data/providers-vibedata
+  ENCRYPTION_BINS_IMAGE: ghcr.io/accelerate-data/providers-vibedata/encryption-bins
+  PROVIDER_IMAGE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
-    paths-ignore:
-      - docs/**
-      - chart/**
-      - .github/workflows/**
 
 jobs:
   build:
@@ -45,12 +50,29 @@ jobs:
           username: ${{ secrets.GHCR_USERNAME }}
           password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Log in to Docker Hub
-        if: ${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Setup crane
+        uses: imjasonh/setup-crane@v0.5
+
+      - name: Wait for provider images
+        env:
+          PROVIDERS_REF: ${{ env.PROVIDERS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
+          ENCRYPTION_BINS_REF: ${{ env.ENCRYPTION_BINS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          for ref in "${PROVIDERS_REF}" "${ENCRYPTION_BINS_REF}"; do
+            echo "Waiting for ${ref}"
+            for attempt in $(seq 1 60); do
+              if crane manifest "${ref}" >/dev/null 2>&1; then
+                echo "Found ${ref}"
+                break
+              fi
+              if [ "${attempt}" -eq 60 ]; then
+                echo "::error::Timed out waiting for ${ref}"
+                exit 1
+              fi
+              sleep 10
+            done
+          done
 
       - name: Build and push Docker images
         uses: depot/build-push-action@v1
@@ -58,30 +80,34 @@ jobs:
         with:
           project: bbqjs4tj1g
           context: .
-          push: true
+          push: false # publishing disabled — see header; canonical build is build-vibedata-image.yml
           pull: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}-enterprise:${{ github.ref_name }}
-            ${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') && format('docker.io/obot/{0}:{1}', github.event.repository.name, github.ref_name) || '' }}
+            ${{ env.OBOT_IMAGE }}:${{ github.ref_name }}
           build-args: |
-            BASE_IMAGE=ghcr.io/obot-platform/obot/base:latest
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            PROVIDERS_IMAGE=${{ env.PROVIDERS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
+            ENCRYPTION_BINS_IMAGE=${{ env.ENCRYPTION_BINS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
+            ENTERPRISE_PROVIDERS_IMAGE=${{ env.PROVIDERS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
 
+      # Publishing disabled: nothing is pushed, so the image cannot be signed,
+      # tagged, or scanned from the registry. These steps are kept (guarded off)
+      # to document what the workflow did when it published.
       - name: Install Cosign
+        if: false
         uses: sigstore/cosign-installer@v3.8.1
         with:
           cosign-release: "v2.4.3"
       - name: Check install!
+        if: false
         run: cosign version
 
       - name: Sign Images
+        if: false
         env:
           DIGEST: ${{ steps.build-and-push.outputs.digest }}
-          TAGS: >-
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}-enterprise:${{ github.ref_name }}
-            ${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') && format('docker.io/obot/{0}:{1}', github.event.repository.name, github.ref_name) || '' }}
+          TAGS: ${{ env.OBOT_IMAGE }}:${{ github.ref_name }}
         run: |
           images=""
           for tag in ${TAGS}; do
@@ -89,17 +115,14 @@ jobs:
           done
           cosign sign --yes ${images}
 
-      - name: Setup crane
-        uses: imjasonh/setup-crane@v0.5
-
-      - name: Copy images to latest tag
-        if: ${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+      - name: Copy OSS image to latest tag
+        if: false
         run: |
-          crane tag ghcr.io/${{ github.repository }}:${{ github.ref_name }} latest
-          crane tag ghcr.io/${{ github.repository }}-enterprise:${{ github.ref_name }} latest
-          crane tag docker.io/obot/${{ github.event.repository.name }}:${{ github.ref_name }} latest
+          crane tag ${{ env.OBOT_IMAGE }}:${{ github.ref_name }} latest
 
-  image-scan:
+  oss-image-scan:
+    # Publishing disabled — no registry image to scan.
+    if: false
     runs-on: depot-ubuntu-22.04
     needs: build
 
@@ -120,7 +143,7 @@ jobs:
       - name: Run Trivy
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
-          image-ref: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          image-ref: ${{ env.OBOT_IMAGE }}:${{ github.ref_name }}
           skip-dirs: "**/venv"
           format: "sarif"
           output: "trivy-results.sarif"

@@ -1,0 +1,43 @@
+name: Verify Sync Metadata
+
+# Guards .accelerate/upstream-sync.json (which drives the vibedata image tag)
+# against drift. Runs on every PR to main so it also catches syncs done as
+# manual merges, not just those produced by the Upstream Sync workflow.
+
+permissions:
+  contents: read
+
+on:
+  # ready_for_review: upstream-sync drafts are created with GITHUB_TOKEN, whose
+  # events trigger no workflows — marking the draft ready must start the checks.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: verify-sync-metadata-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/obot-platform/obot.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream branch and release tags
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
+
+      - name: Verify upstream-sync metadata
+        run: bash scripts/verify-sync-metadata.sh
