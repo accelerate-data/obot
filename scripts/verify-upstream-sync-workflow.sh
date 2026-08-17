@@ -23,6 +23,7 @@ for label in upstream-sync sync:clean sync:touches-customized-files sync:conflic
 done
 require_literal "${sync_workflow}" "--force" "Upstream sync label creation must be idempotent"
 require_literal "${sync_workflow}" "upstreamObotVersion" "Sync metadata must record the stable upstream version"
+require_literal "${sync_workflow}" "RECORDED_HEAD=\"\$(jq -r '.upstreamHeadSha" "Sync analysis must prefer the recorded upstream checkpoint"
 require_literal "${sync_workflow}" "--max-count=50" "Upstream commit summaries must use git's max-count option"
 if grep -Eq 'head[[:space:]]+-?50' "${sync_workflow}"; then
   echo "Upstream commit summaries must not pipe into head under pipefail" >&2

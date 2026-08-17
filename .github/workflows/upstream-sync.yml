@@ -104,6 +104,14 @@ jobs:
           OURS="origin/${BASE_BRANCH}"
           THEIRS="upstream/${UPSTREAM_BRANCH}"
           BASE="$(git merge-base "$OURS" "$THEIRS")"
+          RECORDED_HEAD="$(jq -r '.upstreamHeadSha // empty' .accelerate/upstream-sync.json 2>/dev/null || true)"
+          if printf '%s' "$RECORDED_HEAD" | grep -qE '^[0-9a-f]{40}$' \
+            && git cat-file -e "${RECORDED_HEAD}^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$RECORDED_HEAD" "$THEIRS"; then
+            BASE="$RECORDED_HEAD"
+          else
+            echo "::warning::Recorded upstream checkpoint is unavailable or invalid; using Git merge-base ${BASE}"
+          fi
 
           NEW_COMMITS="$(git rev-list --count "${OURS}..${THEIRS}")"
           set_output new_commits "$NEW_COMMITS"
