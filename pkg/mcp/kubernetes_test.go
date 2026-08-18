@@ -14,6 +14,7 @@ import (
 	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/utils"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -1539,5 +1540,69 @@ func assertNoAuditLogEnv(t *testing.T, env map[string][]byte) {
 		if strings.HasPrefix(key, "NANOBOT_RUN_AUDIT_LOG_") {
 			t.Fatalf("unexpected audit log env %q present", key)
 		}
+	}
+}
+
+// blockingGetClient blocks forever on Get (until ctx is done), simulating a
+// slow/unresponsive API server call that has no internal self-bound timeout.
+type blockingGetClient struct {
+	client.WithWatch
+}
+
+func (b *blockingGetClient) Get(ctx context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// ensureServerDeployment must bound the ctx it uses with the server's own
+// StartupTimeout: image acquisition time must not eat into this budget, so
+// the responsibility for applying StartupTimeout moved from the shared
+// caller (SessionManager.ensureDeployment) down into each backend. Unlike
+// updatedMCPPodName's pod-watch loop (which already self-bounds via
+// server.StartupTimeout independent of ctx), the cachedClient.Get call in
+// the !shouldDeploy branch has no internal self-bound, making it the
+// correct place to prove this backend applies its own bound.
+func TestEnsureServerDeployment_AppliesOwnStartupTimeoutBound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(appsv1) error = %v", err)
+	}
+
+	server := ServerConfig{
+		MCPServerName:  "test-server",
+		Runtime:        types.RuntimeNPX,
+		StartupTimeout: 200 * time.Millisecond,
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	blockingClient := &blockingGetClient{WithWatch: fakeClient}
+
+	k := &kubernetesBackend{
+		cachedClient: blockingClient,
+		mcpNamespace: "obot-mcp",
+		deploymentCache: map[string]*kubernetesDeploymentCacheEntry{
+			server.MCPServerName: {hash: utils.Digest(server)},
+		},
+	}
+
+	type result struct{ err error }
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		_, err := k.ensureServerDeployment(context.Background(), server)
+		done <- result{err: err}
+	}()
+
+	select {
+	case res := <-done:
+		elapsed := time.Since(start)
+		if elapsed > 2*time.Second {
+			t.Fatalf("ensureServerDeployment took %v, want bounded near StartupTimeout", elapsed)
+		}
+		if res.err == nil {
+			t.Fatal("ensureServerDeployment() error = nil, want a timeout error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ensureServerDeployment did not return within 2s; missing its own StartupTimeout bound on an unbounded caller context")
 	}
 }

@@ -404,9 +404,10 @@ func (sm *SessionManager) ensureDeployment(ctx context.Context, server ServerCon
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, server.StartupTimeout)
-	defer cancel()
-
+	// Each backend applies its own StartupTimeout-derived deadline after
+	// acquiring any resources (e.g. pulling a Docker image) it needs before
+	// starting the server, so that acquisition time isn't carved out of the
+	// startup budget meant for creation/start/readiness.
 	return sm.backend.ensureServerDeployment(ctx, server)
 }
 

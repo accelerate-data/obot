@@ -133,6 +133,15 @@ func (k *kubernetesBackend) deployServerObjects(ctx context.Context, server Serv
 }
 
 func (k *kubernetesBackend) ensureServerDeployment(ctx context.Context, server ServerConfig) (ServerConfig, error) {
+	// Kubernetes has no separate image-acquisition phase to decouple (the
+	// kubelet pulls images as part of pod scheduling, bounded by
+	// updatedMCPPodName's own StartupTimeout-based watch loop below), but
+	// ensureServerDeployment now owns applying its own StartupTimeout bound
+	// on ctx, since that responsibility moved out of the shared caller
+	// (SessionManager.ensureDeployment) and into each backend individually.
+	ctx, cancel := context.WithTimeout(ctx, server.StartupTimeout)
+	defer cancel()
+
 	for i, component := range server.Components {
 		component.URL = k.transformObotHostname(component.URL)
 		server.Components[i] = component

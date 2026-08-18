@@ -1,12 +1,15 @@
 package mcp
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
 
+	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
@@ -216,4 +219,63 @@ func TestHTTPClientForServer(t *testing.T) {
 			t.Fatal("invalid tunnel name returned no error")
 		}
 	})
+}
+
+// ctxCapturingBackend implements backend, recording the ctx it was called
+// with so tests can assert on the deadline SessionManager.ensureDeployment
+// hands down to it.
+type ctxCapturingBackend struct {
+	capturedCtx context.Context
+}
+
+func (b *ctxCapturingBackend) ensureServerDeployment(ctx context.Context, server ServerConfig) (ServerConfig, error) {
+	b.capturedCtx = ctx
+	return server, nil
+}
+
+func (b *ctxCapturingBackend) deployServer(context.Context, ServerConfig) error { return nil }
+
+func (b *ctxCapturingBackend) streamServerLogs(context.Context, string) (io.ReadCloser, error) {
+	return nil, nil
+}
+
+func (b *ctxCapturingBackend) getServerDetails(context.Context, string) (types.MCPServerDetails, error) {
+	return types.MCPServerDetails{}, nil
+}
+
+func (b *ctxCapturingBackend) restartServer(context.Context, ServerConfig) error { return nil }
+
+func (b *ctxCapturingBackend) shutdownServer(context.Context, string, bool) error { return nil }
+
+func (b *ctxCapturingBackend) transformObotHostname(url string) string { return url }
+
+func (b *ctxCapturingBackend) remoteConfig(globalConfig RemoteMCPURLValidationConfig) (RemoteMCPURLValidationConfig, []string) {
+	return globalConfig, nil
+}
+
+// Image acquisition can be slow (registry pull), and that time must not be
+// carved out of the tight StartupTimeout budget meant for container
+// creation/start/readiness. ensureDeployment used to wrap the ctx it handed
+// to the backend in its own StartupTimeout-derived deadline; that
+// responsibility now belongs to each backend individually, applied after
+// image acquisition rather than before it.
+func TestEnsureDeployment_DoesNotImposeItsOwnStartupTimeout(t *testing.T) {
+	backend := &ctxCapturingBackend{}
+	sm := &SessionManager{backend: backend}
+
+	server := ServerConfig{
+		Runtime:        types.RuntimeNPX,
+		StartupTimeout: 5 * time.Millisecond,
+	}
+
+	_, err := sm.ensureDeployment(context.Background(), server)
+	if err != nil {
+		t.Fatalf("ensureDeployment() error = %v", err)
+	}
+	if backend.capturedCtx == nil {
+		t.Fatal("backend.ensureServerDeployment was never called")
+	}
+	if _, ok := backend.capturedCtx.Deadline(); ok {
+		t.Fatal("ensureDeployment must not impose its own StartupTimeout-derived deadline; that responsibility now belongs to each backend")
+	}
 }

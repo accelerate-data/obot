@@ -261,6 +261,10 @@ func (d *dockerBackend) deployServer(ctx context.Context, server ServerConfig) e
 		return nil
 	}
 
+	if err := d.pullDeploymentImage(ctx, server); err != nil {
+		return fmt.Errorf("failed to ensure image exists: %w", err)
+	}
+
 	_, _, err = d.createAndStartContainer(ctx, server, server.MCPServerName, configHash, fileEnvKeysHash(server.Files))
 	return err
 }
@@ -330,25 +334,31 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 	configHash := serverID(server)
 	desiredFileEnvKeysHash := fileEnvKeysHash(server.Files)
 
-	// Check if container already exists
 	existing, err := d.getContainer(ctx, server.MCPServerName)
-	if err == nil && existing != nil {
-		currentFileEnvKeysHash, hasFileEnvHash := existing.Labels["mcp.file.env.keys.hash"]
-		if !hasFileEnvHash {
-			currentFileEnvKeysHash = ""
-		}
+	if err != nil {
+		existing = nil
+	}
 
-		desiredImage := d.deploymentImage(server)
-		if existing.Labels["mcp.config.hash"] != configHash ||
-			currentFileEnvKeysHash != desiredFileEnvKeysHash ||
-			existing.NetworkSettings == nil ||
-			existing.NetworkSettings.Networks[d.network] == nil ||
-			desiredImage != "" && existing.Image != desiredImage {
-			// Clear the state. The below logic will remove and recreate the container.
-			existing.State = ""
-		}
+	needsRecreate := dockerContainerNeedsRecreate(existing, configHash, desiredFileEnvKeysHash, d.network, d.deploymentImage(server))
 
-		// Container exists, check state
+	// A recreate requires pulling the image first; a reuse of an
+	// already-running (or already-created) container does not. Either way,
+	// server.StartupTimeout must bound only the creation/start/readiness
+	// work below it, not image acquisition, so the timeout is applied fresh
+	// after any pull rather than around this whole call.
+	return acquireImageThenBoundStartup(ctx, server.StartupTimeout, needsRecreate,
+		func(ctx context.Context) error {
+			return d.pullDeploymentImage(ctx, server)
+		},
+		func(ctx context.Context) (ServerConfig, error) {
+			return d.createOrReuseContainer(ctx, server, mcpServerName, configHash, desiredFileEnvKeysHash, containerEnv, existing, needsRecreate)
+		},
+	)
+}
+
+func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server ServerConfig, mcpServerName, configHash, desiredFileEnvKeysHash string, containerEnv bool, existing *container.Summary, needsRecreate bool) (ServerConfig, error) {
+	if existing != nil && !needsRecreate {
+		// Container exists, is valid, and is created or running.
 		switch existing.State {
 		case container.StateCreated:
 			// Container exists and is created, start it and wait for it to be ready.
@@ -360,6 +370,7 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 				return ServerConfig{}, fmt.Errorf("failed to wait for container: %w", err)
 			}
 
+			var err error
 			existing, err = d.getContainer(ctx, server.MCPServerName)
 			if err != nil {
 				return ServerConfig{}, fmt.Errorf("failed to get running container: %w", err)
@@ -377,32 +388,91 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 				containerPort = server.ContainerPort
 			}
 
-			if err = d.ensureServerReady(ctx, existing, server, containerPort); err != nil {
+			if err := d.ensureServerReady(ctx, existing, server, containerPort); err != nil {
 				return ServerConfig{}, fmt.Errorf("server running, but readiness check failed: %w", err)
 			}
 
 			return d.buildServerConfig(server, existing, containerPort, containerEnv)
-		default:
-			// Container exists but not running, remove it and recreate
-			if err := d.client.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); cerrdefs.IsConflict(err) {
-				// The container is already being removed, wait for it to finish
-				statusCh, errCh := d.client.ContainerWait(ctx, existing.ID, container.WaitConditionRemoved)
-				select {
-				case err := <-errCh:
-					// It's OK if the container is already gone.
-					if err != nil && !cerrdefs.IsNotFound(err) {
-						return ServerConfig{}, fmt.Errorf("error waiting for stopped container to be removed: %w", err)
-					}
-				case <-statusCh:
+		}
+	}
+
+	if existing != nil {
+		// Container exists but is stale or otherwise not reusable, remove it and recreate.
+		if err := d.client.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); cerrdefs.IsConflict(err) {
+			// The container is already being removed, wait for it to finish
+			statusCh, errCh := d.client.ContainerWait(ctx, existing.ID, container.WaitConditionRemoved)
+			select {
+			case err := <-errCh:
+				// It's OK if the container is already gone.
+				if err != nil && !cerrdefs.IsNotFound(err) {
+					return ServerConfig{}, fmt.Errorf("error waiting for stopped container to be removed: %w", err)
 				}
-			} else if err != nil {
-				return ServerConfig{}, fmt.Errorf("failed to remove stopped container: %w", err)
+			case <-statusCh:
 			}
+		} else if err != nil {
+			return ServerConfig{}, fmt.Errorf("failed to remove stopped container: %w", err)
 		}
 	}
 
 	// Create new container
 	return d.createAndStartAndWaitForContainer(ctx, server, mcpServerName, configHash, desiredFileEnvKeysHash, containerEnv)
+}
+
+// dockerContainerNeedsRecreate reports whether ensureDeployment must remove
+// and recreate existing (and therefore must pull the desired image first)
+// rather than reusing it as-is. A nil existing container always needs
+// creating. Otherwise, a config/env/network/image mismatch invalidates the
+// container regardless of its state; absent that, only a Created or Running
+// container is reusable.
+func dockerContainerNeedsRecreate(existing *container.Summary, configHash, desiredFileEnvKeysHash, networkName, desiredImage string) bool {
+	if existing == nil {
+		return true
+	}
+
+	currentFileEnvKeysHash, hasFileEnvHash := existing.Labels["mcp.file.env.keys.hash"]
+	if !hasFileEnvHash {
+		currentFileEnvKeysHash = ""
+	}
+
+	invalidated := existing.Labels["mcp.config.hash"] != configHash ||
+		currentFileEnvKeysHash != desiredFileEnvKeysHash ||
+		existing.NetworkSettings == nil ||
+		existing.NetworkSettings.Networks[networkName] == nil ||
+		desiredImage != "" && existing.Image != desiredImage
+	if invalidated {
+		return true
+	}
+
+	switch existing.State {
+	case container.StateCreated, container.StateRunning:
+		return false
+	default:
+		return true
+	}
+}
+
+// acquireImageThenBoundStartup runs pull (unbounded by startupTimeout, since
+// a registry pull can be legitimately slow) only when needsPull is true, then
+// invokes createOrReuse under a fresh startupTimeout deadline measured from
+// after the pull completes. This keeps image-acquisition time from eating
+// into the tight budget meant for container creation/start/readiness.
+func acquireImageThenBoundStartup(
+	ctx context.Context,
+	startupTimeout time.Duration,
+	needsPull bool,
+	pull func(ctx context.Context) error,
+	createOrReuse func(ctx context.Context) (ServerConfig, error),
+) (ServerConfig, error) {
+	if needsPull {
+		if err := pull(ctx); err != nil {
+			return ServerConfig{}, err
+		}
+	}
+
+	boundedCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
+	return createOrReuse(boundedCtx)
 }
 
 func (d *dockerBackend) deploymentImage(server ServerConfig) string {
@@ -412,6 +482,33 @@ func (d *dockerBackend) deploymentImage(server ServerConfig) string {
 	default:
 		return ""
 	}
+}
+
+// resolveDeploymentImage determines the image createAndStartContainer will
+// use for server, so it can be pulled ahead of container creation. Unlike
+// deploymentImage (which only tracks the image for runtimes whose identity
+// is invalidated by an image change), this resolves the image for every
+// runtime that createAndStartContainer can actually start.
+func (d *dockerBackend) resolveDeploymentImage(server ServerConfig) (string, error) {
+	switch server.Runtime {
+	case otypes.RuntimeUVX, otypes.RuntimeNPX:
+		return d.containerizedBaseImage, nil
+	case otypes.RuntimeContainerized:
+		if server.ContainerImage == "" {
+			return "", fmt.Errorf("container image must be specified for containerized runtime")
+		}
+		return server.ContainerImage, nil
+	default:
+		return "", fmt.Errorf("unsupported runtime: %s", server.Runtime)
+	}
+}
+
+func (d *dockerBackend) pullDeploymentImage(ctx context.Context, server ServerConfig) error {
+	image, err := d.resolveDeploymentImage(server)
+	if err != nil {
+		return err
+	}
+	return d.pullImage(ctx, image, false)
 }
 
 func (d *dockerBackend) streamServerLogs(ctx context.Context, id string) (io.ReadCloser, error) {
@@ -1072,10 +1169,6 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 
 	// Host config with port bindings and volume mounts.
 	hostConfig := newMCPServerHostConfig(containerPortStr, volumeMounts)
-
-	if err := d.pullImage(ctx, image, false); err != nil {
-		return "", 0, fmt.Errorf("failed to ensure image exists: %w", err)
-	}
 
 	// Configure network
 	networkingConfig := &network.NetworkingConfig{}
