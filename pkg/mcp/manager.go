@@ -34,6 +34,9 @@ type Options struct {
 	MCPNamespace                      string   `usage:"The namespace to use for MCP containers" default:"obot-mcp"`
 	MCPDockerNetwork                  string   `usage:"Docker network to attach MCP helper containers to; empty falls back to OBOT_CONTAINER_ENV auto-detection or the default bridge" default:"" name:"mcp-docker-network" env:"OBOT_MCP_DOCKER_NETWORK"`
 	MCPClusterDomain                  string   `usage:"The cluster domain to use for MCP containers" default:"cluster.local"`
+	MCPDockerMemory                   string   `usage:"Memory ceiling for MCP containers on the Docker backend (e.g. 1g); empty leaves them uncapped" default:"1g" name:"mcp-docker-memory" env:"OBOT_MCP_DOCKER_MEMORY"`
+	MCPDockerCPUs                     string   `usage:"CPU ceiling for MCP containers on the Docker backend (e.g. 1); empty leaves them uncapped" default:"1" name:"mcp-docker-cpus" env:"OBOT_MCP_DOCKER_CPUS"`
+	MCPDockerPidsLimit                string   `usage:"Process and thread ceiling for MCP containers on the Docker backend; empty leaves them uncapped" default:"512" name:"mcp-docker-pids-limit" env:"OBOT_MCP_DOCKER_PIDS_LIMIT"`
 	DisallowLocalhostMCP              bool     `usage:"Disallow MCP containers from connecting to localhost" default:"true"`
 	DisallowPrivateIPMCP              bool     `usage:"Disallow MCP containers from connecting to private IPs" default:"true"`
 	DisallowLinkLocalMCP              bool     `usage:"Disallow MCP containers from connecting to link-local addresses" default:"true"`

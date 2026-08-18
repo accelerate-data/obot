@@ -12,6 +12,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/go-connections/nat"
+	"github.com/docker/go-units"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/filters"
@@ -42,6 +44,7 @@ type dockerBackend struct {
 	hostBaseURL                 string
 	hostBaseURLWithPort         string
 	containerizedBaseImage      string
+	mcpResources                container.Resources
 	authEnabled                 bool
 	deploymentCacheMu           sync.RWMutex
 	deploymentCache             map[string]*dockerDeploymentCacheEntry
@@ -72,6 +75,11 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 	// network, overriding whatever was auto-detected.
 	network = chooseMCPNetwork(opts.MCPDockerNetwork, network)
 
+	mcpResources, err := mcpDockerResources(opts.MCPDockerMemory, opts.MCPDockerCPUs, opts.MCPDockerPidsLimit)
+	if err != nil {
+		return nil, err
+	}
+
 	d := &dockerBackend{
 		client:                 cli,
 		containerEnv:           containerEnv,
@@ -80,6 +88,7 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 		hostBaseURL:            "http://" + host,
 		hostBaseURLWithPort:    "http://" + fmt.Sprintf("%s:%d", host, exposedPort),
 		containerizedBaseImage: opts.MCPBaseImage,
+		mcpResources:           mcpResources,
 		authEnabled:            authEnabled,
 		deploymentCache:        map[string]*dockerDeploymentCacheEntry{},
 		syncedFilesHash:        map[string]string{},
@@ -111,7 +120,12 @@ func chooseMCPNetwork(optNetwork string, autoDetected string) string {
 // URL resolves to host.docker.internal is reachable from Obot itself yet
 // unreachable from the shim Obot deploys. Adding it keeps the shim's host
 // reachability consistent with Obot's.
-func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount) *container.HostConfig {
+//
+// Resources carries the operator-configured ceiling. Compose cannot reach these
+// containers — they are created through the mounted Docker socket, outside the
+// Compose project — so this is the only place a Compose deployment can bound
+// them. The Kubernetes backend gets the same bound from a namespace LimitRange.
+func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount, resources container.Resources) *container.HostConfig {
 	return &container.HostConfig{
 		PortBindings: map[nat.Port][]nat.PortBinding{nat.Port(containerPortStr): {{HostIP: "127.0.0.1"}}},
 		Mounts:       mounts,
@@ -119,7 +133,63 @@ func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount) *cont
 		RestartPolicy: container.RestartPolicy{
 			Name: "unless-stopped",
 		},
+		Resources: resources,
 	}
+}
+
+// dockerMinMemoryBytes is Docker's own floor for a container memory limit. The
+// daemon rejects anything smaller when it creates the container, so accepting it
+// here would leave Obot running while every MCP server failed to start.
+const dockerMinMemoryBytes int64 = 6 * 1024 * 1024
+
+// mcpDockerResources turns the operator-facing ceiling strings into a resource
+// block for every MCP server container. An empty value leaves that dimension
+// uncapped, which is the behaviour deployments had before these knobs existed,
+// so clearing one variable is a complete escape hatch. Parsing here rather than
+// at spawn time turns a typo into one clear startup failure instead of an opaque
+// Docker API error on every server. Out-of-range values are rejected for the
+// same reason as malformed ones — Docker refuses them at container-create time,
+// which would break every MCP server rather than bounding it.
+func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, error) {
+	var res container.Resources
+
+	if memory = strings.TrimSpace(memory); memory != "" {
+		parsed, err := units.RAMInBytes(memory)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker memory ceiling %q: %w", memory, err)
+		}
+		if parsed < dockerMinMemoryBytes {
+			return container.Resources{}, fmt.Errorf(
+				"invalid MCP Docker memory ceiling %q: must be at least %s, Docker's own minimum",
+				memory, units.BytesSize(float64(dockerMinMemoryBytes)),
+			)
+		}
+		res.Memory = parsed
+	}
+
+	if cpus = strings.TrimSpace(cpus); cpus != "" {
+		parsed, err := strconv.ParseFloat(cpus, 64)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: %w", cpus, err)
+		}
+		if parsed <= 0 {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: must be greater than 0", cpus)
+		}
+		res.NanoCPUs = int64(parsed * 1e9)
+	}
+
+	if pidsLimit = strings.TrimSpace(pidsLimit); pidsLimit != "" {
+		parsed, err := strconv.ParseInt(pidsLimit, 10, 64)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: %w", pidsLimit, err)
+		}
+		if parsed < 1 {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: must be at least 1", pidsLimit)
+		}
+		res.PidsLimit = &parsed
+	}
+
+	return res, nil
 }
 
 func detectDockerBackendNetwork(ctx context.Context, cli *client.Client) (bool, string, string, error) {
@@ -653,6 +723,13 @@ func (d *dockerBackend) restartServer(ctx context.Context, server ServerConfig) 
 		containerName = id
 	}
 
+	// The stored host config predates this ceiling on any container created
+	// before it existed. Copy the three fields individually — assigning the
+	// whole Resources struct would discard everything else recorded there.
+	inspect.HostConfig.Memory = d.mcpResources.Memory
+	inspect.HostConfig.NanoCPUs = d.mcpResources.NanoCPUs
+	inspect.HostConfig.PidsLimit = d.mcpResources.PidsLimit
+
 	resp, err := d.client.ContainerCreate(ctx, inspect.Config, inspect.HostConfig, networkingConfig, nil, containerName)
 	if err != nil {
 		return fmt.Errorf("failed to recreate container %s: %w", id, err)
@@ -1168,7 +1245,7 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 	}
 
 	// Host config with port bindings and volume mounts.
-	hostConfig := newMCPServerHostConfig(containerPortStr, volumeMounts)
+	hostConfig := newMCPServerHostConfig(containerPortStr, volumeMounts, d.mcpResources)
 
 	// Configure network
 	networkingConfig := &network.NetworkingConfig{}
