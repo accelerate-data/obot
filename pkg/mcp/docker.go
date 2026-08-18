@@ -44,6 +44,7 @@ type dockerBackend struct {
 	hostBaseURL                 string
 	hostBaseURLWithPort         string
 	containerizedBaseImage      string
+	mcpResources                container.Resources
 	authEnabled                 bool
 	deploymentCacheMu           sync.RWMutex
 	deploymentCache             map[string]*dockerDeploymentCacheEntry
@@ -74,6 +75,11 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 	// network, overriding whatever was auto-detected.
 	network = chooseMCPNetwork(opts.MCPDockerNetwork, network)
 
+	mcpResources, err := mcpDockerResources(opts.MCPDockerMemory, opts.MCPDockerCPUs, opts.MCPDockerPidsLimit)
+	if err != nil {
+		return nil, err
+	}
+
 	d := &dockerBackend{
 		client:                 cli,
 		containerEnv:           containerEnv,
@@ -82,6 +88,7 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 		hostBaseURL:            "http://" + host,
 		hostBaseURLWithPort:    "http://" + fmt.Sprintf("%s:%d", host, exposedPort),
 		containerizedBaseImage: opts.MCPBaseImage,
+		mcpResources:           mcpResources,
 		authEnabled:            authEnabled,
 		deploymentCache:        map[string]*dockerDeploymentCacheEntry{},
 		syncedFilesHash:        map[string]string{},
@@ -113,7 +120,12 @@ func chooseMCPNetwork(optNetwork string, autoDetected string) string {
 // URL resolves to host.docker.internal is reachable from Obot itself yet
 // unreachable from the shim Obot deploys. Adding it keeps the shim's host
 // reachability consistent with Obot's.
-func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount) *container.HostConfig {
+//
+// Resources carries the operator-configured ceiling. Compose cannot reach these
+// containers — they are created through the mounted Docker socket, outside the
+// Compose project — so this is the only place a Compose deployment can bound
+// them. The Kubernetes backend gets the same bound from a namespace LimitRange.
+func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount, resources container.Resources) *container.HostConfig {
 	return &container.HostConfig{
 		PortBindings: map[nat.Port][]nat.PortBinding{nat.Port(containerPortStr): {{HostIP: "127.0.0.1"}}},
 		Mounts:       mounts,
@@ -121,6 +133,7 @@ func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount) *cont
 		RestartPolicy: container.RestartPolicy{
 			Name: "unless-stopped",
 		},
+		Resources: resources,
 	}
 }
 
@@ -691,6 +704,13 @@ func (d *dockerBackend) restartServer(ctx context.Context, server ServerConfig) 
 		containerName = id
 	}
 
+	// The stored host config predates this ceiling on any container created
+	// before it existed. Copy the three fields individually — assigning the
+	// whole Resources struct would discard everything else recorded there.
+	inspect.HostConfig.Memory = d.mcpResources.Memory
+	inspect.HostConfig.NanoCPUs = d.mcpResources.NanoCPUs
+	inspect.HostConfig.PidsLimit = d.mcpResources.PidsLimit
+
 	resp, err := d.client.ContainerCreate(ctx, inspect.Config, inspect.HostConfig, networkingConfig, nil, containerName)
 	if err != nil {
 		return fmt.Errorf("failed to recreate container %s: %w", id, err)
@@ -1206,7 +1226,7 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 	}
 
 	// Host config with port bindings and volume mounts.
-	hostConfig := newMCPServerHostConfig(containerPortStr, volumeMounts)
+	hostConfig := newMCPServerHostConfig(containerPortStr, volumeMounts, d.mcpResources)
 
 	// Configure network
 	networkingConfig := &network.NetworkingConfig{}

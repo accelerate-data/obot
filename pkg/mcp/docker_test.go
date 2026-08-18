@@ -12,7 +12,7 @@ import (
 )
 
 func TestNewMCPServerHostConfigMapsHostDockerInternal(t *testing.T) {
-	hc := newMCPServerHostConfig("8099/tcp", nil)
+	hc := newMCPServerHostConfig("8099/tcp", nil, container.Resources{})
 
 	// The shim (and other MCP server containers) must be able to reach services
 	// published on the host via host.docker.internal, matching how Obot's own
@@ -574,5 +574,27 @@ func TestMCPDockerResourcesRejectsGarbage(t *testing.T) {
 				t.Fatal("expected an error, got nil")
 			}
 		})
+	}
+}
+
+func TestNewMCPServerHostConfigAppliesResourceCeiling(t *testing.T) {
+	pids := int64(512)
+	hc := newMCPServerHostConfig("8099/tcp", nil, container.Resources{
+		Memory:    1024 * 1024 * 1024,
+		NanoCPUs:  1_000_000_000,
+		PidsLimit: &pids,
+	})
+
+	if hc.Memory != 1024*1024*1024 {
+		t.Fatalf("expected the memory ceiling on the host config, got %d", hc.Memory)
+	}
+	if hc.NanoCPUs != 1_000_000_000 {
+		t.Fatalf("expected the CPU ceiling on the host config, got %d", hc.NanoCPUs)
+	}
+	if hc.PidsLimit == nil || *hc.PidsLimit != 512 {
+		t.Fatalf("expected the pids ceiling on the host config, got %v", hc.PidsLimit)
+	}
+	if hc.RestartPolicy.Name != "unless-stopped" {
+		t.Fatalf("resource ceiling must not disturb the restart policy, got %q", hc.RestartPolicy.Name)
 	}
 }
