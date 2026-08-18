@@ -12,6 +12,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/go-connections/nat"
+	"github.com/docker/go-units"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/filters"
@@ -120,6 +122,42 @@ func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount) *cont
 			Name: "unless-stopped",
 		},
 	}
+}
+
+// mcpDockerResources turns the operator-facing ceiling strings into a resource
+// block for every MCP server container. An empty value leaves that dimension
+// uncapped, which is the behaviour deployments had before these knobs existed,
+// so clearing one variable is a complete escape hatch. Parsing here rather than
+// at spawn time turns a typo into one clear startup failure instead of an opaque
+// Docker API error on every server.
+func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, error) {
+	var res container.Resources
+
+	if memory = strings.TrimSpace(memory); memory != "" {
+		parsed, err := units.RAMInBytes(memory)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker memory ceiling %q: %w", memory, err)
+		}
+		res.Memory = parsed
+	}
+
+	if cpus = strings.TrimSpace(cpus); cpus != "" {
+		parsed, err := strconv.ParseFloat(cpus, 64)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: %w", cpus, err)
+		}
+		res.NanoCPUs = int64(parsed * 1e9)
+	}
+
+	if pidsLimit = strings.TrimSpace(pidsLimit); pidsLimit != "" {
+		parsed, err := strconv.ParseInt(pidsLimit, 10, 64)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: %w", pidsLimit, err)
+		}
+		res.PidsLimit = &parsed
+	}
+
+	return res, nil
 }
 
 func detectDockerBackendNetwork(ctx context.Context, cli *client.Client) (bool, string, string, error) {

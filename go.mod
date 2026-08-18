@@ -97,7 +97,10 @@ require (
 	sigs.k8s.io/yaml v1.6.0
 )
 
-require github.com/coreos/go-oidc/v3 v3.18.0
+require (
+	github.com/coreos/go-oidc/v3 v3.18.0
+	github.com/docker/go-units v0.5.0
+)
 
 require (
 	cel.dev/expr v0.25.2 // indirect
@@ -159,7 +162,6 @@ require (
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/dlclark/regexp2/v2 v2.2.1 // indirect
-	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dop251/goja v0.0.0-20260701091749-b07b74453ea9 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect

@@ -533,3 +533,46 @@ func TestAcquireImageThenBoundStartup(t *testing.T) {
 		}
 	})
 }
+
+func TestMCPDockerResourcesParsesLimits(t *testing.T) {
+	res, err := mcpDockerResources("1g", "1", "512")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Memory != 1024*1024*1024 {
+		t.Fatalf("expected 1GiB memory, got %d", res.Memory)
+	}
+	if res.NanoCPUs != 1_000_000_000 {
+		t.Fatalf("expected 1 CPU in nanocpus, got %d", res.NanoCPUs)
+	}
+	if res.PidsLimit == nil || *res.PidsLimit != 512 {
+		t.Fatalf("expected pids limit 512, got %v", res.PidsLimit)
+	}
+}
+
+func TestMCPDockerResourcesEmptyLeavesUncapped(t *testing.T) {
+	res, err := mcpDockerResources("", "  ", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Memory != 0 || res.NanoCPUs != 0 || res.PidsLimit != nil {
+		t.Fatalf("expected an uncapped block, got %+v", res)
+	}
+}
+
+func TestMCPDockerResourcesRejectsGarbage(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		memory, cpus, pidsLimit string
+	}{
+		{name: "memory", memory: "banana", cpus: "1", pidsLimit: "512"},
+		{name: "cpus", memory: "1g", cpus: "banana", pidsLimit: "512"},
+		{name: "pids", memory: "1g", cpus: "1", pidsLimit: "banana"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := mcpDockerResources(tc.memory, tc.cpus, tc.pidsLimit); err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+		})
+	}
+}
