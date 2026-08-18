@@ -137,12 +137,19 @@ func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount, resou
 	}
 }
 
+// dockerMinMemoryBytes is Docker's own floor for a container memory limit. The
+// daemon rejects anything smaller when it creates the container, so accepting it
+// here would leave Obot running while every MCP server failed to start.
+const dockerMinMemoryBytes int64 = 6 * 1024 * 1024
+
 // mcpDockerResources turns the operator-facing ceiling strings into a resource
 // block for every MCP server container. An empty value leaves that dimension
 // uncapped, which is the behaviour deployments had before these knobs existed,
 // so clearing one variable is a complete escape hatch. Parsing here rather than
 // at spawn time turns a typo into one clear startup failure instead of an opaque
-// Docker API error on every server.
+// Docker API error on every server. Out-of-range values are rejected for the
+// same reason as malformed ones — Docker refuses them at container-create time,
+// which would break every MCP server rather than bounding it.
 func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, error) {
 	var res container.Resources
 
@@ -150,6 +157,12 @@ func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, er
 		parsed, err := units.RAMInBytes(memory)
 		if err != nil {
 			return container.Resources{}, fmt.Errorf("invalid MCP Docker memory ceiling %q: %w", memory, err)
+		}
+		if parsed < dockerMinMemoryBytes {
+			return container.Resources{}, fmt.Errorf(
+				"invalid MCP Docker memory ceiling %q: must be at least %s, Docker's own minimum",
+				memory, units.BytesSize(float64(dockerMinMemoryBytes)),
+			)
 		}
 		res.Memory = parsed
 	}
@@ -159,6 +172,9 @@ func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, er
 		if err != nil {
 			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: %w", cpus, err)
 		}
+		if parsed <= 0 {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: must be greater than 0", cpus)
+		}
 		res.NanoCPUs = int64(parsed * 1e9)
 	}
 
@@ -166,6 +182,9 @@ func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, er
 		parsed, err := strconv.ParseInt(pidsLimit, 10, 64)
 		if err != nil {
 			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: %w", pidsLimit, err)
+		}
+		if parsed < 1 {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: must be at least 1", pidsLimit)
 		}
 		res.PidsLimit = &parsed
 	}

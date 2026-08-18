@@ -565,9 +565,17 @@ func TestMCPDockerResourcesRejectsGarbage(t *testing.T) {
 		name                    string
 		memory, cpus, pidsLimit string
 	}{
-		{name: "memory", memory: "banana", cpus: "1", pidsLimit: "512"},
-		{name: "cpus", memory: "1g", cpus: "banana", pidsLimit: "512"},
-		{name: "pids", memory: "1g", cpus: "1", pidsLimit: "banana"},
+		{name: "malformed memory", memory: "banana", cpus: "1", pidsLimit: "512"},
+		{name: "malformed cpus", memory: "1g", cpus: "banana", pidsLimit: "512"},
+		{name: "malformed pids", memory: "1g", cpus: "1", pidsLimit: "banana"},
+		// Out of range is as fatal as malformed: Docker rejects each of these
+		// when it creates the container, so accepting them here would leave
+		// Obot up while every MCP server silently failed to start.
+		{name: "memory under Docker's floor", memory: "4m", cpus: "1", pidsLimit: "512"},
+		{name: "zero cpus", memory: "1g", cpus: "0", pidsLimit: "512"},
+		{name: "negative cpus", memory: "1g", cpus: "-1", pidsLimit: "512"},
+		{name: "zero pids", memory: "1g", cpus: "1", pidsLimit: "0"},
+		{name: "negative pids", memory: "1g", cpus: "1", pidsLimit: "-5"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := mcpDockerResources(tc.memory, tc.cpus, tc.pidsLimit); err == nil {
