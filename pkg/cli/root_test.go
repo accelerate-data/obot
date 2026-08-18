@@ -205,3 +205,29 @@ func captureStderr(t *testing.T, fn func()) string {
 	}
 	return string(data)
 }
+
+func TestServerHelpAdvertisesMCPDockerResourceEnvs(t *testing.T) {
+	var output bytes.Buffer
+	cmd := New()
+	cmd.SetArgs([]string{"server", "--help"})
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	help := output.String()
+	for _, want := range []string{
+		"--mcp-docker-memory",
+		"$OBOT_MCP_DOCKER_MEMORY",
+		"--mcp-docker-cpus",
+		"$OBOT_MCP_DOCKER_CPUS",
+		"--mcp-docker-pids-limit",
+		"$OBOT_MCP_DOCKER_PIDS_LIMIT",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("expected server help to include %q, got:\n%s", want, help)
+		}
+	}
+}
