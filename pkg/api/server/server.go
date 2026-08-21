@@ -24,6 +24,7 @@ import (
 	"github.com/obot-platform/obot/pkg/license"
 	"github.com/obot-platform/obot/pkg/proxy"
 	"github.com/obot-platform/obot/pkg/storage"
+	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -73,7 +74,7 @@ func NewServer(storageClient storage.Client, gatewayClient *gclient.Client, loca
 		providerEntitlementGate: license.NewProviderEntitlementGate(licenseProvider, storageClient),
 	}
 	s.otelHandler = otelhttp.NewHandler(
-		s.mux,
+		accessLog(s.mux),
 		"obot/http",
 		otelhttp.WithFilter(func(r *http.Request) bool {
 			return r.URL.Path != "/api/healthz" && !isStaticAssetPath(r.URL.Path)
@@ -348,4 +349,42 @@ func (rw *responseWriter) Flush() {
 // wrapper hides the Hijacker the server provides.
 func (rw *responseWriter) Unwrap() http.ResponseWriter {
 	return rw.ResponseWriter
+}
+
+// accessLog emits one request-completion log per API request, carrying the
+// request context. It sits INSIDE the otelhttp handler so the context holds
+// the server span — the otel logrus bridge then stamps the record with the
+// span's trace id, which is what lets an operator join a log line to its
+// trace. Skips the same paths otelhttp does not trace, so health probes and
+// static assets stay out of the log stream.
+func accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/healthz" || isStaticAssetPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(sw, r)
+		route := r.Pattern
+		if route == "" {
+			route = r.URL.Path
+		}
+		logrus.WithContext(r.Context()).WithFields(logrus.Fields{
+			"method":     r.Method,
+			"route":      route,
+			"status":     sw.status,
+			"durationMs": time.Since(start).Milliseconds(),
+		}).Info("http request completed")
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }
