@@ -293,7 +293,7 @@ func (w *headersResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}
-	return io.Copy(w, r)
+	return io.Copy(w.ResponseWriter, r)
 }
 
 func (w *headersResponseWriter) Flush() {
