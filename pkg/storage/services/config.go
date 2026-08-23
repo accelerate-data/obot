@@ -36,7 +36,11 @@ func New(config Config) (_ *Services, err error) {
 	// Sanitize DSN for logging (remove credentials)
 	sanitizedDSN := logutil.SanitizeDSN(config.DSN)
 	log.Debugf("Creating database factory. dsn: %v", sanitizedDSN)
-	dbClient, err := db.NewFactory(scheme.Scheme, config.DSN)
+	dbClient, err := connectDB(
+		func() (*db.Factory, error) { return db.NewFactory(scheme.Scheme, config.DSN) },
+		dbConnectMaxAttempts,
+		dbConnectRetryDelay,
+	)
 	if err != nil {
 		log.Errorf("Failed to create database factory: dsn=%s error=%v", sanitizedDSN, err)
 		return nil, err
