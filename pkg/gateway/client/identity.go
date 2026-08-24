@@ -19,6 +19,7 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/storage/value"
@@ -184,8 +185,14 @@ func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Iden
 			if err = c.encryptIdentity(ctx, id); err != nil {
 				return nil, false, fmt.Errorf("failed to encrypt identity: %w", err)
 			}
-			if err = tx.Create(id).Error; err != nil {
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(id)
+			if err = result.Error; err != nil {
 				return nil, false, err
+			}
+			if result.RowsAffected == 0 {
+				if err = tx.First(id).Error; err != nil {
+					return nil, false, err
+				}
 			}
 		} else if err != nil {
 			return nil, false, err
