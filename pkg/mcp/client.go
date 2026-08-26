@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -179,7 +180,7 @@ func (sm *SessionManager) loadSession(ctx context.Context, server ServerConfig, 
 
 	var oauthHandler auth.OAuthHandler
 	if clientOpts.TokenStorage != nil {
-		oauthHandler = newOAuth(httpClient, clientOpts.CallbackHandler, clientOpts.ClientLookup, clientOpts.TokenStorage, server.MCPServerName, clientOpts.ClientName, sm.baseURL+"/oauth/mcp/callback", system.OAuthClientIDMetadataURL(sm.baseURL))
+		oauthHandler = newOAuth(httpClient, clientOpts.CallbackHandler, clientOpts.ClientLookup, clientOpts.TokenStorage, server.MCPServerName, clientOpts.ClientName, sm.baseURL+"/oauth/mcp/callback", sm.clientIDMetadataDocument())
 	}
 
 	session, err := c.Connect(ctx, &gomcp.StreamableClientTransport{
@@ -214,4 +215,13 @@ func (sm *SessionManager) loadSession(ctx context.Context, server ServerConfig, 
 	}
 
 	return result, nil
+}
+
+func (sm *SessionManager) clientIDMetadataDocument() string {
+	runtimeOrigin, err := url.Parse(sm.baseURL)
+	if err != nil || sm.forceDynamicClient || !strings.EqualFold(runtimeOrigin.Scheme, "https") {
+		return ""
+	}
+
+	return system.OAuthClientIDMetadataURL(sm.baseURL)
 }

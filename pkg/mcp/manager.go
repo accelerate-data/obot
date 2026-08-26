@@ -92,6 +92,7 @@ type SessionManager struct {
 	tokenService              *persistent.TokenService
 	globalTokenStore          GlobalTokenStore
 	baseURL                   string
+	forceDynamicClient        bool
 	httpListenPort            int
 	remoteURLValidationConfig RemoteMCPURLValidationConfig
 	resourceMaximums          ResourceMaximums
@@ -125,7 +126,7 @@ const streamableHTTPHealthcheckBody string = `{
     }
 }`
 
-func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore GlobalTokenStore, tokenService *persistent.TokenService, baseURL string, httpListenPort int, opts Options, webhookHelper *WebhookHelper, localK8sConfig *rest.Config, client, cachedClient, obotStorageClient kclient.WithWatch, gatewayClient *gateway.Client, obotNamespace string, tunnelManager *tunnel.Manager) (*SessionManager, error) {
+func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore GlobalTokenStore, tokenService *persistent.TokenService, baseURL string, forceDynamicClient bool, httpListenPort int, opts Options, webhookHelper *WebhookHelper, localK8sConfig *rest.Config, client, cachedClient, obotStorageClient kclient.WithWatch, gatewayClient *gateway.Client, obotNamespace string, tunnelManager *tunnel.Manager) (*SessionManager, error) {
 	var backend backend
 	resourceMaximums, err := ParseResourceMaximums(opts)
 	if err != nil {
@@ -193,6 +194,7 @@ func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore G
 		backend:                   backend,
 		runtimeBackend:            opts.MCPRuntimeBackend,
 		baseURL:                   baseURL,
+		forceDynamicClient:        forceDynamicClient,
 		httpListenPort:            httpListenPort,
 		resourceMaximums:          resourceMaximums,
 		storageClient:             obotStorageClient,
