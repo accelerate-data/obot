@@ -2,6 +2,7 @@ package types
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -362,7 +363,9 @@ func TestMapCatalogEntryToServer_RemoteFixedURLKeepsRemoteHeadersAsServerConfig(
 	if result.RemoteConfig == nil || len(result.RemoteConfig.Headers) != 1 {
 		t.Fatalf("Expected one remote header, got %#v", result.RemoteConfig)
 	}
-	if result.RemoteConfig.Headers[0] != header {
+	// reflect.DeepEqual, not !=: MCPHeader carries a slice of configuration
+	// options, so it is no longer comparable.
+	if !reflect.DeepEqual(result.RemoteConfig.Headers[0], header) {
 		t.Fatalf("Expected remote header %#v, got %#v", header, result.RemoteConfig.Headers[0])
 	}
 }
@@ -394,7 +397,7 @@ func TestMapCatalogEntryToServer_RemoteFixedURLCopiesMultiUserHeadersSeparately(
 	if result.MultiUserConfig == nil || len(result.MultiUserConfig.UserDefinedHeaders) != 1 {
 		t.Fatalf("Expected one multi-user header, got %#v", result.MultiUserConfig)
 	}
-	if result.MultiUserConfig.UserDefinedHeaders[0] != header {
+	if !reflect.DeepEqual(result.MultiUserConfig.UserDefinedHeaders[0], header) {
 		t.Fatalf("Expected multi-user header %#v, got %#v", header, result.MultiUserConfig.UserDefinedHeaders[0])
 	}
 }

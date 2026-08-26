@@ -232,6 +232,8 @@ type MCPServerCatalogEntryManifest struct {
 	Icon             string            `json:"icon"`
 	RepoURL          string            `json:"repoURL,omitempty"`
 	ToolPreview      []MCPServerTool   `json:"toolPreview,omitempty"`
+	// UpgradeNote is source-provided Markdown shown before applying catalog updates.
+	UpgradeNote string `json:"upgradeNote,omitempty"`
 
 	// Runtime configuration
 	Runtime Runtime `json:"runtime"`
@@ -289,9 +291,18 @@ type MCPHeader struct {
 	Sensitive bool   `json:"sensitive"`
 	Required  bool   `json:"required"`
 	Prefix    string `json:"prefix,omitempty"` // Optional prefix to prepend to user-supplied values (e.g., "Bearer ")
+	// Options constrains user-supplied values to selections owned by a Git-managed catalog entry.
+	Options []MCPConfigurationOption `json:"options,omitempty"`
 
 	// SecretBinding binds this value to a key in a pre-existing Kubernetes Secret
 	SecretBinding *MCPSecretBinding `json:"secretBinding,omitempty"`
+}
+
+// MCPConfigurationOption is a catalog-owned value that can be selected for an MCP configuration field.
+type MCPConfigurationOption struct {
+	Name        string `json:"name"`
+	Value       string `json:"value"`
+	Description string `json:"description,omitempty"`
 }
 
 // MCPSecretBinding references a single key in a pre-existing Kubernetes Secret

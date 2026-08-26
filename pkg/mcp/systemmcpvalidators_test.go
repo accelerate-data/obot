@@ -190,6 +190,47 @@ func TestValidateSystemMCPServerManifest(t *testing.T) {
 			expectError:         true,
 			expectedErrContains: "secretBinding is not supported for system MCP servers",
 		},
+		{
+			name: "invalid - env option with a blank value",
+			manifest: types.SystemMCPServerManifest{
+				Runtime: types.RuntimeNPX,
+				NPXConfig: &types.NPXRuntimeConfig{
+					Package: "@example/server",
+				},
+				Env: []types.MCPEnv{{
+					MCPHeader: types.MCPHeader{
+						Key:      "REGION",
+						Name:     "Region",
+						Required: true,
+						Options: []types.MCPConfigurationOption{
+							{Name: "United States", Value: ""},
+						},
+					},
+				}},
+			},
+			expectError:         true,
+			expectedErrContains: "env[0].options[0].value cannot be empty",
+		},
+		{
+			name: "invalid - remote header options duplicate a value",
+			manifest: types.SystemMCPServerManifest{
+				Runtime: types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{
+					URL: "https://example.com/mcp",
+					Headers: []types.MCPHeader{{
+						Key:      "X-Region",
+						Name:     "Region",
+						Required: true,
+						Options: []types.MCPConfigurationOption{
+							{Name: "United States", Value: "us"},
+							{Name: "Europe", Value: "us"},
+						},
+					}},
+				},
+			},
+			expectError:         true,
+			expectedErrContains: `remoteConfig.headers[0].options contains duplicate value "us"`,
+		},
 	}
 
 	for _, tt := range tests {

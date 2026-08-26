@@ -85,6 +85,46 @@ npxConfig:
 	require.ErrorContains(t, err, `key "name" already set`)
 }
 
+func TestDecodeCatalogFileAcceptsConfigurationOptionsAndUpgradeNote(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "entry.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`name: Region Aware
+runtime: remote
+upgradeNote: Re-select a region after upgrading.
+remoteConfig:
+  fixedURL: https://example.com/mcp
+  headers:
+    - name: Region Header
+      key: X-Region
+      required: true
+      options:
+        - name: United States
+          value: us
+        - name: Europe
+          value: eu
+env:
+  - name: Region
+    key: REGION
+    required: true
+    options:
+      - name: United States
+        value: us
+        description: US data residency
+`), 0o600))
+
+	entries, _, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+
+	// Strict decode succeeding is not enough: an ignored field would also produce
+	// no error under a non-strict decoder, so assert the values round-tripped.
+	require.Equal(t, "Re-select a region after upgrading.", entries[0].UpgradeNote)
+	require.Len(t, entries[0].Env[0].Options, 1)
+	require.Equal(t, "us", entries[0].Env[0].Options[0].Value)
+	require.Equal(t, "US data residency", entries[0].Env[0].Options[0].Description)
+	require.Len(t, entries[0].RemoteConfig.Headers[0].Options, 2)
+	require.Equal(t, "eu", entries[0].RemoteConfig.Headers[0].Options[1].Value)
+}
+
 func TestNormalizeManifest(t *testing.T) {
 	entry := types.MCPServerCatalogEntryManifest{
 		Runtime:      types.RuntimeRemote,

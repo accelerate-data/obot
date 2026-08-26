@@ -1223,6 +1223,9 @@ func validateCompositeCatalogEntryResourceMaximums(manifest types.MCPServerCatal
 }
 
 func ValidateServerManifest(ctx context.Context, manifest types.MCPServerManifest, isMultiUser bool, options ValidationOptions) error {
+	if err := validateServerConfigurationOptions(manifest); err != nil {
+		return err
+	}
 	if err := validateMCPResourceRequirements(manifest.Runtime, manifest.Resources); err != nil {
 		return err
 	}
@@ -1278,6 +1281,9 @@ func ValidateCatalogEntryForRoute(manifest types.MCPServerCatalogEntryManifest, 
 }
 
 func ValidateCatalogEntryManifest(ctx context.Context, manifest types.MCPServerCatalogEntryManifest, gitManaged bool, options ValidationOptions) error {
+	if err := validateCatalogConfigurationOptions(manifest, ""); err != nil {
+		return err
+	}
 	if utf8.RuneCountInString(manifest.ShortDescription) > maxShortDescriptionLength {
 		return fmt.Errorf("short description must be less than or equal to %d characters", maxShortDescriptionLength)
 	}
@@ -1427,6 +1433,9 @@ func ValidateSystemMCPServerCatalogEntryManifest(ctx context.Context, manifest t
 }
 
 func ValidateSystemMCPServerManifest(ctx context.Context, manifest types.SystemMCPServerManifest, options ValidationOptions) error {
+	if err := validateConfigurationOptions(manifest.Env, remoteHeaders(manifest.RemoteConfig), nil, ""); err != nil {
+		return err
+	}
 	if manifest.RemoteConfig != nil && manifest.RemoteConfig.TunnelName != "" {
 		return types.RuntimeValidationError{
 			Runtime: manifest.Runtime,
