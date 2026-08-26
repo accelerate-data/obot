@@ -299,7 +299,7 @@ go test -race ./pkg/mcp -run TestSessionManagerClientIDMetadataDocument -count=1
 
 Do not dismiss a race as environmental. If a broader package race run reaches a pre-existing unrelated test, record the exact test and still keep the changed-path race tests green.
 
-- [ ] **Step 3: Run the package and repository gates**
+- [x] **Step 3: Run the package and repository gates**
 
 ```bash
 go test ./pkg/gateway/client ./pkg/controller/handlers/mcpservercatalogentry ./pkg/controller/handlers/mcpcatalog ./pkg/mcp ./pkg/services -count=1
@@ -310,7 +310,7 @@ git diff --check
 
 Expected: all commands exit 0. Investigate the first causal failure rather than weakening assertions or changing timeouts.
 
-- [ ] **Step 4: Audit the final scope**
+- [x] **Step 4: Audit the final scope**
 
 ```bash
 git diff --name-only origin/main...HEAD
@@ -332,7 +332,7 @@ Confirm every caller uses the intended cleanup scope, every session receives the
 - Consumes: the committed Obot branch image and Studio's product `OBOT_IMAGE` override
 - Produces: manual proof that local HTTP Studio uses DCR and Linear OAuth remains connected after callback and refresh
 
-- [ ] **Step 1: Build the local Obot image**
+- [x] **Step 1: Build the local Obot image**
 
 Build the worktree with the same Dockerfile used by the repository's image workflow and record the source SHA and image ID in the test notes:
 
