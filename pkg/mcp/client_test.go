@@ -5,6 +5,43 @@ import (
 	"testing"
 )
 
+func TestSessionManagerClientIDMetadataDocument(t *testing.T) {
+	tests := []struct {
+		name               string
+		baseURL            string
+		forceDynamicClient bool
+		want               string
+	}{
+		{
+			name:    "uses the metadata document for an HTTPS origin by default",
+			baseURL: "https://obot.example.com",
+			want:    "https://obot.example.com/oauth/client-metadata.json",
+		},
+		{
+			name:               "omits the metadata document when dynamic registration is forced",
+			baseURL:            "https://obot.example.com",
+			forceDynamicClient: true,
+		},
+		{
+			name:    "omits the metadata document for an HTTP origin",
+			baseURL: "http://host.docker.internal:3000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sm := SessionManager{
+				baseURL:            tt.baseURL,
+				forceDynamicClient: tt.forceDynamicClient,
+			}
+
+			if got := sm.clientIDMetadataDocument(); got != tt.want {
+				t.Fatalf("client ID metadata document = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestServerIDIgnoresDynamicFileData(t *testing.T) {
 	serverA := ServerConfig{
 		Runtime:       "containerized",

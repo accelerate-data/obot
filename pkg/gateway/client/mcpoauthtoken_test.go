@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -973,8 +974,11 @@ func TestCommitMCPStaticOAuthCredentialConsumesProofBeforeAtomicMutation(t *test
 		}); err != nil {
 			t.Fatalf("seed active credential: %v", err)
 		}
-		if err := c.ReplaceMCPOAuthToken(t.Context(), "user-1", "instance-1", "https://mcp.example/api", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "active-token"}); err != nil {
-			t.Fatalf("seed active token: %v", err)
+		if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+			MCPID: "instance-1", UserID: "user-1", URL: "https://mcp.example/api",
+			CatalogEntryName: "catalog-entry-1", AccessToken: "active-token",
+		}).Error; err != nil {
+			t.Fatalf("seed active static OAuth token: %v", err)
 		}
 		if err := c.db.WithContext(t.Context()).Exec(`CREATE TRIGGER fail_static_token_delete BEFORE DELETE ON mcpo_auth_tokens BEGIN SELECT RAISE(FAIL, 'injected token delete failure'); END`).Error; err != nil {
 			t.Fatalf("install token failure trigger: %v", err)
@@ -1163,6 +1167,188 @@ func TestDeleteMCPOAuthTokenForAllUsersTriggersServerReconciliation(t *testing.T
 	}
 }
 
+func TestDeleteMCPStaticOAuthCredentialPreservesDynamicGrantWithoutStaticCredential(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "server-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	if err := c.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "dynamic-token"}); err != nil {
+		t.Fatalf("seed dynamic OAuth grant: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: "fenced-grant", UserID: "user-2", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed fenced static OAuth grant: %v", err)
+	}
+
+	deleted, err := c.DeleteMCPStaticOAuthCredential(t.Context(), entryName, mcpID)
+	if err != nil {
+		t.Fatalf("clean up absent static OAuth credential: %v", err)
+	}
+	if deleted {
+		t.Fatal("reported deleting a static OAuth credential that did not exist")
+	}
+	if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL); err != nil {
+		t.Fatalf("dynamic OAuth grant was deleted by static cleanup: %v", err)
+	}
+	var fencedGrantCount int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+		Where("mcp_id = ?", "fenced-grant").Count(&fencedGrantCount).Error; err != nil {
+		t.Fatalf("count fenced static OAuth grants: %v", err)
+	}
+	if fencedGrantCount != 0 {
+		t.Fatalf("fenced static OAuth grant count = %d, want 0", fencedGrantCount)
+	}
+}
+
+func TestDeleteMCPStaticOAuthCredentialPreservesDynamicGrantWithStaticCredential(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "server-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.ReplaceMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "dynamic-token"}); err != nil {
+		t.Fatalf("seed dynamic OAuth grant: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: "fenced-grant", UserID: "static-user", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed fenced static OAuth grant: %v", err)
+	}
+
+	deleted, err := c.DeleteMCPStaticOAuthCredential(t.Context(), entryName, mcpID)
+	if err != nil {
+		t.Fatalf("delete static OAuth credential: %v", err)
+	}
+	if !deleted {
+		t.Fatal("did not report deleting the static OAuth credential")
+	}
+	if _, err := c.GetMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL); err != nil {
+		t.Fatalf("dynamic OAuth grant was deleted by static cleanup: %v", err)
+	}
+	var fencedGrantCount int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+		Where("mcp_id = ?", "fenced-grant").Count(&fencedGrantCount).Error; err != nil {
+		t.Fatalf("count fenced static OAuth grants: %v", err)
+	}
+	if fencedGrantCount != 0 {
+		t.Fatalf("fenced static OAuth grant count = %d, want 0", fencedGrantCount)
+	}
+}
+
+func TestReplaceMCPStaticOAuthCredentialPreservesDynamicGrant(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "server-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "old-client", "CLIENT_SECRET": "old-secret"},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.ReplaceMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "dynamic-token"}); err != nil {
+		t.Fatalf("seed dynamic OAuth grant: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: "fenced-grant", UserID: "static-user", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed fenced static OAuth grant: %v", err)
+	}
+
+	started, conf := createStaticOAuthTest(t, c)
+	proof := completeSuccessfulStaticOAuthTest(t, c, started)
+	if err := c.commitMCPStaticOAuthCredential(
+		t.Context(), proof, "user-1", entryName, mcpURL,
+		conf.ClientID, conf.ClientSecret, true, mcpID,
+	); err != nil {
+		t.Fatalf("replace static OAuth credential: %v", err)
+	}
+
+	if _, err := c.GetMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL); err != nil {
+		t.Fatalf("dynamic OAuth grant was deleted by credential replacement: %v", err)
+	}
+	var fencedGrantCount int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+		Where("mcp_id = ?", "fenced-grant").Count(&fencedGrantCount).Error; err != nil {
+		t.Fatalf("count fenced static OAuth grants: %v", err)
+	}
+	if fencedGrantCount != 0 {
+		t.Fatalf("fenced static OAuth grant count = %d, want 0", fencedGrantCount)
+	}
+}
+
+func TestDeleteMCPStaticOAuthStateForDeletedCatalogEntryPurgesDeploymentGrants(t *testing.T) {
+	c := newTestClient(t)
+	const entryName = "catalog-entry-1"
+	var triggered []string
+	c.mcpOAuthTokenTrigger = func(_ context.Context, mcpID string) error {
+		triggered = append(triggered, mcpID)
+		return nil
+	}
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&[]gwtypes.MCPOAuthToken{
+		{MCPID: "fenced-grant", UserID: "static-user", CatalogEntryName: entryName},
+		{MCPID: "server-1", UserID: "dynamic-user"},
+		{MCPID: "instance-1", UserID: "container-user"},
+		{MCPID: "unrelated", UserID: "other-user", CatalogEntryName: "other-entry"},
+	}).Error; err != nil {
+		t.Fatalf("seed OAuth grants: %v", err)
+	}
+
+	deleted, err := c.DeleteMCPStaticOAuthStateForDeletedCatalogEntry(
+		t.Context(), entryName, "server-1", "instance-1",
+	)
+	if err != nil {
+		t.Fatalf("purge deleted catalog entry OAuth state: %v", err)
+	}
+	if !deleted {
+		t.Fatal("did not report deleting the static OAuth credential")
+	}
+
+	var targetedGrantCount int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+		Where("catalog_entry_name = ? OR mcp_id IN ?", entryName, []string{"server-1", "instance-1"}).
+		Count(&targetedGrantCount).Error; err != nil {
+		t.Fatalf("count purged OAuth grants: %v", err)
+	}
+	if targetedGrantCount != 0 {
+		t.Fatalf("targeted OAuth grant count = %d, want 0", targetedGrantCount)
+	}
+	var unrelatedGrantCount int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+		Where("mcp_id = ?", "unrelated").Count(&unrelatedGrantCount).Error; err != nil {
+		t.Fatalf("count unrelated OAuth grants: %v", err)
+	}
+	if unrelatedGrantCount != 1 {
+		t.Fatalf("unrelated OAuth grant count = %d, want 1", unrelatedGrantCount)
+	}
+	for _, mcpID := range []string{"fenced-grant", "server-1", "instance-1"} {
+		if !slices.Contains(triggered, mcpID) {
+			t.Fatalf("reconciliation triggers = %v, missing %q", triggered, mcpID)
+		}
+	}
+}
+
 func TestDeleteMCPStaticOAuthCredentialRetriesCleanupNotificationsAfterRowsAreGone(t *testing.T) {
 	c := newTestClient(t)
 	const (
@@ -1245,6 +1431,151 @@ func TestDeleteMCPStaticOAuthCredentialGenerationRejectsStaleClear(t *testing.T)
 	}
 	if _, err := c.GetMCPOAuthToken(t.Context(), "user-1", mcpID, ""); err != nil {
 		t.Fatalf("stale Clear removed current grant: %v", err)
+	}
+}
+
+func TestDeleteMCPStaticOAuthCredentialGenerationPreservesDynamicGrant(t *testing.T) {
+	c := newTestClient(t)
+	const (
+		entryName  = "catalog-entry-1"
+		mcpID      = "server-1"
+		mcpURL     = "https://mcp.example/api"
+		generation = "generation-1"
+	)
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{
+			"CLIENT_ID": "client", "CLIENT_SECRET": "secret",
+			"MCP_URL": mcpURL, "GENERATION": generation,
+		},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.ReplaceMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "dynamic-token"}); err != nil {
+		t.Fatalf("seed dynamic OAuth grant: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: "fenced-grant", UserID: "static-user", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed fenced static OAuth grant: %v", err)
+	}
+
+	deleted, err := c.DeleteMCPStaticOAuthCredentialGeneration(t.Context(), entryName, generation, mcpID)
+	if err != nil {
+		t.Fatalf("delete static OAuth credential generation: %v", err)
+	}
+	if !deleted {
+		t.Fatal("did not report deleting the static OAuth credential generation")
+	}
+	if _, err := c.GetMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL); err != nil {
+		t.Fatalf("dynamic OAuth grant was deleted by generation clear: %v", err)
+	}
+	var fencedGrantCount int64
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+		Where("mcp_id = ?", "fenced-grant").Count(&fencedGrantCount).Error; err != nil {
+		t.Fatalf("count fenced static OAuth grants: %v", err)
+	}
+	if fencedGrantCount != 0 {
+		t.Fatalf("fenced static OAuth grant count = %d, want 0", fencedGrantCount)
+	}
+}
+
+func TestStaticOAuthMutationOverlappingDynamicGrantPreservesGrant(t *testing.T) {
+	const (
+		entryName  = "catalog-entry-1"
+		mcpID      = "server-1"
+		mcpURL     = "https://mcp.example/api"
+		generation = "generation-1"
+	)
+
+	for _, mutation := range []string{"replacement", "generation clear"} {
+		t.Run(mutation, func(t *testing.T) {
+			c := newTestClient(t)
+			if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+				Context: system.MCPOAuthCredentialName(entryName),
+				Name:    "oauth",
+				Secrets: map[string]string{
+					"CLIENT_ID": "old-client", "CLIENT_SECRET": "old-secret",
+					"MCP_URL": mcpURL, "GENERATION": generation,
+				},
+			}); err != nil {
+				t.Fatalf("seed static OAuth credential: %v", err)
+			}
+			if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+				MCPID: mcpID, UserID: "static-user", CatalogEntryName: entryName,
+			}).Error; err != nil {
+				t.Fatalf("seed catalog-owned OAuth grant: %v", err)
+			}
+
+			var mutate func() error
+			switch mutation {
+			case "replacement":
+				started, conf := createStaticOAuthTest(t, c)
+				proof := completeSuccessfulStaticOAuthTest(t, c, started)
+				mutate = func() error {
+					return c.commitMCPStaticOAuthCredential(
+						t.Context(), proof, "user-1", entryName, mcpURL,
+						conf.ClientID, conf.ClientSecret, true, mcpID,
+					)
+				}
+			case "generation clear":
+				mutate = func() error {
+					deleted, err := c.DeleteMCPStaticOAuthCredentialGeneration(
+						t.Context(), entryName, generation, mcpID,
+					)
+					if err == nil && !deleted {
+						return errors.New("static OAuth credential generation was not deleted")
+					}
+					return err
+				}
+			}
+
+			cleanupCommitted := make(chan struct{})
+			releaseCleanup := make(chan struct{})
+			var triggerCalls atomic.Int32
+			c.mcpOAuthTokenTrigger = func(context.Context, string) error {
+				if triggerCalls.Add(1) == 1 {
+					close(cleanupCommitted)
+					<-releaseCleanup
+				}
+				return nil
+			}
+
+			mutationDone := make(chan error, 1)
+			go func() {
+				mutationDone <- mutate()
+			}()
+			select {
+			case <-cleanupCommitted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("static OAuth mutation did not commit")
+			}
+
+			dynamicErr := c.ReplaceMCPOAuthToken(
+				t.Context(), "dynamic-user", mcpID, mcpURL, "", &oauth2.Config{},
+				&oauth2.Token{AccessToken: "dynamic-token"},
+			)
+			close(releaseCleanup)
+			if dynamicErr != nil {
+				t.Fatalf("complete overlapping dynamic OAuth grant: %v", dynamicErr)
+			}
+			if err := <-mutationDone; err != nil {
+				t.Fatalf("complete static OAuth %s: %v", mutation, err)
+			}
+
+			if _, err := c.GetMCPOAuthToken(t.Context(), "dynamic-user", mcpID, mcpURL); err != nil {
+				t.Fatalf("overlapping dynamic OAuth grant was deleted: %v", err)
+			}
+			var ownedGrantCount int64
+			if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthToken{}).
+				Where("catalog_entry_name = ?", entryName).Count(&ownedGrantCount).Error; err != nil {
+				t.Fatalf("count catalog-owned OAuth grants: %v", err)
+			}
+			if ownedGrantCount != 0 {
+				t.Fatalf("catalog-owned OAuth grant count = %d, want 0", ownedGrantCount)
+			}
+		})
 	}
 }
 

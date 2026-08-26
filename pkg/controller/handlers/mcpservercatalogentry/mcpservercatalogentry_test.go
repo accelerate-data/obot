@@ -68,24 +68,27 @@ func TestDetectCompositeDriftMarksEntryNeedingUpdateWhenMultiUserComponentDrifts
 	assert.True(t, updated.Status.NeedsUpdate)
 }
 
-func TestStaticOAuthControllerCleanupRemovesCredentialProofsAndGrants(t *testing.T) {
+func TestStaticOAuthControllerCleanupScopesGrantRemovalByLifecycle(t *testing.T) {
 	for _, tt := range []struct {
-		name           string
-		runtime        types.Runtime
-		staticRequired bool
-		cleanup        func(*Handler, router.Request) error
+		name                     string
+		runtime                  types.Runtime
+		staticRequired           bool
+		wantDeploymentGrantCount int64
+		cleanup                  func(*Handler, router.Request) error
 	}{
 		{
-			name:           "provider no longer requires static OAuth",
-			runtime:        types.RuntimeRemote,
-			staticRequired: false,
+			name:                     "provider no longer requires static OAuth",
+			runtime:                  types.RuntimeRemote,
+			staticRequired:           false,
+			wantDeploymentGrantCount: 2,
 			cleanup: func(handler *Handler, req router.Request) error {
 				return handler.CleanupUnusedOAuthCredentials(req, &router.ResponseWrapper{})
 			},
 		},
 		{
-			name:    "provider changed to a non-remote runtime",
-			runtime: types.RuntimeContainerized,
+			name:                     "provider changed to a non-remote runtime",
+			runtime:                  types.RuntimeContainerized,
+			wantDeploymentGrantCount: 2,
 			cleanup: func(handler *Handler, req router.Request) error {
 				return handler.CleanupUnusedOAuthCredentials(req, &router.ResponseWrapper{})
 			},
@@ -153,11 +156,14 @@ func TestStaticOAuthControllerCleanupRemovesCredentialProofsAndGrants(t *testing
 
 			_, err = gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(entry.Name)}, "oauth")
 			require.Error(t, err)
-			var targetedGrants int64
+			var ownedGrants int64
 			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
-				Where("catalog_entry_name = ? OR mcp_id IN ?", entry.Name, []string{server.Name, instance.Name}).
-				Count(&targetedGrants).Error)
-			require.Zero(t, targetedGrants)
+				Where("catalog_entry_name = ?", entry.Name).Count(&ownedGrants).Error)
+			require.Zero(t, ownedGrants)
+			var deploymentGrants int64
+			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
+				Where("mcp_id IN ?", []string{server.Name, instance.Name}).Count(&deploymentGrants).Error)
+			require.Equal(t, tt.wantDeploymentGrantCount, deploymentGrants)
 			var pendingProofs int64
 			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthPendingState{}).
 				Where("mcp_id = ? AND static_o_auth_test = ?", entry.Name, true).

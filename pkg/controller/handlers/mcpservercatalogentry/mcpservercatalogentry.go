@@ -281,11 +281,11 @@ func (h *Handler) CleanupUnusedOAuthCredentials(req router.Request, _ router.Res
 		return fmt.Errorf("failed to coordinate static OAuth cleanup with credential mutation: %w", err)
 	}
 	defer releaseCredentialLock()
-	cleanupMCPIDs, err := staticOAuthCleanupTargetIDs(req, entry.Name)
+	deploymentMCPIDs, err := staticOAuthDeploymentIDs(req, entry.Name)
 	if err != nil {
 		return err
 	}
-	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthCredential(req.Ctx, entry.Name, cleanupMCPIDs...)
+	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthCredential(req.Ctx, entry.Name, deploymentMCPIDs...)
 	if err != nil {
 		return fmt.Errorf("failed to clean up static OAuth state: %w", err)
 	}
@@ -360,11 +360,11 @@ func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) 
 	}
 	defer releaseCredentialLock()
 
-	cleanupMCPIDs, err := staticOAuthCleanupTargetIDs(req, entry.Name)
+	deploymentMCPIDs, err := staticOAuthDeploymentIDs(req, entry.Name)
 	if err != nil {
 		return err
 	}
-	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthCredential(req.Ctx, entry.Name, cleanupMCPIDs...)
+	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthStateForDeletedCatalogEntry(req.Ctx, entry.Name, deploymentMCPIDs...)
 	if err != nil {
 		return fmt.Errorf("failed to remove static OAuth state: %w", err)
 	}
@@ -375,7 +375,7 @@ func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) 
 	return nil
 }
 
-func staticOAuthCleanupTargetIDs(req router.Request, entryName string) ([]string, error) {
+func staticOAuthDeploymentIDs(req router.Request, entryName string) ([]string, error) {
 	var servers v1.MCPServerList
 	if err := req.List(&servers, &kclient.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entryName),

@@ -185,6 +185,11 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	// Apply must not prune because its informer may still observe stale ownership metadata and
 	// delete a freshly detached entry
 	app := apply.New(req.Client).WithOwnerSubContext(fmt.Sprintf("catalog-%s", mcpCatalog.Name)).WithNoPrune()
+	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog sync with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 
 	// Missing entries cannot be reconciled safely from a partial desired set.
 	if len(mcpCatalog.Status.SyncErrors) > 0 {
@@ -197,11 +202,6 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	}
 
 	log.Infof("Applying MCP catalog entries without prune: catalog=%s entries=%d", mcpCatalog.Name, len(toAdd))
-	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
-	if err != nil {
-		return fmt.Errorf("failed to coordinate catalog sync with static OAuth: %w", err)
-	}
-	defer releaseCatalogMutationLock()
 	if err := app.Apply(req.Ctx, mcpCatalog, toAdd...); err != nil {
 		return err
 	}
