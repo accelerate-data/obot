@@ -218,6 +218,160 @@ func TestStartupRefreshIsNotConsumedByAFailedApply(t *testing.T) {
 	require.Equal(t, []string{"Alpha"}, catalogEntryManifestNames(ctx, t, storageClient))
 }
 
+func TestPartialCatalogSyncWaitsForMutationLockBeforeApply(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+	missingSource := filepath.Join(t.TempDir(), "missing")
+	catalog := &v1.MCPCatalog{
+		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
+		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
+		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir, missingSource}},
+	}
+	entryCreated := make(chan struct{}, 1)
+	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
+		Create: func(ctx context.Context, c kclient.WithWatch, obj kclient.Object, opts ...kclient.CreateOption) error {
+			if _, ok := obj.(*v1.MCPServerCatalogEntry); ok {
+				entryCreated <- struct{}{}
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}, catalog)
+	gatewayClient := newCatalogGatewayClient(t, storageClient)
+	releaseLock, err := gatewayClient.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	require.NoError(t, err)
+	released := false
+	defer func() {
+		if !released {
+			releaseLock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (&Handler{gatewayClient: gatewayClient}).Sync(syncRequest(ctx, storageClient, catalog), &router.ResponseWrapper{})
+	}()
+	require.Eventually(t, func() bool {
+		return getCatalog(ctx, t, storageClient).Status.SyncErrors[missingSource] != ""
+	}, 5*time.Second, 10*time.Millisecond)
+
+	select {
+	case <-entryCreated:
+		t.Fatal("partial catalog apply ran before acquiring the mutation lock")
+	case err := <-done:
+		t.Fatalf("partial catalog sync returned before the mutation lock was released: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseLock()
+	released = true
+	require.NoError(t, <-done)
+	select {
+	case <-entryCreated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("partial catalog apply did not run after releasing the mutation lock")
+	}
+}
+
+func TestCleanCatalogSyncWaitsForMutationLockBeforeRemoval(t *testing.T) {
+	ctx := context.Background()
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+	catalog := &v1.MCPCatalog{
+		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
+		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
+		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
+	}
+	entryDeleted := make(chan struct{}, 1)
+	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
+		Delete: func(ctx context.Context, c kclient.WithWatch, obj kclient.Object, opts ...kclient.DeleteOption) error {
+			if _, ok := obj.(*v1.MCPServerCatalogEntry); ok {
+				entryDeleted <- struct{}{}
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	}, catalog)
+	gatewayClient := newCatalogGatewayClient(t, storageClient)
+	handler := &Handler{gatewayClient: gatewayClient}
+	require.NoError(t, handler.Sync(syncRequest(ctx, storageClient, catalog), &router.ResponseWrapper{}))
+	require.Equal(t, []string{"Alpha"}, catalogEntryManifestNames(ctx, t, storageClient))
+	require.NoError(t, os.Remove(filepath.Join(catalogDir, "alpha.yaml")))
+	forced := getCatalog(ctx, t, storageClient)
+	forced.Annotations[v1.MCPCatalogSyncAnnotation] = "true"
+	require.NoError(t, storageClient.Update(ctx, forced))
+
+	releaseLock, err := gatewayClient.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	require.NoError(t, err)
+	released := false
+	defer func() {
+		if !released {
+			releaseLock()
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		done <- handler.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), &router.ResponseWrapper{})
+	}()
+	require.Eventually(t, func() bool {
+		return getCatalog(ctx, t, storageClient).Annotations[v1.MCPCatalogSyncAnnotation] == ""
+	}, 5*time.Second, 10*time.Millisecond)
+
+	select {
+	case <-entryDeleted:
+		t.Fatal("removed-entry reconciliation ran before acquiring the mutation lock")
+	case err := <-done:
+		t.Fatalf("clean catalog sync returned before the mutation lock was released: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseLock()
+	released = true
+	require.NoError(t, <-done)
+	select {
+	case <-entryDeleted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("removed-entry reconciliation did not run after releasing the mutation lock")
+	}
+}
+
+func TestPartialCatalogSyncCancellationWhileWaitingForMutationLockDoesNotApply(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	catalogDir := t.TempDir()
+	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
+	missingSource := filepath.Join(t.TempDir(), "missing")
+	catalog := &v1.MCPCatalog{
+		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
+		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
+		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir, missingSource}},
+	}
+	var entryCreates atomic.Int32
+	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
+		Create: func(ctx context.Context, c kclient.WithWatch, obj kclient.Object, opts ...kclient.CreateOption) error {
+			if _, ok := obj.(*v1.MCPServerCatalogEntry); ok {
+				entryCreates.Add(1)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}, catalog)
+	gatewayClient := newCatalogGatewayClient(t, storageClient)
+	releaseLock, err := gatewayClient.AcquireCredentialLock(context.Background(), system.MCPStaticOAuthCatalogMutationLock)
+	require.NoError(t, err)
+	defer releaseLock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (&Handler{gatewayClient: gatewayClient}).Sync(syncRequest(ctx, storageClient, catalog), &router.ResponseWrapper{})
+	}()
+	require.Eventually(t, func() bool {
+		return getCatalog(context.Background(), t, storageClient).Status.SyncErrors[missingSource] != ""
+	}, 5*time.Second, 10*time.Millisecond)
+	cancel()
+
+	err = <-done
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, entryCreates.Load())
+}
+
 func TestSyncRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testing.T) {
 	ctx := context.Background()
 	catalogDir := t.TempDir()
