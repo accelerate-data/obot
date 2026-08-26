@@ -342,7 +342,7 @@ git rev-parse HEAD
 docker image inspect obot:vd-4883-local --format '{{.Id}}'
 ```
 
-- [ ] **Step 2: Launch Studio against the local image**
+- [x] **Step 2: Launch Studio against the local image**
 
 Set Studio's supported product override:
 
@@ -352,7 +352,7 @@ OBOT_IMAGE=obot:vd-4883-local
 
 Keep `OBOT_INTERNAL_BASE_URL` and `AGENT_TO_STUDIO_BASE_URL` set to the canonical runtime-origin contract used by the worktree launcher.
 
-- [ ] **Step 3: Verify the user flow**
+- [x] **Step 3: Verify the user flow**
 
 1. Open User Settings -> MCP Servers.
 2. Start Linear OAuth from a local HTTP Studio origin.
@@ -362,7 +362,7 @@ Keep `OBOT_INTERNAL_BASE_URL` and `AGENT_TO_STUDIO_BASE_URL` set to the canonica
 6. Disconnect and reconnect once to exercise cleanup and recreation.
 7. Run a catalog refresh and confirm it does not report synchronization errors caused by credential cleanup.
 
-- [ ] **Step 4: Prepare the Obot PR handoff**
+- [x] **Step 4: Prepare the Obot PR handoff**
 
 Record focused tests, repository gates, local image ID, manual steps, and the four explicitly deferred Linear issues. Raise the Obot PR only after review and all local checks pass.
 
