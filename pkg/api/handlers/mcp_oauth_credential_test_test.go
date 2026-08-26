@@ -495,6 +495,11 @@ func newOAuthCredentialTestGatewayClientWithTrigger(t *testing.T, trigger func(c
 	return newOAuthCredentialTestGatewayClientWithOptions(t, staticOAuthTestEncryptionConfig(), trigger)
 }
 
+func newOAuthCredentialTestGatewayClientWithTriggerAndDB(t *testing.T, trigger func(context.Context, string) error) (*gatewayclient.Client, *gorm.DB) {
+	t.Helper()
+	return newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, staticOAuthTestEncryptionConfig(), trigger)
+}
+
 func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) *gatewayclient.Client {
 	t.Helper()
 	if encryptionConfig == nil {

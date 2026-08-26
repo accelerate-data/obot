@@ -1174,7 +1174,7 @@ func TestReplaceOAuthCredentialsSerializesConcurrentSameProofRequests(t *testing
 
 func TestReplaceOAuthCredentialsCleanupFailureLeavesNewConfigurationAndRequiresFreshProofToRetry(t *testing.T) {
 	failCleanup := false
-	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+	gateway, rawDB := newOAuthCredentialTestGatewayClientWithTriggerAndDB(t, func(_ context.Context, mcpID string) error {
 		if failCleanup && mcpID == "instance-a-user-1" {
 			return errors.New("instance token reconciliation unavailable")
 		}
@@ -1187,9 +1187,7 @@ func TestReplaceOAuthCredentialsCleanupFailureLeavesNewConfigurationAndRequiresF
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
 		t.Fatalf("seed active OAuth credential: %v", err)
 	}
-	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "active-token"}); err != nil {
-		t.Fatalf("seed active instance token: %v", err)
-	}
+	seedCatalogOwnedOAuthToken(t, rawDB, instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, entry.Name, "active-token")
 	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
 	failCleanup = true
 	handler := &MCPCatalogHandler{gatewayClient: gateway}
@@ -1547,7 +1545,7 @@ func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
 
 func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(t *testing.T) {
 	triggered := map[string]int{}
-	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+	gateway, rawDB := newOAuthCredentialTestGatewayClientWithTriggerAndDB(t, func(_ context.Context, mcpID string) error {
 		triggered[mcpID]++
 		return nil
 	})
@@ -1582,17 +1580,13 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 		t.Fatalf("token cleanup trigger fixture is not active: %#v, %v", triggered, err)
 	}
 	clear(triggered)
-	conf := &oauth2.Config{ClientID: "saved-client", ClientSecret: "saved-secret"}
 	for _, instance := range instances {
-		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "instance-token-" + instance.Name}); err != nil {
-			t.Fatalf("seed user token for %s: %v", instance.Name, err)
-		}
+		seedCatalogOwnedOAuthToken(t, rawDB, instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, entry.Name, "instance-token-"+instance.Name)
 	}
 	for _, server := range servers {
-		if err := gateway.ReplaceMCPOAuthToken(t.Context(), "single-user", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "server-token-" + server.Name}); err != nil {
-			t.Fatalf("seed server-name token for %s: %v", server.Name, err)
-		}
+		seedCatalogOwnedOAuthToken(t, rawDB, "single-user", server.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, entry.Name, "server-token-"+server.Name)
 	}
+	conf := &oauth2.Config{ClientID: "saved-client", ClientSecret: "saved-secret"}
 	if err := gateway.ReplaceMCPOAuthToken(t.Context(), unrelatedInstance.Spec.UserID, unrelatedInstance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", conf, &oauth2.Token{AccessToken: "unrelated-instance-token"}); err != nil {
 		t.Fatalf("seed unrelated instance token: %v", err)
 	}
@@ -1761,7 +1755,7 @@ func TestDeleteOAuthCredentialsReturnsInstanceListFailure(t *testing.T) {
 func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 	failPurge := false
 	triggered := map[string]int{}
-	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+	gateway, rawDB := newOAuthCredentialTestGatewayClientWithTriggerAndDB(t, func(_ context.Context, mcpID string) error {
 		triggered[mcpID]++
 		if failPurge && mcpID == "instance-a-user-1" {
 			return errors.New("token purge trigger unavailable")
@@ -1781,9 +1775,7 @@ func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
 	for _, instance := range instances {
-		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token-" + instance.Name}); err != nil {
-			t.Fatalf("seed user token for %s: %v", instance.Name, err)
-		}
+		seedCatalogOwnedOAuthToken(t, rawDB, instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, entry.Name, "token-"+instance.Name)
 	}
 	clear(triggered)
 	failPurge = true
@@ -1804,12 +1796,12 @@ func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 
 func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *testing.T) {
 	purgeAttempts := 0
-	gateway := newOAuthCredentialTestGatewayClientWithTrigger(t, func(_ context.Context, mcpID string) error {
+	gateway, rawDB := newOAuthCredentialTestGatewayClientWithTriggerAndDB(t, func(_ context.Context, mcpID string) error {
 		if mcpID != "instance-a-user-1" {
 			return nil
 		}
 		purgeAttempts++
-		if purgeAttempts == 2 {
+		if purgeAttempts == 1 {
 			return errors.New("token purge trigger unavailable")
 		}
 		return nil
@@ -1823,9 +1815,7 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 	}}); err != nil {
 		t.Fatalf("seed OAuth credential: %v", err)
 	}
-	if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token"}); err != nil {
-		t.Fatalf("seed user token: %v", err)
-	}
+	seedCatalogOwnedOAuthToken(t, rawDB, instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, entry.Name, "token")
 	req := newDeleteOAuthCredentialRequest(t, gateway, entry, server, instance)
 	handler := &MCPCatalogHandler{gatewayClient: gateway}
 
@@ -1838,8 +1828,8 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 	if err := handler.DeleteOAuthCredentials(newDeleteOAuthCredentialRequest(t, gateway, entry, server, instance)); err != nil {
 		t.Fatalf("retry Clear after credential removal: %v", err)
 	}
-	if purgeAttempts != 3 {
-		t.Fatalf("token purge attempts = %d, want seed plus both Clear attempts", purgeAttempts)
+	if purgeAttempts != 2 {
+		t.Fatalf("token purge attempts = %d, want both Clear attempts", purgeAttempts)
 	}
 	if _, err := gateway.GetMCPOAuthToken(t.Context(), instance.Spec.UserID, instance.Name, entry.Spec.Manifest.RemoteConfig.FixedURL); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("user token remained after retry: %v", err)
@@ -1847,7 +1837,7 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 }
 
 func TestReplaceOAuthCredentialsAtomicallySwapsAppAndClearsOnlyMatchingTokens(t *testing.T) {
-	gateway := newOAuthCredentialTestGatewayClient(t)
+	gateway, rawDB := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, staticOAuthTestEncryptionConfig(), nil)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
 	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
@@ -1857,10 +1847,11 @@ func TestReplaceOAuthCredentialsAtomicallySwapsAppAndClearsOnlyMatchingTokens(t 
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "old-client", "CLIENT_SECRET": "old-secret"}}); err != nil {
 		t.Fatalf("seed old OAuth credential: %v", err)
 	}
-	for _, mcpID := range []string{server.Name, instance.Name, unrelatedServer.Name, unrelatedInstance.Name} {
-		if err := gateway.ReplaceMCPOAuthToken(t.Context(), instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL, "", &oauth2.Config{ClientID: "old-client", ClientSecret: "old-secret"}, &oauth2.Token{AccessToken: "old-token-" + mcpID}); err != nil {
-			t.Fatalf("seed old user token for %s: %v", mcpID, err)
-		}
+	for _, mcpID := range []string{server.Name, instance.Name} {
+		seedCatalogOwnedOAuthToken(t, rawDB, instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL, entry.Name, "old-token-"+mcpID)
+	}
+	for _, mcpID := range []string{unrelatedServer.Name, unrelatedInstance.Name} {
+		seedCatalogOwnedOAuthToken(t, rawDB, instance.Spec.UserID, mcpID, entry.Spec.Manifest.RemoteConfig.FixedURL, "entry-unrelated", "old-token-"+mcpID)
 	}
 
 	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, instance.Spec.UserID)
@@ -1976,6 +1967,16 @@ func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.
 		return err
 	}
 	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
+}
+
+func seedCatalogOwnedOAuthToken(t *testing.T, db *gorm.DB, userID, mcpID, mcpURL, entryName, accessToken string) {
+	t.Helper()
+	if err := db.WithContext(t.Context()).Create(&gatewaytypes.MCPOAuthToken{
+		MCPID: mcpID, UserID: userID, URL: mcpURL,
+		CatalogEntryName: entryName, AccessToken: accessToken,
+	}).Error; err != nil {
+		t.Fatalf("seed catalog-owned OAuth token for %s: %v", mcpID, err)
+	}
 }
 
 func successfulStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID, clientID, clientSecret string) string {

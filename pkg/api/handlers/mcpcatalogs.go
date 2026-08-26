@@ -2038,14 +2038,14 @@ func (h *MCPCatalogHandler) SetOAuthCredentials(req api.Context) error {
 		return fmt.Errorf("failed to read existing OAuth credential: %w", err)
 	}
 
-	var cleanupTargets oauthTokenCleanupTargets
+	var reconciliationTargets oauthTokenReconciliationTargets
 	if replaceStaleCredential {
-		cleanupTargets, err = resolveOAuthTokenCleanupTargets(req, entry.Name)
+		reconciliationTargets, err = resolveOAuthTokenReconciliationTargets(req, entry.Name)
 		if err != nil {
 			return err
 		}
 	}
-	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, replaceStaleCredential, cleanupTargets.ids()...); err != nil {
+	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, replaceStaleCredential, reconciliationTargets.ids()...); err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthCredentialExists) {
 			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
 		}
@@ -2122,12 +2122,12 @@ func (h *MCPCatalogHandler) ReplaceOAuthCredentials(req api.Context) error {
 		return err
 	}
 
-	cleanupTargets, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
+	reconciliationTargets, err := resolveOAuthTokenReconciliationTargets(req, entry.Name)
 	if err != nil {
 		return err
 	}
 
-	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, true, cleanupTargets.ids()...); err != nil {
+	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, true, reconciliationTargets.ids()...); err != nil {
 		if errors.Is(err, gclient.ErrMCPStaticOAuthCredentialNotFound) {
 			return types.NewErrBadRequest("OAuth credential does not exist")
 		}
@@ -2186,12 +2186,12 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredentialLock()
 
-	cleanupTargets, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
+	reconciliationTargets, err := resolveOAuthTokenReconciliationTargets(req, entry.Name)
 	if err != nil {
 		return err
 	}
 	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredentialGeneration(
-		req.Context(), entry.Name, clearRequest.ExpectedGeneration, cleanupTargets.ids()...,
+		req.Context(), entry.Name, clearRequest.ExpectedGeneration, reconciliationTargets.ids()...,
 	)
 	if errors.Is(err, gclient.ErrMCPOAuthCatalogCredentialChanged) {
 		return types.NewErrHTTP(http.StatusConflict, "OAuth application changed; reload its status before clearing")
@@ -2212,28 +2212,28 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	return req.Write(map[string]bool{"deleted": deleted})
 }
 
-type oauthTokenCleanupTargets struct {
+type oauthTokenReconciliationTargets struct {
 	serverIDs   []string
 	instanceIDs []string
 }
 
-func (t oauthTokenCleanupTargets) ids() []string {
+func (t oauthTokenReconciliationTargets) ids() []string {
 	ids := make([]string, 0, len(t.serverIDs)+len(t.instanceIDs))
 	ids = append(ids, t.serverIDs...)
 	return append(ids, t.instanceIDs...)
 }
 
-func resolveOAuthTokenCleanupTargets(req api.Context, entryName string) (oauthTokenCleanupTargets, error) {
+func resolveOAuthTokenReconciliationTargets(req api.Context, entryName string) (oauthTokenReconciliationTargets, error) {
 	var mcpServers v1.MCPServerList
 	if err := req.List(&mcpServers, client.MatchingFields{"spec.mcpServerCatalogEntryName": entryName}); err != nil {
-		return oauthTokenCleanupTargets{}, fmt.Errorf("failed to list MCP servers for OAuth token cleanup: %w", err)
+		return oauthTokenReconciliationTargets{}, fmt.Errorf("failed to list MCP servers for OAuth token reconciliation: %w", err)
 	}
 	var mcpServerInstances v1.MCPServerInstanceList
 	if err := req.List(&mcpServerInstances, client.MatchingFields{"spec.mcpServerCatalogEntryName": entryName}); err != nil {
-		return oauthTokenCleanupTargets{}, fmt.Errorf("failed to list MCP server instances for OAuth token cleanup: %w", err)
+		return oauthTokenReconciliationTargets{}, fmt.Errorf("failed to list MCP server instances for OAuth token reconciliation: %w", err)
 	}
 
-	targets := oauthTokenCleanupTargets{
+	targets := oauthTokenReconciliationTargets{
 		serverIDs:   make([]string, 0, len(mcpServers.Items)),
 		instanceIDs: make([]string, 0, len(mcpServerInstances.Items)),
 	}

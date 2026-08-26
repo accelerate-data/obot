@@ -577,7 +577,7 @@ func (c *Client) ClaimMCPStaticOAuthCredentialProof(ctx context.Context, state, 
 // CommitClaimedMCPStaticOAuthCredential applies a previously claimed Save.
 // Credential replacement, grant cleanup, and sibling-proof invalidation remain
 // atomic even though the submitted proof was consumed before this operation.
-func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, claim *MCPStaticOAuthCredentialClaim, replace bool, cleanupMCPIDs ...string) error {
+func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, claim *MCPStaticOAuthCredentialClaim, replace bool, reconcileMCPIDs ...string) error {
 	if claim == nil {
 		return ErrMCPStaticOAuthTestInvalid
 	}
@@ -631,10 +631,11 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 
 		if replace {
 			var err error
-			changedMCPIDs, err = deleteMCPStaticOAuthTokens(tx, claim.mcpID, cleanupMCPIDs)
+			changedMCPIDs, err = deleteOwnedMCPStaticOAuthTokens(tx, claim.mcpID)
 			if err != nil {
 				return err
 			}
+			changedMCPIDs = append(changedMCPIDs, reconcileMCPIDs...)
 		}
 
 		result = tx.Delete(
@@ -655,22 +656,30 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 }
 
 // DeleteMCPStaticOAuthCredential removes the shared application, all pending
-// proofs for the entry, and every matching local user grant in one transaction.
-// The caller must hold the entry credential lock for the complete operation.
-func (c *Client) DeleteMCPStaticOAuthCredential(ctx context.Context, mcpID string, cleanupMCPIDs ...string) (bool, error) {
-	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, "", cleanupMCPIDs...)
+// proofs for the entry, and grants explicitly owned by the entry in one
+// transaction. reconcileMCPIDs are notified after commit but never broaden the
+// deletion scope. The caller must hold the entry credential lock throughout.
+func (c *Client) DeleteMCPStaticOAuthCredential(ctx context.Context, mcpID string, reconcileMCPIDs ...string) (bool, error) {
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, "", nil, reconcileMCPIDs)
 }
 
-// DeleteMCPStaticOAuthCredentialGeneration removes the shared application only
-// when it is still the exact generation reviewed by the caller.
-func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, mcpID, expectedGeneration string, cleanupMCPIDs ...string) (bool, error) {
+// DeleteMCPStaticOAuthCredentialGeneration applies the ownership-scoped cleanup
+// only when the shared application is still the generation reviewed by the caller.
+func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, mcpID, expectedGeneration string, reconcileMCPIDs ...string) (bool, error) {
 	if expectedGeneration == "" {
 		return false, ErrMCPOAuthCatalogCredentialChanged
 	}
-	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, expectedGeneration, cleanupMCPIDs...)
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, expectedGeneration, nil, reconcileMCPIDs)
 }
 
-func (c *Client) deleteMCPStaticOAuthCredential(ctx context.Context, mcpID, expectedGeneration string, cleanupMCPIDs ...string) (bool, error) {
+// DeleteMCPStaticOAuthStateForDeletedCatalogEntry removes every grant for the
+// entry's deployments in addition to entry-owned static OAuth state. Callers
+// must use this only while deleting the catalog entry itself.
+func (c *Client) DeleteMCPStaticOAuthStateForDeletedCatalogEntry(ctx context.Context, mcpID string, deploymentMCPIDs ...string) (bool, error) {
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, "", deploymentMCPIDs, deploymentMCPIDs)
+}
+
+func (c *Client) deleteMCPStaticOAuthCredential(ctx context.Context, mcpID, expectedGeneration string, purgeMCPIDs, reconcileMCPIDs []string) (bool, error) {
 	credentialContext := system.MCPOAuthCredentialName(mcpID)
 	var deleted bool
 	var changedMCPIDs []string
@@ -699,10 +708,15 @@ func (c *Client) deleteMCPStaticOAuthCredential(ctx context.Context, mcpID, expe
 		deleted = result.RowsAffected > 0
 
 		var err error
-		changedMCPIDs, err = deleteMCPStaticOAuthTokens(tx, mcpID, cleanupMCPIDs)
+		if len(purgeMCPIDs) == 0 {
+			changedMCPIDs, err = deleteOwnedMCPStaticOAuthTokens(tx, mcpID)
+		} else {
+			changedMCPIDs, err = deleteMCPStaticOAuthTokensForDeletedCatalogEntry(tx, mcpID, purgeMCPIDs)
+		}
 		if err != nil {
 			return err
 		}
+		changedMCPIDs = append(changedMCPIDs, reconcileMCPIDs...)
 		return tx.Where("mcp_id = ? AND static_o_auth_test = ?", mcpID, true).Delete(&types.MCPOAuthPendingState{}).Error
 	})
 	if err != nil {
@@ -711,10 +725,22 @@ func (c *Client) deleteMCPStaticOAuthCredential(ctx context.Context, mcpID, expe
 	return deleted, c.triggerMCPOAuthTokenChanges(ctx, changedMCPIDs)
 }
 
-func deleteMCPStaticOAuthTokens(tx *gorm.DB, catalogEntryName string, cleanupMCPIDs []string) ([]string, error) {
+func deleteOwnedMCPStaticOAuthTokens(tx *gorm.DB, catalogEntryName string) ([]string, error) {
 	scope := tx.Model(&types.MCPOAuthToken{}).Where("catalog_entry_name = ?", catalogEntryName)
-	if len(cleanupMCPIDs) > 0 {
-		scope = scope.Or("mcp_id IN ?", cleanupMCPIDs)
+	var mcpIDs []string
+	if err := scope.Distinct("mcp_id").Pluck("mcp_id", &mcpIDs).Error; err != nil {
+		return nil, err
+	}
+	if err := scope.Delete(&types.MCPOAuthToken{}).Error; err != nil {
+		return nil, err
+	}
+	return mcpIDs, nil
+}
+
+func deleteMCPStaticOAuthTokensForDeletedCatalogEntry(tx *gorm.DB, catalogEntryName string, deploymentMCPIDs []string) ([]string, error) {
+	scope := tx.Model(&types.MCPOAuthToken{}).Where("catalog_entry_name = ?", catalogEntryName)
+	if len(deploymentMCPIDs) > 0 {
+		scope = scope.Or("mcp_id IN ?", deploymentMCPIDs)
 	}
 	var mcpIDs []string
 	if err := scope.Distinct("mcp_id").Pluck("mcp_id", &mcpIDs).Error; err != nil {
@@ -723,7 +749,7 @@ func deleteMCPStaticOAuthTokens(tx *gorm.DB, catalogEntryName string, cleanupMCP
 	if err := scope.Delete(&types.MCPOAuthToken{}).Error; err != nil {
 		return nil, err
 	}
-	return append(mcpIDs, cleanupMCPIDs...), nil
+	return append(mcpIDs, deploymentMCPIDs...), nil
 }
 
 func (c *Client) triggerMCPOAuthTokenChanges(ctx context.Context, mcpIDs []string) error {
