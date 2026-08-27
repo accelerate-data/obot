@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
@@ -123,6 +125,29 @@ type noopControllerTrigger struct{}
 
 func (noopControllerTrigger) Trigger(context.Context, kschema.GroupVersionKind, string, time.Duration) error {
 	return nil
+}
+
+// recordingControllerTrigger captures what a handler asked the controller to
+// reconcile, so a test can assert the enqueued kind and key rather than only
+// that some callback ran.
+type recordingControllerTrigger struct {
+	lock sync.Mutex
+	gvks []kschema.GroupVersionKind
+	keys []string
+}
+
+func (r *recordingControllerTrigger) Trigger(_ context.Context, gvk kschema.GroupVersionKind, key string, _ time.Duration) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	r.gvks = append(r.gvks, gvk)
+	r.keys = append(r.keys, key)
+	return nil
+}
+
+func (r *recordingControllerTrigger) recorded() ([]kschema.GroupVersionKind, []string) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	return append([]kschema.GroupVersionKind(nil), r.gvks...), append([]string(nil), r.keys...)
 }
 
 func TestConvertMCPResources(t *testing.T) {
@@ -315,6 +340,22 @@ func TestConfigureServerRetriesControllerUpdateConflict(t *testing.T) {
 	assert.Equal(t, "Progressing", updated.Status.DeploymentStatus)
 }
 
+func TestConfigureServerTriggersOwningServerUnderNamespacedKey(t *testing.T) {
+	entry, server := configureServerTestObjects()
+	storage := newFakeStorage(t, &entry, &server)
+	backend := &recordingControllerTrigger{}
+
+	require.NoError(t, configureServerRequestWithTrigger(storage, newHandlerTestGateway(t), `{"TOKEN":"value"}`, func(string) error { return nil }, backend))
+
+	gvks, keys := backend.recorded()
+	// A bare name resolves to the empty namespace, where no MCPServer is ever
+	// stored, so the reconcile would be dropped before any handler ran.
+	assert.Equal(t, []string{system.DefaultNamespace + "/server"}, keys)
+	for _, gvk := range gvks {
+		assert.Equal(t, "MCPServer", gvk.Kind)
+	}
+}
+
 func TestConfigureServerRejectsConcurrentSpecChange(t *testing.T) {
 	entry, server := configureServerTestObjects()
 	storage := &conflictOnceStorage{
@@ -452,12 +493,16 @@ func configureServerRequest(storage kclient.WithWatch, gatewayClient *gateway.Cl
 }
 
 func configureServerRequestWithConfig(storage kclient.WithWatch, gatewayClient *gateway.Client, config string, shutdown func(string) error) error {
+	return configureServerRequestWithTrigger(storage, gatewayClient, config, shutdown, noopControllerTrigger{})
+}
+
+func configureServerRequestWithTrigger(storage kclient.WithWatch, gatewayClient *gateway.Client, config string, shutdown func(string) error, backend nahbackend.Trigger) error {
 	request := httptest.NewRequest(http.MethodPost, "/api/mcp-catalogs/default/servers/server/configure", strings.NewReader(config))
 	request.SetPathValue("catalog_id", "default")
 	request.SetPathValue("mcp_server_id", "server")
 
 	err := (&MCPHandler{
-		controllerBackend: noopControllerTrigger{},
+		controllerBackend: backend,
 		shutdownMCPServer: shutdown,
 	}).ConfigureServer(api.Context{
 		ResponseWriter: httptest.NewRecorder(),

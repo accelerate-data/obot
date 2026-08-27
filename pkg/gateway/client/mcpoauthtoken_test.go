@@ -1143,27 +1143,149 @@ func TestStaticOAuthCleanupQueriesUseTargetedIndexes(t *testing.T) {
 	}
 }
 
+type recordedControllerTrigger struct {
+	gvk schema.GroupVersionKind
+	key string
+}
+
+type recordingControllerBackend struct {
+	triggers []recordedControllerTrigger
+}
+
+func (r *recordingControllerBackend) Trigger(_ context.Context, gvk schema.GroupVersionKind, key string, _ time.Duration) error {
+	r.triggers = append(r.triggers, recordedControllerTrigger{gvk: gvk, key: key})
+	return nil
+}
+
 func TestDeleteMCPOAuthTokenForAllUsersTriggersServerReconciliation(t *testing.T) {
 	c := newTestClient(t)
-	triggered := 0
-	c.mcpOAuthTokenTrigger = func(context.Context, string) error {
-		triggered++
+	var triggered []string
+	c.mcpOAuthTokenTrigger = func(_ context.Context, mcpID string) error {
+		triggered = append(triggered, mcpID)
 		return nil
 	}
 	conf := &oauth2.Config{ClientID: "client", ClientSecret: "secret"}
 	if err := c.ReplaceMCPOAuthToken(t.Context(), "user-1", "server-1", "https://mcp.example/api", "", conf, &oauth2.Token{AccessToken: "token"}); err != nil {
 		t.Fatalf("seed OAuth token: %v", err)
 	}
-	if triggered != 1 {
-		t.Fatalf("Replace trigger count = %d, want 1", triggered)
+	if !slices.Equal(triggered, []string{"server-1"}) {
+		t.Fatalf("Replace notified %#v, want [server-1]", triggered)
 	}
-	triggered = 0
+	triggered = nil
 
 	if err := c.DeleteMCPOAuthTokenForAllUsers(t.Context(), "server-1"); err != nil {
 		t.Fatalf("delete OAuth tokens: %v", err)
 	}
-	if triggered != 1 {
-		t.Fatalf("Delete trigger count = %d, want 1", triggered)
+	if !slices.Equal(triggered, []string{"server-1"}) {
+		t.Fatalf("Delete notified %#v, want [server-1]", triggered)
+	}
+}
+
+// A multi-user credential change carries the MCPServerInstance ID, so the
+// production trigger wiring has to reconcile the owning MCPServer under a
+// namespace-qualified key. Wire the real trigger function, not a stub, so a
+// regression in either the kind or the key fails here.
+func TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation(t *testing.T) {
+	const (
+		instanceName = system.MCPServerInstancePrefix + "abc"
+		serverName   = system.MCPServerPrefix + "def"
+		userID       = "user-1"
+	)
+
+	storageClient := clientfake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(&v1.MCPServerInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: system.DefaultNamespace},
+			Spec:       v1.MCPServerInstanceSpec{UserID: userID, MCPServerName: serverName},
+		}).
+		Build()
+	backend := &recordingControllerBackend{}
+
+	// Constructed through the same entry point production uses, so the trigger
+	// under test is the one New wires rather than a test-installed stand-in.
+	c := New(
+		t.Context(), newTestDB(t), storageClient, nil, backend,
+		nil, nil, time.Hour, 1, 0, 0, 0, false,
+	)
+
+	wantKey := system.DefaultNamespace + "/" + serverName
+
+	if err := c.ReplaceMCPOAuthToken(t.Context(), userID, instanceName, "https://mcp.example/api", "", &oauth2.Config{ClientID: "client", ClientSecret: "secret"}, &oauth2.Token{AccessToken: "token"}); err != nil {
+		t.Fatalf("seed OAuth token: %v", err)
+	}
+	if len(backend.triggers) != 1 || backend.triggers[0].key != wantKey {
+		t.Fatalf("Replace triggers = %#v, want one key %s", backend.triggers, wantKey)
+	}
+	backend.triggers = nil
+
+	if err := c.DeleteMCPOAuthTokenForAllUsers(t.Context(), instanceName); err != nil {
+		t.Fatalf("delete OAuth tokens: %v", err)
+	}
+
+	if len(backend.triggers) != 1 || backend.triggers[0].key != wantKey {
+		t.Fatalf("Delete triggers = %#v, want one key %s", backend.triggers, wantKey)
+	}
+	if got := backend.triggers[0].gvk; got != v1.SchemeGroupVersion.WithKind("MCPServer") {
+		t.Fatalf("triggered kind = %s, want MCPServer", got)
+	}
+}
+
+// Catalog-entry deletion notifies the deployment identifiers it purged, and for
+// a multi-user deployment those are MCPServerInstance IDs. The cleanup path has
+// to resolve them to their owner too, or the reconcile is enqueued against a
+// kind that has no OAuth handlers.
+func TestDeletedCatalogEntryCleanupTriggersTheOwningServerOfAnInstanceGrant(t *testing.T) {
+	const (
+		entryName    = "catalog-entry-1"
+		instanceName = system.MCPServerInstancePrefix + "abc"
+		serverName   = system.MCPServerPrefix + "def"
+	)
+
+	storageClient := clientfake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(&v1.MCPServerInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: system.DefaultNamespace},
+			Spec:       v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: serverName},
+		}).
+		Build()
+	backend := &recordingControllerBackend{}
+	c := New(
+		t.Context(), newTestDB(t), storageClient, nil, backend,
+		nil, nil, time.Hour, 1, 0, 0, 0, false,
+	)
+
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: instanceName, UserID: "user-1", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed instance OAuth grant: %v", err)
+	}
+
+	deleted, err := c.DeleteMCPStaticOAuthStateForDeletedCatalogEntry(t.Context(), entryName, instanceName)
+	if err != nil {
+		t.Fatalf("purge deleted catalog entry OAuth state: %v", err)
+	}
+	if !deleted {
+		t.Fatal("did not report deleting the static OAuth credential")
+	}
+
+	wantKey := system.DefaultNamespace + "/" + serverName
+	if len(backend.triggers) == 0 {
+		t.Fatal("cleanup enqueued no reconcile")
+	}
+	for _, got := range backend.triggers {
+		if got.key != wantKey {
+			t.Fatalf("cleanup triggers = %#v, want every key %s", backend.triggers, wantKey)
+		}
+		if want := v1.SchemeGroupVersion.WithKind("MCPServer"); got.gvk != want {
+			t.Fatalf("triggered kind = %s, want %s", got.gvk, want)
+		}
 	}
 }
 
