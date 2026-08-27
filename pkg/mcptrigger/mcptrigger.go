@@ -24,15 +24,10 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// MCPServerGVK is the kind enqueued by this package.
-var MCPServerGVK = v1.SchemeGroupVersion.WithKind("MCPServer")
+var mcpServerGVK = v1.SchemeGroupVersion.WithKind("MCPServer")
 
-// key returns the namespace-qualified controller key for name.
-func key(name string) string {
-	return system.DefaultNamespace + "/" + name
-}
-
-// Server enqueues a reconcile for the named MCPServer.
+// Server enqueues a reconcile for the named MCPServer. An empty name means
+// there is nothing to reconcile.
 func Server(ctx context.Context, backend nahbackend.Trigger, serverName string) error {
 	if backend == nil {
 		return fmt.Errorf("MCP server controller backend is not configured")
@@ -40,7 +35,7 @@ func Server(ctx context.Context, backend nahbackend.Trigger, serverName string) 
 	if serverName == "" {
 		return nil
 	}
-	return backend.Trigger(ctx, MCPServerGVK, key(serverName), 0)
+	return backend.Trigger(ctx, mcpServerGVK, system.DefaultNamespace+"/"+serverName, 0)
 }
 
 // OwningServer enqueues a reconcile for the MCPServer that owns mcpID.
@@ -48,31 +43,33 @@ func Server(ctx context.Context, backend nahbackend.Trigger, serverName string) 
 // An MCPServerInstance ID is resolved to its owning MCPServer; any other ID is
 // treated as an MCPServer name.
 func OwningServer(ctx context.Context, c kclient.Reader, backend nahbackend.Trigger, mcpID string) error {
-	if mcpID == "" {
-		return nil
+	if !system.IsMCPServerInstanceID(mcpID) {
+		return Server(ctx, backend, mcpID)
+	}
+	if c == nil {
+		return fmt.Errorf("cannot resolve MCP server instance %s: no storage client is configured", mcpID)
 	}
 
-	serverName := mcpID
-	if system.IsMCPServerInstanceID(mcpID) {
-		if c == nil {
-			return fmt.Errorf("cannot resolve MCP server instance %s: no storage client is configured", mcpID)
-		}
-
-		var instance v1.MCPServerInstance
-		if err := c.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: mcpID}, &instance); err != nil {
-			if apierrors.IsNotFound(err) {
-				// Credential rows outlive the instance they were created for, so a
-				// deleted instance is expected here. There is no owner left to
-				// reconcile, and failing would break the caller's delete.
-				return nil
-			}
-			return fmt.Errorf("failed to get MCP server instance %s: %w", mcpID, err)
-		}
-		if instance.Spec.MCPServerName == "" {
+	var instance v1.MCPServerInstance
+	if err := c.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: mcpID}, &instance); err != nil {
+		if apierrors.IsNotFound(err) {
+			// Credential rows outlive the instance they were created for, so a
+			// deleted instance is expected here. There is no owner left to
+			// reconcile, and failing would break the caller's delete. A read
+			// that fails for any other reason is not expected steady state, so
+			// it surfaces like any other trigger failure.
 			return nil
 		}
-		serverName = instance.Spec.MCPServerName
+		return fmt.Errorf("failed to get MCP server instance %s: %w", mcpID, err)
 	}
+	return Server(ctx, backend, instance.Spec.MCPServerName)
+}
 
-	return Server(ctx, backend, serverName)
+// OwningServerTrigger returns the MCP OAuth credential-change notification the
+// gateway client is constructed with. Production and tests install this same
+// value, so a test cannot pass against a hand-written copy of the wiring.
+func OwningServerTrigger(c kclient.Reader, backend nahbackend.Trigger) func(context.Context, string) error {
+	return func(ctx context.Context, mcpID string) error {
+		return OwningServer(ctx, c, backend, mcpID)
+	}
 }

@@ -2,6 +2,7 @@ package mcptrigger
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,10 +10,12 @@ import (
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 type recordedTrigger struct {
@@ -30,7 +33,7 @@ func (r *recordingBackend) Trigger(_ context.Context, gvk schema.GroupVersionKin
 	return nil
 }
 
-func newStorageClient(t *testing.T, objs ...kclient.Object) kclient.Client {
+func newStorageClient(t *testing.T, objs ...kclient.Object) kclient.WithWatch {
 	t.Helper()
 	return fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
@@ -125,6 +128,38 @@ func TestOwningServerIgnoresInstanceWithoutOwner(t *testing.T) {
 
 	require.NoError(t, OwningServer(context.Background(), c, backend, instanceName))
 	require.Empty(t, backend.triggers)
+}
+
+func TestOwningServerReportsInstanceReadFailure(t *testing.T) {
+	const instanceName = system.MCPServerInstancePrefix + "abc"
+
+	backend := &recordingBackend{}
+	c := interceptor.NewClient(newStorageClient(t, mcpServerInstance(instanceName, system.MCPServerPrefix+"def")), interceptor.Funcs{
+		Get: func(context.Context, kclient.WithWatch, kclient.ObjectKey, kclient.Object, ...kclient.GetOption) error {
+			return apierrors.NewInternalError(errors.New("etcd unavailable"))
+		},
+	})
+
+	err := OwningServer(context.Background(), c, backend, instanceName)
+	require.ErrorContains(t, err, instanceName)
+	require.ErrorContains(t, err, "etcd unavailable")
+	// The owner is unknown, so nothing may be enqueued in its place.
+	require.Empty(t, backend.triggers)
+}
+
+func TestOwningServerTriggerWiresOwningServerResolution(t *testing.T) {
+	const (
+		instanceName = system.MCPServerInstancePrefix + "abc"
+		serverName   = system.MCPServerPrefix + "def"
+	)
+
+	backend := &recordingBackend{}
+	trigger := OwningServerTrigger(newStorageClient(t, mcpServerInstance(instanceName, serverName)), backend)
+
+	require.NoError(t, trigger(context.Background(), instanceName))
+	require.Len(t, backend.triggers, 1)
+	require.Equal(t, system.DefaultNamespace+"/"+serverName, backend.triggers[0].key)
+	require.Equal(t, "MCPServer", backend.triggers[0].gvk.Kind)
 }
 
 func TestOwningServerReportsStorageFailure(t *testing.T) {

@@ -1203,12 +1203,17 @@ func TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation(t *tes
 	backend := &recordingControllerBackend{}
 
 	c := newTestClient(t)
-	c.mcpOAuthTokenTrigger = func(ctx context.Context, mcpID string) error {
-		return mcptrigger.OwningServer(ctx, storageClient, backend, mcpID)
-	}
+	// The same value production is constructed with, so reverting the wiring in
+	// pkg/services breaks this test.
+	c.mcpOAuthTokenTrigger = mcptrigger.OwningServerTrigger(storageClient, backend)
+
+	wantKey := system.DefaultNamespace + "/" + serverName
 
 	if err := c.ReplaceMCPOAuthToken(t.Context(), userID, instanceName, "https://mcp.example/api", "", &oauth2.Config{ClientID: "client", ClientSecret: "secret"}, &oauth2.Token{AccessToken: "token"}); err != nil {
 		t.Fatalf("seed OAuth token: %v", err)
+	}
+	if len(backend.triggers) != 1 || backend.triggers[0].key != wantKey {
+		t.Fatalf("Replace triggers = %#v, want one key %s", backend.triggers, wantKey)
 	}
 	backend.triggers = nil
 
@@ -1216,9 +1221,8 @@ func TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation(t *tes
 		t.Fatalf("delete OAuth tokens: %v", err)
 	}
 
-	wantKey := system.DefaultNamespace + "/" + serverName
 	if len(backend.triggers) != 1 || backend.triggers[0].key != wantKey {
-		t.Fatalf("controller triggers = %#v, want one key %s", backend.triggers, wantKey)
+		t.Fatalf("Delete triggers = %#v, want one key %s", backend.triggers, wantKey)
 	}
 	if got := backend.triggers[0].gvk; got != v1.SchemeGroupVersion.WithKind("MCPServer") {
 		t.Fatalf("triggered kind = %s, want MCPServer", got)

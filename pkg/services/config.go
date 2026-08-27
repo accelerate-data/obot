@@ -613,9 +613,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		gatewayDB,
 		storageClient,
 		encryptionConfig,
-		func(ctx context.Context, mcpID string) error {
-			return mcptrigger.OwningServer(ctx, storageClient, r.Backend(), mcpID)
-		},
+		mcptrigger.OwningServerTrigger(storageClient, r.Backend()),
 		config.AuthOwnerEmails,
 		config.AuthAdminEmails,
 		time.Duration(config.MCPAuditLogPersistIntervalSeconds)*time.Second,
