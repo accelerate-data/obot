@@ -577,6 +577,10 @@ func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
 	})
 }
 
+// The token endpoint is set directly here because enforcement happens per dial on
+// the resolved address, whatever populated the URL. The discovery-driven case --
+// a reachable authorization server advertising an internal token endpoint -- is
+// covered by TestDiscoveredInternalTokenEndpointIsRejectedAtExchange in pkg/mcp.
 func TestStateManagerBlocksDynamicTokenExchangeToPrivateAddress(t *testing.T) {
 	const (
 		entryName = "catalog-entry-1"

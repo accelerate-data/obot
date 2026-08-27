@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -641,4 +642,53 @@ func TestNoRedirectClientRejectsRedirect(t *testing.T) {
 	require.NotContains(t, err.Error(), "refresh-token")
 	require.NotContains(t, err.Error(), "client-secret")
 	require.False(t, reachedTarget.Load(), "redirect target must never receive the refresh credentials")
+}
+
+// AC5(a): a reachable authorization server can advertise a token endpoint inside
+// the estate. The token URL therefore comes from provider-controlled metadata,
+// not from operator configuration, and the remote-network policy has to reject it
+// at exchange time. The metadata host stands in for a public one by being
+// allow-listed; the token endpoint it names is not.
+func TestDiscoveredInternalTokenEndpointIsRejectedAtExchange(t *testing.T) {
+	var tokenEndpointReached atomic.Bool
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tokenEndpointReached.Store(true)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"leaked","token_type":"Bearer"}`)
+	}))
+	t.Cleanup(tokenEndpoint.Close)
+
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/.well-known/") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":"%s/authorize","token_endpoint":%q,"response_types_supported":["code"]}`,
+			"http://"+r.Host, "http://"+r.Host, tokenEndpoint.URL)
+	}))
+	t.Cleanup(authServer.Close)
+
+	metadataClient := safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback: true, BlockPrivateIP: true, BlockLinkLocal: true,
+		AllowList: []string{strings.TrimPrefix(authServer.URL, "http://")},
+	})
+	metadata, _, _, _, err := getAuthServerMetadata(t.Context(), metadataClient, authServer.URL)
+	require.NoError(t, err)
+	require.Equal(t, tokenEndpoint.URL, metadata.TokenEndpoint, "discovery must yield the provider-named token endpoint")
+
+	conf := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: metadata.AuthorizationEndpoint, TokenURL: metadata.TokenEndpoint},
+	}
+	exchangeClient := safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback: true, BlockPrivateIP: true, BlockLinkLocal: true, BlockRedirects: true,
+	})
+
+	_, err = ExchangeOAuthToken(WithOAuthHTTPClient(t.Context(), exchangeClient), conf, "code-1", "verifier-1")
+	require.Error(t, err)
+	require.False(t, tokenEndpointReached.Load(), "the internal token endpoint must never be contacted")
+	for _, secret := range []string{"code-1", "verifier-1", "dynamic-secret"} {
+		require.NotContains(t, err.Error(), secret)
+	}
 }

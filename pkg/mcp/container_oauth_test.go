@@ -93,7 +93,7 @@ func TestContainerOAuthAuthorizationIsInjectedPerUser(t *testing.T) {
 	// A backend is required because the refresh runs on the operator's
 	// remote-network policy client, which the backend supplies.
 	sm := &SessionManager{
-		backend: containerOAuthTestBackend(),
+		backend: &policyRecordingBackend{},
 		globalTokenStore: perUserContainerTokenStore{
 			"user-a": {AccessToken: "access-a", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
 			"user-b": {AccessToken: "access-b", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
@@ -112,14 +112,45 @@ func TestContainerOAuthAuthorizationIsInjectedPerUser(t *testing.T) {
 	require.Equal(t, []string{"Bearer access-b"}, userB.PassthroughHeaderValues)
 }
 
-// The container OAuth refresh replays the refresh token and client secret, so the
-// client it runs on must both enforce the operator's remote-network policy and
-// refuse redirects. This guards the exact composition
-// addContainerOAuthAuthorization uses.
-func TestContainerOAuthRefreshClientEnforcesPolicyAndRejectsRedirects(t *testing.T) {
-	sm := &SessionManager{backend: containerOAuthTestBackend()}
+// policyRecordingBackend counts how many times a caller asked for the operator's
+// remote-network configuration. A container OAuth authorization that never asks
+// is running its refresh outside the policy.
+type policyRecordingBackend struct {
+	ctxCapturingBackend
+	remoteConfigCalls int
+}
 
-	policyClient, err := sm.HTTPClientForServer(ServerConfig{}, nil, nil, 0)
+func (b *policyRecordingBackend) remoteConfig(globalConfig RemoteMCPURLValidationConfig) (RemoteMCPURLValidationConfig, []string) {
+	b.remoteConfigCalls++
+	return globalConfig, nil
+}
+
+// The container OAuth refresh replays the refresh token and client secret, so it
+// must run on the operator's remote-network policy client and must refuse
+// redirects. ResolveContainerOAuth pins the token endpoint to a trusted Microsoft
+// Entra host, so the refresh itself cannot be pointed at a local test server;
+// this asserts the two halves separately -- that the production path builds the
+// policy client at all, and that the client it builds enforces the policy.
+func TestContainerOAuthRefreshRunsOnTheNetworkPolicyClient(t *testing.T) {
+	backend := &policyRecordingBackend{}
+	sm := &SessionManager{
+		backend: backend,
+		globalTokenStore: perUserContainerTokenStore{
+			"user-a": {AccessToken: "access-a", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
+		},
+	}
+	server := ServerConfig{UserID: "user-a", MCPServerName: "shared-fabric", Env: []string{
+		"INSTANCE=https://login.microsoftonline.com/", "TENANT=tenant", "CLIENT=client", "SECRET=secret",
+	}}
+	descriptor := types.ContainerizedRuntimeConfig{OAuth: &types.ContainerOAuthConfig{
+		Provider: types.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
+		ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
+	}}
+
+	require.NoError(t, sm.addContainerOAuthAuthorization(t.Context(), descriptor, "instance-a", &server))
+	require.Equal(t, 1, backend.remoteConfigCalls, "container OAuth refresh must build the remote-network policy client")
+
+	policyClient, err := sm.HTTPClientForServer(server, nil, nil, 0)
 	require.NoError(t, err)
 	refreshClient := NoRedirectClient(policyClient)
 	require.NotNil(t, refreshClient.CheckRedirect, "container refresh client must reject redirects")
@@ -133,13 +164,4 @@ func TestContainerOAuthRefreshClientEnforcesPolicyAndRejectsRedirects(t *testing
 
 	_, err = refreshClient.Post(tokenEndpoint.URL, "application/x-www-form-urlencoded", http.NoBody)
 	require.Error(t, err, "loopback token endpoint must be blocked by the remote-network policy")
-}
-
-func containerOAuthTestBackend() backend {
-	return &kubernetesBackend{
-		httpListenPort:   8080,
-		mcpNamespace:     "obot-mcp",
-		mcpClusterDomain: "cluster.local",
-		serviceFQDN:      "obot.obot-system.svc.cluster.local",
-	}
 }
