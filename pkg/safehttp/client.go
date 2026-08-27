@@ -15,6 +15,11 @@ type ClientOptions struct {
 	BlockLoopback  bool
 	BlockPrivateIP bool
 	BlockLinkLocal bool
+	// BlockRedirects rejects any HTTP redirect instead of following it. Set it on
+	// clients that carry credentials, such as OAuth token exchange and refresh, so
+	// an authorization code, PKCE verifier, or client secret is never replayed to
+	// another origin.
+	BlockRedirects bool
 	AllowList      []string
 	Timeout        time.Duration
 	Headers        http.Header
@@ -33,7 +38,7 @@ func NewClient(options ClientOptions) *http.Client {
 	}
 	transport.DialContext = dialer.DialContext
 
-	return &http.Client{
+	client := &http.Client{
 		Timeout: options.Timeout,
 		Transport: checkingTransport{
 			base:    transport,
@@ -41,6 +46,18 @@ func NewClient(options ClientOptions) *http.Client {
 			headers: options.Headers.Clone(),
 		},
 	}
+	if options.BlockRedirects {
+		client.CheckRedirect = RejectRedirects
+	}
+
+	return client
+}
+
+// RejectRedirects is an http.Client CheckRedirect policy that refuses every
+// redirect. The error names only the target host, so a redirected request's
+// credentials never reach a log or an API response.
+func RejectRedirects(req *http.Request, _ []*http.Request) error {
+	return fmt.Errorf("refusing to follow redirect to %s", req.URL.Host)
 }
 
 type checkingTransport struct {
