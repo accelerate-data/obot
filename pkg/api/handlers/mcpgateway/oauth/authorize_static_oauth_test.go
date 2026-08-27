@@ -283,7 +283,7 @@ func TestStaticOAuthCallbackBlocksPrivateTokenEndpoint(t *testing.T) {
 	}
 	h := &handler{
 		oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)},
-		staticOAuthHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
+		oauthExchangeHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
 			BlockLoopback:  true,
 			BlockPrivateIP: true,
 			BlockLinkLocal: true,

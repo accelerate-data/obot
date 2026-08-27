@@ -7,19 +7,20 @@ import (
 	"strings"
 
 	"github.com/obot-platform/obot/pkg/gateway/client"
-	"github.com/obot-platform/obot/pkg/mcp"
 	"golang.org/x/oauth2"
 )
 
 type stateManager struct {
-	gatewayClient         *client.Client
-	staticOAuthHTTPClient *http.Client
+	gatewayClient *client.Client
+	// exchangeHTTPClient carries the operator's remote-network policy. Every OAuth
+	// token exchange runs through it, not only the static-catalog and container ones.
+	exchangeHTTPClient *http.Client
 }
 
-func newStateManager(gatewayClient *client.Client, staticOAuthHTTPClient ...*http.Client) *stateManager {
+func newStateManager(gatewayClient *client.Client, exchangeHTTPClient ...*http.Client) *stateManager {
 	manager := &stateManager{gatewayClient: gatewayClient}
-	if len(staticOAuthHTTPClient) > 0 {
-		manager.staticOAuthHTTPClient = staticOAuthHTTPClient[0]
+	if len(exchangeHTTPClient) > 0 {
+		manager.exchangeHTTPClient = exchangeHTTPClient[0]
 	}
 	return manager
 }
@@ -73,8 +74,8 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	}
 
 	exchangeContext := ctx
-	if (ps.CatalogEntryName != "" || mcp.IsContainerOAuthResource(ps.URL)) && sm.staticOAuthHTTPClient != nil {
-		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, sm.staticOAuthHTTPClient)
+	if sm.exchangeHTTPClient != nil {
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, sm.exchangeHTTPClient)
 	}
 	token, err := conf.Exchange(exchangeContext, code, oauth2.SetAuthURLParam("code_verifier", ps.Verifier))
 	if err != nil {

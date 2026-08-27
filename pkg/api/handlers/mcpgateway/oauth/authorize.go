@@ -613,8 +613,8 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 			conf.Scopes = strings.Fields(pendingState.Scopes)
 		}
 		exchangeContext := req.Context()
-		if h.staticOAuthHTTPClient != nil {
-			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.staticOAuthHTTPClient)
+		if h.oauthExchangeHTTPClient != nil {
+			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.oauthExchangeHTTPClient)
 		}
 		if _, err := nmcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier); err != nil {
 			status = types.MCPStaticOAuthTestStatusFailed

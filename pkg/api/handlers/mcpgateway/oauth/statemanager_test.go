@@ -576,3 +576,35 @@ func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
 		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	})
 }
+
+func TestStateManagerBlocksDynamicTokenExchangeToPrivateAddress(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("restricted client reached the private token endpoint")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(client, safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback:  true,
+		BlockPrivateIP: true,
+		BlockLinkLocal: true,
+	}))
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	// An empty catalog entry name is what a dynamically registered client records.
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-dynamic-private", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-dynamic-private", "code-1", "", "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to exchange code")
+	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
