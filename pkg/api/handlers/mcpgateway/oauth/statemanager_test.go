@@ -691,11 +691,16 @@ func TestStateManagerSanitizesProviderCallbackError(t *testing.T) {
 	}
 	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-provider-error", "verifier-1", config))
 
-	_, _, err := manager.createToken(t.Context(), "state-provider-error", "", "access_denied", "user ws-internal-7 denied, trace req-abc123")
+	// Both provider-controlled fields carry a payload: the description is dropped
+	// entirely, and the code survives only through the character filter.
+	_, _, err := manager.createToken(t.Context(), "state-provider-error", "", "access_denied\r\n<script>alert(1)</script>", "user ws-internal-7 denied, trace req-abc123")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "access_denied")
 	require.NotContains(t, err.Error(), "req-abc123")
 	require.NotContains(t, err.Error(), "ws-internal-7")
+	require.NotContains(t, err.Error(), "<script>")
+	require.NotContains(t, err.Error(), "\n")
+	require.NotContains(t, err.Error(), "\r")
 }
 
 func TestOAuthCallbackDoesNotReflectUpstreamErrorResponse(t *testing.T) {

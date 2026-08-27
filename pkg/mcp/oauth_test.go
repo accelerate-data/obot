@@ -692,3 +692,29 @@ func TestDiscoveredInternalTokenEndpointIsRejectedAtExchange(t *testing.T) {
 		require.NotContains(t, err.Error(), secret)
 	}
 }
+
+// SafeOAuthErrorCode is the only guard on the provider-controlled `error`
+// parameter, which reaches a log line and an API error message at three call
+// sites. A provider that puts its payload in the code rather than the
+// description gets nothing else in the way.
+func TestSafeOAuthErrorCode(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		code string
+		want string
+	}{
+		{"rfc 6749 code kept whole", "access_denied", "access_denied"},
+		{"dotted and dashed codes kept", "invalid-request.v2", "invalid-request.v2"},
+		{"markup stripped", "access_denied<script>alert(1)</script>", "access_deniedscriptalert1script"},
+		{"newlines stripped so a code cannot forge a log line", "access_denied\r\nlevel=info msg=ok", "access_deniedlevelinfomsgok"},
+		{"spaces and punctuation stripped", "access denied: trace req/abc", "accessdeniedtracereqabc"},
+		{"truncated at 64 characters", strings.Repeat("a", 100), strings.Repeat("a", 64)},
+		{"empty falls back", "", "unspecified_error"},
+		{"all-invalid falls back", "<<< >>>", "unspecified_error"},
+		{"truncation happens before filtering", strings.Repeat("<", 64) + "leaked", "unspecified_error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, SafeOAuthErrorCode(tt.code))
+		})
+	}
+}
