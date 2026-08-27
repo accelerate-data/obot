@@ -46,7 +46,6 @@ import (
 	"github.com/obot-platform/obot/pkg/localauth"
 	"github.com/obot-platform/obot/pkg/logutil"
 	"github.com/obot-platform/obot/pkg/mcp"
-	"github.com/obot-platform/obot/pkg/mcptrigger"
 	"github.com/obot-platform/obot/pkg/messagepolicy"
 	"github.com/obot-platform/obot/pkg/modelaccesspolicy"
 	"github.com/obot-platform/obot/pkg/oidcjwt"
@@ -613,7 +612,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		gatewayDB,
 		storageClient,
 		encryptionConfig,
-		mcptrigger.OwningServerTrigger(storageClient, r.Backend()),
+		r.Backend(),
 		config.AuthOwnerEmails,
 		config.AuthAdminEmails,
 		time.Duration(config.MCPAuditLogPersistIntervalSeconds)*time.Second,

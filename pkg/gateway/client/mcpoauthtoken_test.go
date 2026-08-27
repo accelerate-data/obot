@@ -15,7 +15,6 @@ import (
 
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	gwtypes "github.com/obot-platform/obot/pkg/gateway/types"
-	"github.com/obot-platform/obot/pkg/mcptrigger"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
@@ -1202,10 +1201,12 @@ func TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation(t *tes
 		Build()
 	backend := &recordingControllerBackend{}
 
-	c := newTestClient(t)
-	// The same value production is constructed with, so reverting the wiring in
-	// pkg/services breaks this test.
-	c.mcpOAuthTokenTrigger = mcptrigger.OwningServerTrigger(storageClient, backend)
+	// Constructed through the same entry point production uses, so the trigger
+	// under test is the one New wires rather than a test-installed stand-in.
+	c := New(
+		t.Context(), newTestDB(t), storageClient, nil, backend,
+		nil, nil, time.Hour, 1, 0, 0, 0, false,
+	)
 
 	wantKey := system.DefaultNamespace + "/" + serverName
 

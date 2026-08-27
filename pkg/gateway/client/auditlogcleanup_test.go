@@ -12,7 +12,7 @@ import (
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
 )
 
-func newTestClient(t *testing.T) *Client {
+func newTestDB(t *testing.T) *gatewaydb.DB {
 	t.Helper()
 
 	services, err := sservices.New(sservices.Config{
@@ -29,6 +29,13 @@ func newTestClient(t *testing.T) *Client {
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatalf("failed to auto-migrate: %v", err)
 	}
+	return db
+}
+
+func newTestClient(t *testing.T) *Client {
+	t.Helper()
+
+	db := newTestDB(t)
 
 	return &Client{
 		db:                        db,

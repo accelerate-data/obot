@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -540,7 +541,31 @@ func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptio
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
+	return gatewayclient.New(
+		t.Context(), database, nil, encryptionConfig,
+		&mcpIDRecordingBackend{trigger: trigger}, nil, nil, time.Hour, 10, 0, 0, 0, false,
+	), services.DB.DB
+}
+
+// mcpIDRecordingBackend lets a test keep asserting on MCP IDs while the gateway
+// client under test builds its real trigger, so the enqueued key is the one
+// production would enqueue.
+type mcpIDRecordingBackend struct {
+	trigger func(context.Context, string) error
+}
+
+func (b *mcpIDRecordingBackend) Trigger(ctx context.Context, gvk schema.GroupVersionKind, key string, _ time.Duration) error {
+	if b.trigger == nil {
+		return nil
+	}
+	if want := v1.SchemeGroupVersion.WithKind("MCPServer"); gvk != want {
+		return fmt.Errorf("triggered kind %s, want %s", gvk, want)
+	}
+	namespace, name, ok := strings.Cut(key, "/")
+	if !ok || namespace != system.DefaultNamespace {
+		return fmt.Errorf("triggered key %q is not namespace-qualified under %s", key, system.DefaultNamespace)
+	}
+	return b.trigger(ctx, name)
 }
 
 func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {

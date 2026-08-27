@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/db"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcptrigger"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -67,7 +69,7 @@ type Client struct {
 	mcpOAuthTokenTrigger      func(context.Context, string) error
 }
 
-func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptionConfig *encryptionconfig.EncryptionConfiguration, mcpOAuthTokenTrigger func(context.Context, string) error, ownerEmails, adminEmails []string, auditLogPersistenceInterval time.Duration, auditLogBatchSize, auditLogRetentionDays, llmAuditLogRetentionDays, deviceScanRetentionDays int, llmAuditEnabled bool) *Client {
+func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptionConfig *encryptionconfig.EncryptionConfiguration, controllerBackend nahbackend.Trigger, ownerEmails, adminEmails []string, auditLogPersistenceInterval time.Duration, auditLogBatchSize, auditLogRetentionDays, llmAuditLogRetentionDays, deviceScanRetentionDays int, llmAuditEnabled bool) *Client {
 	explicitRoleEmailsSet := make(map[string]types2.Role, len(ownerEmails)+len(adminEmails))
 	for _, email := range adminEmails {
 		explicitRoleEmailsSet[strings.ToLower(email)] = types2.RoleAdmin
@@ -85,7 +87,6 @@ func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptio
 		enforcementBuffer:         make([]types.EnforcementDecisionLog, 0, 2*auditLogBatchSize),
 		kickEnforcementPersist:    make(chan struct{}),
 		storageClient:             storageClient,
-		mcpOAuthTokenTrigger:      mcpOAuthTokenTrigger,
 		apiKeyCache:               make(map[[32]byte]apiKeyValidationCacheEntry),
 		apiKeyCacheTTL:            apiKeyValidationCacheTTL,
 		serviceAccountCache:       make(map[[32]byte]serviceAccountValidationCacheEntry),
@@ -97,6 +98,12 @@ func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptio
 		auditLogDeleteBatchSize:   defaultAuditLogDeleteBatchSize,
 		deviceScanCleanupInterval: defaultDeviceScanCleanupInterval,
 		deviceScanDeleteBatchSize: defaultDeviceScanDeleteBatchSize,
+	}
+
+	if controllerBackend != nil {
+		// Callers without a controller backend (tests, and any caller that does
+		// not run controllers) have nothing to notify.
+		c.mcpOAuthTokenTrigger = mcptrigger.OwningServerTrigger(storageClient, controllerBackend)
 	}
 
 	go c.runMCPAuditLogPersistenceLoop(ctx, auditLogPersistenceInterval)
