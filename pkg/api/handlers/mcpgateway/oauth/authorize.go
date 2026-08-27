@@ -19,6 +19,7 @@ import (
 	"github.com/obot-platform/obot/pkg/auth"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
@@ -774,10 +775,14 @@ func (h *handler) maybeHandleDebuggerCallback(req api.Context) (bool, error) {
 	q := url.Values{}
 	q.Set("state", state)
 	if errorCode != "" {
-		q.Set("error", errorCode)
+		// The provider controls both values, and this redirect lands in browser
+		// history, referrer headers, and access logs. Only the error code is
+		// repeated; the description is provider free text that can carry request
+		// identifiers, so it stays in the server-side log.
 		if errorDescription != "" {
-			q.Set("error_description", errorDescription)
+			log.Errorf("MCP OAuth debugger callback returned provider error %s: %s", mcp.SafeOAuthErrorCode(errorCode), errorDescription)
 		}
+		q.Set("error", mcp.SafeOAuthErrorCode(errorCode))
 	} else {
 		q.Set("code", code)
 	}

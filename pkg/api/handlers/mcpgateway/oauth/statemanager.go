@@ -58,7 +58,11 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 		// Clean up the pending state before returning the error
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
 		// error_description is provider-controlled free text that can carry request
-		// identifiers and internal details. Only the error code is safe to repeat.
+		// identifiers and internal details. Only the error code is safe to repeat;
+		// the description stays in the server-side log.
+		if errorDescription != "" {
+			log.Errorf("MCP OAuth provider returned error %s: %s", mcp.SafeOAuthErrorCode(errorStr), errorDescription)
+		}
 		return "", "", fmt.Errorf("error returned from oauth server: %s", mcp.SafeOAuthErrorCode(errorStr))
 	}
 
