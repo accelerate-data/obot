@@ -47,6 +47,12 @@ const (
 	// so the callback is not an oracle for which states exist. It names no flow for the
 	// same reason, and because a dynamic or container callback is not a credential test.
 	invalidOAuthCallbackStateMessage = "invalid or expired OAuth callback state"
+
+	// oauthCallbackFailureMessage covers every callback failure that is not a
+	// rejected state. The underlying error is logged server-side instead, so an
+	// upstream response body, request identifier, or credential is never reflected
+	// back to the browser.
+	oauthCallbackFailureMessage = "MCP OAuth callback could not be completed"
 )
 
 // oauthError represents an OAuth 2.0 error response.
@@ -524,7 +530,8 @@ func (h *handler) oauthCallback(req api.Context) error {
 		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
 			return types.NewErrBadRequest(invalidOAuthCallbackStateMessage)
 		}
-		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
+		log.Errorf("MCP OAuth callback failed: %v", err)
+		return types.NewErrHTTP(http.StatusBadRequest, oauthCallbackFailureMessage)
 	}
 
 	if oauthAuthRequestID == "" {

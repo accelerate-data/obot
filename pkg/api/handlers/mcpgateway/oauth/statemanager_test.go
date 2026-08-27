@@ -641,3 +641,88 @@ func TestStateManagerRejectsTokenEndpointRedirect(t *testing.T) {
 	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
+
+func TestStateManagerSanitizesUpstreamExchangeError(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code cd-9f2 rejected for workspace ws-internal-7 at 10.0.0.4","request_id":"req-abc123"}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(client)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-upstream-error", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-upstream-error", "code-1", "", "")
+	require.Error(t, err)
+	message := err.Error()
+	require.Contains(t, message, "failed to exchange code")
+	require.Contains(t, message, "invalid_grant")
+	for _, leaked := range []string{"req-abc123", "ws-internal-7", "10.0.0.4", "cd-9f2", "dynamic-secret", "verifier-1", provider.URL} {
+		require.NotContains(t, message, leaked)
+	}
+}
+
+func TestStateManagerSanitizesProviderCallbackError(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	manager := newStateManager(client)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: "https://provider.example/token"},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-provider-error", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-provider-error", "", "access_denied", "user ws-internal-7 denied, trace req-abc123")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "access_denied")
+	require.NotContains(t, err.Error(), "req-abc123")
+	require.NotContains(t, err.Error(), "ws-internal-7")
+}
+
+func TestOAuthCallbackDoesNotReflectUpstreamErrorResponse(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	gatewayClient := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code cd-9f2 rejected for workspace ws-internal-7","request_id":"req-abc123"}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(gatewayClient)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-callback-leak", "verifier-1", config))
+
+	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: manager}}
+	err := h.oauthCallback(api.Context{
+		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state=state-callback-leak&code=code-1", nil),
+		ResponseWriter: httptest.NewRecorder(),
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), oauthCallbackFailureMessage)
+	for _, leaked := range []string{"req-abc123", "ws-internal-7", "cd-9f2", "invalid_grant", "dynamic-secret", "verifier-1", provider.URL} {
+		require.NotContains(t, err.Error(), leaked)
+	}
+}

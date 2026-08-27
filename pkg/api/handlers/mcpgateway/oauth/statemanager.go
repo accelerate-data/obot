@@ -2,8 +2,10 @@ package oauth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/obot-platform/obot/pkg/gateway/client"
@@ -56,7 +58,9 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	if errorStr != "" {
 		// Clean up the pending state before returning the error
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		return "", "", fmt.Errorf("error returned from oauth server: %s, %s", errorStr, errorDescription)
+		// error_description is provider-controlled free text that can carry request
+		// identifiers and internal details. Only the error code is safe to repeat.
+		return "", "", fmt.Errorf("error returned from oauth server: %s", safeOAuthErrorCode(errorStr))
 	}
 
 	conf := &oauth2.Config{
@@ -80,7 +84,7 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	token, err := conf.Exchange(exchangeContext, code, oauth2.SetAuthURLParam("code_verifier", ps.Verifier))
 	if err != nil {
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		return "", "", fmt.Errorf("failed to exchange code: %w", err)
+		return "", "", fmt.Errorf("failed to exchange code: %w", sanitizeTokenExchangeError(err))
 	}
 
 	if err := sm.gatewayClient.CommitMCPOAuthPendingStateToken(ctx, ps, ps.OAuthAuthRequestID, conf, token); err != nil {
@@ -88,4 +92,51 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	}
 
 	return ps.OAuthAuthRequestID, ps.MCPID, nil
+}
+
+// safeOAuthErrorCode keeps only the characters RFC 6749 allows in an error code,
+// so a provider cannot smuggle markup, newlines, or free-form detail through it.
+func safeOAuthErrorCode(code string) string {
+	if len(code) > 64 {
+		code = code[:64]
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-', r == '.':
+			return r
+		default:
+			return -1
+		}
+	}, code)
+	if cleaned == "" {
+		return "unspecified_error"
+	}
+	return cleaned
+}
+
+// sanitizeTokenExchangeError reduces a token-endpoint failure to a stable code or
+// status. The oauth2 package embeds the raw upstream response body in
+// RetrieveError, and that body carries provider request identifiers, workspace
+// identifiers, and echoed request parameters that must never reach a log or an
+// API response.
+func sanitizeTokenExchangeError(err error) error {
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) {
+		if retrieveErr.ErrorCode != "" {
+			return fmt.Errorf("token endpoint rejected the exchange: %s", safeOAuthErrorCode(retrieveErr.ErrorCode))
+		}
+		if retrieveErr.Response != nil {
+			return fmt.Errorf("token endpoint rejected the exchange with status %d", retrieveErr.Response.StatusCode)
+		}
+		return errors.New("token endpoint rejected the exchange")
+	}
+
+	// A transport failure names the full request URL, which repeats the token
+	// endpoint back to the caller. Keep only the underlying cause.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("could not reach the token endpoint: %w", urlErr.Err)
+	}
+
+	return errors.New("token exchange failed")
 }
