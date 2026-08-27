@@ -130,24 +130,24 @@ func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config,
 		tokenStorage: tokenStorage,
 		conf:         conf,
 		tok:          tok,
-		tokenSource:  conf.TokenSource(withOAuthHTTPClient(context.Background(), httpClient), tok),
+		tokenSource:  conf.TokenSource(WithOAuthHTTPClient(context.Background(), httpClient), tok),
 	})
 }
 
-// withOAuthHTTPClient binds an HTTP client to the context the oauth2 package
+// WithOAuthHTTPClient binds an HTTP client to the context the oauth2 package
 // reads. Without it, oauth2 falls back to http.DefaultClient and bypasses the
 // operator's remote-network policy entirely.
-func withOAuthHTTPClient(ctx context.Context, httpClient *http.Client) context.Context {
+func WithOAuthHTTPClient(ctx context.Context, httpClient *http.Client) context.Context {
 	if httpClient == nil {
 		return ctx
 	}
 	return context.WithValue(ctx, oauth2.HTTPClient, httpClient)
 }
 
-// noRedirectClient copies an HTTP client with redirects rejected. The source
+// NoRedirectClient copies an HTTP client with redirects rejected. The source
 // client is shared with the MCP transport and metadata discovery, which both
 // still follow redirects, so it is cloned rather than mutated.
-func noRedirectClient(httpClient *http.Client) *http.Client {
+func NoRedirectClient(httpClient *http.Client) *http.Client {
 	if httpClient == nil {
 		return nil
 	}
@@ -257,7 +257,7 @@ func (o *oauth) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 		return nil, err
 	}
 
-	return newStorageBackedTokenSource(o.tokenStorage, oauthConfig, token, noRedirectClient(o.metadataClient)), nil
+	return newStorageBackedTokenSource(o.tokenStorage, oauthConfig, token, NoRedirectClient(o.metadataClient)), nil
 }
 
 func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Response) error {
@@ -335,7 +335,7 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 		}
 	}
 
-	tok, err := ExchangeOAuthToken(withOAuthHTTPClient(ctx, noRedirectClient(o.metadataClient)), conf, cb.Code, verifier)
+	tok, err := ExchangeOAuthToken(WithOAuthHTTPClient(ctx, NoRedirectClient(o.metadataClient)), conf, cb.Code, verifier)
 	if err != nil {
 		slog.Warn("oauth code exchange failed",
 			"server", o.serverName,

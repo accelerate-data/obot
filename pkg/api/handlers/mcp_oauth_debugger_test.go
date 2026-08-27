@@ -445,3 +445,73 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 	}
 	return b
 }
+
+func TestExchangeAndPersistOAuthDebuggerTokenRejectsRedirectAndSanitizesError(t *testing.T) {
+	const (
+		mcpID  = "direct-mcp-server"
+		mcpURL = "https://direct-mcp.example/api"
+	)
+
+	t.Run("redirect", func(t *testing.T) {
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Error("redirect target received the debugger exchange credentials")
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(target.Close)
+		redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+		}))
+		t.Cleanup(redirector.Close)
+
+		pending, gatewayClient := newRedirectDebuggerPendingState(t, mcpID, mcpURL, "redirect-state", redirector.URL)
+		_, err := exchangeAndPersistOAuthDebuggerToken(t.Context(), gatewayClient, pending, "code-1", http.DefaultClient)
+		if err == nil {
+			t.Fatal("expected the redirected debugger exchange to fail")
+		}
+		if !strings.Contains(err.Error(), "redirect") {
+			t.Fatalf("error = %q, want a redirect refusal", err)
+		}
+		for _, leaked := range []string{"verifier-1", "dynamic-secret"} {
+			if strings.Contains(err.Error(), leaked) {
+				t.Fatalf("error %q leaked %q", err, leaked)
+			}
+		}
+	})
+
+	t.Run("upstream error body", func(t *testing.T) {
+		provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code cd-9f2 rejected for workspace ws-internal-7","request_id":"req-abc123"}`)
+		}))
+		t.Cleanup(provider.Close)
+
+		pending, gatewayClient := newRedirectDebuggerPendingState(t, mcpID, mcpURL, "error-state", provider.URL)
+		_, err := exchangeAndPersistOAuthDebuggerToken(t.Context(), gatewayClient, pending, "code-1", http.DefaultClient)
+		if err == nil {
+			t.Fatal("expected the rejected debugger exchange to fail")
+		}
+		for _, leaked := range []string{"req-abc123", "ws-internal-7", "cd-9f2"} {
+			if strings.Contains(err.Error(), leaked) {
+				t.Fatalf("error %q leaked %q", err, leaked)
+			}
+		}
+	})
+}
+
+func newRedirectDebuggerPendingState(t *testing.T, mcpID, mcpURL, state, tokenURL string) (*gatewaytypes.MCPOAuthPendingState, *gateway.Client) {
+	t.Helper()
+	gatewayClient := newDirectOAuthDebuggerTestClient(t, mcpID)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: tokenURL + "/authorize", TokenURL: tokenURL, AuthStyle: oauth2.AuthStyleInParams},
+	}
+	if err := gatewayClient.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, OAuthDebuggerPendingStateMarker, "", state, "verifier-1", config); err != nil {
+		t.Fatalf("create debugger pending state: %v", err)
+	}
+	pending, err := gatewayClient.GetMCPOAuthPendingState(t.Context(), state)
+	if err != nil {
+		t.Fatalf("load debugger pending state: %v", err)
+	}
+	return pending, gatewayClient
+}

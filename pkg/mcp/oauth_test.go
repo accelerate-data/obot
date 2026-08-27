@@ -635,7 +635,7 @@ func TestNoRedirectClientRejectsRedirect(t *testing.T) {
 	}
 	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
 
-	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, noRedirectClient(http.DefaultClient)).Token()
+	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, NoRedirectClient(http.DefaultClient)).Token()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "redirect")
 	require.NotContains(t, err.Error(), "refresh-token")

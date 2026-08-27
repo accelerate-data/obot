@@ -195,11 +195,13 @@ func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *ga
 	conf := oauthDebuggerConfigFromPendingState(pendingState)
 	exchangeContext := ctx
 	if len(httpClients) > 0 && httpClients[0] != nil {
-		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, httpClients[0])
+		// The exchange replays the authorization code, PKCE verifier, and client
+		// secret, so it must not follow a redirect to another origin.
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, mcp.NoRedirectClient(httpClients[0]))
 	}
 	token, err := conf.Exchange(exchangeContext, code, oauth2.VerifierOption(pendingState.Verifier))
 	if err != nil {
-		return nil, fmt.Errorf("failed to exchange OAuth code: %w", err)
+		return nil, fmt.Errorf("failed to exchange OAuth code: %w", mcp.SanitizeTokenExchangeError(err))
 	}
 
 	if err := gatewayClient.CommitMCPOAuthPendingStateToken(ctx, pendingState, "", conf, token); err != nil {

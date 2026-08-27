@@ -2,6 +2,8 @@ package mcp
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -88,10 +90,15 @@ func TestContainerOAuthAuthorizationIsInjectedPerUser(t *testing.T) {
 		Provider: types.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
 		ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
 	}}
-	sm := &SessionManager{globalTokenStore: perUserContainerTokenStore{
-		"user-a": {AccessToken: "access-a", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
-		"user-b": {AccessToken: "access-b", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
-	}}
+	// A backend is required because the refresh runs on the operator's
+	// remote-network policy client, which the backend supplies.
+	sm := &SessionManager{
+		backend: containerOAuthTestBackend(),
+		globalTokenStore: perUserContainerTokenStore{
+			"user-a": {AccessToken: "access-a", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
+			"user-b": {AccessToken: "access-b", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
+		},
+	}
 	server := func(user string) ServerConfig {
 		return ServerConfig{UserID: user, MCPServerName: "shared-fabric", Env: []string{
 			"INSTANCE=https://login.microsoftonline.com/", "TENANT=tenant", "CLIENT=client", "SECRET=secret",
@@ -103,4 +110,36 @@ func TestContainerOAuthAuthorizationIsInjectedPerUser(t *testing.T) {
 	require.Equal(t, []string{"Authorization"}, userA.PassthroughHeaderNames)
 	require.Equal(t, []string{"Bearer access-a"}, userA.PassthroughHeaderValues)
 	require.Equal(t, []string{"Bearer access-b"}, userB.PassthroughHeaderValues)
+}
+
+// The container OAuth refresh replays the refresh token and client secret, so the
+// client it runs on must both enforce the operator's remote-network policy and
+// refuse redirects. This guards the exact composition
+// addContainerOAuthAuthorization uses.
+func TestContainerOAuthRefreshClientEnforcesPolicyAndRejectsRedirects(t *testing.T) {
+	sm := &SessionManager{backend: containerOAuthTestBackend()}
+
+	policyClient, err := sm.HTTPClientForServer(ServerConfig{}, nil, nil, 0)
+	require.NoError(t, err)
+	refreshClient := NoRedirectClient(policyClient)
+	require.NotNil(t, refreshClient.CheckRedirect, "container refresh client must reject redirects")
+	require.Nil(t, policyClient.CheckRedirect, "the shared MCP transport client must keep following redirects")
+
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("loopback token endpoint received a container OAuth refresh")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(tokenEndpoint.Close)
+
+	_, err = refreshClient.Post(tokenEndpoint.URL, "application/x-www-form-urlencoded", http.NoBody)
+	require.Error(t, err, "loopback token endpoint must be blocked by the remote-network policy")
+}
+
+func containerOAuthTestBackend() backend {
+	return &kubernetesBackend{
+		httpListenPort:   8080,
+		mcpNamespace:     "obot-mcp",
+		mcpClusterDomain: "cluster.local",
+		serviceFQDN:      "obot.obot-system.svc.cluster.local",
+	}
 }
