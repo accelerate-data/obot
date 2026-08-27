@@ -12,7 +12,6 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/mcp"
-	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
@@ -32,17 +31,10 @@ type MCPOAuthHandlerFactory struct {
 func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManager, client kclient.Client, gatewayClient *client.Client, globalTokenStore mcp.GlobalTokenStore, secretBindingAllowedLabel string, forceDynamicClient bool) *MCPOAuthHandlerFactory {
 	remoteURLValidationConfig := sessionManager.RemoteMCPURLValidationConfig()
 	f := &MCPOAuthHandlerFactory{
-		baseURL:           baseURL,
-		mcpSessionManager: sessionManager,
-		client:            client,
-		stateMgr: newStateManager(gatewayClient, safehttp.NewClient(safehttp.ClientOptions{
-			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
-			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
-			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
-			// A redirected token request replays the authorization code, PKCE
-			// verifier, and client secret to whatever origin the provider names.
-			BlockRedirects: true,
-		})),
+		baseURL:                   baseURL,
+		mcpSessionManager:         sessionManager,
+		client:                    client,
+		stateMgr:                  newStateManager(gatewayClient, newOAuthExchangeClient(remoteURLValidationConfig)),
 		tokenStore:                globalTokenStore,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 	}
