@@ -2,11 +2,14 @@ package oauth
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -431,6 +434,14 @@ func newStateManagerTestClient(t *testing.T, entryName, mcpID string) *gateway.C
 
 func newStateManagerTestClientWithStaticRequirement(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) *gateway.Client {
 	t.Helper()
+	client, _ := newStateManagerTestClientWithDB(t, entryName, mcpID, staticOAuthRequired)
+	return client
+}
+
+// newStateManagerTestClientWithDB also returns the gorm handle so a test can
+// age a pending state past its TTL without waiting for background cleanup.
+func newStateManagerTestClientWithDB(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) (*gateway.Client, *gorm.DB) {
+	t.Helper()
 	storage := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(
@@ -453,7 +464,7 @@ func newStateManagerTestClientWithStaticRequirement(t *testing.T, entryName, mcp
 	require.NoError(t, db.AutoMigrate())
 	client := gateway.New(t.Context(), db, storage, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	return client
+	return client, services.DB.DB
 }
 
 func newDirectStateManagerTestClient(t *testing.T, mcpID string) (*gateway.Client, kclient.Client) {
@@ -473,4 +484,95 @@ func newDirectStateManagerTestClient(t *testing.T, mcpID string) (*gateway.Clien
 	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
 	return gatewayClient, storageClient
+}
+
+func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	newManagerWithProvider := func(t *testing.T) (*stateManager, *gateway.Client, *gorm.DB, *atomic.Int64) {
+		t.Helper()
+		client, db := newStateManagerTestClientWithDB(t, entryName, mcpID, false)
+		var exchanges atomic.Int64
+		provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"access_token":"dynamic-access-%d","token_type":"Bearer"}`, exchanges.Add(1))
+		}))
+		t.Cleanup(provider.Close)
+		config := &oauth2.Config{
+			ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+			Endpoint: oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL},
+		}
+		manager := newStateManager(client)
+		require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "dynamic-state", "verifier-1", config))
+		return manager, client, db, &exchanges
+	}
+
+	t.Run("only one concurrent callback exchanges and writes a token", func(t *testing.T) {
+		manager, client, _, exchanges := newManagerWithProvider(t)
+
+		const attempts = 8
+		start := make(chan struct{})
+		results := make(chan error, attempts)
+		var wg sync.WaitGroup
+		for range attempts {
+			wg.Go(func() {
+				<-start
+				_, _, err := manager.createToken(t.Context(), "dynamic-state", "code-1", "", "")
+				results <- err
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		var succeeded int
+		for err := range results {
+			if err == nil {
+				succeeded++
+			} else {
+				require.ErrorIs(t, err, gateway.ErrMCPOAuthPendingStateInvalid)
+			}
+		}
+		require.Equal(t, 1, succeeded, "exactly one callback may consume the state")
+		require.Equal(t, int64(1), exchanges.Load(), "a losing callback must not reach the provider")
+
+		stored, err := client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+		require.NoError(t, err)
+		require.Equal(t, "dynamic-access-1", stored.AccessToken)
+	})
+
+	t.Run("a replayed callback cannot overwrite the token after success", func(t *testing.T) {
+		manager, client, _, exchanges := newManagerWithProvider(t)
+
+		_, _, err := manager.createToken(t.Context(), "dynamic-state", "code-1", "", "")
+		require.NoError(t, err)
+
+		_, _, err = manager.createToken(t.Context(), "dynamic-state", "code-1", "", "")
+		require.ErrorIs(t, err, gateway.ErrMCPOAuthPendingStateInvalid)
+		require.Equal(t, int64(1), exchanges.Load())
+
+		stored, err := client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+		require.NoError(t, err)
+		require.Equal(t, "dynamic-access-1", stored.AccessToken)
+	})
+
+	t.Run("a stale state is rejected when cleanup has not run", func(t *testing.T) {
+		manager, client, db, exchanges := newManagerWithProvider(t)
+		// Background cleanup deliberately never runs: consumption itself must
+		// enforce the creation-time cutoff.
+		hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte("dynamic-state")))
+		require.NoError(t, db.WithContext(t.Context()).Model(&gatewaytypes.MCPOAuthPendingState{}).
+			Where("hashed_state = ?", hashedState).
+			Update("created_at", time.Now().Add(-24*time.Hour)).Error)
+
+		_, _, err := manager.createToken(t.Context(), "dynamic-state", "code-1", "", "")
+		require.ErrorIs(t, err, gateway.ErrMCPOAuthPendingStateInvalid)
+		require.Zero(t, exchanges.Load())
+
+		_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	})
 }

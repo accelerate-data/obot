@@ -41,6 +41,10 @@ const (
 	ErrTemporarilyUnavailable  ErrorCode = "temporarily_unavailable"
 	ErrInvalidClientMetadata   ErrorCode = "invalid_client_metadata"
 
+	// invalidStaticOAuthCredentialTestMessage is the single response body for every
+	// rejected OAuth callback state, static or not. Keeping one message means a caller
+	// cannot tell an unknown state from an expired, already-claimed, or non-static one,
+	// so the callback is not an oracle for which states exist.
 	invalidStaticOAuthCredentialTestMessage = "invalid or expired static OAuth credential test"
 )
 
@@ -516,7 +520,7 @@ func (h *handler) oauthCallback(req api.Context) error {
 
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
 			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 		}
 		return types.NewErrHTTP(http.StatusBadRequest, err.Error())

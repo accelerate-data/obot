@@ -94,4 +94,7 @@ type MCPOAuthPendingState struct {
 	StaticOAuthSaveProof           string
 	Encrypted                      bool
 	CreatedAt                      time.Time
+	// ClaimedAt is nil until a callback claims the row for exchange. A claim is
+	// terminal: the row can never be consumed again, whatever the outcome.
+	ClaimedAt *time.Time
 }
