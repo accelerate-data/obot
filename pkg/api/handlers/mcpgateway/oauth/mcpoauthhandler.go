@@ -39,6 +39,9 @@ func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManage
 			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
 			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
 			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
+			// A redirected token request replays the authorization code, PKCE
+			// verifier, and client secret to whatever origin the provider names.
+			BlockRedirects: true,
 		})),
 		tokenStore:                globalTokenStore,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,

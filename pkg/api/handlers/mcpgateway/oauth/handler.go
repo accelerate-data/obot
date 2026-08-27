@@ -45,6 +45,9 @@ func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTo
 			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
 			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
 			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
+			// Token exchange and refresh carry credentials; a redirect would replay
+			// them to another origin. Metadata discovery above still follows them.
+			BlockRedirects: true,
 		}),
 		baseURL:             baseURL,
 		oauthChecker:        oauthChecker,

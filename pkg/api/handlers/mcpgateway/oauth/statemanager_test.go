@@ -608,3 +608,36 @@ func TestStateManagerBlocksDynamicTokenExchangeToPrivateAddress(t *testing.T) {
 	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
+
+func TestStateManagerRejectsTokenEndpointRedirect(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("redirect target received the exchange: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(attacker.Close)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(client, safehttp.NewClient(safehttp.ClientOptions{BlockRedirects: true}))
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-redirect", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-redirect", "code-1", "", "")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "code-1")
+	require.NotContains(t, err.Error(), "verifier-1")
+	require.NotContains(t, err.Error(), "dynamic-secret")
+	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
