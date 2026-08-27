@@ -269,3 +269,49 @@ func TestAllowListMatchesExactAndSuffixHosts(t *testing.T) {
 		})
 	}
 }
+
+func TestNewClientRejectsRedirectsWhenBlocked(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("redirect target must not be reached")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	resp, err := NewClient(ClientOptions{BlockRedirects: true}).Post(origin.URL, "application/x-www-form-urlencoded", strings.NewReader("code=secret-code"))
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("expected redirect to be rejected")
+	}
+	if !strings.Contains(err.Error(), "redirect") {
+		t.Fatalf("expected a redirect error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "secret-code") {
+		t.Fatalf("error leaked the request body: %v", err)
+	}
+}
+
+func TestNewClientFollowsRedirectsByDefault(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer origin.Close()
+
+	resp, err := NewClient(ClientOptions{}).Get(origin.URL)
+	if err != nil {
+		t.Fatalf("expected redirect to be followed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d", resp.StatusCode)
+	}
+}

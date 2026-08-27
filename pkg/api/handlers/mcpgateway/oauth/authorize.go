@@ -19,6 +19,7 @@ import (
 	"github.com/obot-platform/obot/pkg/auth"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
@@ -47,6 +48,12 @@ const (
 	// so the callback is not an oracle for which states exist. It names no flow for the
 	// same reason, and because a dynamic or container callback is not a credential test.
 	invalidOAuthCallbackStateMessage = "invalid or expired OAuth callback state"
+
+	// oauthCallbackFailureMessage covers every callback failure that is not a
+	// rejected state. The underlying error is logged server-side instead, so an
+	// upstream response body, request identifier, or credential is never reflected
+	// back to the browser.
+	oauthCallbackFailureMessage = "MCP OAuth callback could not be completed"
 )
 
 // oauthError represents an OAuth 2.0 error response.
@@ -524,7 +531,8 @@ func (h *handler) oauthCallback(req api.Context) error {
 		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
 			return types.NewErrBadRequest(invalidOAuthCallbackStateMessage)
 		}
-		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
+		log.Errorf("MCP OAuth callback failed: %v", err)
+		return types.NewErrHTTP(http.StatusBadRequest, oauthCallbackFailureMessage)
 	}
 
 	if oauthAuthRequestID == "" {
@@ -613,8 +621,8 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 			conf.Scopes = strings.Fields(pendingState.Scopes)
 		}
 		exchangeContext := req.Context()
-		if h.staticOAuthHTTPClient != nil {
-			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.staticOAuthHTTPClient)
+		if h.oauthExchangeHTTPClient != nil {
+			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.oauthExchangeHTTPClient)
 		}
 		if _, err := nmcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier); err != nil {
 			status = types.MCPStaticOAuthTestStatusFailed
@@ -767,10 +775,14 @@ func (h *handler) maybeHandleDebuggerCallback(req api.Context) (bool, error) {
 	q := url.Values{}
 	q.Set("state", state)
 	if errorCode != "" {
-		q.Set("error", errorCode)
+		// The provider controls both values, and this redirect lands in browser
+		// history, referrer headers, and access logs. Only the error code is
+		// repeated; the description is provider free text that can carry request
+		// identifiers, so it stays in the server-side log.
 		if errorDescription != "" {
-			q.Set("error_description", errorDescription)
+			log.Errorf("MCP OAuth debugger callback returned provider error %s: %s", mcp.SafeOAuthErrorCode(errorCode), errorDescription)
 		}
+		q.Set("error", mcp.SafeOAuthErrorCode(errorCode))
 	} else {
 		q.Set("code", code)
 	}

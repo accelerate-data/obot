@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
@@ -460,7 +462,7 @@ func TestStorageBackedTokenSourcePersistsRefreshedToken(t *testing.T) {
 		Expiry:       time.Now().Add(-time.Hour),
 	}
 
-	tok, err := newStorageBackedTokenSource(storage, conf, initial).Token()
+	tok, err := newStorageBackedTokenSource(storage, conf, initial, server.Client()).Token()
 	require.NoError(t, err)
 	require.Equal(t, "new-access-token", tok.AccessToken)
 	require.Equal(t, "new-refresh-token", tok.RefreshToken)
@@ -588,4 +590,157 @@ func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 
 func hVerifier(callback *oauthAuthorizeCallbackHandler) string {
 	return callback.verifier
+}
+
+func TestStorageBackedTokenSourceUsesSuppliedHTTPClient(t *testing.T) {
+	// A TLS server the default client cannot verify: a successful refresh proves
+	// the supplied client carried the request, not http.DefaultClient.
+	server := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	conf := &oauth2.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		Endpoint:     oauth2.Endpoint{TokenURL: server.URL, AuthStyle: oauth2.AuthStyleInParams},
+	}
+	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
+
+	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, nil).Token()
+	require.Error(t, err, "refresh without a supplied client must not reach the TLS token endpoint")
+
+	tok, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, server.Client()).Token()
+	require.NoError(t, err)
+	require.Equal(t, "new-access-token", tok.AccessToken)
+}
+
+func TestNoRedirectClientRejectsRedirect(t *testing.T) {
+	var reachedTarget atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		reachedTarget.Store(true)
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"access_token":"leaked","token_type":"Bearer"}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		http.Redirect(rw, req, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	conf := &oauth2.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		Endpoint:     oauth2.Endpoint{TokenURL: redirector.URL, AuthStyle: oauth2.AuthStyleInParams},
+	}
+	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
+
+	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, NoRedirectClient(http.DefaultClient)).Token()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "redirect")
+	require.NotContains(t, err.Error(), "refresh-token")
+	require.NotContains(t, err.Error(), "client-secret")
+	require.False(t, reachedTarget.Load(), "redirect target must never receive the refresh credentials")
+}
+
+// AC5(a): a reachable authorization server can advertise a token endpoint inside
+// the estate. The token URL therefore comes from provider-controlled metadata,
+// not from operator configuration, and the remote-network policy has to reject it
+// at exchange time. The metadata host stands in for a public one by being
+// allow-listed; the token endpoint it names is not.
+func TestDiscoveredInternalTokenEndpointIsRejectedAtExchange(t *testing.T) {
+	var tokenEndpointReached atomic.Bool
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		tokenEndpointReached.Store(true)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access_token":"leaked","token_type":"Bearer"}`)
+	}))
+	t.Cleanup(tokenEndpoint.Close)
+
+	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/.well-known/") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":"%s/authorize","token_endpoint":%q,"response_types_supported":["code"]}`,
+			"http://"+r.Host, "http://"+r.Host, tokenEndpoint.URL)
+	}))
+	t.Cleanup(authServer.Close)
+
+	metadataClient := safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback: true, BlockPrivateIP: true, BlockLinkLocal: true,
+		AllowList: []string{strings.TrimPrefix(authServer.URL, "http://")},
+	})
+	metadata, _, _, _, err := getAuthServerMetadata(t.Context(), metadataClient, authServer.URL)
+	require.NoError(t, err)
+	require.Equal(t, tokenEndpoint.URL, metadata.TokenEndpoint, "discovery must yield the provider-named token endpoint")
+
+	conf := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: metadata.AuthorizationEndpoint, TokenURL: metadata.TokenEndpoint},
+	}
+	exchangeClient := safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback: true, BlockPrivateIP: true, BlockLinkLocal: true, BlockRedirects: true,
+	})
+
+	_, err = ExchangeOAuthToken(WithOAuthHTTPClient(t.Context(), exchangeClient), conf, "code-1", "verifier-1")
+	require.Error(t, err)
+	require.False(t, tokenEndpointReached.Load(), "the internal token endpoint must never be contacted")
+	for _, secret := range []string{"code-1", "verifier-1", "dynamic-secret"} {
+		require.NotContains(t, err.Error(), secret)
+	}
+}
+
+// SafeOAuthErrorCode is the only guard on the provider-controlled `error`
+// parameter, which reaches a log line and an API error message at three call
+// sites. A provider that puts its payload in the code rather than the
+// description gets nothing else in the way.
+func TestSafeOAuthErrorCode(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		code string
+		want string
+	}{
+		{"rfc 6749 code kept whole", "access_denied", "access_denied"},
+		{"dotted and dashed codes kept", "invalid-request.v2", "invalid-request.v2"},
+		{"markup stripped", "access_denied<script>alert(1)</script>", "access_deniedscriptalert1script"},
+		{"newlines stripped so a code cannot forge a log line", "access_denied\r\nlevel=info msg=ok", "access_deniedlevelinfomsgok"},
+		{"spaces and punctuation stripped", "access denied: trace req/abc", "accessdeniedtracereqabc"},
+		{"truncated at 64 characters", strings.Repeat("a", 100), strings.Repeat("a", 64)},
+		{"empty falls back", "", "unspecified_error"},
+		{"all-invalid falls back", "<<< >>>", "unspecified_error"},
+		{"truncation happens before filtering", strings.Repeat("<", 64) + "leaked", "unspecified_error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, SafeOAuthErrorCode(tt.code))
+		})
+	}
+}
+
+// Callers distinguish an aborted exchange from a rejected one, so the sanitizer
+// must not flatten a cancellation into its generic message.
+func TestSanitizeTokenExchangeErrorPreservesCancellation(t *testing.T) {
+	for name, err := range map[string]error{
+		"bare":    context.Canceled,
+		"wrapped": fmt.Errorf("exchange aborted: %w", context.Canceled),
+		"urlErr":  &url.Error{Op: "Post", URL: "https://provider.example/token", Err: context.Canceled},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sanitized := SanitizeTokenExchangeError(err)
+			if !errors.Is(sanitized, context.Canceled) {
+				t.Fatalf("cancellation was flattened: %v", sanitized)
+			}
+			if strings.Contains(sanitized.Error(), "provider.example") {
+				t.Fatalf("sanitized error leaked the token endpoint: %v", sanitized)
+			}
+		})
+	}
+
+	deadline := SanitizeTokenExchangeError(fmt.Errorf("exchange timed out: %w", context.DeadlineExceeded))
+	if !errors.Is(deadline, context.DeadlineExceeded) {
+		t.Fatalf("deadline was flattened: %v", deadline)
+	}
 }

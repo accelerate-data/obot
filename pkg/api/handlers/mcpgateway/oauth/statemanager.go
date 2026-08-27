@@ -12,14 +12,16 @@ import (
 )
 
 type stateManager struct {
-	gatewayClient         *client.Client
-	staticOAuthHTTPClient *http.Client
+	gatewayClient *client.Client
+	// exchangeHTTPClient carries the operator's remote-network policy. Every OAuth
+	// token exchange runs through it, not only the static-catalog and container ones.
+	exchangeHTTPClient *http.Client
 }
 
-func newStateManager(gatewayClient *client.Client, staticOAuthHTTPClient ...*http.Client) *stateManager {
+func newStateManager(gatewayClient *client.Client, exchangeHTTPClient ...*http.Client) *stateManager {
 	manager := &stateManager{gatewayClient: gatewayClient}
-	if len(staticOAuthHTTPClient) > 0 {
-		manager.staticOAuthHTTPClient = staticOAuthHTTPClient[0]
+	if len(exchangeHTTPClient) > 0 {
+		manager.exchangeHTTPClient = exchangeHTTPClient[0]
 	}
 	return manager
 }
@@ -55,7 +57,13 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	if errorStr != "" {
 		// Clean up the pending state before returning the error
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		return "", "", fmt.Errorf("error returned from oauth server: %s, %s", errorStr, errorDescription)
+		// error_description is provider-controlled free text that can carry request
+		// identifiers and internal details. Only the error code is safe to repeat;
+		// the description stays in the server-side log.
+		if errorDescription != "" {
+			log.Errorf("MCP OAuth provider returned error %s: %s", mcp.SafeOAuthErrorCode(errorStr), errorDescription)
+		}
+		return "", "", fmt.Errorf("error returned from oauth server: %s", mcp.SafeOAuthErrorCode(errorStr))
 	}
 
 	conf := &oauth2.Config{
@@ -73,13 +81,13 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	}
 
 	exchangeContext := ctx
-	if (ps.CatalogEntryName != "" || mcp.IsContainerOAuthResource(ps.URL)) && sm.staticOAuthHTTPClient != nil {
-		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, sm.staticOAuthHTTPClient)
+	if sm.exchangeHTTPClient != nil {
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, sm.exchangeHTTPClient)
 	}
 	token, err := conf.Exchange(exchangeContext, code, oauth2.SetAuthURLParam("code_verifier", ps.Verifier))
 	if err != nil {
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		return "", "", fmt.Errorf("failed to exchange code: %w", err)
+		return "", "", fmt.Errorf("failed to exchange code: %w", mcp.SanitizeTokenExchangeError(err))
 	}
 
 	if err := sm.gatewayClient.CommitMCPOAuthPendingStateToken(ctx, ps, ps.OAuthAuthRequestID, conf, token); err != nil {

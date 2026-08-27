@@ -576,3 +576,162 @@ func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
 		require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 	})
 }
+
+// The token endpoint is set directly here because enforcement happens per dial on
+// the resolved address, whatever populated the URL. The discovery-driven case --
+// a reachable authorization server advertising an internal token endpoint -- is
+// covered by TestDiscoveredInternalTokenEndpointIsRejectedAtExchange in pkg/mcp.
+func TestStateManagerBlocksDynamicTokenExchangeToPrivateAddress(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("restricted client reached the private token endpoint")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(client, safehttp.NewClient(safehttp.ClientOptions{
+		BlockLoopback:  true,
+		BlockPrivateIP: true,
+		BlockLinkLocal: true,
+	}))
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	// An empty catalog entry name is what a dynamically registered client records.
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-dynamic-private", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-dynamic-private", "code-1", "", "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to exchange code")
+	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestStateManagerRejectsTokenEndpointRedirect(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("redirect target received the exchange: %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(attacker.Close)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, attacker.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(client, safehttp.NewClient(safehttp.ClientOptions{BlockRedirects: true}))
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-redirect", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-redirect", "code-1", "", "")
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "code-1")
+	require.NotContains(t, err.Error(), "verifier-1")
+	require.NotContains(t, err.Error(), "dynamic-secret")
+	_, err = client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestStateManagerSanitizesUpstreamExchangeError(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code cd-9f2 rejected for workspace ws-internal-7 at 10.0.0.4","request_id":"req-abc123"}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(client)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-upstream-error", "verifier-1", config))
+
+	_, _, err := manager.createToken(t.Context(), "state-upstream-error", "code-1", "", "")
+	require.Error(t, err)
+	message := err.Error()
+	require.Contains(t, message, "failed to exchange code")
+	require.Contains(t, message, "invalid_grant")
+	for _, leaked := range []string{"req-abc123", "ws-internal-7", "10.0.0.4", "cd-9f2", "dynamic-secret", "verifier-1", provider.URL} {
+		require.NotContains(t, message, leaked)
+	}
+}
+
+func TestStateManagerSanitizesProviderCallbackError(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	manager := newStateManager(client)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: "https://provider.example/token"},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-provider-error", "verifier-1", config))
+
+	// Both provider-controlled fields carry a payload: the description is dropped
+	// entirely, and the code survives only through the character filter.
+	_, _, err := manager.createToken(t.Context(), "state-provider-error", "", "access_denied\r\n<script>alert(1)</script>", "user ws-internal-7 denied, trace req-abc123")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "access_denied")
+	require.NotContains(t, err.Error(), "req-abc123")
+	require.NotContains(t, err.Error(), "ws-internal-7")
+	require.NotContains(t, err.Error(), "<script>")
+	require.NotContains(t, err.Error(), "\n")
+	require.NotContains(t, err.Error(), "\r")
+}
+
+func TestOAuthCallbackDoesNotReflectUpstreamErrorResponse(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	gatewayClient := newStateManagerTestClientWithStaticRequirement(t, entryName, mcpID, false)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code cd-9f2 rejected for workspace ws-internal-7","request_id":"req-abc123"}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	manager := newStateManager(gatewayClient)
+	config := &oauth2.Config{
+		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: provider.URL},
+	}
+	require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", "state-callback-leak", "verifier-1", config))
+
+	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: manager}}
+	err := h.oauthCallback(api.Context{
+		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state=state-callback-leak&code=code-1", nil),
+		ResponseWriter: httptest.NewRecorder(),
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), oauthCallbackFailureMessage)
+	for _, leaked := range []string{"req-abc123", "ws-internal-7", "cd-9f2", "invalid_grant", "dynamic-secret", "verifier-1", provider.URL} {
+		require.NotContains(t, err.Error(), leaked)
+	}
+}

@@ -594,7 +594,7 @@ func (h *handler) doTokenExchange(req api.Context, oauthClient v1.OAuthClient, r
 	}
 
 	// Refresh the token if needed
-	tok, err := refreshOAuthToken(req.Context(), h.staticOAuthHTTPClient, config, token)
+	tok, err := refreshOAuthToken(req.Context(), h.oauthExchangeHTTPClient, config, token)
 	if err != nil {
 		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "failed to refresh token", ""))
 	}

@@ -24,7 +24,7 @@ type handler struct {
 	clientExpiration time.Duration
 
 	clientMetadataHTTPClient *http.Client
-	staticOAuthHTTPClient    *http.Client
+	oauthExchangeHTTPClient  *http.Client
 	clientMetadataCache      map[string]clientMetadataCacheEntry
 	clientMetadataCacheLock  sync.Mutex
 }
@@ -41,16 +41,12 @@ func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTo
 			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
 			Timeout:        clientMetadataFetchTimeout,
 		}),
-		staticOAuthHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
-			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
-			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
-			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
-		}),
-		baseURL:             baseURL,
-		oauthChecker:        oauthChecker,
-		acrHelper:           acrHelper,
-		clientExpiration:    clientSecretExpiration,
-		clientMetadataCache: map[string]clientMetadataCacheEntry{},
+		oauthExchangeHTTPClient: newOAuthExchangeClient(remoteURLValidationConfig),
+		baseURL:                 baseURL,
+		oauthChecker:            oauthChecker,
+		acrHelper:               acrHelper,
+		clientExpiration:        clientSecretExpiration,
+		clientMetadataCache:     map[string]clientMetadataCacheEntry{},
 	}
 
 	// Expose two sets of endpoints: one for clients that look at the oauth-protected-resource metadata and one for clients that don't.

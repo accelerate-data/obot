@@ -126,7 +126,12 @@ func (sm *SessionManager) addContainerOAuthAuthorization(ctx context.Context, co
 		return types.NewErrBadRequest("MCP server requires OAuth authorization")
 	}
 
-	refreshed, err := conf.TokenSource(ctx, token).Token()
+	refreshClient, err := sm.HTTPClientForServer(*server, nil, nil, 0)
+	if err != nil {
+		return fmt.Errorf("failed to build container OAuth refresh client: %w", err)
+	}
+
+	refreshed, err := conf.TokenSource(WithOAuthHTTPClient(ctx, NoRedirectClient(refreshClient)), token).Token()
 	if err != nil {
 		if deleteErr := store.DeleteTokenConfig(ctx); deleteErr != nil {
 			return fmt.Errorf("failed to discard invalid container OAuth grant after refresh failure: %w", deleteErr)
