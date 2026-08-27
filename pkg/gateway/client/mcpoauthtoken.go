@@ -40,6 +40,7 @@ var (
 	ErrMCPStaticOAuthCredentialNotFound = errors.New("static OAuth credential does not exist")
 	ErrMCPStaticOAuthEncryptionRequired = errors.New("static OAuth credential encryption is required")
 	ErrMCPOAuthCatalogCredentialChanged = errors.New("catalog OAuth credential changed")
+	ErrMCPOAuthPendingStateInvalid      = errors.New("invalid, expired, or already claimed OAuth state")
 )
 
 const mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
@@ -841,6 +842,29 @@ func (c *Client) GetMCPOAuthPendingState(ctx context.Context, state string) (*ty
 	}
 
 	return ps, nil
+}
+
+// ClaimMCPOAuthPendingState atomically admits exactly one unexpired callback
+// for a dynamic or container pending state. The creation-time cutoff is part of
+// the same conditional update, so an expired row is rejected even when the
+// background cleanup has not run or has failed. Static OAuth test rows are
+// excluded because their callback is claimed by ClaimMCPStaticOAuthTest, which
+// runs earlier in callback dispatch and owns a different status transition.
+func (c *Client) ClaimMCPOAuthPendingState(ctx context.Context, state string) (*types.MCPOAuthPendingState, error) {
+	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	now := time.Now()
+	result := c.db.WithContext(ctx).
+		Model(&types.MCPOAuthPendingState{}).
+		Where("hashed_state = ? AND static_o_auth_test = ? AND claimed_at IS NULL AND created_at >= ?", hashedState, false, now.Add(-pendingStateTTL)).
+		Update("claimed_at", now)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, ErrMCPOAuthPendingStateInvalid
+	}
+
+	return c.GetMCPOAuthPendingState(ctx, state)
 }
 
 func (c *Client) DeleteMCPOAuthPendingState(ctx context.Context, hashedState string) error {

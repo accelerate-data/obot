@@ -143,7 +143,7 @@ func TestStaticOAuthCallbackClaimsProofBeforeProviderExchange(t *testing.T) {
 
 	select {
 	case loser := <-responses:
-		if loser.status != http.StatusBadRequest || loser.body != "invalid or expired static OAuth credential test\n" {
+		if loser.status != http.StatusBadRequest || loser.body != "invalid or expired OAuth callback state\n" {
 			t.Fatalf("concurrent loser = %d body=%q, want generic bad request", loser.status, loser.body)
 		}
 	case <-time.After(2 * time.Second):
@@ -216,7 +216,7 @@ func assertSafeStaticOAuthCallbackFailure(t *testing.T, server http.Handler, pat
 	if recorder.Code != wantStatus {
 		t.Fatalf("callback response = %d body=%q, want %d", recorder.Code, recorder.Body.String(), wantStatus)
 	}
-	if recorder.Body.String() != "invalid or expired static OAuth credential test\n" {
+	if recorder.Body.String() != "invalid or expired OAuth callback state\n" {
 		t.Fatalf("callback response body = %q, want generic invalid-or-expired error", recorder.Body.String())
 	}
 	for _, value := range sensitive {

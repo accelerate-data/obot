@@ -28,10 +28,28 @@ func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthA
 	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, conf)
 }
 
+// createToken consumes a dynamic or container pending state exactly once.
+//
+// The claim is atomic and terminal: whichever concurrent callback wins owns the
+// authorization attempt, and no later callback for the same state can exchange a
+// code or overwrite the stored token. Every failure path inherits that contract:
+//
+//   - Provider denial: the provider issued no code, so the attempt is dead. The
+//     row is removed and the user must start a new authorization.
+//   - Token-exchange failure: the authorization code is single-use at the
+//     provider and is already spent, so replaying the same callback cannot
+//     succeed. The row is removed and the user must start a new authorization.
+//   - Cancellation: the exchange may have completed upstream. The best-effort
+//     removal runs on the cancelled context and may not land, but the standing
+//     claim still bars a second exchange.
+//   - Persistence failure: the token was exchanged but not durably stored.
+//     CommitMCPOAuthPendingStateToken removes the row on the failures it can
+//     attribute, and the claim bars reuse regardless, so no competing callback
+//     can write over the outcome.
 func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, errorDescription string) (string, string, error) {
-	ps, err := sm.gatewayClient.GetMCPOAuthPendingState(ctx, state)
+	ps, err := sm.gatewayClient.ClaimMCPOAuthPendingState(ctx, state)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get oauth state: %w", err)
+		return "", "", fmt.Errorf("failed to claim oauth state: %w", err)
 	}
 
 	if errorStr != "" {
