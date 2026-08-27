@@ -704,6 +704,11 @@ func TestClaimMCPStaticOAuthTestEnforcesTTLAndExactlyOnce(t *testing.T) {
 			t.Fatalf("read claimed status: %v", err)
 		}
 		assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusPending, "")
+		// The read side reports a claim with no recorded time as interrupted, so the
+		// claim must stamp status and lease timestamp in the same statement.
+		if age := time.Since(requireLiveStaticOAuthTestClaim(t, c, state.CallbackState)); age < 0 || age > staticOAuthTestClaimLease {
+			t.Fatalf("claim stamp age = %s, want a live stamp within the %s lease", age, staticOAuthTestClaimLease)
+		}
 	})
 
 	t.Run("expired row remains unclaimed", func(t *testing.T) {
@@ -723,6 +728,131 @@ func TestClaimMCPStaticOAuthTestEnforcesTTLAndExactlyOnce(t *testing.T) {
 			t.Fatalf("expired proof should remain until cleanup: %v", err)
 		}
 	})
+}
+
+func TestGetMCPStaticOAuthTestStatusReportsAbandonedClaimAsInterrupted(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		ageClaim func(t *testing.T, c *Client, hashedState string)
+	}{
+		{
+			name: "lease expired",
+			ageClaim: func(t *testing.T, c *Client, hashedState string) {
+				t.Helper()
+				if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthPendingState{}).
+					Where("hashed_state = ?", hashedState).
+					Update("static_o_auth_test_claimed_at", time.Now().Add(-staticOAuthTestClaimLease-time.Second)).Error; err != nil {
+					t.Fatalf("age claim: %v", err)
+				}
+			},
+		},
+		{
+			// A claim recorded before this column existed, or by a process that
+			// died before it could stamp one, is by definition abandoned.
+			name: "claim without a recorded claim time",
+			ageClaim: func(t *testing.T, c *Client, hashedState string) {
+				t.Helper()
+				if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthPendingState{}).
+					Where("hashed_state = ?", hashedState).
+					Update("static_o_auth_test_claimed_at", nil).Error; err != nil {
+					t.Fatalf("clear claim time: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestClient(t)
+			state, _ := createStaticOAuthTest(t, c)
+			if _, err := c.ClaimMCPStaticOAuthTest(t.Context(), state.CallbackState); err != nil {
+				t.Fatalf("claim static OAuth test: %v", err)
+			}
+			hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state.CallbackState)))
+			tt.ageClaim(t, c, hashedState)
+
+			result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "catalog-entry-1")
+			if err != nil {
+				t.Fatalf("read interrupted status: %v", err)
+			}
+			assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusFailed, apitypes.MCPStaticOAuthTestFailureInterrupted)
+		})
+	}
+}
+
+// An interrupted test is terminal, so the user retries immediately with a fresh test
+// rather than waiting out the pending-state TTL.
+func TestStaticOAuthTestRetryAfterInterruptedClaimSucceeds(t *testing.T) {
+	c := newTestClient(t)
+	state, _ := createStaticOAuthTest(t, c)
+	if _, err := c.ClaimMCPStaticOAuthTest(t.Context(), state.CallbackState); err != nil {
+		t.Fatalf("claim static OAuth test: %v", err)
+	}
+	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state.CallbackState)))
+	if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthPendingState{}).
+		Where("hashed_state = ?", hashedState).
+		Update("static_o_auth_test_claimed_at", time.Now().Add(-staticOAuthTestClaimLease-time.Second)).Error; err != nil {
+		t.Fatalf("age claim: %v", err)
+	}
+	result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "catalog-entry-1")
+	if err != nil {
+		t.Fatalf("read interrupted status: %v", err)
+	}
+	assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusFailed, apitypes.MCPStaticOAuthTestFailureInterrupted)
+
+	retry, _ := createStaticOAuthTest(t, c)
+	if _, err := c.ClaimMCPStaticOAuthTest(t.Context(), retry.CallbackState); err != nil {
+		t.Fatalf("claim retried static OAuth test: %v", err)
+	}
+	if proof := completeSuccessfulStaticOAuthTest(t, c, retry); proof == "" {
+		t.Fatal("retried static OAuth test produced no save proof")
+	}
+}
+
+// The read and the write side share one lease, so a claim still inside it must remain
+// completable while one aged past it is already interrupted and must not be completable.
+// Wall-clock cannot pin the instant the lease expires, so the cases bracket it instead.
+func TestCompleteMCPStaticOAuthTestFencesClaimByLease(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		claimedAt any
+		wantDone  bool
+	}{
+		{name: "claim still inside the lease", claimedAt: time.Now().Add(-staticOAuthTestClaimLease / 2), wantDone: true},
+		{name: "claim aged past the lease", claimedAt: time.Now().Add(-staticOAuthTestClaimLease - time.Second)},
+		{name: "claim without a recorded claim time", claimedAt: nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestClient(t)
+			state, _ := createStaticOAuthTest(t, c)
+			if _, err := c.ClaimMCPStaticOAuthTest(t.Context(), state.CallbackState); err != nil {
+				t.Fatalf("claim static OAuth test: %v", err)
+			}
+			hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state.CallbackState)))
+			if err := c.db.WithContext(t.Context()).Model(&gwtypes.MCPOAuthPendingState{}).
+				Where("hashed_state = ?", hashedState).
+				Update("static_o_auth_test_claimed_at", tt.claimedAt).Error; err != nil {
+				t.Fatalf("rewrite claim time: %v", err)
+			}
+
+			if tt.wantDone {
+				if proof := completeSuccessfulStaticOAuthTest(t, c, state); proof == "" {
+					t.Fatal("completion inside the lease produced no save proof")
+				}
+				return
+			}
+
+			if err := c.CompleteMCPStaticOAuthTest(t.Context(), state.CallbackState, apitypes.MCPStaticOAuthTestStatusSucceeded, ""); !errors.Is(err, ErrMCPStaticOAuthTestInvalid) {
+				t.Fatalf("complete abandoned claim returned %v, want invalid test", err)
+			}
+			result, err := c.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "catalog-entry-1")
+			if err != nil {
+				t.Fatalf("read status after rejected completion: %v", err)
+			}
+			assertStaticOAuthTestResult(t, result, apitypes.MCPStaticOAuthTestStatusFailed, apitypes.MCPStaticOAuthTestFailureInterrupted)
+			if result.Proof != "" {
+				t.Fatalf("rejected completion minted a save proof: %+v", result)
+			}
+		})
+	}
 }
 
 func TestCompleteMCPStaticOAuthTestRejectsUnsafeFailureCategoryWithoutEchoingIt(t *testing.T) {
@@ -1722,6 +1852,24 @@ func completeSuccessfulStaticOAuthTest(t *testing.T, c *Client, started MCPStati
 		t.Fatalf("save proof was not independently minted: %+v", result)
 	}
 	return result.Proof
+}
+
+// requireLiveStaticOAuthTestClaim returns the lease timestamp of a claimed row, failing
+// when the claim was recorded without one.
+func requireLiveStaticOAuthTestClaim(t *testing.T, c *Client, callbackState string) time.Time {
+	t.Helper()
+	var pending gwtypes.MCPOAuthPendingState
+	if err := c.db.WithContext(t.Context()).
+		First(&pending, "hashed_state = ?", fmt.Sprintf("%x", sha256.Sum256([]byte(callbackState)))).Error; err != nil {
+		t.Fatalf("read claimed pending state: %v", err)
+	}
+	if pending.StaticOAuthTestStatus != mcpStaticOAuthTestStatusClaimed {
+		t.Fatalf("pending status = %q, want %q", pending.StaticOAuthTestStatus, mcpStaticOAuthTestStatusClaimed)
+	}
+	if pending.StaticOAuthTestClaimedAt == nil {
+		t.Fatal("claim recorded no lease timestamp, so the read side would report a live claim as interrupted")
+	}
+	return *pending.StaticOAuthTestClaimedAt
 }
 
 func createStaticOAuthTest(t *testing.T, c *Client) (MCPStaticOAuthTestStart, *oauth2.Config) {

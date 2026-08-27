@@ -47,6 +47,8 @@ const (
 	MCPStaticOAuthTestFailureInvalidCallback     MCPStaticOAuthTestFailureCategory = "invalid_callback"
 	MCPStaticOAuthTestFailureTokenExchange       MCPStaticOAuthTestFailureCategory = "token_exchange_failed"
 	MCPStaticOAuthTestFailureExpired             MCPStaticOAuthTestFailureCategory = "expired"
+	// Interrupted: the callback was admitted but never completed, so the test must be retried.
+	MCPStaticOAuthTestFailureInterrupted MCPStaticOAuthTestFailureCategory = "interrupted"
 )
 
 // MCPStaticOAuthTestResult contains the non-secret state of one credential test.

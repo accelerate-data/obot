@@ -89,11 +89,15 @@ type MCPOAuthPendingState struct {
 	StaticOAuthTestStateHash       string `gorm:"index"`
 	StaticOAuthTestStatus          apitypes.MCPStaticOAuthTestStatus
 	StaticOAuthTestFailureCategory apitypes.MCPStaticOAuthTestFailureCategory
-	StaticOAuthTestCompletedAt     time.Time
-	StaticOAuthSaveProofHash       string `gorm:"index"`
-	StaticOAuthSaveProof           string
-	Encrypted                      bool
-	CreatedAt                      time.Time
+	// StaticOAuthTestClaimedAt bounds how long an admitted callback may hold the test.
+	// Nil only on a row claimed before this column existed, which is treated as abandoned;
+	// claiming stamps the status and this column in one statement.
+	StaticOAuthTestClaimedAt   *time.Time
+	StaticOAuthTestCompletedAt time.Time
+	StaticOAuthSaveProofHash   string `gorm:"index"`
+	StaticOAuthSaveProof       string
+	Encrypted                  bool
+	CreatedAt                  time.Time
 	// ClaimedAt is nil until a callback claims the row for exchange. A claim is
 	// terminal: the row can never be consumed again, whatever the outcome.
 	ClaimedAt *time.Time
