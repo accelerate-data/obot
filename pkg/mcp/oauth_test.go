@@ -460,7 +460,7 @@ func TestStorageBackedTokenSourcePersistsRefreshedToken(t *testing.T) {
 		Expiry:       time.Now().Add(-time.Hour),
 	}
 
-	tok, err := newStorageBackedTokenSource(storage, conf, initial).Token()
+	tok, err := newStorageBackedTokenSource(storage, conf, initial, server.Client()).Token()
 	require.NoError(t, err)
 	require.Equal(t, "new-access-token", tok.AccessToken)
 	require.Equal(t, "new-refresh-token", tok.RefreshToken)
@@ -588,4 +588,57 @@ func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 
 func hVerifier(callback *oauthAuthorizeCallbackHandler) string {
 	return callback.verifier
+}
+
+func TestStorageBackedTokenSourceUsesSuppliedHTTPClient(t *testing.T) {
+	// A TLS server the default client cannot verify: a successful refresh proves
+	// the supplied client carried the request, not http.DefaultClient.
+	server := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	conf := &oauth2.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		Endpoint:     oauth2.Endpoint{TokenURL: server.URL, AuthStyle: oauth2.AuthStyleInParams},
+	}
+	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
+
+	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, nil).Token()
+	require.Error(t, err, "refresh without a supplied client must not reach the TLS token endpoint")
+
+	tok, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, server.Client()).Token()
+	require.NoError(t, err)
+	require.Equal(t, "new-access-token", tok.AccessToken)
+}
+
+func TestNoRedirectClientRejectsRedirect(t *testing.T) {
+	var reachedTarget atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		reachedTarget.Store(true)
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"access_token":"leaked","token_type":"Bearer"}`))
+	}))
+	defer target.Close()
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		http.Redirect(rw, req, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer redirector.Close()
+
+	conf := &oauth2.Config{
+		ClientID:     "client-id",
+		ClientSecret: "client-secret",
+		Endpoint:     oauth2.Endpoint{TokenURL: redirector.URL, AuthStyle: oauth2.AuthStyleInParams},
+	}
+	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
+
+	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, noRedirectClient(http.DefaultClient)).Token()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "redirect")
+	require.NotContains(t, err.Error(), "refresh-token")
+	require.NotContains(t, err.Error(), "client-secret")
+	require.False(t, reachedTarget.Load(), "redirect target must never receive the refresh credentials")
 }

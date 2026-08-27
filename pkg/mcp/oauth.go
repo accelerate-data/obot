@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -120,19 +121,45 @@ type storageBackedTokenSource struct {
 	tokenSource  oauth2.TokenSource
 }
 
-func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token) oauth2.TokenSource {
+// newStorageBackedTokenSource builds a token source that persists refreshed
+// tokens. httpClient carries the operator's remote-network policy and must
+// reject redirects, because a refresh replays the refresh token and client
+// secret to whatever origin the token endpoint names.
+func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, httpClient *http.Client) oauth2.TokenSource {
 	return oauth2.ReuseTokenSource(tok, &storageBackedTokenSource{
 		tokenStorage: tokenStorage,
 		conf:         conf,
 		tok:          tok,
-		tokenSource:  conf.TokenSource(context.Background(), tok),
+		tokenSource:  conf.TokenSource(withOAuthHTTPClient(context.Background(), httpClient), tok),
 	})
+}
+
+// withOAuthHTTPClient binds an HTTP client to the context the oauth2 package
+// reads. Without it, oauth2 falls back to http.DefaultClient and bypasses the
+// operator's remote-network policy entirely.
+func withOAuthHTTPClient(ctx context.Context, httpClient *http.Client) context.Context {
+	if httpClient == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, oauth2.HTTPClient, httpClient)
+}
+
+// noRedirectClient copies an HTTP client with redirects rejected. The source
+// client is shared with the MCP transport and metadata discovery, which both
+// still follow redirects, so it is cloned rather than mutated.
+func noRedirectClient(httpClient *http.Client) *http.Client {
+	if httpClient == nil {
+		return nil
+	}
+	clone := *httpClient
+	clone.CheckRedirect = safehttp.RejectRedirects
+	return &clone
 }
 
 func (ts *storageBackedTokenSource) Token() (*oauth2.Token, error) {
 	tok, err := ts.tokenSource.Token()
 	if err != nil {
-		return nil, err
+		return nil, SanitizeTokenExchangeError(err)
 	}
 
 	ts.lock.Lock()
@@ -230,7 +257,7 @@ func (o *oauth) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 		return nil, err
 	}
 
-	return newStorageBackedTokenSource(o.tokenStorage, oauthConfig, token), nil
+	return newStorageBackedTokenSource(o.tokenStorage, oauthConfig, token, noRedirectClient(o.metadataClient)), nil
 }
 
 func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Response) error {
@@ -297,7 +324,10 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 	case cb = <-ch:
 		if cb.Error != "" {
 			slog.Warn("oauth callback returned error", "server", o.serverName, "error", cb.Error, "description", cb.ErrorDescription)
-			return fmt.Errorf("authorization failed: %s, %s", cb.Error, cb.ErrorDescription)
+			// error_description is provider-controlled free text that can carry
+			// request identifiers and internal detail. Only the code is safe to
+			// return; the full description stays in the server-side log above.
+			return fmt.Errorf("authorization failed: %s", SafeOAuthErrorCode(cb.Error))
 		}
 		if cb.Code == "" {
 			slog.Warn("oauth callback missing authorization code", "server", o.serverName)
@@ -305,7 +335,7 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 		}
 	}
 
-	tok, err := ExchangeOAuthToken(ctx, conf, cb.Code, verifier)
+	tok, err := ExchangeOAuthToken(withOAuthHTTPClient(ctx, noRedirectClient(o.metadataClient)), conf, cb.Code, verifier)
 	if err != nil {
 		slog.Warn("oauth code exchange failed",
 			"server", o.serverName,
@@ -613,7 +643,7 @@ func GetOAuthAuthorizationURL(ctx context.Context, callbackHandler CallbackHandl
 func ExchangeOAuthToken(ctx context.Context, conf *oauth2.Config, code, verifier string) (*oauth2.Token, error) {
 	tok, err := conf.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
-		return nil, fmt.Errorf("failed to exchange code for token: %w", err)
+		return nil, fmt.Errorf("failed to exchange code for token: %w", SanitizeTokenExchangeError(err))
 	}
 
 	return tok, nil
@@ -1167,4 +1197,51 @@ func parseClientRegistrationResponse(reader io.Reader) (clientRegistrationRespon
 	}
 
 	return response, nil
+}
+
+// SafeOAuthErrorCode keeps only the characters RFC 6749 allows in an error code,
+// so a provider cannot smuggle markup, newlines, or free-form detail through it.
+func SafeOAuthErrorCode(code string) string {
+	if len(code) > 64 {
+		code = code[:64]
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-', r == '.':
+			return r
+		default:
+			return -1
+		}
+	}, code)
+	if cleaned == "" {
+		return "unspecified_error"
+	}
+	return cleaned
+}
+
+// SanitizeTokenExchangeError reduces a token-endpoint failure to a stable code or
+// status. The oauth2 package embeds the raw upstream response body in
+// RetrieveError, and that body carries provider request identifiers, workspace
+// identifiers, and echoed request parameters that must never reach a log or an
+// API response.
+func SanitizeTokenExchangeError(err error) error {
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) {
+		if retrieveErr.ErrorCode != "" {
+			return fmt.Errorf("token endpoint rejected the exchange: %s", SafeOAuthErrorCode(retrieveErr.ErrorCode))
+		}
+		if retrieveErr.Response != nil {
+			return fmt.Errorf("token endpoint rejected the exchange with status %d", retrieveErr.Response.StatusCode)
+		}
+		return errors.New("token endpoint rejected the exchange")
+	}
+
+	// A transport failure names the full request URL, which repeats the token
+	// endpoint back to the caller. Keep only the underlying cause.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return fmt.Errorf("could not reach the token endpoint: %w", urlErr.Err)
+	}
+
+	return errors.New("token exchange failed")
 }
