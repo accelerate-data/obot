@@ -1243,5 +1243,12 @@ func SanitizeTokenExchangeError(err error) error {
 		return fmt.Errorf("could not reach the token endpoint: %w", urlErr.Err)
 	}
 
+	// A cancelled or timed-out exchange carries no upstream detail, and callers
+	// match on it to tell an aborted request from a rejected one, so the chain
+	// stays intact.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+
 	return errors.New("token exchange failed")
 }

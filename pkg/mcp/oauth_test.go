@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -716,5 +717,30 @@ func TestSafeOAuthErrorCode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			require.Equal(t, tt.want, SafeOAuthErrorCode(tt.code))
 		})
+	}
+}
+
+// Callers distinguish an aborted exchange from a rejected one, so the sanitizer
+// must not flatten a cancellation into its generic message.
+func TestSanitizeTokenExchangeErrorPreservesCancellation(t *testing.T) {
+	for name, err := range map[string]error{
+		"bare":    context.Canceled,
+		"wrapped": fmt.Errorf("exchange aborted: %w", context.Canceled),
+		"urlErr":  &url.Error{Op: "Post", URL: "https://provider.example/token", Err: context.Canceled},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sanitized := SanitizeTokenExchangeError(err)
+			if !errors.Is(sanitized, context.Canceled) {
+				t.Fatalf("cancellation was flattened: %v", sanitized)
+			}
+			if strings.Contains(sanitized.Error(), "provider.example") {
+				t.Fatalf("sanitized error leaked the token endpoint: %v", sanitized)
+			}
+		})
+	}
+
+	deadline := SanitizeTokenExchangeError(fmt.Errorf("exchange timed out: %w", context.DeadlineExceeded))
+	if !errors.Is(deadline, context.DeadlineExceeded) {
+		t.Fatalf("deadline was flattened: %v", deadline)
 	}
 }
