@@ -1230,6 +1230,65 @@ func TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation(t *tes
 	}
 }
 
+// Catalog-entry deletion notifies the deployment identifiers it purged, and for
+// a multi-user deployment those are MCPServerInstance IDs. The cleanup path has
+// to resolve them to their owner too, or the reconcile is enqueued against a
+// kind that has no OAuth handlers.
+func TestDeletedCatalogEntryCleanupTriggersTheOwningServerOfAnInstanceGrant(t *testing.T) {
+	const (
+		entryName    = "catalog-entry-1"
+		instanceName = system.MCPServerInstancePrefix + "abc"
+		serverName   = system.MCPServerPrefix + "def"
+	)
+
+	storageClient := clientfake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(&v1.MCPServerInstance{
+			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: system.DefaultNamespace},
+			Spec:       v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: serverName},
+		}).
+		Build()
+	backend := &recordingControllerBackend{}
+	c := New(
+		t.Context(), newTestDB(t), storageClient, nil, backend,
+		nil, nil, time.Hour, 1, 0, 0, 0, false,
+	)
+
+	if err := c.UpsertCredential(t.Context(), gwtypes.Credential{
+		Context: system.MCPOAuthCredentialName(entryName),
+		Name:    "oauth",
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
+	}); err != nil {
+		t.Fatalf("seed static OAuth credential: %v", err)
+	}
+	if err := c.db.WithContext(t.Context()).Create(&gwtypes.MCPOAuthToken{
+		MCPID: instanceName, UserID: "user-1", CatalogEntryName: entryName,
+	}).Error; err != nil {
+		t.Fatalf("seed instance OAuth grant: %v", err)
+	}
+
+	deleted, err := c.DeleteMCPStaticOAuthStateForDeletedCatalogEntry(t.Context(), entryName, instanceName)
+	if err != nil {
+		t.Fatalf("purge deleted catalog entry OAuth state: %v", err)
+	}
+	if !deleted {
+		t.Fatal("did not report deleting the static OAuth credential")
+	}
+
+	wantKey := system.DefaultNamespace + "/" + serverName
+	if len(backend.triggers) == 0 {
+		t.Fatal("cleanup enqueued no reconcile")
+	}
+	for _, got := range backend.triggers {
+		if got.key != wantKey {
+			t.Fatalf("cleanup triggers = %#v, want every key %s", backend.triggers, wantKey)
+		}
+		if want := v1.SchemeGroupVersion.WithKind("MCPServer"); got.gvk != want {
+			t.Fatalf("triggered kind = %s, want %s", got.gvk, want)
+		}
+	}
+}
+
 func TestDeleteMCPStaticOAuthCredentialPreservesDynamicGrantWithoutStaticCredential(t *testing.T) {
 	c := newTestClient(t)
 	const (
