@@ -26,8 +26,10 @@ import (
 
 var mcpServerGVK = v1.SchemeGroupVersion.WithKind("MCPServer")
 
-// Server enqueues a reconcile for the named MCPServer. An empty name means
-// there is nothing to reconcile.
+// Server enqueues a reconcile for the named MCPServer. A caller that resolved
+// no server name passes an empty one, and there is nothing to enqueue for it.
+// A missing backend is a wiring error rather than an empty result, so it is
+// reported even when the name is empty.
 func Server(ctx context.Context, backend nahbackend.Trigger, serverName string) error {
 	if backend == nil {
 		return fmt.Errorf("MCP server controller backend is not configured")
@@ -54,14 +56,22 @@ func OwningServer(ctx context.Context, c kclient.Reader, backend nahbackend.Trig
 	if err := c.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: mcpID}, &instance); err != nil {
 		if apierrors.IsNotFound(err) {
 			// Credential rows outlive the instance they were created for, so a
-			// deleted instance is expected here. There is no owner left to
-			// reconcile, and failing would break the caller's delete. A read
-			// that fails for any other reason is not expected steady state, so
-			// it surfaces like any other trigger failure.
+			// deleted instance is expected here. The owner is then
+			// unrecoverable: an MCPOAuthToken row records only the MCP ID, and
+			// the instance held the only pointer to its server. The owning
+			// MCPServer may well still exist, but nothing derives status from
+			// an instance's row -- SyncThirdPartyAuthStatus reads the token for
+			// the server's own Spec.UserID and Name -- so there is no state
+			// left to go stale, and failing here would break the caller's
+			// delete. A read that fails for any other reason is not expected
+			// steady state, so it surfaces like any other trigger failure.
 			return nil
 		}
 		return fmt.Errorf("failed to get MCP server instance %s: %w", mcpID, err)
 	}
+	// An instance always names its server at creation and no writer changes it
+	// afterwards, so an empty owner here means the object is malformed rather
+	// than that its server is gone. There is no name to enqueue either way.
 	return Server(ctx, backend, instance.Spec.MCPServerName)
 }
 
