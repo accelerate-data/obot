@@ -596,7 +596,8 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	if config.ElectionFile != "" {
 		electionConfig = leader.NewFileElectionConfig(config.ElectionFile)
 	} else {
-		electionConfig = leader.NewDefaultElectionConfig("", "obot-controller", leaderElectionRESTConfig(restConfig))
+		electionConfig = leader.NewSQLElectionConfig("obot-controller", dbAccess.SQLDB).
+			WithLegacyLeaseLock("", leaderElectionRESTConfig(restConfig))
 	}
 	r, err := nah.NewRouter("obot-controller", &nah.Options{
 		RESTConfig:     restConfig,
