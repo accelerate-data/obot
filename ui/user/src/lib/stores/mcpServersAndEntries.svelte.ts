@@ -18,6 +18,17 @@ interface McpServerAndEntries {
 	lastFetched: number | null;
 	isInitialized: boolean;
 }
+
+type MCPDataScope = 'user' | 'admin';
+
+interface MCPDataOptions {
+	forceRefresh?: boolean;
+	scope?: MCPDataScope;
+}
+
+let loadedScope: MCPDataScope | undefined;
+let fetchGeneration = 0;
+
 const store = $state<{
 	current: McpServerAndEntries;
 	refreshAll: () => Promise<void>;
@@ -25,8 +36,8 @@ const store = $state<{
 	refreshUserConfiguredServers: () => Promise<void>;
 	refreshUserInstances: () => Promise<void>;
 	removeServer: (serverID: string) => void;
-	initialize: (forceRefresh?: boolean) => void;
-	fetchData: (forceRefresh?: boolean) => Promise<void>;
+	initialize: (options?: MCPDataOptions) => void;
+	fetchData: (options?: MCPDataOptions) => Promise<void>;
 }>({
 	current: {
 		entries: [],
@@ -65,14 +76,19 @@ function setCanConnectAndFilterDeleted(
 		}));
 }
 
-async function fetchData(forceRefresh = false) {
-	if (store.current.loading) return;
-
+async function fetchData({ forceRefresh = false, scope = 'admin' }: MCPDataOptions = {}) {
+	const generation = ++fetchGeneration;
 	const now = Date.now();
 	const cacheAge = 5 * 60 * 1000; // 5 minutes cache
 
 	// Return cached data if it's fresh and not forcing refresh
-	if (!forceRefresh && store.current.isInitialized && cacheAge > 0) {
+	if (
+		!store.current.loading &&
+		!forceRefresh &&
+		loadedScope === scope &&
+		store.current.isInitialized &&
+		cacheAge > 0
+	) {
 		if (store.current.lastFetched && now - store.current.lastFetched < cacheAge) {
 			return;
 		}
@@ -86,7 +102,7 @@ async function fetchData(forceRefresh = false) {
 		let userConfiguredServers: MCPCatalogServer[] = [];
 		let userInstances: MCPServerInstance[] = [];
 
-		if (profile.current.hasAdminAccess?.()) {
+		if (scope === 'admin' && profile.current.hasAdminAccess?.()) {
 			const [
 				adminEntries,
 				adminServers,
@@ -101,7 +117,7 @@ async function fetchData(forceRefresh = false) {
 				AdminService.listAllUserWorkspaceCatalogEntries(),
 				AdminService.listAllUserWorkspaceMCPServers(),
 				UserService.listSingleOrRemoteMcpServers(),
-				UserService.listMCPs(),
+				UserService.listMCPs({ minimal: true }),
 				UserService.listMCPCatalogServers()
 			]);
 
@@ -119,19 +135,30 @@ async function fetchData(forceRefresh = false) {
 			userInstances = await UserService.listMcpServerInstances();
 			userConfiguredServers = filterOutDuplicateAndDeleted([...servers, ...ownConfiguredServers]);
 		} else {
-			const [ownConfiguredServers, entriesResult, serversResult] = await Promise.all([
-				UserService.listSingleOrRemoteMcpServers(),
-				UserService.listMCPs(),
-				UserService.listMCPCatalogServers()
-			]);
+			const userScopedServersPromise = UserService.listMCPCatalogServers();
+			const [ownConfiguredServers, entriesResult, userScopedServers, serversResult] =
+				await Promise.all([
+					UserService.listSingleOrRemoteMcpServers(),
+					UserService.listMCPs({ minimal: true }),
+					userScopedServersPromise,
+					profile.current.hasAdminAccess?.()
+						? AdminService.listMCPCatalogServers(DEFAULT_MCP_CATALOG_ID, { all: true })
+						: userScopedServersPromise
+				]);
 
-			entries = entriesResult.filter((entry) => !entry.deleted);
-			servers = serversResult;
+			entries = entriesResult
+				.filter((entry) => !entry.deleted)
+				.map((entry) => ({ ...entry, canConnect: true }));
+			const accessibleServerIds = new Set(userScopedServers.map((server) => server.id));
+			servers = serversResult.map((server) => ({
+				...server,
+				canConnect: accessibleServerIds.has(server.id)
+			}));
 			userInstances = await UserService.listMcpServerInstances();
-			userConfiguredServers = filterOutDuplicateAndDeleted([
-				...serversResult,
-				...ownConfiguredServers
-			]);
+			userConfiguredServers = filterOutDuplicateAndDeleted([...servers, ...ownConfiguredServers]);
+		}
+		if (generation !== fetchGeneration) {
+			return;
 		}
 		store.current = {
 			entries,
@@ -142,27 +169,31 @@ async function fetchData(forceRefresh = false) {
 			lastFetched: now,
 			isInitialized: true
 		};
+		loadedScope = scope;
 	} catch (error) {
+		if (generation !== fetchGeneration) {
+			return;
+		}
 		errors.append(error);
 		store.current.loading = false;
 	}
 }
 
 async function refreshAll() {
-	await fetchData(true);
+	await fetchData({ forceRefresh: true, scope: loadedScope });
 }
 
-async function initialize(forceRefresh = false) {
-	await fetchData(forceRefresh);
+async function initialize(options: MCPDataOptions = {}) {
+	await fetchData(options);
 }
 
 async function refreshEntries() {
 	try {
-		if (profile.current.hasAdminAccess?.()) {
+		if (loadedScope !== 'user' && profile.current.hasAdminAccess?.()) {
 			const [adminEntries, workspaceEntries, userScopedEntries] = await Promise.all([
 				AdminService.listMCPCatalogEntries(DEFAULT_MCP_CATALOG_ID, { all: true }),
 				AdminService.listAllUserWorkspaceCatalogEntries(),
-				UserService.listMCPs()
+				UserService.listMCPs({ minimal: true })
 			]);
 			store.current = {
 				...store.current,
@@ -172,7 +203,7 @@ async function refreshEntries() {
 				)
 			};
 		} else {
-			const entries = await UserService.listMCPs();
+			const entries = await UserService.listMCPs({ minimal: true });
 			store.current = {
 				...store.current,
 				entries: entries.filter((entry) => !entry.deleted)

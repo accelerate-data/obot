@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -167,9 +168,10 @@ func (m *MCPHandler) ListEntriesFromAllSources(req api.Context) error {
 	if err := req.List(&list); err != nil {
 		return err
 	}
+	minimal, _ := strconv.ParseBool(req.URL.Query().Get("minimal"))
 
 	convertEntry := func(entry v1.MCPServerCatalogEntry) types.MCPServerCatalogEntry {
-		return ConvertMCPServerCatalogEntryWithWorkspace(entry, entry.Spec.PowerUserWorkspaceID, "", m.serverURL)
+		return convertMCPServerCatalogEntryForList(entry, entry.Spec.PowerUserWorkspaceID, "", m.serverURL, minimal)
 	}
 
 	// Allow admins/auditors to bypass ACR filtering with ?all=true
@@ -182,7 +184,7 @@ func (m *MCPHandler) ListEntriesFromAllSources(req api.Context) error {
 	}
 
 	// Apply ACR filtering for regular users and for admins without ?all=true
-	var entries []types.MCPServerCatalogEntry
+	entries := make([]types.MCPServerCatalogEntry, 0, len(list.Items))
 	for _, entry := range list.Items {
 		if HideMultiUserCatalogEntry(req, entry) {
 			continue
@@ -248,6 +250,24 @@ func ConvertMCPServerCatalogEntryWithWorkspace(entry v1.MCPServerCatalogEntry, p
 		NeedsUpdate:               entry.Status.NeedsUpdate,
 		OAuthCredentialConfigured: entry.Status.OAuthCredentialConfigured,
 		ConnectURL:                defaultCatalogEntryConnectURL(serverURL, entry),
+	}
+}
+
+func convertMCPServerCatalogEntryForList(entry v1.MCPServerCatalogEntry, powerUserWorkspaceID, powerUserID, serverURL string, minimal bool) types.MCPServerCatalogEntry {
+	if minimal {
+		minimizeMCPServerCatalogEntryManifest(&entry.Spec.Manifest)
+	}
+	return ConvertMCPServerCatalogEntryWithWorkspace(entry, powerUserWorkspaceID, powerUserID, serverURL)
+}
+
+func minimizeMCPServerCatalogEntryManifest(manifest *types.MCPServerCatalogEntryManifest) {
+	manifest.Description = ""
+	manifest.ToolPreview = nil
+	manifest.RepoURL = ""
+	if manifest.CompositeConfig != nil {
+		for i := range manifest.CompositeConfig.ComponentServers {
+			minimizeMCPServerCatalogEntryManifest(&manifest.CompositeConfig.ComponentServers[i].Manifest)
+		}
 	}
 }
 
