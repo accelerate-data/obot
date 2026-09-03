@@ -290,6 +290,8 @@ func errFromResponse(resp *http.Response) error {
 	return &types.ErrHTTP{Code: resp.StatusCode, Message: msg}
 }
 
+func ErrorFromResponse(resp *http.Response) error { return errFromResponse(resp) }
+
 // trimPartialRune removes an incomplete UTF-8 sequence from the end of data.
 func trimPartialRune(data []byte) []byte {
 	for range utf8.UTFMax - 1 {
