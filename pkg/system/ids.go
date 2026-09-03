@@ -49,8 +49,12 @@ const (
 	NanobotAgentPrefix            = "nba1"
 	PublishedArtifactPrefix       = "pa1"
 	OktaGroupMigrationPrefix      = "ogm1"
+	AuthProviderCleanupPrefix     = "apc1"
+	ProviderChangePrefix          = "pcc1"
 
 	ObotMCPServerName = SystemMCPServerPrefix + "obot-mcp-server"
+	ProviderChangeAuthName = ProviderChangePrefix + "auth"
+	ProviderSyncName       = "provider-sync"
 )
 
 func IsMCPServerID(id string) bool {
