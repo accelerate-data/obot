@@ -1,6 +1,6 @@
 module github.com/obot-platform/obot
 
-go 1.26.5
+go 1.27
 
 replace (
 	// Carries the Entra offline_access fix and forced-expiry refresh proof (VD-4128)
@@ -30,7 +30,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.10
 	github.com/coder/websocket v1.8.15
 	github.com/containerd/errdefs v1.0.0
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/docker/go-connections v0.6.0
+	github.com/docker/go-units v0.5.0
 	github.com/fatih/color v1.19.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/go-git/go-billy/v5 v5.9.0
@@ -50,7 +52,7 @@ require (
 	github.com/obot-platform/chat-completion-client v0.0.0-20260529163740-88dd50945c18
 	github.com/obot-platform/cmd v0.0.0-20260707150346-5103d461ab67
 	github.com/obot-platform/kinm v0.0.0-20260717005812-cd2688a2a64e
-	github.com/obot-platform/nah v0.0.0-20260707163210-8bdf0035e79f
+	github.com/obot-platform/nah v0.0.0-20260902222426-636420908be9
 	github.com/obot-platform/nanobot v0.0.92
 	github.com/obot-platform/obot/apiclient v0.0.0-20250813183905-ade719c1e8bf
 	github.com/obot-platform/obot/logger v0.0.0-20241217130503-4004a5c69f32
@@ -65,13 +67,16 @@ require (
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/sjson v1.2.5
 	github.com/zalando/go-keyring v0.2.8
+	go.opentelemetry.io/contrib/bridges/otellogrus v0.19.0
 	go.opentelemetry.io/contrib/exporters/autoexport v0.69.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/log v0.20.0
+	go.opentelemetry.io/otel/log/logtest v0.20.0
 	go.opentelemetry.io/otel/sdk v1.44.0
 	go.opentelemetry.io/otel/sdk/log v0.20.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
+	go.opentelemetry.io/otel/trace v1.44.0
 	go.yaml.in/yaml/v3 v3.0.4
 	golang.org/x/crypto v0.53.0
 	golang.org/x/exp v0.0.0-20260611194520-c48552f49976
@@ -95,14 +100,6 @@ require (
 	k8s.io/streaming v0.36.2
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/yaml v1.6.0
-)
-
-require (
-	github.com/coreos/go-oidc/v3 v3.18.0
-	github.com/docker/go-units v0.5.0
-	go.opentelemetry.io/contrib/bridges/otellogrus v0.19.0
-	go.opentelemetry.io/otel/log/logtest v0.20.0
-	go.opentelemetry.io/otel/trace v1.44.0
 )
 
 require (

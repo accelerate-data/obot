@@ -28,7 +28,6 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"go.yaml.in/yaml/v3"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -205,9 +204,7 @@ func appendProviders(registryPath string, authProviderManifests []providerFromFi
 		m.Manifest.Command = path.Join(registryPath, m.Manifest.Command)
 
 		objs = append(objs, &v1.ModelProvider{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: m.Name,
-			},
+			Name: m.Name,
 			Spec: v1.ModelProviderSpec{
 				ModelProviderManifest: m.Manifest,
 			},
@@ -223,9 +220,7 @@ func appendProviders(registryPath string, authProviderManifests []providerFromFi
 		a.Manifest.Command = path.Join(registryPath, a.Manifest.Command)
 
 		objs = append(objs, &v1.AuthProvider{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: a.Name,
-			},
+			Name: a.Name,
 			Spec: v1.AuthProviderSpec{
 				AuthProviderManifest: a.Manifest,
 			},
@@ -401,7 +396,7 @@ func SetAuthProviderConfiguredStatus(ctx context.Context, gatewayClient *gateway
 		missingConfigParams []string
 	)
 	if len(authProvider.Spec.RequiredConfigurationParameters) > 0 {
-		cred, err := gatewayClient.RevealCredential(ctx, []string{authProvider.Name, system.GenericModelProviderCredentialContext}, authProvider.Name)
+		cred, err := gatewayClient.RevealCredential(ctx, []string{authProvider.Name, system.GenericAuthProviderCredentialContext}, authProvider.Name)
 		if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
 			return fmt.Errorf("failed to reveal credential for auth provider %q: %w", authProvider.Name, err)
 		}
@@ -473,12 +468,13 @@ func BackPopulateModels(ctx context.Context, client kclient.Client, dispatcher *
 		return nil
 	}
 
-	availableModels, err := dispatcher.ModelsForProvider(ctx, *modelProvider)
+	availableModels, err := dispatcher.FreshModelsForProvider(ctx, *modelProvider)
 	if err != nil {
 		// Don't error and retry because it will likely fail again. Log the error, and the user can re-sync manually.
 		// Also, the modelProvider.Status.Error field will bubble up to the user in the UI.
 
 		// Check if the model provider returned a properly formatted error message and set it as status
+		modelProvider.Status.Error = err.Error()
 		match := jsonErrRegexp.FindString(err.Error())
 		if match != "" {
 			modelProvider.Status.Error = match
@@ -508,6 +504,7 @@ func BackPopulateModels(ctx context.Context, client kclient.Client, dispatcher *
 		log.Errorf("%v", err)
 		return nil
 	}
+	modelProvider.Status.Error = ""
 
 	models := make([]kclient.Object, 0, len(availableModels.Models))
 	for _, model := range availableModels.Models {
@@ -517,10 +514,8 @@ func BackPopulateModels(ctx context.Context, client kclient.Client, dispatcher *
 		}
 		dialect := modelDialect(model.Metadata, modelProvider.Spec.Dialect)
 		discovered := &v1.Model{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: modelProvider.Namespace,
-				Name:      modelName(modelProvider.Name, model.ID),
-			},
+			Namespace: modelProvider.Namespace,
+			Name:      modelName(modelProvider.Name, model.ID),
 			Spec: v1.ModelSpec{
 				Manifest: types.ModelManifest{
 					Name:          strings.ReplaceAll(model.ID, "/", "-"),

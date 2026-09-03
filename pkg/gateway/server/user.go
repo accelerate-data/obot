@@ -17,7 +17,6 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
@@ -83,9 +82,7 @@ func (s *Server) getUsers(apiContext api.Context) error {
 		trimmedUsers := make([]types2.User, 0, len(validUsers))
 		for _, u := range validUsers {
 			trimmedUsers = append(trimmedUsers, types2.User{
-				Metadata: types2.Metadata{
-					ID: fmt.Sprint(u.ID),
-				},
+				ID:          fmt.Sprint(u.ID),
 				DisplayName: u.DisplayName,
 			})
 		}
@@ -150,9 +147,7 @@ func (s *Server) getUser(apiContext api.Context) error {
 	// Basic and Power users are only allowed to access IDs and display names, so we have all the information needed for that.
 	if userIsBasicOrPower(apiContext.User) {
 		return apiContext.Write(types2.User{
-			Metadata: types2.Metadata{
-				ID: fmt.Sprint(user.ID),
-			},
+			ID:          fmt.Sprint(user.ID),
 			DisplayName: user.DisplayName,
 		})
 	}
@@ -239,10 +234,8 @@ func (s *Server) updateUser(apiContext api.Context) error {
 	if originalUser.Role != existingUser.Role {
 		pkgLog.Infof("User role changed via API: userID=%d oldRole=%d newRole=%d", existingUser.ID, originalUser.Role, existingUser.Role)
 		if err = apiContext.Create(&v1.UserRoleChange{
-			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: system.UserRoleChangePrefix,
-				Namespace:    apiContext.Namespace(),
-			},
+			GenerateName: system.UserRoleChangePrefix,
+			Namespace:    apiContext.Namespace(),
 			Spec: v1.UserRoleChangeSpec{
 				UserID: existingUser.ID,
 			},
@@ -324,10 +317,8 @@ func (s *Server) deleteUser(apiContext api.Context) (err error) {
 	}
 
 	if err = apiContext.Create(&v1.UserDelete{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: system.UserDeletePrefix,
-			Namespace:    apiContext.Namespace(),
-		},
+		GenerateName: system.UserDeletePrefix,
+		Namespace:    apiContext.Namespace(),
 		Spec: v1.UserDeleteSpec{
 			UserID: existingUser.ID,
 		},

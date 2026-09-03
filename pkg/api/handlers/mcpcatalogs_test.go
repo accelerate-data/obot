@@ -27,7 +27,6 @@ import (
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
@@ -38,10 +37,8 @@ import (
 
 func TestAcceptCatalogEntryOwnership(t *testing.T) {
 	entry := &v1.MCPServerCatalogEntry{
-		ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{
-				"example.com/keep": "true",
-			},
+		Annotations: map[string]string{
+			"example.com/keep": "true",
 		},
 		Spec: v1.MCPServerCatalogEntrySpec{
 			Editable:  false,
@@ -90,8 +87,8 @@ func TestMCPCatalogHandlerGetEntryCapacity(t *testing.T) {
 			entryCatalogName: "catalog-1",
 			entryRuntime:     types.RuntimeContainerized,
 			servers: []v1.MCPServer{{
-				ObjectMeta: metav1.ObjectMeta{Name: "server-1", Namespace: system.DefaultNamespace},
-				Spec:       v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"},
+				Name: "server-1", Namespace: system.DefaultNamespace,
+				Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"},
 			}},
 			providerInfo:    types.MCPCapacityInfo{Source: types.CapacitySourceDeployments, ActiveDeployments: 1},
 			wantServerNames: []string{"server-1"},
@@ -102,8 +99,8 @@ func TestMCPCatalogHandlerGetEntryCapacity(t *testing.T) {
 			entryCatalogName: "catalog-1",
 			entryRuntime:     types.RuntimeContainerized,
 			servers: []v1.MCPServer{
-				{ObjectMeta: metav1.ObjectMeta{Name: "template-server", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1", Template: true}},
-				{ObjectMeta: metav1.ObjectMeta{Name: "server-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"}},
+				{Name: "template-server", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1", Template: true}},
+				{Name: "server-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"}},
 			},
 			providerInfo:    types.MCPCapacityInfo{ActiveDeployments: 1},
 			wantServerNames: []string{"server-1"},
@@ -139,9 +136,9 @@ func TestMCPCatalogHandlerGetEntryCapacity(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			provider := &fakeCapacityInfoProvider{info: tt.providerInfo, err: tt.providerErr}
 			objects := []client.Object{
-				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "catalog-1", Namespace: system.DefaultNamespace}},
+				&v1.MCPCatalog{Name: "catalog-1", Namespace: system.DefaultNamespace},
 				&v1.MCPServerCatalogEntry{
-					ObjectMeta: metav1.ObjectMeta{Name: "entry-1", Namespace: system.DefaultNamespace},
+					Name: "entry-1", Namespace: system.DefaultNamespace,
 					Spec: v1.MCPServerCatalogEntrySpec{
 						MCPCatalogName: tt.entryCatalogName,
 						Manifest:       types.MCPServerCatalogEntryManifest{Runtime: tt.entryRuntime},
@@ -466,14 +463,13 @@ func TestPrepareTempServerConfigDoesNotUseBoundSecretInURL(t *testing.T) {
 		key       = "WORKSPACE"
 	)
 	localK8sClient := fake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "remote-secret", Namespace: namespace, Labels: map[string]string{label: "true"}},
-		Data:       map[string][]byte{"token": []byte("secret-value")},
+		Name: "remote-secret", Namespace: namespace, Labels: map[string]string{label: "true"},
+		Data: map[string][]byte{"token": []byte("secret-value")},
 	}).Build()
 	manifest := types.MCPServerManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-			Key: key, Required: true,
-		}}},
+		Env: []types.MCPEnv{{
+			Key: key, Required: true}},
 		RemoteConfig: &types.RemoteRuntimeConfig{
 			IsTemplate:  true,
 			URLTemplate: "https://example.com/mcp/${WORKSPACE}",
@@ -499,7 +495,7 @@ func TestPrepareTempServerConfigDoesNotUseBoundSecretInURL(t *testing.T) {
 
 func TestPopulateComponentManifestsHydratesMCPServerID(t *testing.T) {
 	server := &v1.MCPServer{
-		ObjectMeta: metav1.ObjectMeta{Name: "shared-server", Namespace: system.DefaultNamespace},
+		Name: "shared-server", Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerSpec{
 			MCPCatalogID: "default",
 			Manifest: types.MCPServerManifest{
@@ -537,7 +533,7 @@ func TestPopulateComponentManifestsHydratesMCPServerID(t *testing.T) {
 
 func TestPopulateComponentManifestsHydratesSameCatalogEntryID(t *testing.T) {
 	entry := &v1.MCPServerCatalogEntry{
-		ObjectMeta: metav1.ObjectMeta{Name: "component-entry", Namespace: system.DefaultNamespace},
+		Name: "component-entry", Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerCatalogEntrySpec{
 			MCPCatalogName: "custom",
 			Manifest: types.MCPServerCatalogEntryManifest{
@@ -584,7 +580,7 @@ func TestSetOAuthCredentialsRejectsProoflessSaveWithoutPersistingCredentials(t *
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	recorder := httptest.NewRecorder()
 	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", `{"clientID":"candidate-client","clientSecret":"candidate-secret"}`, recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
 
@@ -920,7 +916,7 @@ func TestStaticOAuthSaveAndProviderUpdateShareCatalogMutationFence(t *testing.T)
 		require.NoError(t, err)
 		recorder := httptest.NewRecorder()
 		req := newStaticOAuthTestRequest(t, http.MethodPut, "/", string(body), recorder, gateway,
-			&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+			&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 		req.SetPathValue("catalog_id", "default")
 		req.SetPathValue("entry_id", entry.Name)
 
@@ -1010,8 +1006,8 @@ func TestSetOAuthCredentialsRejectsProviderChangeWhileWaitingForCredentialLock(t
 func TestReplaceOAuthCredentialsRejectsMismatchedProofWithoutMutatingActiveConfiguration(t *testing.T) {
 	gateway := newOAuthCredentialTestGatewayClient(t)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
-	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
-	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	server := &v1.MCPServer{Name: "server-a", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{Name: "instance-a-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
 		t.Fatalf("seed active OAuth credential: %v", err)
@@ -1181,8 +1177,8 @@ func TestReplaceOAuthCredentialsCleanupFailureLeavesNewConfigurationAndRequiresF
 		return nil
 	})
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
-	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
-	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	server := &v1.MCPServer{Name: "server-a", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{Name: "instance-a-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "active-client", "CLIENT_SECRET": "active-secret"}}); err != nil {
 		t.Fatalf("seed active OAuth credential: %v", err)
@@ -1231,7 +1227,7 @@ func TestReplaceOAuthCredentialsSupportsWorkspaceScope(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed workspace OAuth credential: %v", err)
 	}
-	workspace := &v1.PowerUserWorkspace{ObjectMeta: metav1.ObjectMeta{Name: "workspace-1", Namespace: system.DefaultNamespace}, Spec: v1.PowerUserWorkspaceSpec{UserID: "user-1"}}
+	workspace := &v1.PowerUserWorkspace{Name: "workspace-1", Namespace: system.DefaultNamespace, Spec: v1.PowerUserWorkspaceSpec{UserID: "user-1"}}
 	proof := successfulStaticOAuthCredentialProof(t, gateway, entry.Name, entry.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 	req := newReplaceOAuthCredentialRequest(t, gateway, entry, "user-1", "candidate-client", "candidate-secret", proof, workspace)
 	req.SetPathValue("catalog_id", "")
@@ -1290,7 +1286,7 @@ func TestGetOAuthCredentialsReturnsCallbackAndNeverSecret(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
 
@@ -1319,7 +1315,7 @@ func TestGetOAuthCredentialsFailsClosedWithoutProviderBinding(t *testing.T) {
 	}))
 	recorder := httptest.NewRecorder()
 	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
 
@@ -1344,7 +1340,7 @@ func TestGetOAuthCredentialsFailsClosedWithoutGeneration(t *testing.T) {
 	}))
 	recorder := httptest.NewRecorder()
 	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
 
@@ -1373,7 +1369,7 @@ func TestGetOAuthCredentialsFailsClosedAfterCatalogURLChanges(t *testing.T) {
 	}
 	recorder := httptest.NewRecorder()
 	req := newStaticOAuthTestRequest(t, http.MethodGet, "/", "", recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
 
@@ -1456,7 +1452,7 @@ func TestOAuthCredentialsFailClosedOnCredentialReadErrors(t *testing.T) {
 			default:
 				recorder := httptest.NewRecorder()
 				req = newStaticOAuthTestRequest(t, tt.method, "/", "", recorder, gateway,
-					&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+					&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 				req.SetPathValue("catalog_id", "default")
 				req.SetPathValue("entry_id", entry.Name)
 			}
@@ -1501,7 +1497,7 @@ func TestOAuthCredentialsFailClosedOnTransientDatabaseReadErrors(t *testing.T) {
 			default:
 				recorder := httptest.NewRecorder()
 				req = newStaticOAuthTestRequest(t, method, "/", "", recorder, gateway,
-					&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+					&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 				req.SetPathValue("catalog_id", "default")
 				req.SetPathValue("entry_id", entry.Name)
 			}
@@ -1551,25 +1547,25 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 	})
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 	servers := []*v1.MCPServer{
-		{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "server-b", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}},
+		{Name: "server-a", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}},
+		{Name: "server-b", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}},
 	}
 	instances := []*v1.MCPServerInstance{
-		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: servers[0].Name, MCPServerCatalogEntryName: entry.Name}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-2", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: servers[0].Name, MCPServerCatalogEntryName: entry.Name}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "instance-b-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: servers[1].Name, MCPServerCatalogEntryName: entry.Name}},
+		{Name: "instance-a-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: servers[0].Name, MCPServerCatalogEntryName: entry.Name}},
+		{Name: "instance-a-user-2", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: servers[0].Name, MCPServerCatalogEntryName: entry.Name}},
+		{Name: "instance-b-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: servers[1].Name, MCPServerCatalogEntryName: entry.Name}},
 	}
 	unrelatedServer := &v1.MCPServer{
-		ObjectMeta: metav1.ObjectMeta{Name: "server-unrelated", Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-unrelated"},
+		Name: "server-unrelated", Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-unrelated"},
 	}
 	unrelatedInstance := &v1.MCPServerInstance{
-		ObjectMeta: metav1.ObjectMeta{Name: "instance-unrelated", Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: unrelatedServer.Name, MCPServerCatalogEntryName: "entry-unrelated"},
+		Name: "instance-unrelated", Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: unrelatedServer.Name, MCPServerCatalogEntryName: "entry-unrelated"},
 	}
 	rules := []*v1.AccessControlRule{
-		{ObjectMeta: metav1.ObjectMeta{Name: "acr-a", Namespace: system.DefaultNamespace}, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "acr-b", Namespace: system.DefaultNamespace}, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
+		{Name: "acr-a", Namespace: system.DefaultNamespace, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
+		{Name: "acr-b", Namespace: system.DefaultNamespace, Spec: v1.AccessControlRuleSpec{MCPCatalogID: "default"}},
 	}
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth", Secrets: map[string]string{
 		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
@@ -1596,7 +1592,7 @@ func TestDeleteOAuthCredentialsRetainsSiblingDeploymentsAndClearsEveryUserToken(
 	clear(triggered)
 
 	objects := []client.Object{
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}},
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace},
 		entry, servers[0], servers[1], instances[0], instances[1], instances[2], unrelatedServer, unrelatedInstance, rules[0], rules[1],
 	}
 	storageClient := fake.NewClientBuilder().
@@ -1763,10 +1759,10 @@ func TestDeleteOAuthCredentialsReturnsServerTokenPurgeFailure(t *testing.T) {
 		return nil
 	})
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
-	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	server := &v1.MCPServer{Name: "server-a", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
 	instances := []*v1.MCPServerInstance{
-		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-2", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
+		{Name: "instance-a-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
+		{Name: "instance-a-user-2", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-2", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}},
 	}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{
@@ -1807,8 +1803,8 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 		return nil
 	})
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
-	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
-	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	server := &v1.MCPServer{Name: "server-a", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{Name: "instance-a-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{
 		"CLIENT_ID": "saved-client", "CLIENT_SECRET": "saved-secret", "GENERATION": testStaticOAuthCredentialGeneration,
@@ -1839,10 +1835,10 @@ func TestDeleteOAuthCredentialsRetryAfterTriggerFailureRetriesNotification(t *te
 func TestReplaceOAuthCredentialsAtomicallySwapsAppAndClearsOnlyMatchingTokens(t *testing.T) {
 	gateway, rawDB := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, staticOAuthTestEncryptionConfig(), nil)
 	entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
-	server := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-a", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
-	instance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-a-user-1", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
-	unrelatedServer := &v1.MCPServer{ObjectMeta: metav1.ObjectMeta{Name: "server-unrelated", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-unrelated"}}
-	unrelatedInstance := &v1.MCPServerInstance{ObjectMeta: metav1.ObjectMeta{Name: "instance-unrelated", Namespace: system.DefaultNamespace}, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: unrelatedServer.Name, MCPServerCatalogEntryName: "entry-unrelated"}}
+	server := &v1.MCPServer{Name: "server-a", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: entry.Name}}
+	instance := &v1.MCPServerInstance{Name: "instance-a-user-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: server.Name, MCPServerCatalogEntryName: entry.Name}}
+	unrelatedServer := &v1.MCPServer{Name: "server-unrelated", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-unrelated"}}
+	unrelatedInstance := &v1.MCPServerInstance{Name: "instance-unrelated", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: unrelatedServer.Name, MCPServerCatalogEntryName: "entry-unrelated"}}
 	credName := system.MCPOAuthCredentialName(entry.Name)
 	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: credName, Name: "oauth", Secrets: map[string]string{"CLIENT_ID": "old-client", "CLIENT_SECRET": "old-secret"}}); err != nil {
 		t.Fatalf("seed old OAuth credential: %v", err)
@@ -1882,7 +1878,7 @@ func TestReplaceOAuthCredentialsAtomicallySwapsAppAndClearsOnlyMatchingTokens(t 
 func newDeleteOAuthCredentialRequest(t *testing.T, gateway *gatewayclient.Client, entry *v1.MCPServerCatalogEntry, objects ...client.Object) api.Context {
 	t.Helper()
 	allObjects := []client.Object{
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}},
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace},
 		entry,
 	}
 	allObjects = append(allObjects, objects...)

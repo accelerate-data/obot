@@ -9,7 +9,6 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var log = logger.Package()
@@ -99,10 +98,8 @@ func (h *Handler) ConfirmOwner(req api.Context) error {
 
 	// Create the UserRoleChange
 	if err := req.Create(&v1.UserRoleChange{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: system.UserRoleChangePrefix,
-			Namespace:    system.DefaultNamespace,
-		},
+		GenerateName: system.UserRoleChangePrefix,
+		Namespace:    system.DefaultNamespace,
 		Spec: v1.UserRoleChangeSpec{
 			UserID: user.ID,
 		},

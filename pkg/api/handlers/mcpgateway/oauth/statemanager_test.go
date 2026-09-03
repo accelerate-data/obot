@@ -27,7 +27,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -378,11 +377,11 @@ func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.
 		WithScheme(scheme.Scheme).
 		WithObjects(
 			&v1.MCPServerInstance{
-				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
-				Spec:       v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
+				Namespace: system.DefaultNamespace, Name: mcpID,
+				Spec: v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
 			},
 			&v1.MCPServerCatalogEntry{
-				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
+				Namespace: system.DefaultNamespace, Name: entryName,
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
 					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL, StaticOAuthRequired: true},
 				}},
@@ -446,11 +445,11 @@ func newStateManagerTestClientWithDB(t *testing.T, entryName, mcpID string, stat
 		WithScheme(scheme.Scheme).
 		WithObjects(
 			&v1.MCPServerInstance{
-				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
-				Spec:       v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
+				Namespace: system.DefaultNamespace, Name: mcpID,
+				Spec: v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
 			},
 			&v1.MCPServerCatalogEntry{
-				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
+				Namespace: system.DefaultNamespace, Name: entryName,
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
 					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api", StaticOAuthRequired: staticOAuthRequired},
 				}},
@@ -472,8 +471,8 @@ func newDirectStateManagerTestClient(t *testing.T, mcpID string) (*gateway.Clien
 	storageClient := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(&v1.MCPServer{
-			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
-			Spec:       v1.MCPServerSpec{},
+			Namespace: system.DefaultNamespace, Name: mcpID,
+			Spec: v1.MCPServerSpec{},
 		}).
 		Build()
 	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})

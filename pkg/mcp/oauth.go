@@ -508,7 +508,7 @@ func (o *oauth) resolveClientInfo(ctx context.Context, serverName string, discov
 	if o.clientLookup != nil {
 		clientInfo.ClientID, clientInfo.ClientSecret, lookupErr = o.clientLookup.Lookup(ctx, protectedResourceMetadata.AuthorizationServers[0])
 	}
-	if lookupErr == nil && clientInfo.ClientID != "" && clientInfo.ClientSecret != "" {
+	if lookupErr == nil && clientInfo.ClientID != "" {
 		slog.Info("using static oauth client credentials", "server", serverName, "authorization_server", protectedResourceMetadata.AuthorizationServers[0])
 		return clientInfo, nil
 	}
@@ -1225,8 +1225,7 @@ func SafeOAuthErrorCode(code string) string {
 // identifiers, and echoed request parameters that must never reach a log or an
 // API response.
 func SanitizeTokenExchangeError(err error) error {
-	var retrieveErr *oauth2.RetrieveError
-	if errors.As(err, &retrieveErr) {
+	if retrieveErr, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
 		if retrieveErr.ErrorCode != "" {
 			return fmt.Errorf("token endpoint rejected the exchange: %s", SafeOAuthErrorCode(retrieveErr.ErrorCode))
 		}
@@ -1238,8 +1237,7 @@ func SanitizeTokenExchangeError(err error) error {
 
 	// A transport failure names the full request URL, which repeats the token
 	// endpoint back to the caller. Keep only the underlying cause.
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		return fmt.Errorf("could not reach the token endpoint: %w", urlErr.Err)
 	}
 

@@ -25,7 +25,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ErrorCode defines the set of OAuth 2.0 error codes as per RFC 6749.
@@ -226,10 +225,8 @@ func (h *handler) authorize(req api.Context) error {
 	}
 
 	oauthAppAuthRequest := v1.OAuthAuthRequest{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: system.OAuthAuthRequestPrefix,
-			Namespace:    oauthClient.Namespace,
-		},
+		GenerateName: system.OAuthAuthRequestPrefix,
+		Namespace:    oauthClient.Namespace,
 		Spec: v1.OAuthAuthRequestSpec{
 			Scope:               scope,
 			Resource:            resource,

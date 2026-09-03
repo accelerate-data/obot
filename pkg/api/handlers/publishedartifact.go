@@ -27,7 +27,6 @@ import (
 	"github.com/obot-platform/obot/pkg/storage/blob"
 	"github.com/obot-platform/obot/pkg/system"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -201,10 +200,8 @@ func (h *PublishedArtifactHandler) createNewArtifact(req api.Context, data []byt
 	}
 
 	artifact := v1.PublishedArtifact{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      artifactName,
-			Namespace: req.Namespace(),
-		},
+		Name:      artifactName,
+		Namespace: req.Namespace(),
 		Spec: v1.PublishedArtifactSpec{
 			PublishedArtifactManifest: manifest,
 			AuthorID:                  authorID,

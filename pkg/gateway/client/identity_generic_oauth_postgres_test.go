@@ -14,7 +14,6 @@ import (
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -120,16 +119,12 @@ func newPostgresGenericOAuthTestClient(t *testing.T, database *gatewaydb.DB, iss
 			WithScheme(storagescheme.Scheme).
 			WithObjects(
 				&v1.AuthProvider{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      genericOAuthAuthProviderName,
-						Namespace: system.DefaultNamespace,
-					},
+					Name:      genericOAuthAuthProviderName,
+					Namespace: system.DefaultNamespace,
 				},
 				&v1.UserDefaultRoleSetting{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      system.DefaultRoleSettingName,
-						Namespace: system.DefaultNamespace,
-					},
+					Name:      system.DefaultRoleSettingName,
+					Namespace: system.DefaultNamespace,
 					Spec: v1.UserDefaultRoleSettingSpec{
 						Role: apitypes.RoleBasic,
 					},

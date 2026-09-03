@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -264,11 +263,11 @@ func newCatalogTokenStoreTestClientWithStorage(t *testing.T, entryName, mcpID st
 		WithScheme(scheme.Scheme).
 		WithObjects(
 			&v1.MCPServerInstance{
-				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
-				Spec:       v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
+				Namespace: system.DefaultNamespace, Name: mcpID,
+				Spec: v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
 			},
 			&v1.MCPServerCatalogEntry{
-				ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
+				Namespace: system.DefaultNamespace, Name: entryName,
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
 					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api", StaticOAuthRequired: staticOAuthRequired},
 				}},

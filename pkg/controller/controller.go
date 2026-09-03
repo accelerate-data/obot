@@ -14,6 +14,7 @@ import (
 	"github.com/obot-platform/obot/pkg/controller/handlers/mdmassetsource"
 	"github.com/obot-platform/obot/pkg/controller/handlers/modelinfosource"
 	"github.com/obot-platform/obot/pkg/controller/handlers/provider"
+	"github.com/obot-platform/obot/pkg/controller/handlers/providerconfigurationchange"
 	"github.com/obot-platform/obot/pkg/controller/handlers/secret"
 	"github.com/obot-platform/obot/pkg/controller/handlers/tunnelpeer"
 	"github.com/obot-platform/obot/pkg/localauth"
@@ -27,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	// Enable logrus logging in nah
@@ -54,6 +54,7 @@ func New(services *services.Services) (*Controller, error) {
 	}
 
 	c.setupRoutes()
+	c.setupEveryReplicaRoutes()
 	c.setupLocalK8sRoutes()
 
 	services.Router.PosStart(c.PostStart)
@@ -196,12 +197,10 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 		}
 		if !foundOBOTURLEntry {
 			existing.Spec.Manifest.Env = append(existing.Spec.Manifest.Env, types.MCPEnv{
-				MCPHeader: types.MCPHeader{
-					Name:     "OBOT_URL",
-					Key:      "OBOT_URL",
-					Required: true,
-					Value:    internalURL,
-				},
+				Name:     "OBOT_URL",
+				Key:      "OBOT_URL",
+				Required: true,
+				Value:    internalURL,
 			})
 			needsUpdate = true
 		}
@@ -219,11 +218,9 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 	// Create the SystemMCPServer
 	log.Infof("Creating obot MCP server (image=%s)", image)
 	server := &v1.SystemMCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       system.ObotMCPServerName,
-			Namespace:  system.DefaultNamespace,
-			Finalizers: []string{v1.SystemMCPServerFinalizer},
-		},
+		Name:       system.ObotMCPServerName,
+		Namespace:  system.DefaultNamespace,
+		Finalizers: []string{v1.SystemMCPServerFinalizer},
 		Spec: v1.SystemMCPServerSpec{
 			Manifest: types.SystemMCPServerManifest{
 				Name:             "Obot MCP Server",
@@ -236,12 +233,10 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 				},
 				Env: []types.MCPEnv{
 					{
-						MCPHeader: types.MCPHeader{
-							Name:     "OBOT_URL",
-							Key:      "OBOT_URL",
-							Required: true,
-							Value:    internalURL,
-						},
+						Name:     "OBOT_URL",
+						Key:      "OBOT_URL",
+						Required: true,
+						Value:    internalURL,
 					},
 				},
 			},
@@ -252,6 +247,18 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 }
 
 func (c *Controller) PostStart(ctx context.Context, client kclient.Client) {
+	if err := providerconfigurationchange.CleanupOrphanedStagedCredentials(
+		ctx,
+		client,
+		c.services.GatewayClient,
+		time.Now(),
+		providerconfigurationchange.OrphanedStagedCredentialGracePeriod,
+	); err != nil {
+		panic(fmt.Errorf("cleanup orphaned staged provider credentials: %w", err))
+	}
+	if err := providerconfigurationchange.EnsureDaemonSync(ctx, client); err != nil {
+		panic(err)
+	}
 	go c.providerHandler.PollRegistries(ctx, client)
 	var err error
 	for range 3 {
@@ -358,9 +365,14 @@ func (c *Controller) Start(ctx context.Context) error {
 	}
 	// Tunnel peers are process-local, so this separate router intentionally has
 	// no leader election and runs its handler on every Obot replica.
+	if c.services.K8SEveryReplicaRouter != nil {
+		if err := c.services.K8SEveryReplicaRouter.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start tunnel peer Kubernetes router: %w", err)
+		}
+	}
 	if c.services.EveryReplicaRouter != nil {
 		if err := c.services.EveryReplicaRouter.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start tunnel peer Kubernetes router: %w", err)
+			return fmt.Errorf("failed to start every replica router: %w", err)
 		}
 	}
 
@@ -371,10 +383,8 @@ func ensureDefaultUserRoleSetting(ctx context.Context, client kclient.Client) er
 	var defaultRoleSetting v1.UserDefaultRoleSetting
 	if err := client.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: system.DefaultRoleSettingName}, &defaultRoleSetting); apierrors.IsNotFound(err) {
 		defaultRoleSetting = v1.UserDefaultRoleSetting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      system.DefaultRoleSettingName,
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      system.DefaultRoleSettingName,
+			Namespace: system.DefaultNamespace,
 			Spec: v1.UserDefaultRoleSettingSpec{
 				Role: types.RoleBasic,
 			},
@@ -416,10 +426,8 @@ func ensureHostedAgentPoolDefaults(ctx context.Context, client kclient.Client) e
 	}
 
 	return client.Create(ctx, &v1.HostedAgentPoolDefaults{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      key.Name,
-			Namespace: key.Namespace,
-		},
+		Name:      key.Name,
+		Namespace: key.Namespace,
 		Spec: v1.HostedAgentPoolDefaultsSpec{
 			Manifest: types.HostedAgentPoolDefaultsManifest{
 				Capacity: types.HostedAgentResourceQuantity{
@@ -457,10 +465,8 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 		// Create default settings
 		// SetViaHelm only applies to pod scheduling settings, not PSA
 		k8sSettings = v1.K8sSettings{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      system.K8sSettingsName,
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      system.K8sSettingsName,
+			Namespace: system.DefaultNamespace,
 			Spec: v1.K8sSettingsSpec{
 				SetViaHelm:         settingsSetViaHelm,
 				MaximumsSetViaHelm: maximumsSetViaHelm,
@@ -666,10 +672,8 @@ func ensureAppPreferences(ctx context.Context, client kclient.Client) error {
 	if apierrors.IsNotFound(err) {
 		// Create default preferences
 		appPrefs = v1.AppPreferences{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      system.AppPreferencesName,
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      system.AppPreferencesName,
+			Namespace: system.DefaultNamespace,
 		}
 		return kclient.IgnoreAlreadyExists(client.Create(ctx, &appPrefs))
 	}
@@ -697,9 +701,9 @@ func (c *Controller) setupLocalK8sRoutes() {
 		// instead of waiting for the periodic service-account key rotation loop.
 		c.services.LocalRouter.Type(&corev1.Secret{}).Namespace(c.services.ServiceNamespace).Name(serviceaccounts.NetworkPolicySecretName).IncludeRemoved().HandlerFunc(c.reconcileServiceAccountSecretChange)
 	}
-	if c.services.EveryReplicaRouter != nil {
+	if c.services.K8SEveryReplicaRouter != nil {
 		peerHandler := tunnelpeer.New(c.services.TunnelManager.ID, c.services.TunnelManager)
-		c.services.EveryReplicaRouter.Type(&corev1.Service{}).Namespace(c.services.TunnelManager.ServiceNamespace).Name(c.services.TunnelManager.ServiceName).HandlerFunc(peerHandler.Reconcile)
+		c.services.K8SEveryReplicaRouter.Type(&corev1.Service{}).Namespace(c.services.TunnelManager.ServiceNamespace).Name(c.services.TunnelManager.ServiceName).HandlerFunc(peerHandler.Reconcile)
 	}
 }
 

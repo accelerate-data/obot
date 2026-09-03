@@ -25,7 +25,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
@@ -50,7 +49,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 
 	startRecorder := httptest.NewRecorder()
 	startReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, `{"clientID":"  static-client  ","clientSecret":"  static-secret  "}`, startRecorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	startReq.SetPathValue("catalog_id", "default")
 	startReq.SetPathValue("entry_id", entry.Name)
 
@@ -94,7 +93,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 
 	statusRecorder := httptest.NewRecorder()
 	statusReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["testState"]), statusRecorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	statusReq.SetPathValue("catalog_id", "default")
 	statusReq.SetPathValue("entry_id", entry.Name)
 	if err := handler.GetOAuthCredentialTest(statusReq); err != nil {
@@ -114,7 +113,7 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	}
 
 	wrongCallerReq := newStaticOAuthTestRequest(t, http.MethodPost, `/`, staticOAuthStatusBody(t, started["testState"]), httptest.NewRecorder(), gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	wrongCallerReq.User = &user.DefaultInfo{Name: "other", UID: "user-2"}
 	wrongCallerReq.SetPathValue("catalog_id", "default")
 	wrongCallerReq.SetPathValue("entry_id", entry.Name)
@@ -131,7 +130,7 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 	)
 	entry := staticOAuthTestEntry(entryName, "default", mcpURL)
 	instance := &v1.MCPServerInstance{
-		ObjectMeta: metav1.ObjectMeta{Name: mcpID, Namespace: system.DefaultNamespace},
+		Name: mcpID, Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
 			UserID:                    "user-1",
 			MCPServerCatalogEntryName: entryName,
@@ -146,7 +145,7 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
 		}).
 		WithObjects(
-			&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}},
+			&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace},
 			entry,
 			instance,
 		).
@@ -260,7 +259,7 @@ func TestStartOAuthCredentialTestRejectsWrongScopeShapeCandidatesAndBlockedURL(t
 				handler.remoteURLValidationConfig = mcp.RemoteMCPURLValidationConfig{AllowLocalhostMCP: true, AllowPrivateIPMCP: true, AllowLinkLocalMCP: true}
 			}
 			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", tt.body, httptest.NewRecorder(), gateway,
-				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+				&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
 			if err := handler.StartOAuthCredentialTest(req); err == nil {
@@ -293,7 +292,7 @@ func TestStartOAuthCredentialTestRejectsUnsafeDiscoveredEndpoints(t *testing.T) 
 				},
 			}
 			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", `{"clientID":"client","clientSecret":"secret"}`, httptest.NewRecorder(), gateway,
-				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+				&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
 			if err := handler.StartOAuthCredentialTest(req); err == nil {
@@ -323,7 +322,7 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 			}
 			recorder := httptest.NewRecorder()
 			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state.TestState), recorder, gateway,
-				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+				&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
 			if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err != nil {
@@ -349,7 +348,7 @@ func TestGetOAuthCredentialTestProjectsSafeCompletedStatusesAndEntryIsolation(t 
 	entryTwo := staticOAuthTestEntry("entry-2", "default", "https://mcp.example/api")
 	state := pendingStaticOAuthCredentialProof(t, gateway, entryOne.Name, entryOne.Spec.Manifest.RemoteConfig.FixedURL, "user-1")
 	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state.TestState), httptest.NewRecorder(), gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entryTwo)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entryTwo)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entryTwo.Name)
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err == nil {
@@ -369,7 +368,7 @@ func TestGetOAuthCredentialTestProjectsExpiredStatusAtHandlerBoundary(t *testing
 
 	recorder := httptest.NewRecorder()
 	req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, state.TestState), recorder, gateway,
-		&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+		&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 	req.SetPathValue("catalog_id", "default")
 	req.SetPathValue("entry_id", entry.Name)
 	if err := (&MCPCatalogHandler{gatewayClient: gateway}).GetOAuthCredentialTest(req); err != nil {
@@ -427,7 +426,7 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 			entry := staticOAuthTestEntry("entry-1", "default", "https://mcp.example/api")
 			proof := tt.prepare(t, gateway, entry)
 			req := newStaticOAuthTestRequest(t, http.MethodPost, "/", staticOAuthStatusBody(t, proof), httptest.NewRecorder(), gateway,
-				&v1.MCPCatalog{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: system.DefaultNamespace}}, entry)
+				&v1.MCPCatalog{Name: "default", Namespace: system.DefaultNamespace}, entry)
 			req.SetPathValue("catalog_id", "default")
 			req.SetPathValue("entry_id", entry.Name)
 
@@ -442,7 +441,7 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 
 func staticOAuthTestEntry(name, catalogName, fixedURL string) *v1.MCPServerCatalogEntry {
 	return &v1.MCPServerCatalogEntry{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: system.DefaultNamespace},
+		Name: name, Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerCatalogEntrySpec{
 			MCPCatalogName: catalogName,
 			Manifest: types.MCPServerCatalogEntryManifest{

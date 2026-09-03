@@ -20,7 +20,6 @@ import (
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
 	"github.com/obot-platform/obot/pkg/system"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -42,10 +41,8 @@ func TestGetCurrentUserContinuesWhenAuthProviderURLUnavailable(t *testing.T) {
 	}
 
 	kclient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(&v1.AuthProvider{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "generic-oauth-auth-provider",
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      "generic-oauth-auth-provider",
+		Namespace: system.DefaultNamespace,
 		Status: v1.AuthProviderStatus{
 			MissingConfigurationParameters: []string{"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID"},
 		},
@@ -141,10 +138,8 @@ func newGatewayTestClient(t *testing.T) *gatewayclient.Client {
 	}
 
 	storageClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(&v1.UserDefaultRoleSetting{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultRoleSettingName,
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      system.DefaultRoleSettingName,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.UserDefaultRoleSettingSpec{
 			Role: apitypes.RoleBasic,
 		},

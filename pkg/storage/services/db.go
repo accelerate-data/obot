@@ -49,12 +49,10 @@ func connectDB(
 // that resolves on its own (DNS lookup failure, connection refused) as opposed
 // to a permanent configuration error (e.g. an unsupported DSN scheme).
 func isTransientConnectError(err error) bool {
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return true
 	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
+	if _, ok := errors.AsType[*net.OpError](err); ok {
 		return true
 	}
 	var connectErr *pgconn.ConnectError

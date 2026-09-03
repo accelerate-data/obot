@@ -16,7 +16,6 @@ import (
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
 	"github.com/obot-platform/obot/pkg/system"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -285,10 +284,8 @@ func testAuthProvider(name string, required []string, optional []string) *v1.Aut
 
 func testAuthProviderValue(name string, required []string, optional []string) v1.AuthProvider {
 	return v1.AuthProvider{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: system.DefaultNamespace,
-			Name:      name,
-		},
+		Namespace: system.DefaultNamespace,
+		Name:      name,
 		Spec: v1.AuthProviderSpec{
 			AuthProviderManifest: types.AuthProviderManifest{
 				CommonProviderMetadata: types.CommonProviderMetadata{

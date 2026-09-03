@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/obot-platform/nah/pkg/name"
@@ -197,6 +198,7 @@ func (h *MCPCatalogHandler) Update(req api.Context) error {
 func (h *MCPCatalogHandler) ListEntries(req api.Context) error {
 	catalogName := req.PathValue("catalog_id")
 	workspaceID := req.PathValue("workspace_id")
+	minimal, _ := strconv.ParseBool(req.URL.Query().Get("minimal"))
 	var powerUserID string
 
 	// Verify the scope exists
@@ -232,7 +234,7 @@ func (h *MCPCatalogHandler) ListEntries(req api.Context) error {
 	if (req.UserIsAdmin() || req.UserIsAuditor()) && req.URL.Query().Get("all") == "true" {
 		entries := make([]types.MCPServerCatalogEntry, 0, len(list.Items))
 		for _, entry := range list.Items {
-			entries = append(entries, ConvertMCPServerCatalogEntryWithWorkspace(entry, workspaceID, powerUserID, h.serverURL))
+			entries = append(entries, convertMCPServerCatalogEntryForList(entry, workspaceID, powerUserID, h.serverURL, minimal))
 		}
 		return req.Write(types.MCPServerCatalogEntryList{Items: entries})
 	}
@@ -261,7 +263,7 @@ func (h *MCPCatalogHandler) ListEntries(req api.Context) error {
 			if !req.UserIsAdmin() && entryRequiresStaticOAuthCreds(entry) {
 				continue
 			}
-			entries = append(entries, ConvertMCPServerCatalogEntryWithWorkspace(entry, workspaceID, powerUserID, h.serverURL))
+			entries = append(entries, convertMCPServerCatalogEntryForList(entry, workspaceID, powerUserID, h.serverURL, minimal))
 		}
 	}
 
@@ -357,9 +359,7 @@ func (h *MCPCatalogHandler) CreateEntry(req api.Context) error {
 	cleanName := normalizeMCPCatalogEntryName(manifest.Name)
 
 	entry := v1.MCPServerCatalogEntry{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: req.Namespace(),
-		},
+		Namespace: req.Namespace(),
 		Spec: v1.MCPServerCatalogEntrySpec{
 			Editable: true,
 			Manifest: manifest,
@@ -418,9 +418,21 @@ func (h *MCPCatalogHandler) UpdateEntry(req api.Context) error {
 	if err := req.Read(&manifest); err != nil {
 		return types.NewErrBadRequest("failed to read entry manifest: %v", err)
 	}
+
 	if manifest.ServerUserType == "" {
 		manifest.ServerUserType = types.ServerUserTypeSingleUser
 	}
+
+	// Component manifests are snapshots of their referenced entries and must not
+	// be accepted from the request. Besides keeping updates consistent with
+	// creation, this prevents a component from combining another entry's ID (and
+	// static OAuth credentials) with attacker-controlled connection metadata.
+	if manifest.Runtime == types.RuntimeComposite && manifest.CompositeConfig != nil {
+		if err := h.populateComponentManifests(req, &manifest, catalogName, workspaceID); err != nil {
+			return err
+		}
+	}
+
 	if err := validateCatalogEntryManifestWithResourceMaximums(req, manifest, false, h.sessionManager); err != nil {
 		return types.NewErrBadRequest("failed to validate entry manifest: %v", err)
 	}
@@ -640,8 +652,7 @@ func (h *MCPCatalogHandler) GetEntryCapacity(req api.Context) error {
 
 	info, err := h.capacityInfoProvider.GetCapacityInfoForServers(req.Context(), serverNames)
 	if err != nil {
-		var notSupported *mcp.ErrNotSupportedByBackend
-		if errors.As(err, &notSupported) {
+		if notSupported, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrBadRequest("%s", notSupported.Error())
 		}
 		return err
@@ -1343,10 +1354,8 @@ func (h *MCPCatalogHandler) GenerateComponentToolPreviews(req api.Context) error
 	// - it may no longer exist
 	// - we already have enough information to generate composite tool overrides for the component
 	entry := v1.MCPServerCatalogEntry{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      component.CatalogEntryID,
-			Namespace: composite.Namespace,
-		},
+		Name:      component.CatalogEntryID,
+		Namespace: composite.Namespace,
 		Spec: v1.MCPServerCatalogEntrySpec{
 			MCPCatalogName: composite.Spec.MCPCatalogName,
 			Manifest:       component.Manifest,
@@ -1574,9 +1583,7 @@ func tempServerAndConfig(ctx context.Context, gatewayClient *gclient.Client, cli
 	// Create temporary MCPServer object to use existing conversion logic
 	tempName := "tool-preview-" + utils.Digest(serverManifest)[:16]
 	tempMCPServer := v1.MCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: tempName,
-		},
+		Name: tempName,
 		Spec: v1.MCPServerSpec{
 			Manifest: serverManifest,
 		},
@@ -1603,11 +1610,9 @@ func tempServerAndConfig(ctx context.Context, gatewayClient *gclient.Client, cli
 	}
 
 	oauthClient := v1.OAuthClient{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       clientID,
-			Namespace:  namespace,
-			Finalizers: []string{v1.OAuthClientFinalizer},
-		},
+		Name:       clientID,
+		Namespace:  namespace,
+		Finalizers: []string{v1.OAuthClientFinalizer},
 		Spec: v1.OAuthClientSpec{
 			Manifest: types.OAuthClientManifest{
 				GrantTypes: []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
@@ -1702,16 +1707,14 @@ func revealCatalogTokens(req api.Context, catalogName string) (map[string]string
 
 func convertMCPCatalog(catalog v1.MCPCatalog, tokenEnv map[string]string) types.MCPCatalog {
 	return types.MCPCatalog{
-		Metadata: MetadataFrom(&catalog),
-		MCPCatalogManifest: types.MCPCatalogManifest{
-			DisplayName:               catalog.Spec.DisplayName,
-			SourceURLs:                catalog.Spec.SourceURLs,
-			SourceURLCredentials:      maskCatalogCredentials(catalog.Spec.SourceURLs, tokenEnv),
-			SourceURLGitCredentialIDs: catalog.Spec.SourceURLGitCredentialIDs,
-		},
-		LastSynced: *types.NewTime(catalog.Status.LastSyncTime.Time),
-		SyncErrors: catalog.Status.SyncErrors,
-		IsSyncing:  catalog.Status.IsSyncing || catalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true",
+		Metadata:                  MetadataFrom(&catalog),
+		DisplayName:               catalog.Spec.DisplayName,
+		SourceURLs:                catalog.Spec.SourceURLs,
+		SourceURLCredentials:      maskCatalogCredentials(catalog.Spec.SourceURLs, tokenEnv),
+		SourceURLGitCredentialIDs: catalog.Spec.SourceURLGitCredentialIDs,
+		LastSynced:                *types.NewTime(catalog.Status.LastSyncTime.Time),
+		SyncErrors:                catalog.Status.SyncErrors,
+		IsSyncing:                 catalog.Status.IsSyncing || catalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true",
 	}
 }
 

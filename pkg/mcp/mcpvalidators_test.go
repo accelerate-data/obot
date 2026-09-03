@@ -69,10 +69,10 @@ func TestValidateCatalogEntryManifest_ContainerOAuth(t *testing.T) {
 			},
 		},
 		Env: []types.MCPEnv{
-			{MCPHeader: types.MCPHeader{Key: "ENTRA_INSTANCE"}},
-			{MCPHeader: types.MCPHeader{Key: "ENTRA_TENANT_ID"}},
-			{MCPHeader: types.MCPHeader{Key: "ENTRA_CLIENT_ID"}},
-			{MCPHeader: types.MCPHeader{Key: "ENTRA_CLIENT_SECRET"}},
+			{Key: "ENTRA_INSTANCE"},
+			{Key: "ENTRA_TENANT_ID"},
+			{Key: "ENTRA_CLIENT_ID"},
+			{Key: "ENTRA_CLIENT_SECRET"},
 		},
 	}
 
@@ -93,7 +93,7 @@ func TestValidateCatalogEntryManifest_ContainerOAuth(t *testing.T) {
 	manifest.Env = manifest.Env[:3]
 	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "is not declared in env")
 
-	manifest.Env = append(manifest.Env, types.MCPEnv{MCPHeader: types.MCPHeader{Key: "ENTRA_CLIENT_SECRET"}})
+	manifest.Env = append(manifest.Env, types.MCPEnv{Key: "ENTRA_CLIENT_SECRET"})
 	manifest.MultiUserConfig = &types.MultiUserConfig{UserDefinedHeaders: []types.MCPHeader{{Key: "authorization"}}}
 	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "Authorization cannot be user-defined")
 }
@@ -899,8 +899,7 @@ func TestRemoteValidator_ValidateConfig_HeaderValidation(t *testing.T) {
 					return
 				}
 
-				var runtimeErr types.RuntimeValidationError
-				if errors.As(err, &runtimeErr) {
+				if runtimeErr, ok := errors.AsType[types.RuntimeValidationError](err); ok {
 					if runtimeErr.Field != tt.errorField {
 						t.Errorf("expected error field %q, got %q", tt.errorField, runtimeErr.Field)
 					}
@@ -1257,8 +1256,7 @@ func TestRemoteValidator_ValidateCatalogConfig_HeaderValidation(t *testing.T) {
 					return
 				}
 
-				var runtimeErr types.RuntimeValidationError
-				if errors.As(err, &runtimeErr) {
+				if runtimeErr, ok := errors.AsType[types.RuntimeValidationError](err); ok {
 					if runtimeErr.Field != tt.errorField {
 						t.Errorf("expected error field %q, got %q", tt.errorField, runtimeErr.Field)
 					}
@@ -2461,7 +2459,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound env accepted for admin-managed multi-user server",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				Env:     []types.MCPEnv{{MCPHeader: types.MCPHeader{Key: "DD_API_KEY", SecretBinding: binding}}},
+				Env:     []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding}},
 			},
 			adminManaged: true,
 			backend:      "kubernetes",
@@ -2518,7 +2516,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound env under remote runtime is rejected",
 			manifest: types.MCPServerManifest{
 				Runtime:      types.RuntimeRemote,
-				Env:          []types.MCPEnv{{MCPHeader: types.MCPHeader{Key: "DD_API_KEY", SecretBinding: binding}}},
+				Env:          []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding}},
 				RemoteConfig: &types.RemoteRuntimeConfig{},
 			},
 			gitManaged: true,
@@ -2529,7 +2527,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "file-backed env with secret binding is accepted",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				Env:     []types.MCPEnv{{MCPHeader: types.MCPHeader{Key: "DD_API_KEY", SecretBinding: binding}, File: true}},
+				Env:     []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding, File: true}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
@@ -2538,7 +2536,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound env accepted for git-managed containerized",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				Env:     []types.MCPEnv{{MCPHeader: types.MCPHeader{Key: "DD_API_KEY", SecretBinding: binding}}},
+				Env:     []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
@@ -2548,7 +2546,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeNPX,
 				Env: []types.MCPEnv{{
-					MCPHeader:   types.MCPHeader{Key: "DD_API_KEY", SecretBinding: binding},
+					Key: "DD_API_KEY", SecretBinding: binding,
 					DynamicFile: true,
 				}},
 			},
@@ -2560,7 +2558,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeNPX,
 				Env: []types.MCPEnv{{
-					MCPHeader:   types.MCPHeader{Key: "DD_API_KEY"},
+					Key:         "DD_API_KEY",
 					File:        true,
 					DynamicFile: true,
 				}},
@@ -2595,9 +2593,8 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 			name: "urlTemplate referencing non-bound env is allowed",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeRemote,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "HOST", Required: true,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "HOST", Required: true}},
 				RemoteConfig: &types.RemoteCatalogConfig{
 					URLTemplate: "https://${HOST}/mcp",
 				},
@@ -2607,9 +2604,8 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 			name: "urlTemplate referencing secret-bound env is rejected",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeRemote,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "TOKEN", Required: true, SecretBinding: binding,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "TOKEN", Required: true, SecretBinding: binding}},
 				RemoteConfig: &types.RemoteCatalogConfig{
 					URLTemplate: "https://example.com/${TOKEN}/mcp",
 				},
@@ -2620,9 +2616,8 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 			name: "no urlTemplate with bound env passes to core check",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "TOKEN", Required: true, SecretBinding: binding,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "TOKEN", Required: true, SecretBinding: binding}},
 			},
 		},
 	}
@@ -2654,9 +2649,8 @@ func TestValidateSecretBindingsCatalogEntryMultiUser(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:        types.RuntimeNPX,
 				ServerUserType: types.ServerUserTypeMultiUser,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "TOKEN", SecretBinding: binding,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "TOKEN", SecretBinding: binding}},
 			},
 			adminManaged: true,
 		},
@@ -2665,9 +2659,8 @@ func TestValidateSecretBindingsCatalogEntryMultiUser(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:        types.RuntimeNPX,
 				ServerUserType: types.ServerUserTypeMultiUser,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "TOKEN", SecretBinding: binding,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "TOKEN", SecretBinding: binding}},
 			},
 			wantErr: "multi-user catalog entries",
 		},
@@ -2676,9 +2669,8 @@ func TestValidateSecretBindingsCatalogEntryMultiUser(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:        types.RuntimeNPX,
 				ServerUserType: types.ServerUserTypeSingleUser,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "TOKEN", SecretBinding: binding,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "TOKEN", SecretBinding: binding}},
 			},
 			adminManaged: true,
 			wantErr:      "multi-user catalog entries",
@@ -2721,9 +2713,8 @@ func TestValidateSecretBindingsCatalogEntryRejectsAdminAdded(t *testing.T) {
 			name: "env adminAdded rejected",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-					Key: "TOKEN", SecretBinding: binding,
-				}}},
+				Env: []types.MCPEnv{{
+					Key: "TOKEN", SecretBinding: binding}},
 			},
 			wantErr: "secretBinding.adminAdded is not valid for catalog entry",
 		},
@@ -2744,9 +2735,8 @@ func TestValidateSecretBindingsCatalogEntryRejectsAdminAdded(t *testing.T) {
 				CompositeConfig: &types.CompositeCatalogConfig{ComponentServers: []types.CatalogComponentServer{{
 					Manifest: types.MCPServerCatalogEntryManifest{
 						Runtime: types.RuntimeNPX,
-						Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-							Key: "TOKEN", SecretBinding: binding,
-						}}},
+						Env: []types.MCPEnv{{
+							Key: "TOKEN", SecretBinding: binding}},
 					},
 				}}},
 			},
@@ -2780,8 +2770,8 @@ func TestValidateSecretBindingsCatalogEntryRejectsMultiUserHeaderBinding(t *test
 }
 
 func TestValidateTemplateReferences_Server(t *testing.T) {
-	required := types.MCPEnv{MCPHeader: types.MCPHeader{Key: "TAG", Required: true}}
-	optional := types.MCPEnv{MCPHeader: types.MCPHeader{Key: "TAG", Required: false}}
+	required := types.MCPEnv{Key: "TAG", Required: true}
+	optional := types.MCPEnv{Key: "TAG", Required: false}
 
 	tests := []struct {
 		name     string
@@ -2879,8 +2869,8 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 }
 
 func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
-	required := types.MCPEnv{MCPHeader: types.MCPHeader{Key: "TAG", Required: true}}
-	optional := types.MCPEnv{MCPHeader: types.MCPHeader{Key: "TAG", Required: false}}
+	required := types.MCPEnv{Key: "TAG", Required: true}
+	optional := types.MCPEnv{Key: "TAG", Required: false}
 
 	tests := []struct {
 		name     string

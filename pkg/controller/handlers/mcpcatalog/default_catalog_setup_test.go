@@ -8,7 +8,6 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -19,14 +18,10 @@ const (
 
 func existingDefaultCatalog(sourceURLs ...string) *v1.MCPCatalog {
 	return &v1.MCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "MCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "MCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  sourceURLs,
