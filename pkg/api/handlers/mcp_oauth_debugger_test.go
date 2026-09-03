@@ -22,7 +22,6 @@ import (
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -129,7 +128,7 @@ func newDirectOAuthDebuggerTestClient(t *testing.T, mcpID string) *gateway.Clien
 	storageClient := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(&v1.MCPServer{
-			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
+			Namespace: system.DefaultNamespace, Name: mcpID,
 		}).
 		Build()
 	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})

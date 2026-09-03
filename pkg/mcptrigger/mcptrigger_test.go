@@ -11,7 +11,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -43,10 +42,8 @@ func newStorageClient(t *testing.T, objs ...kclient.Object) kclient.WithWatch {
 
 func mcpServerInstance(name, serverName string) *v1.MCPServerInstance {
 	return &v1.MCPServerInstance{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      name,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
 			UserID:        "user-1",
 			MCPServerName: serverName,

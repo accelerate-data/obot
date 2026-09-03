@@ -13,7 +13,6 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type LocalAuthHandler struct {
@@ -51,11 +50,9 @@ func (h *LocalAuthHandler) List(req api.Context) error {
 	items := make([]LocalAuthUser, 0, len(users))
 	for _, user := range users {
 		items = append(items, LocalAuthUser{
-			Metadata: types.Metadata{
-				ID:      strconv.FormatUint(uint64(user.ID), 10),
-				Created: *types.NewTime(user.CreatedAt),
-			},
-			Email: user.Email,
+			ID:      strconv.FormatUint(uint64(user.ID), 10),
+			Created: *types.NewTime(user.CreatedAt),
+			Email:   user.Email,
 		})
 	}
 
@@ -82,11 +79,9 @@ func (h *LocalAuthHandler) Create(req api.Context) error {
 	}
 
 	return req.Write(LocalAuthUser{
-		Metadata: types.Metadata{
-			ID:      strconv.FormatUint(uint64(user.ID), 10),
-			Created: *types.NewTime(user.CreatedAt),
-		},
-		Email: user.Email,
+		ID:      strconv.FormatUint(uint64(user.ID), 10),
+		Created: *types.NewTime(user.CreatedAt),
+		Email:   user.Email,
 	})
 }
 
@@ -157,10 +152,8 @@ func (h *LocalAuthHandler) Delete(req api.Context) error {
 
 		if err == nil {
 			if err = req.Create(&v1.UserDelete{
-				ObjectMeta: metav1.ObjectMeta{
-					GenerateName: system.UserDeletePrefix,
-					Namespace:    req.Namespace(),
-				},
+				GenerateName: system.UserDeletePrefix,
+				Namespace:    req.Namespace(),
 				Spec: v1.UserDeleteSpec{
 					UserID: gatewayUser.ID,
 				},

@@ -13,7 +13,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 )
 
@@ -22,10 +21,8 @@ import (
 // nil mcpOAuthChecker is never reached.
 func TestServerInstanceGetOAuthURLRejectsNonOwner(t *testing.T) {
 	instance := v1.MCPServerInstance{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "instance-1",
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      "instance-1",
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
 			UserID:        "owner-uid",
 			MCPServerName: "server-1",
@@ -48,20 +45,16 @@ func TestServerInstanceGetOAuthURLRejectsNonOwner(t *testing.T) {
 
 func TestServerInstanceRedirectOAuthURLRedirectsOwnedInstance(t *testing.T) {
 	instance := v1.MCPServerInstance{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "instance-1",
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      "instance-1",
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
 			UserID:        "owner-uid",
 			MCPServerName: "server-1",
 		},
 	}
 	server := v1.MCPServer{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "server-1",
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      "server-1",
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerSpec{
 			NeedsURL: true,
 		},

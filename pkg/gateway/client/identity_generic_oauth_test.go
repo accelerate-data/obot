@@ -9,7 +9,6 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -187,16 +186,12 @@ func newGenericOAuthTestClient(t *testing.T, issuer, trust string) *Client {
 	c := newTestClient(t)
 	c.storageClient = fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(
 		&v1.AuthProvider{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      genericOAuthAuthProviderName,
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      genericOAuthAuthProviderName,
+			Namespace: system.DefaultNamespace,
 		},
 		&v1.UserDefaultRoleSetting{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      system.DefaultRoleSettingName,
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      system.DefaultRoleSettingName,
+			Namespace: system.DefaultNamespace,
 			Spec: v1.UserDefaultRoleSettingSpec{
 				Role: types2.RoleBasic,
 			},

@@ -26,10 +26,8 @@ func (h *handler) register(req api.Context) error {
 	clientID := system.OAuthClientPrefix + strings.ToLower(rand.Text())
 
 	oauthClient := v1.OAuthClient{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      clientID,
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      clientID,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.OAuthClientSpec{
 			Manifest: oauthClientManifest,
 		},
@@ -115,11 +113,9 @@ func (h *handler) deleteClient(req api.Context) error {
 
 	log.Infof("Deleting dynamic OAuth client registration: client=%s/%s", namespace, name)
 	return req.Delete(&v1.OAuthClient{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       name,
-			Namespace:  namespace,
-			Finalizers: []string{v1.OAuthClientFinalizer},
-		},
+		Name:       name,
+		Namespace:  namespace,
+		Finalizers: []string{v1.OAuthClientFinalizer},
 	})
 }
 

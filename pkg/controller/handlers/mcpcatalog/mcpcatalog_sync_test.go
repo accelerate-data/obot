@@ -20,7 +20,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -34,14 +33,10 @@ func TestSyncSkipsRecentCatalogAndForceSyncPrunesRemovedEntries(t *testing.T) {
 	writeCatalogEntry(t, catalogDir, "beta.yaml", "Beta")
 
 	catalog := &v1.MCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "MCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "MCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  []string{catalogDir},
@@ -83,14 +78,10 @@ func TestSyncRefreshesRecentlySyncedCatalogOnRestart(t *testing.T) {
 	writeCatalogEntry(t, catalogDir, "beta.yaml", "Beta")
 
 	catalog := &v1.MCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "MCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "MCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  []string{catalogDir},
@@ -130,28 +121,20 @@ func TestSyncSystemRefreshesRecentlySyncedCatalogOnRestart(t *testing.T) {
 
 	// Both are named "default" in a deployment, so both must refresh on a restart.
 	catalog := &v1.MCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "MCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "MCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  []string{catalogDir},
 		},
 	}
 	systemCatalog := &v1.SystemMCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "SystemMCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "SystemMCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.SystemMCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  []string{catalogDir},
@@ -185,14 +168,10 @@ func TestStartupRefreshIsNotConsumedByAFailedApply(t *testing.T) {
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 
 	catalog := &v1.MCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "MCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "MCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  []string{catalogDir},
@@ -225,9 +204,9 @@ func TestPartialCatalogSyncWaitsForMutationLockBeforeApply(t *testing.T) {
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 	missingSource := filepath.Join(t.TempDir(), "missing")
 	catalog := &v1.MCPCatalog{
-		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
-		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir, missingSource}},
+		APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog",
+		Name: system.DefaultCatalog, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir, missingSource}},
 	}
 	entryCreated := make(chan struct{}, 1)
 	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
@@ -279,9 +258,9 @@ func TestCleanCatalogSyncWaitsForMutationLockBeforeRemoval(t *testing.T) {
 	catalogDir := t.TempDir()
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 	catalog := &v1.MCPCatalog{
-		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
-		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
+		APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog",
+		Name: system.DefaultCatalog, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
 	}
 	entryDeleted := make(chan struct{}, 1)
 	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
@@ -340,9 +319,9 @@ func TestCleanCatalogRemovalAndApplyShareMutationLock(t *testing.T) {
 	catalogDir := t.TempDir()
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 	catalog := &v1.MCPCatalog{
-		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
-		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
+		APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog",
+		Name: system.DefaultCatalog, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
 	}
 	baseClient := newCatalogSyncFakeClient(catalog)
 	gatewayClient := newCatalogGatewayClient(t, baseClient)
@@ -443,9 +422,9 @@ func TestCleanCatalogSyncCancellationWhileWaitingForMutationLockDoesNotRemoveOrA
 	catalogDir := t.TempDir()
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 	catalog := &v1.MCPCatalog{
-		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
-		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
+		APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog",
+		Name: system.DefaultCatalog, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir}},
 	}
 	baseClient := newCatalogSyncFakeClient(catalog)
 	gatewayClient := newCatalogGatewayClient(t, baseClient)
@@ -503,9 +482,9 @@ func TestPartialCatalogSyncCancellationWhileWaitingForMutationLockDoesNotApply(t
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 	missingSource := filepath.Join(t.TempDir(), "missing")
 	catalog := &v1.MCPCatalog{
-		TypeMeta:   metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog"},
-		ObjectMeta: metav1.ObjectMeta{Name: system.DefaultCatalog, Namespace: system.DefaultNamespace},
-		Spec:       v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir, missingSource}},
+		APIVersion: v1.SchemeGroupVersion.String(), Kind: "MCPCatalog",
+		Name: system.DefaultCatalog, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPCatalogSpec{DisplayName: "Default", SourceURLs: []string{catalogDir, missingSource}},
 	}
 	var entryCreates atomic.Int32
 	storageClient := newCatalogSyncFakeClientWithInterceptor(interceptor.Funcs{
@@ -541,14 +520,10 @@ func TestSyncRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testing.T) 
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 
 	catalog := &v1.MCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "MCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "MCPCatalog",
+		Name:       system.DefaultCatalog,
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  []string{catalogDir},
@@ -584,14 +559,10 @@ func TestSyncSystemRetriesSourceFailuresAfterShortBackoffWithoutPruning(t *testi
 	writeCatalogEntry(t, catalogDir, "alpha.yaml", "Alpha")
 
 	catalog := &v1.SystemMCPCatalog{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "SystemMCPCatalog",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "system",
-			Namespace: system.DefaultNamespace,
-		},
+		APIVersion: v1.SchemeGroupVersion.String(),
+		Kind:       "SystemMCPCatalog",
+		Name:       "system",
+		Namespace:  system.DefaultNamespace,
 		Spec: v1.SystemMCPCatalogSpec{
 			DisplayName: "System",
 			SourceURLs:  []string{catalogDir},

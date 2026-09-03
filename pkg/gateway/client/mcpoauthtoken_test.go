@@ -20,7 +20,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	"k8s.io/apiserver/pkg/storage/value"
@@ -41,13 +40,13 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t *testing.T) 
 			WithScheme(scheme.Scheme).
 			WithObjects(
 				&v1.MCPServerInstance{
-					ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: mcpID},
+					Namespace: system.DefaultNamespace, Name: mcpID,
 					Spec: v1.MCPServerInstanceSpec{
 						MCPServerCatalogEntryName: entryName,
 					},
 				},
 				&v1.MCPServerCatalogEntry{
-					ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: entryName},
+					Namespace: system.DefaultNamespace, Name: entryName,
 					Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
 						RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL, StaticOAuthRequired: true},
 					}},
@@ -300,13 +299,13 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t *testing.T) 
 			otherMCPID = "mcp-instance-2"
 		)
 		if err := c.storageClient.Create(t.Context(), &v1.MCPServerInstance{
-			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: otherMCPID},
-			Spec:       v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: otherEntry},
+			Namespace: system.DefaultNamespace, Name: otherMCPID,
+			Spec: v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: otherEntry},
 		}); err != nil {
 			t.Fatalf("create unrelated MCP instance: %v", err)
 		}
 		if err := c.storageClient.Create(t.Context(), &v1.MCPServerCatalogEntry{
-			ObjectMeta: metav1.ObjectMeta{Namespace: system.DefaultNamespace, Name: otherEntry},
+			Namespace: system.DefaultNamespace, Name: otherEntry,
 			Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
 				RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: mcpURL},
 			}},
@@ -1325,8 +1324,8 @@ func TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation(t *tes
 	storageClient := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(&v1.MCPServerInstance{
-			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: system.DefaultNamespace},
-			Spec:       v1.MCPServerInstanceSpec{UserID: userID, MCPServerName: serverName},
+			Name: instanceName, Namespace: system.DefaultNamespace,
+			Spec: v1.MCPServerInstanceSpec{UserID: userID, MCPServerName: serverName},
 		}).
 		Build()
 	backend := &recordingControllerBackend{}
@@ -1374,8 +1373,8 @@ func TestDeletedCatalogEntryCleanupTriggersTheOwningServerOfAnInstanceGrant(t *t
 	storageClient := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(&v1.MCPServerInstance{
-			ObjectMeta: metav1.ObjectMeta{Name: instanceName, Namespace: system.DefaultNamespace},
-			Spec:       v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: serverName},
+			Name: instanceName, Namespace: system.DefaultNamespace,
+			Spec: v1.MCPServerInstanceSpec{UserID: "user-1", MCPServerName: serverName},
 		}).
 		Build()
 	backend := &recordingControllerBackend{}

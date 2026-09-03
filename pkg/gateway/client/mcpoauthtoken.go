@@ -265,8 +265,7 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 	}
 	credential, err := c.RevealCredential(ctx, []string{credentialKey}, "oauth")
 	if err != nil {
-		var notFound CredentialNotFoundError
-		if errors.As(err, &notFound) {
+		if _, ok := errors.AsType[CredentialNotFoundError](err); ok {
 			if entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
 				return "", ErrMCPOAuthCatalogCredentialChanged
 			}

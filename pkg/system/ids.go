@@ -52,7 +52,7 @@ const (
 	AuthProviderCleanupPrefix     = "apc1"
 	ProviderChangePrefix          = "pcc1"
 
-	ObotMCPServerName = SystemMCPServerPrefix + "obot-mcp-server"
+	ObotMCPServerName      = SystemMCPServerPrefix + "obot-mcp-server"
 	ProviderChangeAuthName = ProviderChangePrefix + "auth"
 	ProviderSyncName       = "provider-sync"
 )

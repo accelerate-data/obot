@@ -19,8 +19,8 @@ func TestValidateCatalogEntryManifestConfigurationOptions(t *testing.T) {
 		ServerUserType: types.ServerUserTypeSingleUser,
 		Runtime:        types.RuntimeNPX,
 		NPXConfig:      &types.NPXRuntimeConfig{Package: "test-server"},
-		Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-			Key: "REGION", Name: "Region", Required: true, Options: testConfigurationOptions()}}},
+		Env: []types.MCPEnv{{
+			Key: "REGION", Name: "Region", Required: true, Options: testConfigurationOptions()}},
 	}
 
 	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), base, true, ValidationOptions{}))
@@ -75,8 +75,8 @@ func TestValidateServerManifestConfigurationOptions(t *testing.T) {
 	base := types.MCPServerManifest{
 		Runtime:   types.RuntimeNPX,
 		NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
-		Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
-			Key: "REGION", Name: "Region", Required: true, Options: testConfigurationOptions()}}},
+		Env: []types.MCPEnv{{
+			Key: "REGION", Name: "Region", Required: true, Options: testConfigurationOptions()}},
 	}
 
 	require.NoError(t, ValidateServerManifest(t.Context(), base, false, ValidationOptions{}))
@@ -99,11 +99,11 @@ func TestValidateCatalogEntryManifestCompositeConfigurationOptions(t *testing.T)
 					ServerUserType: types.ServerUserTypeSingleUser,
 					Runtime:        types.RuntimeNPX,
 					NPXConfig:      &types.NPXRuntimeConfig{Package: "test-server"},
-					Env: []types.MCPEnv{{MCPHeader: types.MCPHeader{
+					Env: []types.MCPEnv{{
 						Key: "REGION", Name: "Region", Required: true, Options: []types.MCPConfigurationOption{
 							{Name: "United States", Value: "us"},
 							{Name: "Europe", Value: "us"},
-						}}}},
+						}}},
 				},
 			}},
 		},

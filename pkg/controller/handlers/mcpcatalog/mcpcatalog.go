@@ -323,7 +323,7 @@ func reconcileRemovedEntries(ctx context.Context, c client.Client, catalog *v1.M
 	}
 
 	for entryName := range missingNames {
-		entry := &v1.MCPServerCatalogEntry{ObjectMeta: metav1.ObjectMeta{Name: entryName, Namespace: catalog.Namespace}}
+		entry := &v1.MCPServerCatalogEntry{Name: entryName, Namespace: catalog.Namespace}
 		if err := c.Delete(ctx, entry); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete unused catalog entry %q: %w", entryName, err)
 		}
@@ -640,10 +640,8 @@ func (h *Handler) readSystemMCPCatalog(ctx context.Context, catalogName, sourceU
 		}
 
 		systemObjs = append(systemObjs, &v1.SystemMCPServerCatalogEntry{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name.SafeHashConcatName(catalogName, cleanName),
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      name.SafeHashConcatName(catalogName, cleanName),
+			Namespace: system.DefaultNamespace,
 			Spec: v1.SystemMCPServerCatalogEntrySpec{
 				SystemMCPCatalogName: catalogName,
 				SourceURL:            sourceURL,
@@ -691,10 +689,8 @@ func (h *Handler) readMCPCatalog(ctx context.Context, catalogName, sourceURL, to
 		}
 
 		catalogEntry := v1.MCPServerCatalogEntry{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      catalogEntryName,
-				Namespace: system.DefaultNamespace,
-			},
+			Name:      catalogEntryName,
+			Namespace: system.DefaultNamespace,
 			Spec: v1.MCPServerCatalogEntrySpec{
 				MCPCatalogName: catalogName,
 				SourceURL:      sourceURL,
@@ -841,10 +837,8 @@ func (h *Handler) SetUpDefaultMCPCatalog(ctx context.Context, c client.Client) e
 	}
 
 	if err := c.Create(ctx, &v1.MCPCatalog{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      system.DefaultCatalog,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  sourceURLs,
@@ -869,10 +863,8 @@ func (h *Handler) SetUpDefaultSystemMCPCatalog(ctx context.Context, c client.Cli
 	}
 
 	if err := c.Create(ctx, &v1.SystemMCPCatalog{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      system.DefaultCatalog,
-			Namespace: system.DefaultNamespace,
-		},
+		Name:      system.DefaultCatalog,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.SystemMCPCatalogSpec{
 			DisplayName: "Default",
 			SourceURLs:  sourceURLs,
