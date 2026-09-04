@@ -22,6 +22,18 @@ const (
 	defaultContainerPort          = 8099
 	defaultWebhookToolName        = "fire-webhook"
 	serviceUnavailableGracePeriod = 10 * time.Second
+	// Nanobot serves a 500 for any recorded health error, including a transient one: its
+	// first checkTools runs under a two-minute deadline, and a command runtime (npx/uvx)
+	// downloading its package under load can outrun it. The health ticker then re-checks
+	// every minute against a now-warm cache, so the 500 clears on its own. Cover that
+	// recovery — a minute of tick plus its 30-second check — with margin.
+	//
+	// This is a ceiling on how long a 500 is tolerated, not a guarantee that it is what
+	// ends the poll: the readiness context is already bounded by ServerConfig.StartupTimeout,
+	// so whichever is shorter wins. Below the default 60s StartupTimeout the context ends
+	// the poll first, which reports the same ErrHealthCheckFailed carrying the same nanobot
+	// body — only later than the pre-grace behaviour did.
+	internalServerErrorGracePeriod = 2 * time.Minute
 
 	runtimeBackendDocker          = "docker"
 	RuntimeBackendKubernetes      = "kubernetes"
@@ -75,7 +87,7 @@ func ensureServerReady(ctx context.Context, url string, server ServerConfig) err
 	}
 
 	if server.HealthzPath != "" {
-		return ensureHTTPGetOK(ctx, client, urlWithPath(url, server.HealthzPath))
+		return ensureHTTPGetOK(ctx, client, urlWithPath(url, server.HealthzPath), internalServerErrorGracePeriod)
 	}
 
 	if server.ContainerPath != "" {
@@ -166,8 +178,13 @@ func ensureServerReady(ctx context.Context, url string, server ServerConfig) err
 	}
 }
 
-func ensureHTTPGetOK(ctx context.Context, client *http.Client, url string) error {
-	var firstServiceUnavailable time.Time
+// ensureHTTPGetOK polls url until it answers 200 or the health check is judged to have
+// permanently failed. internalServerErrorGracePeriod controls how long a 500 is tolerated
+// before it counts as permanent: callers polling for readiness pass a non-zero window so a
+// still-starting server can recover, while callers probing for a single permanent verdict
+// pass zero to fail on the first 500.
+func ensureHTTPGetOK(ctx context.Context, client *http.Client, url string, internalServerErrorGracePeriod time.Duration) error {
+	var firstServiceUnavailable, firstInternalServerError time.Time
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 		if err != nil {
@@ -200,13 +217,26 @@ func ensureHTTPGetOK(ctx context.Context, client *http.Client, url string) error
 
 			case http.StatusInternalServerError:
 				lastErr = fmt.Errorf("internal server error: %s", string(body))
-				// Nanobot returns 500 when tool listing permanently fails.
-				return fmt.Errorf("%w: %v", ErrHealthCheckFailed, lastErr)
+				// Nanobot returns 500 both when tool listing permanently fails and while a
+				// command runtime is still starting up, and the two are indistinguishable
+				// from here. Only treat it as permanent once it has persisted past the
+				// caller's grace period.
+				if internalServerErrorGracePeriod <= 0 {
+					return fmt.Errorf("%w: %v", ErrHealthCheckFailed, lastErr)
+				}
+				if firstInternalServerError.IsZero() {
+					firstInternalServerError = time.Now()
+				} else if time.Since(firstInternalServerError) > internalServerErrorGracePeriod {
+					return fmt.Errorf("%w: %v", ErrHealthCheckFailed, lastErr)
+				}
+
 			default:
 				lastErr = fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
 				// A non-503 response (e.g. 425 TooEarly) means we're reaching the actual
 				// nanobot process, not a proxy. Reset the grace period so that any subsequent
-				// 503 gets a fresh window.
+				// 503 gets a fresh window. The 500 window is deliberately NOT reset here: it
+				// measures how long the server has been failing to come up, and an alternating
+				// 500/425 server would otherwise postpone the verdict for ever.
 				firstServiceUnavailable = time.Time{}
 			}
 		}

@@ -845,7 +845,9 @@ func analyzePodStatusWithClient(ctx context.Context, pod *corev1.Pod, server Ser
 
 	// If this is a command-based MCP server, then check for a 500 from the health check.
 	if pod.Status.PodIP != "" && (server.Runtime == types.RuntimeNPX || server.Runtime == types.RuntimeUVX) {
-		if err := ensureHTTPGetOK(ctx, healthCheckClient, fmt.Sprintf("http://%s:%d%s", pod.Status.PodIP, defaultContainerPort, server.HealthzPath)); err != nil {
+		// A zero grace period keeps this a single fail-fast verdict rather than a poll:
+		// the enclosing watch loop, not this call, owns retrying until StartupTimeout.
+		if err := ensureHTTPGetOK(ctx, healthCheckClient, fmt.Sprintf("http://%s:%d%s", pod.Status.PodIP, defaultContainerPort, server.HealthzPath), 0); err != nil {
 			return false, err
 		}
 	}
