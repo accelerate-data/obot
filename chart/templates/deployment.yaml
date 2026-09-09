@@ -110,24 +110,39 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+          # /api/healthz pings the database and reports whether the controllers
+          # have caught up, so it is not free: on a CPU-limited pod doing its
+          # startup work it can take longer than the kubelet's 1s default, and a
+          # probe that times out is a probe that failed. Five seconds separates a
+          # busy pod from a stuck one.
+          #
+          # The startup budget is what a stuck pod costs before Kubernetes
+          # replaces it, and it has to stay under whatever is waiting on the
+          # pool. Ten minutes fits inside the installer's companion wait, so a
+          # replica that recovers by restarting recovers while someone is still
+          # watching. Twenty did not: an install stopped on a pod that went ready
+          # five minutes later.
           startupProbe:
             httpGet:
               path: /api/healthz
               port: http
-            failureThreshold: 120
+            failureThreshold: 60
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /api/healthz
               port: http
             failureThreshold: 5
             periodSeconds: 10
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /api/healthz
               port: http
             failureThreshold: 5
             periodSeconds: 10
+            timeoutSeconds: 5
           env:
             - name: OBOT_SERVER_SERVICE_ACCOUNT_NAME
               valueFrom:
