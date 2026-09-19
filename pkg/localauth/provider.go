@@ -13,13 +13,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/hash"
@@ -37,6 +37,9 @@ const (
 
 	// LoginPath is the UI route that renders the login form.
 	LoginPath = "/login/local"
+	// ChangePasswordPath is the page a restricted local-auth session is sent to; it may otherwise
+	// only use the activation page.
+	ChangePasswordPath = "/change-password"
 
 	sessionDuration = 7 * 24 * time.Hour
 
@@ -44,8 +47,6 @@ const (
 	// its cookie and log in again. See pkg/proxy/proxy.go.
 	invalidSessionBody = "record not found"
 )
-
-var log = logger.Package()
 
 type Provider struct {
 	gatewayClient *client.Client
@@ -90,7 +91,7 @@ func (p *Provider) Start(ctx context.Context) (url.URL, error) {
 
 	go func() {
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Errorf("local auth provider server exited: %v", err)
+			slog.Error("local auth provider server exited", "error", err)
 		}
 	}()
 
@@ -98,7 +99,7 @@ func (p *Provider) Start(ctx context.Context) (url.URL, error) {
 	go p.throttle.run(ctx)
 
 	u := url.URL{Scheme: "http", Host: listener.Addr().String()}
-	log.Infof("Started local auth provider: url=%s", u.String())
+	slog.Info("Started local auth provider", "url", u.String())
 
 	return u, nil
 }
@@ -125,7 +126,7 @@ func (p *Provider) cleanupSessions(ctx context.Context) {
 	defer t.Stop()
 	for {
 		if err := p.gatewayClient.DeleteExpiredLocalAuthSessions(ctx); err != nil {
-			log.Warnf("failed to clean up expired local auth sessions: %v", err)
+			slog.Warn("failed to clean up expired local auth sessions", "error", err)
 		}
 
 		select {
@@ -138,7 +139,7 @@ func (p *Provider) cleanupSessions(ctx context.Context) {
 
 // start redirects to the login form in the UI, preserving the post-login redirect target.
 func (p *Provider) start(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, LoginPath+"?rd="+url.QueryEscape(redirectTarget(r.URL.Query().Get("rd"))), http.StatusFound)
+	http.Redirect(w, r, LoginPath+"?rd="+url.QueryEscape(auth.SafeRedirectPath(r.URL.Query().Get("rd"))), http.StatusFound)
 }
 
 func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
@@ -147,7 +148,7 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rd := redirectTarget(r.FormValue("rd"))
+	rd := auth.SafeRedirectPath(r.FormValue("rd"))
 
 	// Reject cross-origin logins. Browsers always send Origin on POST, so this blocks login CSRF
 	// without requiring the login form to carry a token.
@@ -170,7 +171,7 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 
 	user, err := p.gatewayClient.LocalAuthUserByEmail(r.Context(), email)
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Errorf("failed to look up local auth user: %v", err)
+		slog.Error("failed to look up local auth user", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -184,7 +185,7 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 
 	if err := VerifyPassword(passwordHash, password); err != nil || user == nil {
 		if err != nil && !errors.Is(err, ErrInvalidPassword) {
-			log.Warnf("failed to verify password for local auth user: %v", err)
+			slog.Warn("failed to verify password for local auth user", "error", err)
 		}
 		p.throttle.failed(email)
 		p.loginFailed(w, r, rd, "Incorrect email or password.")
@@ -193,7 +194,7 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 
 	allowed, err := p.emailDomainAllowed(r.Context(), email)
 	if err != nil {
-		log.Errorf("failed to check allowed email domains: %v", err)
+		slog.Error("failed to check allowed email domains", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	} else if !allowed {
@@ -205,18 +206,50 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 
 	token, err := generateToken()
 	if err != nil {
-		log.Errorf("failed to generate session token: %v", err)
+		slog.Error("failed to generate session token", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	expiresAt := time.Now().Add(sessionDuration)
 	if err := p.gatewayClient.CreateLocalAuthSession(r.Context(), hash.String(token), user.ID, expiresAt); err != nil {
-		log.Errorf("failed to create local auth session: %v", err)
+		slog.Error("failed to create local auth session", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 
+	p.setSessionCookie(w, token, expiresAt)
+
+	if user.RequirePasswordChange {
+		rd = ChangePasswordPath + "?rd=" + url.QueryEscape(rd)
+	}
+	http.Redirect(w, r, rd, http.StatusFound)
+}
+
+// ActivateInitialOwner validates a setup token and starts a restricted session for the account it
+// was bound to. The token stays reusable until password completion or expiry, and an invalid one
+// tells the caller nothing about the account.
+func (p *Provider) ActivateInitialOwner(ctx context.Context, setupToken string) (string, time.Time, error) {
+	if len(setupToken) < 32 {
+		return "", time.Time{}, gorm.ErrRecordNotFound
+	}
+
+	token, err := generateToken()
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	expiresAt := time.Now().Add(sessionDuration)
+	if _, err := p.gatewayClient.ActivateLocalAuthUser(ctx, hash.String(setupToken), hash.String(token), expiresAt); err != nil {
+		return "", time.Time{}, err
+	}
+	return token, expiresAt, nil
+}
+
+func (p *Provider) SetSessionCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
+	p.setSessionCookie(w, token, expiresAt)
+}
+
+func (p *Provider) setSessionCookie(w http.ResponseWriter, token string, expiresAt time.Time) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.ObotAccessTokenCookie,
 		Value:    token,
@@ -226,8 +259,6 @@ func (p *Provider) login(w http.ResponseWriter, r *http.Request) {
 		Secure:   p.secureCookies(),
 		SameSite: http.SameSiteLaxMode,
 	})
-
-	http.Redirect(w, r, rd, http.StatusFound)
 }
 
 func (p *Provider) loginFailed(w http.ResponseWriter, r *http.Request, rd, message string) {
@@ -237,7 +268,7 @@ func (p *Provider) loginFailed(w http.ResponseWriter, r *http.Request, rd, messa
 func (p *Provider) signOut(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(auth.ObotAccessTokenCookie); err == nil {
 		if err := p.gatewayClient.DeleteLocalAuthSession(r.Context(), hash.String(cookie.Value)); err != nil {
-			log.Warnf("failed to delete local auth session: %v", err)
+			slog.Warn("failed to delete local auth session", "error", err)
 		}
 	}
 
@@ -251,7 +282,7 @@ func (p *Provider) signOut(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	http.Redirect(w, r, redirectTarget(r.URL.Query().Get("rd")), http.StatusFound)
+	http.Redirect(w, r, auth.SafeRedirectPath(r.URL.Query().Get("rd")), http.StatusFound)
 }
 
 // getState resolves the session cookie on a serialized request into the user it belongs to.
@@ -274,7 +305,7 @@ func (p *Provider) getState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, invalidSessionBody, http.StatusInternalServerError)
 		return
 	} else if err != nil {
-		log.Errorf("failed to look up local auth session: %v", err)
+		slog.Error("failed to look up local auth session", "error", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -285,10 +316,11 @@ func (p *Provider) getState(w http.ResponseWriter, r *http.Request) {
 		// email rather than the session token so that user info needs no database lookup: the
 		// gateway asks for it from inside an open transaction, and on SQLite — which allows a
 		// single connection — a query here would deadlock against that transaction.
-		AccessToken:       p.tokens.sign(user.Email),
-		User:              user.Email,
-		PreferredUsername: user.Email,
-		Email:             user.Email,
+		AccessToken:           p.tokens.sign(user.Email),
+		User:                  user.Email,
+		PreferredUsername:     user.Email,
+		Email:                 user.Email,
+		RequirePasswordChange: user.RequirePasswordChange,
 	})
 }
 
@@ -308,14 +340,12 @@ func (p *Provider) getUserInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// EmailDomainAllowed reports whether the given email is allowed by the provider's configured
-// email domain restriction. An unconfigured provider allows nothing.
-func (p *Provider) EmailDomainAllowed(ctx context.Context, email string) (bool, error) {
-	return p.emailDomainAllowed(ctx, client.NormalizeEmail(email))
-}
-
 func (p *Provider) emailDomainAllowed(ctx context.Context, email string) (bool, error) {
-	cred, err := p.gatewayClient.RevealCredential(ctx, []string{ProviderName, system.GenericAuthProviderCredentialContext}, ProviderName)
+	cred, err := p.gatewayClient.RevealCredential(ctx, []string{
+		ProviderName,
+		system.GenericAuthProviderCredentialContext,
+		system.ReplacementAuthProviderCredentialContext,
+	}, ProviderName)
 	if err != nil {
 		if errors.As(err, &client.CredentialNotFoundError{}) {
 			return false, nil
@@ -344,14 +374,6 @@ func emailDomainAllowed(domains, email string) bool {
 
 func (p *Provider) secureCookies() bool {
 	return strings.HasPrefix(p.serverURL, "https://")
-}
-
-// redirectTarget sanitizes a post-login redirect so that it can only point back into Obot.
-func redirectTarget(rd string) string {
-	if !strings.HasPrefix(rd, "/") || strings.HasPrefix(rd, "//") {
-		return "/"
-	}
-	return rd
 }
 
 // sameOrigin reports whether the request was initiated by the page it claims to come from.
@@ -394,6 +416,6 @@ func generateToken() (string, error) {
 func writeJSON(w http.ResponseWriter, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(body); err != nil {
-		log.Warnf("failed to write local auth provider response: %v", err)
+		slog.Warn("failed to write local auth provider response", "error", err)
 	}
 }

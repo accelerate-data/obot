@@ -1,44 +1,117 @@
 package mcp
 
 import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/obot-platform/mmmcp"
 )
 
-func TestSessionManagerClientIDMetadataDocument(t *testing.T) {
+func TestAuthorizationErrorSurvivesSDKWrapping(t *testing.T) {
+	const challenge = `Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", challenge)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	client := gomcp.NewClient(&gomcp.Implementation{Name: "test", Version: "test"}, nil)
+	_, err := client.Connect(t.Context(), &gomcp.StreamableClientTransport{
+		Endpoint:             server.URL,
+		HTTPClient:           server.Client(),
+		DisableStandaloneSSE: true,
+		OAuthHandler:         authorizationErrorOAuthHandler{},
+	}, nil)
+	if err == nil {
+		t.Fatal("Connect() error = nil, want authentication-required error")
+	}
+
+	authErr, ok := errors.AsType[*mmmcp.AuthorizationError](err)
+	if !ok {
+		t.Fatalf("Connect() error = %v, want *mmmcp.AuthorizationError", err)
+	}
+	if authErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("StatusCode = %d, want %d", authErr.StatusCode, http.StatusUnauthorized)
+	}
+	if authErr.ResourceMetadata != "https://example.com/.well-known/oauth-protected-resource" {
+		t.Fatalf("ResourceMetadata = %q, want challenge resource metadata", authErr.ResourceMetadata)
+	}
+}
+
+func TestOAuthHandlerForClientUsesConfiguredClientIDMetadataDocument(t *testing.T) {
 	tests := []struct {
-		name               string
-		baseURL            string
-		forceDynamicClient bool
-		want               string
+		name     string
+		document string
 	}{
 		{
-			name:    "uses the metadata document for an HTTPS origin by default",
-			baseURL: "https://obot.example.com",
-			want:    "https://obot.example.com/oauth/client-metadata.json",
+			name:     "CIMD enabled",
+			document: "https://obot.example.com/oauth/client-metadata.json",
 		},
 		{
-			name:               "omits the metadata document when dynamic registration is forced",
-			baseURL:            "https://obot.example.com",
-			forceDynamicClient: true,
-		},
-		{
-			name:    "omits the metadata document for an HTTP origin",
-			baseURL: "http://host.docker.internal:3000",
+			name: "CIMD disabled",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sm := SessionManager{
-				baseURL:            tt.baseURL,
-				forceDynamicClient: tt.forceDynamicClient,
-			}
+			sm := &SessionManager{baseURL: "https://obot.example.com"}
+			handler := sm.oauthHandlerForClient(http.DefaultClient, "test-server", ClientOption{
+				ClientName:                    "test-client",
+				TokenStorage:                  &recordingTokenStorage{},
+				OAuthClientIDMetadataDocument: tt.document,
+			})
 
-			if got := sm.clientIDMetadataDocument(); got != tt.want {
-				t.Fatalf("client ID metadata document = %q, want %q", got, tt.want)
+			oauthHandler, ok := handler.(*oauth)
+			if !ok {
+				t.Fatalf("expected *oauth handler, got %T", handler)
+			}
+			if oauthHandler.clientIDMetadataDocument != tt.document {
+				t.Fatalf("expected CIMD document %q, got %q", tt.document, oauthHandler.clientIDMetadataDocument)
 			}
 		})
+	}
+}
+
+func TestServerIDSharesDeploymentButNotUserSession(t *testing.T) {
+	first := ServerConfig{
+		Runtime:       "containerized",
+		MCPServerName: "ms1shared",
+		Scope:         "ms1shared-vmcp1shared",
+		UserID:        "1",
+		AuditLogMetadata: map[string]string{
+			"mcpID":  "ms1shared",
+			"userID": "1",
+		},
+	}
+	second := first
+	second.UserID = "2"
+	second.AuditLogMetadata = map[string]string{
+		"mcpID":  "ms1shared",
+		"userID": "2",
+	}
+	if serverID(first) != serverID(second) {
+		t.Fatal("audit attribution must not change the shared deployment")
+	}
+	if clientID(first, "default") == clientID(second, "default") {
+		t.Fatal("different users must retain separate authenticated client sessions")
+	}
+	if first.AuditLogMetadata["userID"] != "1" || second.AuditLogMetadata["userID"] != "2" {
+		t.Fatal("computing IDs must not modify audit metadata")
+	}
+	second.UserID = first.UserID
+	if clientID(first, "default") != clientID(second, "default") {
+		t.Fatal("audit metadata alone must not change the client session")
+	}
+	if clientID(first, "default") == clientID(first, oauthCheckClientScope) {
+		t.Fatal("OAuth checks must retain separate client sessions")
+	}
+	second.Scope = "ms1dedicated-vmcpi1second"
+	if serverID(first) == serverID(second) {
+		t.Fatal("instance-scoped servers must retain separate deployments")
 	}
 }
 

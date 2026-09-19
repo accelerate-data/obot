@@ -1,7 +1,9 @@
 package setup
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/obot-platform/obot/apiclient/types"
@@ -10,15 +12,21 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 )
 
-type Handler struct {
-	serverURL        string
-	bootstrapEnabler *bootstrap.Bootstrap
+type configuredAuthProviderGetter interface {
+	GetConfiguredAuthProvider(context.Context) (string, error)
 }
 
-func NewHandler(serverURL string, bootstrapEnabler *bootstrap.Bootstrap) *Handler {
+type Handler struct {
+	serverURL          string
+	bootstrapEnabler   *bootstrap.Bootstrap
+	authProviderGetter configuredAuthProviderGetter
+}
+
+func NewHandler(serverURL string, bootstrapEnabler *bootstrap.Bootstrap, authProviderGetter configuredAuthProviderGetter) *Handler {
 	return &Handler{
-		serverURL:        serverURL,
-		bootstrapEnabler: bootstrapEnabler,
+		serverURL:          serverURL,
+		bootstrapEnabler:   bootstrapEnabler,
+		authProviderGetter: authProviderGetter,
 	}
 }
 
@@ -27,7 +35,7 @@ func NewHandler(serverURL string, bootstrapEnabler *bootstrap.Bootstrap) *Handle
 func (h *Handler) requireBootstrap(req api.Context) error {
 	// Check if user is bootstrap user
 	if req.User.GetName() != system.BootstrapName {
-		log.Infof("Denied setup endpoint for non-bootstrap user")
+		slog.Info("Denied setup endpoint for non-bootstrap user")
 		return types.NewErrHTTP(http.StatusForbidden,
 			"this endpoint requires bootstrap authentication")
 	}
@@ -46,7 +54,7 @@ func (h *Handler) requireBootstrapEnabled(req api.Context) error {
 		return err
 	}
 	if !enabled {
-		log.Infof("Rejected setup endpoint because bootstrap mode is disabled")
+		slog.Info("Rejected setup endpoint because bootstrap mode is disabled")
 		return types.NewErrHTTP(http.StatusNotFound, "not found")
 	}
 

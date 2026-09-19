@@ -251,6 +251,33 @@ func TestTokenStorePreservesLegacyDynamicGrantRefresh(t *testing.T) {
 	require.Equal(t, "new-dynamic", stored.AccessToken)
 }
 
+func TestDynamicCatalogOAuthPendingStateDoesNotRequireStaticCredential(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, false)
+
+	err := client.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, "", entryName, "state", "verifier", mcpURL, &oauth2.Config{
+		ClientID: "dynamic-client",
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  "https://auth.example/authorize",
+			TokenURL: "https://auth.example/token",
+		},
+	})
+	require.NoError(t, err)
+
+	pending, err := client.GetMCPOAuthPendingState(t.Context(), "state")
+	require.NoError(t, err)
+	require.Empty(t, pending.CatalogCredentialGeneration)
+	require.NoError(t, client.CommitMCPOAuthPendingStateToken(t.Context(), pending, "", &oauth2.Config{ClientID: "dynamic-client"}, &oauth2.Token{AccessToken: "dynamic-access"}))
+	stored, err := client.GetMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL)
+	require.NoError(t, err)
+	require.Equal(t, "dynamic-access", stored.AccessToken)
+	require.Empty(t, stored.CatalogEntryName)
+}
+
 func newCatalogTokenStoreTestClient(t *testing.T, entryName, mcpID string, staticOAuthRequired bool) *gateway.Client {
 	t.Helper()
 	client, _ := newCatalogTokenStoreTestClientWithStorage(t, entryName, mcpID, staticOAuthRequired)
@@ -263,11 +290,13 @@ func newCatalogTokenStoreTestClientWithStorage(t *testing.T, entryName, mcpID st
 		WithScheme(scheme.Scheme).
 		WithObjects(
 			&v1.MCPServerInstance{
-				Namespace: system.DefaultNamespace, Name: mcpID,
-				Spec: v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
+				Namespace: system.DefaultNamespace,
+				Name:      mcpID,
+				Spec:      v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entryName},
 			},
 			&v1.MCPServerCatalogEntry{
-				Namespace: system.DefaultNamespace, Name: entryName,
+				Namespace: system.DefaultNamespace,
+				Name:      entryName,
 				Spec: v1.MCPServerCatalogEntrySpec{Manifest: apitypes.MCPServerCatalogEntryManifest{
 					RemoteConfig: &apitypes.RemoteCatalogConfig{FixedURL: "https://mcp.example/api", StaticOAuthRequired: staticOAuthRequired},
 				}},

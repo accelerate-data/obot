@@ -1,19 +1,6 @@
-import { handleRouteError } from '$lib/errors';
-import { AdminService } from '$lib/services';
-import { profile } from '$lib/stores';
 import type { PageLoad } from './$types';
+import { redirect } from '@sveltejs/kit';
 
-export const load: PageLoad = async ({ params, fetch }) => {
-	const { id } = params;
-
-	let accessControlRule;
-	try {
-		accessControlRule = await AdminService.getAccessControlRule(id, { fetch });
-	} catch (err) {
-		handleRouteError(err, `/admin/mcp-access-policies/${id}`, profile.current);
-	}
-
-	return {
-		accessControlRule
-	};
+export const load: PageLoad = ({ params, url }) => {
+	throw redirect(301, `/mcp-servers/access-policies/${encodeURIComponent(params.id)}${url.search}`);
 };

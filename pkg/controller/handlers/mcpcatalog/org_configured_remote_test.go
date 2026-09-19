@@ -10,26 +10,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestReadMCPCatalogAcceptsOrgConfiguredRemoteShapes(t *testing.T) {
+func TestReadMCPCatalogAcceptsOrgConfiguredRemoteEntries(t *testing.T) {
 	dir := t.TempDir()
 	manifests := map[string]string{
 		"github.yaml": `name: GitHub
 entryKey: obot-github
-serverUserType: multiUser
 shortDescription: GitHub
 description: GitHub
 runtime: remote
 remoteConfig:
   hostname: api.githubcopilot.com
-  headers:
-    - name: Personal Access Token
-      key: Authorization
-      required: true
-      sensitive: true
+config:
+  - name: Personal Access Token
+    key: Authorization
+    required: true
+    sensitive: true
+    usage: header
 `,
 		"databricks.yaml": `name: Databricks Genie Spaces
 entryKey: obot-databricks-genie-spaces
-serverUserType: multiUser
 shortDescription: Databricks
 description: Databricks
 metadata:
@@ -37,23 +36,24 @@ metadata:
 runtime: remote
 remoteConfig:
   URLTemplate: ${DATABRICKS_WORKSPACE_URL}/api/2.0/mcp/genie/${DATABRICKS_GENIE_SPACE_ID}
-  headers:
-    - name: Personal Access Token
-      key: Authorization
-      required: true
-      sensitive: true
-      prefix: "Bearer "
-env:
+config:
+  - name: Personal Access Token
+    key: Authorization
+    required: true
+    sensitive: true
+    prefix: "Bearer "
+    usage: header
   - name: Databricks workspace hostname
     key: DATABRICKS_WORKSPACE_URL
     required: true
+    usage: env
   - name: Genie space ID
     key: DATABRICKS_GENIE_SPACE_ID
     required: true
+    usage: env
 `,
 		"google-maps.yaml": `name: Google Maps Grounding Lite
 entryKey: obot-google-maps-grounding-lite
-serverUserType: multiUser
 shortDescription: Google Maps
 description: Google Maps
 metadata:
@@ -61,11 +61,12 @@ metadata:
 runtime: remote
 remoteConfig:
   fixedURL: https://mapstools.googleapis.com/mcp
-  headers:
-    - name: API Key
-      key: X-Goog-Api-Key
-      required: true
-      sensitive: true
+config:
+  - name: API Key
+    key: X-Goog-Api-Key
+    required: true
+    sensitive: true
+    usage: header
 `,
 	}
 
@@ -81,16 +82,15 @@ remoteConfig:
 	for _, object := range objects {
 		entry, ok := object.(*v1.MCPServerCatalogEntry)
 		require.True(t, ok, "unexpected catalog object %T", object)
-		require.Equal(t, types.ServerUserTypeMultiUser, entry.Spec.Manifest.ServerUserType)
 		entries[entry.Spec.Manifest.EntryKey] = entry.Spec.Manifest
 	}
 
 	github := entries["obot-github"]
 	require.Equal(t, "api.githubcopilot.com", github.RemoteConfig.Hostname)
-	require.Len(t, github.RemoteConfig.Headers, 1)
-	require.Equal(t, "AUTHORIZATION", github.RemoteConfig.Headers[0].Key)
-	require.True(t, github.RemoteConfig.Headers[0].Required)
-	require.True(t, github.RemoteConfig.Headers[0].Sensitive)
+	githubConfig := configByKey(github.Config)
+	require.Equal(t, types.Header, githubConfig["AUTHORIZATION"].Usage)
+	require.True(t, githubConfig["AUTHORIZATION"].Required)
+	require.True(t, githubConfig["AUTHORIZATION"].Sensitive)
 
 	databricks := entries["obot-databricks-genie-spaces"]
 	require.Equal(t, "true", databricks.Metadata["allow-multiple"])
@@ -99,19 +99,27 @@ remoteConfig:
 		"${DATABRICKS_WORKSPACE_URL}/api/2.0/mcp/genie/${DATABRICKS_GENIE_SPACE_ID}",
 		databricks.RemoteConfig.URLTemplate,
 	)
-	require.Len(t, databricks.RemoteConfig.Headers, 1)
-	require.Equal(t, "AUTHORIZATION", databricks.RemoteConfig.Headers[0].Key)
-	require.True(t, databricks.RemoteConfig.Headers[0].Required)
-	require.True(t, databricks.RemoteConfig.Headers[0].Sensitive)
-	require.Equal(t, "Bearer ", databricks.RemoteConfig.Headers[0].Prefix)
-	require.Equal(t, "DATABRICKS_WORKSPACE_URL", databricks.Env[0].Key)
-	require.Equal(t, "DATABRICKS_GENIE_SPACE_ID", databricks.Env[1].Key)
+	databricksConfig := configByKey(databricks.Config)
+	require.Equal(t, types.Header, databricksConfig["AUTHORIZATION"].Usage)
+	require.True(t, databricksConfig["AUTHORIZATION"].Required)
+	require.True(t, databricksConfig["AUTHORIZATION"].Sensitive)
+	require.Equal(t, "Bearer ", databricksConfig["AUTHORIZATION"].Prefix)
+	require.Equal(t, types.Env, databricksConfig["DATABRICKS_WORKSPACE_URL"].Usage)
+	require.Equal(t, types.Env, databricksConfig["DATABRICKS_GENIE_SPACE_ID"].Usage)
 
 	googleMaps := entries["obot-google-maps-grounding-lite"]
 	require.Equal(t, "true", googleMaps.Metadata["allow-multiple"])
 	require.Equal(t, "https://mapstools.googleapis.com/mcp", googleMaps.RemoteConfig.FixedURL)
-	require.Len(t, googleMaps.RemoteConfig.Headers, 1)
-	require.Equal(t, "X-GOOG-API-KEY", googleMaps.RemoteConfig.Headers[0].Key)
-	require.True(t, googleMaps.RemoteConfig.Headers[0].Required)
-	require.True(t, googleMaps.RemoteConfig.Headers[0].Sensitive)
+	googleMapsConfig := configByKey(googleMaps.Config)
+	require.Equal(t, types.Header, googleMapsConfig["X-GOOG-API-KEY"].Usage)
+	require.True(t, googleMapsConfig["X-GOOG-API-KEY"].Required)
+	require.True(t, googleMapsConfig["X-GOOG-API-KEY"].Sensitive)
+}
+
+func configByKey(config []types.MCPConfig) map[string]types.MCPConfig {
+	result := make(map[string]types.MCPConfig, len(config))
+	for _, item := range config {
+		result[item.Key] = item
+	}
+	return result
 }

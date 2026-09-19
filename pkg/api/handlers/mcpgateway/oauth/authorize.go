@@ -1,68 +1,47 @@
 package oauth
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
-	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/handlers"
-	"github.com/obot-platform/obot/pkg/auth"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/utils"
+	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
+	"github.com/obot-platform/obot/pkg/wait"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
 
-// ErrorCode defines the set of OAuth 2.0 error codes as per RFC 6749.
-type ErrorCode string
-
 const (
-	ErrInvalidClient           ErrorCode = "invalid_client"
-	ErrInvalidGrant            ErrorCode = "invalid_grant"
-	ErrInvalidRequest          ErrorCode = "invalid_request"
-	ErrUnauthorizedClient      ErrorCode = "unauthorized_client"
-	ErrAccessDenied            ErrorCode = "access_denied"
-	ErrUnsupportedResponseType ErrorCode = "unsupported_response_type"
-	ErrInvalidScope            ErrorCode = "invalid_scope"
-	ErrServerError             ErrorCode = "server_error"
-	ErrTemporarilyUnavailable  ErrorCode = "temporarily_unavailable"
-	ErrInvalidClientMetadata   ErrorCode = "invalid_client_metadata"
-
-	// invalidOAuthCallbackStateMessage is the single response body for every rejected
-	// OAuth callback state, whatever flow created it. Keeping one message means a caller
-	// cannot tell an unknown state from an expired, already-claimed, or wrong-flow one,
-	// so the callback is not an oracle for which states exist. It names no flow for the
-	// same reason, and because a dynamic or container callback is not a credential test.
-	invalidOAuthCallbackStateMessage = "invalid or expired OAuth callback state"
-
-	// oauthCallbackFailureMessage covers every callback failure that is not a
-	// rejected state. The underlying error is logged server-side instead, so an
-	// upstream response body, request identifier, or credential is never reflected
-	// back to the browser.
-	oauthCallbackFailureMessage = "MCP OAuth callback could not be completed"
+	ErrInvalidClient                        ErrorCode = "invalid_client"
+	ErrInvalidGrant                         ErrorCode = "invalid_grant"
+	ErrInvalidRequest                       ErrorCode = "invalid_request"
+	ErrAccessDenied                         ErrorCode = "access_denied"
+	ErrUnsupportedResponseType              ErrorCode = "unsupported_response_type"
+	ErrServerError                          ErrorCode = "server_error"
+	ErrInvalidClientMetadata                ErrorCode = "invalid_client_metadata"
+	invalidStaticOAuthCredentialTestMessage           = "invalid or expired static OAuth credential test"
 )
 
-// staticOAuthTokenExchangeTimeout bounds one provider token exchange during a credential
-// test. It is a var so tests can shorten it; keep it below the gateway's claim lease.
-var staticOAuthTokenExchangeTimeout = 30 * time.Second
-
-// staticOAuthTestCompletionTimeout bounds persisting the outcome once the exchange settles,
-// which runs detached from the request so a disconnect still records a terminal result.
-const staticOAuthTestCompletionTimeout = 10 * time.Second
+// ErrorCode defines the set of OAuth 2.0 error codes as per RFC 6749.
+type ErrorCode string
 
 // oauthError represents an OAuth 2.0 error response.
 type oauthError struct {
@@ -71,8 +50,31 @@ type oauthError struct {
 	State       string    `json:"state,omitempty"`
 }
 
+type oauthConsentData struct {
+	VMCPInstanceID            string                   `json:"vmcpInstanceID,omitempty"`
+	VMCPComponents            []types.VMCPComponent    `json:"vmcpComponents,omitempty"`
+	AuthRequestID             string                   `json:"authRequestID"`
+	ContinueURL               string                   `json:"continueURL"`
+	CancelURL                 string                   `json:"cancelURL"`
+	ClientName                string                   `json:"clientName"`
+	ClientCredentialSource    string                   `json:"clientCredentialSource"`
+	ClientURI                 string                   `json:"clientURI,omitempty"`
+	RedirectURI               string                   `json:"redirectURI"`
+	Scope                     string                   `json:"scope,omitempty"`
+	PolicyURI                 string                   `json:"policyURI,omitempty"`
+	TOSURI                    string                   `json:"tosURI,omitempty"`
+	MCPConfigRequired         bool                     `json:"mcpConfigRequired"`
+	MCPServer                 *types.MCPServer         `json:"mcpServer,omitempty"`
+	MCPServerInstance         *types.MCPServerInstance `json:"mcpServerInstance,omitempty"`
+	MCPAuthRequired           bool                     `json:"mcpAuthRequired"`
+	UserHasSecondLevelOAuthed bool                     `json:"userHasSecondLevelOAuthed"`
+	MCPServerName             string                   `json:"mcpServerName,omitempty"`
+	MCPServerURL              string                   `json:"mcpServerURL,omitempty"`
+	ThirdPartyAuthURL         string                   `json:"thirdPartyAuthURL,omitempty"`
+}
+
 func newOAuthError(code ErrorCode, description, state string) oauthError {
-	log.Infof("OAuth error: code=%s description=%s state=%s", code, description, state)
+	slog.Info("OAuth error", "code", code, "description", description, "state", state)
 	return oauthError{
 		Code:        code,
 		Description: obotErrorPrefix + description,
@@ -92,8 +94,8 @@ func newOAuthErrHTTP(statusCode int, oauthErr oauthError) *types.ErrHTTP {
 	return types.NewErrHTTP(statusCode, oauthErr.Error())
 }
 
-func newInvalidClientErr(statusCode int, description string) *types.ErrHTTP {
-	return newOAuthErrHTTP(statusCode, newOAuthError(ErrInvalidClient, description, ""))
+func newInvalidClientErr(description string) *types.ErrHTTP {
+	return newOAuthErrHTTP(http.StatusUnauthorized, newOAuthError(ErrInvalidClient, description, ""))
 }
 
 func (e oauthError) toQuery() url.Values {
@@ -246,7 +248,7 @@ func (h *handler) authorize(req api.Context) error {
 		return nil
 	}
 
-	log.Infof("Created OAuth authorization request and redirecting user to authenticate: authRequest=%s client=%s requestedMCPID=%s", oauthAppAuthRequest.Name, oauthClient.Name, mcpID)
+	slog.Info("Created OAuth authorization request and redirecting user to authenticate", "authRequest", oauthAppAuthRequest.Name, "client", oauthClient.Name, "requestedMCPID", mcpID)
 	http.Redirect(req.ResponseWriter, req.Request, fmt.Sprintf("/?rd=/oauth/callback/%s", oauthAppAuthRequest.Name), http.StatusFound)
 
 	return nil
@@ -277,11 +279,11 @@ func (h *handler) callback(req api.Context) error {
 		}
 
 		mcpID = serverOrInstanceID
-		audience = "/" + audience
-		if !strings.HasSuffix(oauthAppAuthRequest.Spec.Resource, audience) || oauthAppAuthRequest.Spec.MCPID != mcpID {
+		if !strings.HasSuffix(oauthAppAuthRequest.Spec.Resource, "/"+audience) || oauthAppAuthRequest.Spec.MCPID != mcpID {
 			// Ensure the audience is what the server expects.
-			oauthAppAuthRequest.Spec.Resource = fmt.Sprintf("%s/mcp-connect%s", h.baseURL, audience)
+			oauthAppAuthRequest.Spec.Resource = fmt.Sprintf("%s/mcp-connect/%s", h.baseURL, audience)
 			oauthAppAuthRequest.Spec.MCPID = mcpID
+			oauthAppAuthRequest.Spec.Audience = audience
 			if err = req.Update(&oauthAppAuthRequest); err != nil {
 				redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, fmt.Sprintf("failed to update OAuth app auth request: %v", err), oauthAppAuthRequest.Spec.State))
 				return nil
@@ -290,7 +292,7 @@ func (h *handler) callback(req api.Context) error {
 	}
 
 	oauthAppAuthRequest.Spec.UserID = req.UserID()
-	oauthAppAuthRequest.Spec.AuthProviderUserID = auth.FirstExtraValue(req.User.GetExtra(), "auth_provider_user_id")
+	oauthAppAuthRequest.Spec.AuthProviderUserID = cmp.Or(req.User.GetExtra()["auth_provider_user_id"]...)
 	oauthAppAuthRequest.Spec.AuthProviderNamespace = authProviderNamespace
 	oauthAppAuthRequest.Spec.AuthProviderName = authProviderName
 	if err := req.Update(&oauthAppAuthRequest); err != nil {
@@ -303,14 +305,34 @@ func (h *handler) callback(req api.Context) error {
 		return nil
 	}
 
-	log.Infof("Prepared OAuth consent and redirecting user to consent screen: authRequest=%s client=%s", oauthAppAuthRequest.Name, oauthAppAuthRequest.Spec.ClientID)
+	slog.Info("Prepared OAuth consent and redirecting user to consent screen", "authRequest", oauthAppAuthRequest.Name, "client", oauthAppAuthRequest.Spec.ClientID)
 	http.Redirect(req.ResponseWriter, req.Request, fmt.Sprintf("/auth/oauth/consent/%s", oauthAppAuthRequest.Name), http.StatusFound)
 
 	return nil
 }
 
 func (h *handler) prepareOAuthConsent(req api.Context, oauthAppAuthRequest *v1.OAuthAuthRequest) error {
-	if oauthAppAuthRequest.Spec.ConsentPrepared && !oauthAppAuthRequest.Spec.ConsentMCPConfigRequired {
+	vmcp, instance, err := vmcpConsentTarget(req, oauthAppAuthRequest.Spec.MCPID)
+	if err != nil {
+		return err
+	}
+	if vmcp != nil {
+		missing, err := vmcpConsentMissingConfiguration(req, *vmcp, *instance)
+		if err != nil {
+			return err
+		}
+		if len(missing) > 0 {
+			oauthAppAuthRequest.Spec.ConsentPrepared = true
+			oauthAppAuthRequest.Spec.ConsentMCPConfigRequired = true
+			oauthAppAuthRequest.Spec.ConsentMCPAuthRequired = false
+			oauthAppAuthRequest.Spec.ConsentMCPAuthURL = ""
+			oauthAppAuthRequest.Spec.UserHasSecondLevelOAuthed = false
+			oauthAppAuthRequest.Spec.ConsentMCPServerName = vmcp.Spec.Manifest.DisplayName
+			oauthAppAuthRequest.Spec.ConsentMCPServerURL = ""
+			return req.Update(oauthAppAuthRequest)
+		}
+	}
+	if vmcp == nil && oauthAppAuthRequest.Spec.ConsentPrepared && !oauthAppAuthRequest.Spec.ConsentMCPConfigRequired {
 		return nil
 	}
 
@@ -331,6 +353,33 @@ func (h *handler) prepareOAuthConsent(req api.Context, oauthAppAuthRequest *v1.O
 		return req.Update(oauthAppAuthRequest)
 	}
 
+	// Single-user components receive configuration asynchronously. Do not probe
+	// OAuth with credentials from before the user's save.
+	if vmcp != nil {
+		if syncHash := instance.Annotations[v1.VMCPInstanceConfigurationSyncAnnotation]; syncHash != "" {
+			checkHash := utils.Digest([]any{vmcpconfig.ComponentsForInstance(*vmcp, *instance), syncHash})
+			instance, err = wait.For(req.Context(), req.Storage, instance, func(current *v1.VMCPInstance) (bool, error) {
+				return current.Status.ConfigurationCheckHash == checkHash, nil
+			})
+			if err != nil {
+				return fmt.Errorf("wait for VMCP instance configuration: %w", err)
+			}
+			for _, component := range mcpServerConfig.Components {
+				if component.MCPServerInstanceID != "" {
+					continue
+				}
+				_, err := wait.For(req.Context(), req.Storage, &v1.MCPServer{
+					Name:      component.Name,
+					Namespace: vmcp.Namespace,
+				}, func(server *v1.MCPServer) (bool, error) {
+					return server.Status.VMCPUserConfigurationHash == instance.Status.UserConfigurationHash, nil
+				})
+				if err != nil {
+					return fmt.Errorf("wait for VMCP component configuration: %w", err)
+				}
+			}
+		}
+	}
 	u, err := h.oauthChecker.CheckForMCPAuth(req, mcpServer, mcpServerConfig, req.User.GetUID(), mcpID, oauthAppAuthRequest.Name)
 	if err != nil {
 		return err
@@ -360,11 +409,9 @@ func (h *handler) consent(req api.Context) error {
 		return nil
 	}
 
-	if !oauthAppAuthRequest.Spec.ConsentPrepared || oauthAppAuthRequest.Spec.ConsentMCPConfigRequired {
-		if err := h.prepareOAuthConsent(req, &oauthAppAuthRequest); err != nil {
-			redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
-			return nil
-		}
+	if err := h.prepareOAuthConsent(req, &oauthAppAuthRequest); err != nil {
+		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
+		return nil
 	}
 
 	if !oauthAppAuthRequest.Spec.ConsentPrepared {
@@ -372,11 +419,7 @@ func (h *handler) consent(req api.Context) error {
 		return nil
 	}
 
-	clientID := oauthAppAuthRequest.Spec.ClientID
-	if !isClientIDMetadataDocumentURL(clientID) {
-		clientID = oauthAppAuthRequest.Namespace + ":" + clientID
-	}
-
+	clientID := oauthAuthRequestClientID(oauthAppAuthRequest)
 	oauthClient, err := h.resolveOAuthClient(req.Context(), req.Storage, clientID)
 	if err != nil {
 		if oauthErr, ok := errors.AsType[oauthError](err); ok {
@@ -389,6 +432,16 @@ func (h *handler) consent(req api.Context) error {
 	}
 
 	continueURL, cancelURL := oauthConsentURLs(oauthAppAuthRequest)
+	vmcp, instance, err := vmcpConsentTarget(req, oauthAppAuthRequest.Spec.MCPID)
+	if err != nil {
+		return err
+	}
+	if vmcp != nil {
+		data := oauthConsentPageData(oauthAppAuthRequest, oauthClient, continueURL, cancelURL, nil, nil)
+		data.VMCPInstanceID = instance.Name
+		data.VMCPComponents = vmcpconfig.ComponentsForInstance(*vmcp, *instance)
+		return req.Write(data)
+	}
 	var (
 		mcpServer         *types.MCPServer
 		mcpServerInstance *types.MCPServerInstance
@@ -404,7 +457,7 @@ func (h *handler) consent(req api.Context) error {
 			redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
 			return nil
 		}
-		log.Warnf("Failed to load optional MCP configuration target for OAuth consent: authRequest=%s mcpID=%s error=%v", oauthAppAuthRequest.Name, oauthAppAuthRequest.Spec.MCPID, err)
+		slog.Warn("Failed to load optional MCP configuration target for OAuth consent", "authRequest", oauthAppAuthRequest.Name, "mcpID", oauthAppAuthRequest.Spec.MCPID, "error", err)
 	}
 
 	return req.Write(oauthConsentPageData(oauthAppAuthRequest, oauthClient, continueURL, cancelURL, mcpServer, mcpServerInstance))
@@ -416,6 +469,9 @@ func (h *handler) approveConsent(req api.Context) error {
 		return err
 	}
 
+	if err := h.prepareOAuthConsent(req, &oauthAppAuthRequest); err != nil {
+		return err
+	}
 	oauthAppAuthRequest.Spec.ConsentApproved = true
 	if oauthAppAuthRequest.Spec.ConsentMCPConfigRequired {
 		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrInvalidRequest, "MCP server configuration is required before consent can be approved", oauthAppAuthRequest.Spec.State))
@@ -432,12 +488,12 @@ func (h *handler) approveConsent(req api.Context) error {
 			return nil
 		}
 
-		log.Infof("OAuth consent approved; redirecting to second-level MCP authentication: authRequest=%s mcpID=%s", oauthAppAuthRequest.Name, oauthAppAuthRequest.Spec.MCPID)
+		slog.Info("OAuth consent approved; redirecting to second-level MCP authentication", "authRequest", oauthAppAuthRequest.Name, "mcpID", oauthAppAuthRequest.Spec.MCPID)
 		http.Redirect(req.ResponseWriter, req.Request, oauthAppAuthRequest.Spec.ConsentMCPAuthURL, http.StatusFound)
 		return nil
 	}
 
-	log.Infof("OAuth consent approved; redirecting to completion screen: authRequest=%s client=%s", oauthAppAuthRequest.Name, oauthAppAuthRequest.Spec.ClientID)
+	slog.Info("OAuth consent approved; redirecting to completion screen", "authRequest", oauthAppAuthRequest.Name, "client", oauthAppAuthRequest.Spec.ClientID)
 	redirectWithOAuthCompletion(req, oauthAppAuthRequest.Name)
 	return nil
 }
@@ -448,7 +504,7 @@ func (h *handler) cancelConsent(req api.Context) error {
 		return err
 	}
 
-	log.Infof("User denied OAuth consent: authRequest=%s client=%s", oauthAppAuthRequest.Name, oauthAppAuthRequest.Spec.ClientID)
+	slog.Info("User denied OAuth consent", "authRequest", oauthAppAuthRequest.Name, "client", oauthAppAuthRequest.Spec.ClientID)
 	redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrAccessDenied, "user denied OAuth consent", oauthAppAuthRequest.Spec.State))
 	return nil
 }
@@ -501,7 +557,7 @@ func (h *handler) oauthComplete(req api.Context) error {
 		return types.NewErrHTTP(http.StatusInternalServerError, err.Error())
 	}
 
-	log.Infof("OAuth completion issued authorization code for client redirect: authRequest=%s client=%s", oauthAppAuthRequest.Name, oauthAppAuthRequest.Spec.ClientID)
+	slog.Info("OAuth completion issued authorization code for client redirect", "authRequest", oauthAppAuthRequest.Name, "client", oauthAppAuthRequest.Spec.ClientID)
 	http.Redirect(req.ResponseWriter, req.Request, authorizeResponseURL(oauthAppAuthRequest, code, oauthAppAuthRequest.Spec.Scope), http.StatusFound)
 	return nil
 }
@@ -534,17 +590,16 @@ func (h *handler) oauthCallback(req api.Context) error {
 
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
-			return types.NewErrBadRequest(invalidOAuthCallbackStateMessage)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 		}
-		log.Errorf("MCP OAuth callback failed: %v", err)
-		return types.NewErrHTTP(http.StatusBadRequest, oauthCallbackFailureMessage)
+		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
 	}
 
 	if oauthAuthRequestID == "" {
 		// If there is no OAuth request object, then MCP OAuth wasn't started by OAuth; likely the UI kicked it off.
 		// Redirect to the OAuth completion page.
-		log.Infof("Completed MCP OAuth callback without first-level OAuth auth request context")
+		slog.Info("Completed MCP OAuth callback without first-level OAuth auth request context")
 		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
 		return nil
 	}
@@ -558,29 +613,37 @@ func (h *handler) oauthCallback(req api.Context) error {
 
 	if !req.UserIsAuthenticated() || req.User.GetName() == system.BootstrapName || authProviderName == system.BootstrapName || authProviderNamespace == system.BootstrapName {
 		// The user is either not authenticated or is authenticated as the bootstrap user.
-		log.Infof("Denied MCP OAuth callback because user is not authenticated with a non-bootstrap identity: authRequest=%s", oauthAppAuthRequest.Name)
+		slog.Info("Denied MCP OAuth callback because user is not authenticated with a non-bootstrap identity", "authRequest", oauthAppAuthRequest.Name)
 		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrAccessDenied, "user is not authenticated", ""))
 		return nil
 	}
 
-	// Check if the MCP server is a component of a composite; only finalize if it's not
+	// Check if the MCP server is a component of an aggregate; only finalize if it's not
+	var instance v1.MCPServerInstance
+	if system.IsMCPServerInstanceID(mcpServerID) {
+		if err := req.Get(&instance, mcpServerID); err != nil {
+			redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
+			return nil
+		}
+		mcpServerID = instance.Spec.MCPServerName
+	}
 	var server v1.MCPServer
 	if err := req.Get(&server, mcpServerID); err != nil {
 		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
 		return nil
 	}
 
-	if server.Spec.CompositeName != "" {
-		// MCP server is a component of a composite.
+	if instance.Spec.VMCPInstanceID != "" || instance.Spec.CompositeName != "" || server.Spec.CompositeName != "" || server.Spec.VMCPInstanceID != "" || server.Spec.VMCPID != "" {
+		// MCP server is a component of an aggregate.
 		// Redirect to OAuth completion page; the checkCompositeAuth handler will redirect back
-		// to the 1st level OAuth redirect URL when all pending 2nd level OAuth for the composite server's
+		// to the 1st level OAuth redirect URL when all pending 2nd level OAuth for the aggregate server's
 		// component servers are completed.
-		log.Infof("MCP OAuth callback completed for composite component server, awaiting composite finalization: authRequest=%s mcpServer=%s composite=%s", oauthAppAuthRequest.Name, server.Name, server.Spec.CompositeName)
+		slog.Info("MCP OAuth callback completed for aggregate component server, awaiting aggregate finalization", "authRequest", oauthAppAuthRequest.Name, "mcpServer", server.Name, "composite", server.Spec.CompositeName, "vmcpInstance", server.Spec.VMCPInstanceID, "vmcp", server.Spec.VMCPID)
 		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
 		return nil
 	}
 
-	log.Infof("Completed MCP OAuth callback and redirecting to completion screen: authRequest=%s mcpServer=%s", oauthAppAuthRequest.Name, mcpServerID)
+	slog.Info("Completed MCP OAuth callback and redirecting to completion screen", "authRequest", oauthAppAuthRequest.Name, "mcpServer", mcpServerID)
 	redirectWithOAuthCompletion(req, oauthAppAuthRequest.Name)
 
 	return nil
@@ -591,59 +654,42 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 	if state == "" {
 		return false, nil
 	}
-
-	pendingState, err := h.oauthChecker.stateMgr.gatewayClient.GetMCPOAuthPendingState(req.Context(), state)
+	pending, err := h.oauthChecker.stateMgr.gatewayClient.GetMCPOAuthPendingState(req.Context(), state)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	} else if err != nil {
 		return false, errors.New("failed to load static OAuth credential test")
-	} else if !pendingState.StaticOAuthTest {
+	} else if !pending.StaticOAuthTest {
 		return false, nil
 	}
-	pendingState, err = h.oauthChecker.stateMgr.gatewayClient.ClaimMCPStaticOAuthTest(req.Context(), state)
+	pending, err = h.oauthChecker.stateMgr.gatewayClient.ClaimMCPStaticOAuthTest(req.Context(), state)
 	if errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
-		return true, types.NewErrBadRequest(invalidOAuthCallbackStateMessage)
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 	} else if err != nil {
 		return true, errors.New("failed to claim static OAuth credential test")
 	}
 
 	code := req.URL.Query().Get("code")
-	failureCategory := staticOAuthCallbackInputFailure(pendingState, state, code, req.URL.Query().Get("error"))
+	failure := staticOAuthCallbackInputFailure(pending, state, code, req.URL.Query().Get("error"))
 	status := types.MCPStaticOAuthTestStatusSucceeded
-	if failureCategory != "" {
+	if failure != "" {
 		status = types.MCPStaticOAuthTestStatusFailed
 	} else {
-		conf := &oauth2.Config{
-			ClientID:     pendingState.ClientID,
-			ClientSecret: pendingState.ClientSecret,
-			Endpoint: oauth2.Endpoint{
-				AuthURL:   pendingState.AuthURL,
-				TokenURL:  pendingState.TokenURL,
-				AuthStyle: pendingState.AuthStyle,
-			},
-			RedirectURL: pendingState.RedirectURL,
+		conf := &oauth2.Config{ClientID: pending.ClientID, ClientSecret: pending.ClientSecret, Endpoint: oauth2.Endpoint{AuthURL: pending.AuthURL, TokenURL: pending.TokenURL, AuthStyle: pending.AuthStyle}, RedirectURL: pending.RedirectURL}
+		if pending.Scopes != "" {
+			conf.Scopes = strings.Fields(pending.Scopes)
 		}
-		if pendingState.Scopes != "" {
-			conf.Scopes = strings.Fields(pendingState.Scopes)
+		exchangeContext := req.Context()
+		if h.staticOAuthHTTPClient != nil {
+			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.staticOAuthHTTPClient)
 		}
-		// Bound the provider exchange so a stalled provider cannot hold the claim past its lease.
-		exchangeContext, cancelExchange := context.WithTimeout(req.Context(), staticOAuthTokenExchangeTimeout)
-		defer cancelExchange()
-		if h.oauthExchangeHTTPClient != nil {
-			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.oauthExchangeHTTPClient)
-		}
-		if _, err := nmcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier); err != nil {
+		if _, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pending.Verifier, pending.ResourceURL); err != nil {
 			status = types.MCPStaticOAuthTestStatusFailed
-			failureCategory = types.MCPStaticOAuthTestFailureTokenExchange
+			failure = types.MCPStaticOAuthTestFailureTokenExchange
 		}
 	}
-
-	// Record the outcome even when the browser has already gone away, so an abandoned
-	// popup leaves a terminal result rather than a claim the user has to wait out.
-	completionContext, cancelCompletion := context.WithTimeout(context.WithoutCancel(req.Context()), staticOAuthTestCompletionTimeout)
-	defer cancelCompletion()
-	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(completionContext, state, status, failureCategory); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
-		return true, types.NewErrBadRequest(invalidOAuthCallbackStateMessage)
+	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(req.Context(), state, status, failure); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 	} else if err != nil {
 		return true, errors.New("failed to complete static OAuth credential test")
 	}
@@ -651,11 +697,11 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 	return true, nil
 }
 
-func staticOAuthCallbackInputFailure(pendingState *gatewaytypes.MCPOAuthPendingState, state, code, errorCode string) types.MCPStaticOAuthTestFailureCategory {
+func staticOAuthCallbackInputFailure(pending *gatewaytypes.MCPOAuthPendingState, state, code, errorCode string) types.MCPStaticOAuthTestFailureCategory {
 	if errorCode != "" {
 		return types.MCPStaticOAuthTestFailureAuthorizationDenied
 	}
-	if pendingState.State != state || code == "" {
+	if pending.State != state || code == "" {
 		return types.MCPStaticOAuthTestFailureInvalidCallback
 	}
 	return ""
@@ -670,7 +716,7 @@ func authenticatedOAuthUser(req api.Context, oauthAppAuthRequest v1.OAuthAuthReq
 		return authProviderName, authProviderNamespace, true
 	}
 
-	log.Infof("Denied %s because user is not authenticated with a non-bootstrap identity: authRequest=%s", phase, oauthAppAuthRequest.Name)
+	slog.Info("Denied request because user is not authenticated with a non-bootstrap identity", "phase", phase, "authRequest", oauthAppAuthRequest.Name)
 	redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrAccessDenied, "user is not authenticated", oauthAppAuthRequest.Spec.State))
 	return "", "", false
 }
@@ -680,30 +726,9 @@ func authenticatedOAuthConsentUser(req api.Context, oauthAppAuthRequest v1.OAuth
 		return true
 	}
 
-	log.Infof("Denied OAuth consent because authenticated user does not match auth request user: authRequest=%s", oauthAppAuthRequest.Name)
+	slog.Info("Denied OAuth consent because authenticated user does not match auth request user", "authRequest", oauthAppAuthRequest.Name)
 	redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrAccessDenied, "user is not authorized for this OAuth request", oauthAppAuthRequest.Spec.State))
 	return false
-}
-
-type oauthConsentData struct {
-	AuthRequestID             string                   `json:"authRequestID"`
-	ContinueURL               string                   `json:"continueURL"`
-	CancelURL                 string                   `json:"cancelURL"`
-	ClientName                string                   `json:"clientName"`
-	ClientCredentialSource    string                   `json:"clientCredentialSource"`
-	ClientURI                 string                   `json:"clientURI,omitempty"`
-	RedirectURI               string                   `json:"redirectURI"`
-	Scope                     string                   `json:"scope,omitempty"`
-	PolicyURI                 string                   `json:"policyURI,omitempty"`
-	TOSURI                    string                   `json:"tosURI,omitempty"`
-	MCPConfigRequired         bool                     `json:"mcpConfigRequired"`
-	MCPServer                 *types.MCPServer         `json:"mcpServer,omitempty"`
-	MCPServerInstance         *types.MCPServerInstance `json:"mcpServerInstance,omitempty"`
-	MCPAuthRequired           bool                     `json:"mcpAuthRequired"`
-	UserHasSecondLevelOAuthed bool                     `json:"userHasSecondLevelOAuthed"`
-	MCPServerName             string                   `json:"mcpServerName,omitempty"`
-	MCPServerURL              string                   `json:"mcpServerURL,omitempty"`
-	ThirdPartyAuthURL         string                   `json:"thirdPartyAuthURL,omitempty"`
 }
 
 func oauthConsentPageData(oauthAppAuthRequest v1.OAuthAuthRequest, oauthClient v1.OAuthClient, continueURL, cancelURL string, mcpServer *types.MCPServer, mcpServerInstance *types.MCPServerInstance) oauthConsentData {
@@ -787,14 +812,10 @@ func (h *handler) maybeHandleDebuggerCallback(req api.Context) (bool, error) {
 	q := url.Values{}
 	q.Set("state", state)
 	if errorCode != "" {
-		// The provider controls both values, and this redirect lands in browser
-		// history, referrer headers, and access logs. Only the error code is
-		// repeated; the description is provider free text that can carry request
-		// identifiers, so it stays in the server-side log.
+		q.Set("error", errorCode)
 		if errorDescription != "" {
-			log.Errorf("MCP OAuth debugger callback returned provider error %s: %s", mcp.SafeOAuthErrorCode(errorCode), errorDescription)
+			q.Set("error_description", errorDescription)
 		}
-		q.Set("error", mcp.SafeOAuthErrorCode(errorCode))
 	} else {
 		q.Set("code", code)
 	}

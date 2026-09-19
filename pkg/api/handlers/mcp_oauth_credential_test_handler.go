@@ -24,7 +24,6 @@ func (h *MCPCatalogHandler) verifyOAuthCredentialTestAccess(req api.Context) (*v
 		return nil, err
 	}
 	if entry.Spec.Manifest.Runtime != types.RuntimeRemote ||
-		entry.Spec.Manifest.ServerUserType != types.ServerUserTypeMultiUser ||
 		entry.Spec.Manifest.RemoteConfig == nil ||
 		strings.TrimSpace(entry.Spec.Manifest.RemoteConfig.FixedURL) == "" {
 		return nil, types.NewErrBadRequest("static OAuth verification requires a multi-user remote entry with a fixed URL")
@@ -75,6 +74,13 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	if len(metadata.ClientRegistration) > 0 && json.Unmarshal(metadata.ClientRegistration, &registration) != nil {
 		return types.NewErrBadRequest("OAuth provider metadata is incomplete")
 	}
+	var discoveredResourceURL string
+	if len(metadata.ProtectedResourceMetadata) > 0 {
+		discoveredResourceURL, err = mcp.ParseOAuthResourceURL(metadata.ProtectedResourceMetadata)
+		if err != nil {
+			return types.NewErrBadRequest("OAuth provider metadata is incomplete")
+		}
+	}
 
 	conf := &oauth2.Config{
 		ClientID:     candidate.ClientID,
@@ -90,12 +96,13 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 		conf.Scopes = strings.Fields(registration.Scope)
 	}
 
+	resourceURL := mcp.ResolveOAuthResourceURL(authorizationServer.AuthorizationEndpoint, discoveredResourceURL, fixedURL)
 	verifier := oauth2.GenerateVerifier()
-	started, err := h.gatewayClient.CreateMCPStaticOAuthTest(req.Context(), req.User.GetUID(), entry.Name, fixedURL, verifier, conf)
+	started, err := h.gatewayClient.CreateMCPStaticOAuthTestForResource(req.Context(), req.User.GetUID(), entry.Name, fixedURL, resourceURL, verifier, conf)
 	if err != nil {
 		return errors.New("failed to create static OAuth credential test")
 	}
-	oauthURL, err := nmcp.AuthCodeURL(conf, authorizationServer.AuthorizationEndpoint, fixedURL, started.CallbackState, verifier)
+	oauthURL, err := nmcp.AuthCodeURL(conf, authorizationServer.AuthorizationEndpoint, resourceURL, started.CallbackState, verifier)
 	if err != nil {
 		return errors.New("failed to create static OAuth authorization URL")
 	}

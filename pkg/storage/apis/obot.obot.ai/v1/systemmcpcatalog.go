@@ -1,6 +1,8 @@
 package v1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
@@ -24,14 +26,6 @@ type SystemMCPCatalogStatus struct {
 	IsSyncing    bool              `json:"isSyncing,omitempty"`
 }
 
-func (in *SystemMCPCatalog) GetColumns() [][]string {
-	return [][]string{
-		{"Name", "Name"},
-		{"Source URLs", "Spec.SourceURLs"},
-		{"Last Synced", "{{ago .Status.LastSyncTime}}"},
-	}
-}
-
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 type SystemMCPCatalogList struct {
@@ -39,4 +33,12 @@ type SystemMCPCatalogList struct {
 	metav1.ListMeta `json:"metadata"`
 
 	Items []SystemMCPCatalog `json:"items"`
+}
+
+func (in *SystemMCPCatalog) GetColumns() [][]string {
+	return [][]string{
+		{"Name", "Name"},
+		{"Source URLs", "Spec.SourceURLs"},
+		{"Last Synced", "{{ago .Status.LastSyncTime}}"},
+	}
 }

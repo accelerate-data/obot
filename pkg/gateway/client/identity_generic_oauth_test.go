@@ -13,7 +13,7 @@ import (
 )
 
 func TestGenericOAuthLinksByEmailWhenIssuerTrustedAndEmailVerified(t *testing.T) {
-	c := newGenericOAuthTestClient(t, "https://issuer.example.com/", "true")
+	c := newGenericOAuthTestClient(t, "https://issuer.example.com", "true")
 	ctx := context.Background()
 
 	existing, err := c.EnsureIdentity(ctx, &types.Identity{

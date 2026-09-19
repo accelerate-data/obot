@@ -3,11 +3,13 @@ package handlers
 import (
 	"archive/zip"
 	"bytes"
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"os"
@@ -19,7 +21,6 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
-	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/hash"
 	"github.com/obot-platform/obot/pkg/publishedartifact"
 	"github.com/obot-platform/obot/pkg/skillformat"
@@ -42,7 +43,9 @@ const (
 
 // errConcurrentCreate is returned by createNewArtifact when another request
 // created the same artifact first, signaling the retry loop to re-GET and update.
-var errConcurrentCreate = fmt.Errorf("concurrent create detected")
+var (
+	errConcurrentCreate = fmt.Errorf("concurrent create detected")
+)
 
 type publishedArtifactUpdateRequest struct {
 	Description *string         `json:"description,omitempty"`
@@ -79,19 +82,19 @@ func (h *PublishedArtifactHandler) Create(req api.Context) error {
 		return err
 	}
 
-	log.Debugf("Received artifact upload (%d bytes)", len(data))
+	slog.Debug("Received artifact upload", "bytes", len(data))
 
 	fm, body, err := readSkillFrontmatterFromZIP(data)
 	if err != nil {
 		return types.NewErrBadRequest("invalid artifact ZIP: %v", err)
 	}
 
-	log.Debugf("Parsed SKILL.md from ZIP: name=%q description=%q", fm.Name, fm.Description)
+	slog.Debug("Parsed SKILL.md from ZIP", "name", fm.Name, "description", fm.Description)
 
 	authorID := req.User.GetUID()
-	authorEmail := auth.FirstExtraValue(req.User.GetExtra(), "email")
+	authorEmail := cmp.Or(req.User.GetExtra()["email"]...)
 
-	log.Debugf("Artifact author: id=%q email=%q", authorID, authorEmail)
+	slog.Debug("Artifact author", "id", authorID, "email", authorEmail)
 
 	// Build the manifest for DB storage from SKILL.md frontmatter.
 	manifest := types.PublishedArtifactManifest{
@@ -115,7 +118,7 @@ func (h *PublishedArtifactHandler) Create(req api.Context) error {
 		if apierrors.IsNotFound(err) {
 			// No existing artifact — try to create a new one.
 			if err := h.createNewArtifact(req, data, fm, body, manifest, authorID, authorEmail, artifactName); errors.Is(err, errConcurrentCreate) {
-				log.Debugf("Concurrent create for artifact %s (attempt %d/%d), retrying", artifactName, attempt+1, maxPublishRetries)
+				slog.Debug("Concurrent create for artifact, retrying", "artifact", artifactName, "attempt", attempt+1, "maxAttempts", maxPublishRetries)
 				continue
 			} else if err != nil {
 				return err
@@ -140,7 +143,7 @@ func (h *PublishedArtifactHandler) Create(req api.Context) error {
 			return fmt.Errorf("failed to generate upload nonce: %w", err)
 		}
 		blobKey := fmt.Sprintf("published-artifacts/%s/v%d-%s.zip", existing.Name, version, nonce)
-		log.Debugf("Updating existing artifact %s: v%d -> v%d, blobKey=%s", existing.Name, existing.Spec.LatestVersion, version, blobKey)
+		slog.Debug("Updating existing artifact", "artifact", existing.Name, "fromVersion", existing.Spec.LatestVersion, "toVersion", version, "blobKey", blobKey)
 
 		if err := h.blobStore.Upload(req.Context(), h.bucket, blobKey, bytes.NewReader(rewrittenData)); err != nil {
 			return fmt.Errorf("failed to upload artifact: %w", err)
@@ -159,20 +162,20 @@ func (h *PublishedArtifactHandler) Create(req api.Context) error {
 		})
 
 		if err := req.Update(&existing); apierrors.IsConflict(err) {
-			log.Debugf("Conflict updating artifact %s (attempt %d/%d), retrying", existing.Name, attempt+1, maxPublishRetries)
+			slog.Debug("Conflict updating artifact, retrying", "artifact", existing.Name, "attempt", attempt+1, "maxAttempts", maxPublishRetries)
 			// Safe to delete — this key is unique to this request.
 			if delErr := h.blobStore.Delete(req.Context(), h.bucket, blobKey); delErr != nil {
-				log.Errorf("failed to delete provisional blob %s after conflict: %v", blobKey, delErr)
+				slog.Error("failed to delete provisional blob after conflict", "blobKey", blobKey, "error", delErr)
 			}
 			continue
 		} else if err != nil {
 			if delErr := h.blobStore.Delete(req.Context(), h.bucket, blobKey); delErr != nil {
-				log.Errorf("failed to delete blob %s after update error: %v", blobKey, delErr)
+				slog.Error("failed to delete blob after update error", "blobKey", blobKey, "error", delErr)
 			}
 			return err
 		}
 
-		log.Infof("Published artifact %s v%d (updated)", existing.Name, version)
+		slog.Info("Published updated artifact version", "artifact", existing.Name, "version", version)
 		return req.Write(convertPublishedArtifactForRequester(&existing, req.User, req.UserIsAdmin()))
 	}
 
@@ -193,7 +196,7 @@ func (h *PublishedArtifactHandler) createNewArtifact(req api.Context, data []byt
 		return fmt.Errorf("failed to generate upload nonce: %w", err)
 	}
 	blobKey := fmt.Sprintf("published-artifacts/%s/v1-%s.zip", artifactName, nonce)
-	log.Debugf("Uploading blob for new artifact %s v1, blobKey=%s", artifactName, blobKey)
+	slog.Debug("Uploading blob for new artifact", "artifact", artifactName, "version", 1, "blobKey", blobKey)
 
 	if err := h.blobStore.Upload(req.Context(), h.bucket, blobKey, bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("failed to upload artifact: %w", err)
@@ -224,17 +227,17 @@ func (h *PublishedArtifactHandler) createNewArtifact(req api.Context, data []byt
 		// Another concurrent request created this artifact first — clean up our blob
 		// and return errConcurrentCreate so the caller's retry loop re-reads and takes the update path.
 		if delErr := h.blobStore.Delete(req.Context(), h.bucket, blobKey); delErr != nil {
-			log.Errorf("failed to delete blob %s after AlreadyExists: %v", blobKey, delErr)
+			slog.Error("failed to delete blob after AlreadyExists", "blobKey", blobKey, "error", delErr)
 		}
 		return errConcurrentCreate
 	} else if err != nil {
 		if delErr := h.blobStore.Delete(req.Context(), h.bucket, blobKey); delErr != nil {
-			log.Errorf("failed to delete blob %s after create error: %v", blobKey, delErr)
+			slog.Error("failed to delete blob after create error", "blobKey", blobKey, "error", delErr)
 		}
 		return err
 	}
 
-	log.Infof("Published artifact %s v1 (new, id=%s)", manifest.Name, artifact.Name)
+	slog.Info("Published new artifact", "name", manifest.Name, "version", 1, "artifact", artifact.Name)
 	return req.WriteCreated(convertPublishedArtifactForRequester(&artifact, req.User, req.UserIsAdmin()))
 }
 
@@ -259,7 +262,7 @@ func (h *PublishedArtifactHandler) List(req api.Context) error {
 
 	query := strings.ToLower(req.URL.Query().Get("q"))
 
-	log.Debugf("Listing artifacts: type=%q query=%q userID=%q isAdmin=%v totalInDB=%d", artifactType, query, req.User.GetUID(), req.UserIsAdmin(), len(artifacts.Items))
+	slog.Debug("Listing artifacts", "type", artifactType, "query", query, "userID", req.User.GetUID(), "isAdmin", req.UserIsAdmin(), "totalInDB", len(artifacts.Items))
 
 	items := make([]types.PublishedArtifact, 0, len(artifacts.Items))
 	for i := range artifacts.Items {
@@ -282,7 +285,7 @@ func (h *PublishedArtifactHandler) List(req api.Context) error {
 		items = append(items, convertPublishedArtifactForRequester(a, req.User, req.UserIsAdmin()))
 	}
 
-	log.Debugf("Returning %d artifacts (filtered from %d)", len(items), len(artifacts.Items))
+	slog.Debug("Returning artifacts", "returned", len(items), "totalBeforeFilter", len(artifacts.Items))
 	return req.Write(types.PublishedArtifactList{Items: items})
 }
 
@@ -322,7 +325,7 @@ func (h *PublishedArtifactHandler) Download(req api.Context) error {
 		version = parsed
 	}
 
-	log.Debugf("Download requested: artifact=%s name=%q version=%d", id, artifact.Spec.Name, version)
+	slog.Debug("Download requested", "artifact", id, "name", artifact.Spec.Name, "version", version)
 
 	// Find the blob key for the requested version
 	blobKey := ""
@@ -336,7 +339,7 @@ func (h *PublishedArtifactHandler) Download(req api.Context) error {
 		return types.NewErrNotFound("version %d not found", version)
 	}
 
-	log.Debugf("Downloading blob: bucket=%s key=%s", h.bucket, blobKey)
+	slog.Debug("Downloading blob", "bucket", h.bucket, "key", blobKey)
 
 	reader, err := h.blobStore.Download(req.Context(), h.bucket, blobKey)
 	if err != nil {
@@ -454,7 +457,7 @@ func (h *PublishedArtifactHandler) Update(req api.Context) error {
 		if len(*update.Description) > maxArtifactDescriptionLen {
 			return types.NewErrBadRequest("description must be %d characters or fewer", maxArtifactDescriptionLen)
 		}
-		log.Debugf("Updating artifact %s description: %q -> %q", id, artifact.Spec.Description, *update.Description)
+		slog.Debug("Updating artifact description", "artifact", id, "oldDescription", artifact.Spec.Description, "newDescription", *update.Description)
 		artifact.Spec.Description = *update.Description
 	}
 	if update.Subjects != nil {
@@ -472,7 +475,7 @@ func (h *PublishedArtifactHandler) Update(req api.Context) error {
 		if entry == nil {
 			return types.NewErrNotFound("version %d not found", version)
 		}
-		log.Debugf("Updating artifact %s version %d subjects (count=%d)", id, version, len(update.Subjects))
+		slog.Debug("Updating artifact version subjects", "artifact", id, "version", version, "subjectCount", len(update.Subjects))
 		entry.Subjects = update.Subjects
 	}
 
@@ -480,7 +483,7 @@ func (h *PublishedArtifactHandler) Update(req api.Context) error {
 		return err
 	}
 
-	log.Infof("Updated artifact %s (%s)", id, artifact.Spec.Name)
+	slog.Info("Updated artifact", "artifact", id, "name", artifact.Spec.Name)
 	return req.Write(convertPublishedArtifactForRequester(&artifact, req.User, req.UserIsAdmin()))
 }
 
@@ -495,12 +498,12 @@ func (h *PublishedArtifactHandler) Delete(req api.Context) error {
 		return err
 	}
 
-	log.Debugf("Deleting artifact %s (%s), removing %d version blobs", id, artifact.Spec.Name, len(artifact.Status.Versions))
+	slog.Debug("Deleting artifact and removing version blobs", "artifact", id, "name", artifact.Spec.Name, "versionCount", len(artifact.Status.Versions))
 
 	// Delete all version blobs
 	for _, entry := range artifact.Status.Versions {
 		if err := h.blobStore.Delete(req.Context(), h.bucket, entry.BlobKey); err != nil {
-			log.Errorf("Failed to delete blob %s for artifact %s: %v", entry.BlobKey, id, err)
+			slog.Error("Failed to delete blob for artifact", "blobKey", entry.BlobKey, "artifact", id, "error", err)
 		}
 	}
 
@@ -508,7 +511,7 @@ func (h *PublishedArtifactHandler) Delete(req api.Context) error {
 		return err
 	}
 
-	log.Infof("Deleted artifact %s (%s)", id, artifact.Spec.Name)
+	slog.Info("Deleted artifact", "artifact", id, "name", artifact.Spec.Name)
 	return nil
 }
 

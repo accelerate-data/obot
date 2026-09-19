@@ -6,14 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/accesstoken"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/auth"
@@ -23,19 +22,41 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
-var log = logger.Package()
-
 const (
 	CurrentAuthProviderCookie  = "current_auth_provider"
 	ObotAccessTokenCookie      = "obot_access_token"
-	ObotAccessTokenCookieZero  = "obot_access_token_0"
 	ObotAuthProviderQueryParam = "obot-auth-provider"
 )
 
-var ErrInvalidSession = errors.New("invalid session")
+var (
+	ErrInvalidSession = errors.New("invalid session")
+)
 
 type Manager struct {
 	dispatcher *dispatcher.Dispatcher
+}
+
+type Proxy struct {
+	proxy                               *httputil.ReverseProxy
+	url, name, namespace, groupIDPrefix string
+}
+
+// serializableRequest represents an HTTP request that can be serialized for authentication flows
+type serializableRequest struct {
+	Method string              `json:"method"`
+	URL    string              `json:"url"`
+	Header map[string][]string `json:"header"`
+}
+
+// serializableState represents the authentication state returned from auth providers
+type serializableState struct {
+	ExpiresOn             *time.Time `json:"expiresOn"`
+	AccessToken           string     `json:"accessToken"`
+	PreferredUsername     string     `json:"preferredUsername"`
+	User                  string     `json:"user"`
+	Email                 string     `json:"email"`
+	SetCookies            []string   `json:"setCookies"`
+	RequirePasswordChange bool       `json:"requirePasswordChange"`
 }
 
 func NewProxyManager(dispatcher *dispatcher.Dispatcher) *Manager {
@@ -67,7 +88,26 @@ func (pm *Manager) AuthenticateRequest(req *http.Request) (*authenticator.Respon
 		return nil, false, err
 	}
 
-	return proxy.authenticateRequest(req)
+	resp, ok, err := proxy.authenticateRequest(req)
+	if ok || !errors.Is(err, ErrInvalidSession) {
+		return resp, ok, err
+	}
+
+	// A verification login is served by the staged provider, so the active one cannot validate its
+	// session. Fall back only for the browser holding the verification.
+	staged, stagedErr := pm.dispatcher.GetStagedAuthProvider(req.Context())
+	if stagedErr != nil || staged == "" {
+		return resp, ok, err
+	}
+	if loginable, loginErr := pm.dispatcher.LoginableAuthProvider(req.Context(), req, staged); loginErr != nil || !loginable {
+		return resp, ok, err
+	}
+	stagedProxy, stagedErr := pm.createProxy(req.Context(), system.DefaultNamespace+"/"+staged)
+	if stagedErr != nil {
+		return resp, ok, err
+	}
+
+	return stagedProxy.authenticateRequest(req)
 }
 
 func (pm *Manager) HandlerFunc(ctx api.Context) error {
@@ -75,15 +115,44 @@ func (pm *Manager) HandlerFunc(ctx api.Context) error {
 	return nil
 }
 
+// stagedVerificationProvider returns the staged provider when this request belongs to a
+// verification round trip, and "" otherwise. The round trip is identified by the verify cookie
+// rather than a query parameter because a provider's own login pages redirect through paths that
+// name no provider of their own.
+func (pm *Manager) stagedVerificationProvider(r *http.Request) string {
+	if cookie, err := r.Cookie(auth.AuthProviderVerifyCookie); err != nil || cookie.Value == "" {
+		return ""
+	}
+
+	staged, err := pm.dispatcher.GetStagedAuthProvider(r.Context())
+	if err != nil || staged == "" {
+		return ""
+	}
+
+	// LoginableAuthProvider re-checks that cookie against an open verification, so a stale or
+	// forged one cannot turn the staged provider into a login path of its own.
+	loginable, err := pm.dispatcher.LoginableAuthProvider(r.Context(), r, staged)
+	if err != nil || !loginable {
+		return ""
+	}
+
+	return system.DefaultNamespace + "/" + staged
+}
+
+func clearCurrentAuthProviderCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:   CurrentAuthProviderCookie,
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+}
+
 func (pm *Manager) ServeHTTP(user user.Info, w http.ResponseWriter, r *http.Request) {
 	// If the proxy manager is not set up, just redirect the user.
 	// This can happen when auth is disabled.
 	if pm == nil {
-		rd := r.URL.Query().Get("rd")
-		if rd == "" || !strings.HasPrefix(rd, "/") {
-			rd = "/"
-		}
-		http.Redirect(w, r, rd, http.StatusFound)
+		http.Redirect(w, r, auth.SafeRedirectPath(r.URL.Query().Get("rd")), http.StatusFound)
 		return
 	}
 
@@ -92,7 +161,14 @@ func (pm *Manager) ServeHTTP(user user.Info, w http.ResponseWriter, r *http.Requ
 		provider string
 		err      error
 	)
-	if len(user.GetExtra()["auth_provider_name"]) > 0 && len(user.GetExtra()["auth_provider_namespace"]) > 0 {
+	if requested := pm.stagedVerificationProvider(r); requested != "" {
+		// A verification deliberately signs in through a provider other than the caller's, so it is
+		// the only case where the provider a request names beats the one its session uses.
+		provider = requested
+		if r.URL.Path == "/oauth2/callback" {
+			clearCurrentAuthProviderCookie(w)
+		}
+	} else if len(user.GetExtra()["auth_provider_name"]) > 0 && len(user.GetExtra()["auth_provider_namespace"]) > 0 {
 		provider = fmt.Sprintf("%s/%s", user.GetExtra()["auth_provider_namespace"][0], user.GetExtra()["auth_provider_name"][0])
 	} else if r.URL.Path == "/oauth2/callback" {
 		// Check for the current auth provider cookie.
@@ -100,12 +176,7 @@ func (pm *Manager) ServeHTTP(user user.Info, w http.ResponseWriter, r *http.Requ
 			provider = cookie.Value
 
 			// Now delete the current auth provider cookie so that it doesn't interfere with anything.
-			http.SetCookie(w, &http.Cookie{
-				Name:   CurrentAuthProviderCookie,
-				Value:  "",
-				Path:   "/",
-				MaxAge: -1,
-			})
+			clearCurrentAuthProviderCookie(w)
 		} else {
 			http.Error(w, "Login timed out. Please try again.", http.StatusUnauthorized)
 			return
@@ -148,12 +219,12 @@ func (pm *Manager) ServeHTTP(user user.Info, w http.ResponseWriter, r *http.Requ
 		}
 
 		// Check if the provider is configured.
-		configuredProvider, err := pm.dispatcher.GetConfiguredAuthProvider(r.Context())
+		loginable, err := pm.dispatcher.LoginableAuthProvider(r.Context(), r, name)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to get configured auth provider: %v", err), http.StatusInternalServerError)
 			return
 		}
-		if configuredProvider != "" && configuredProvider != name {
+		if !loginable {
 			http.Error(w, "auth provider not configured: "+provider, http.StatusBadRequest)
 			return
 		}
@@ -182,7 +253,7 @@ func (pm *Manager) ServeHTTP(user user.Info, w http.ResponseWriter, r *http.Requ
 		})
 	}
 
-	log.Infof("forwarding request for %s to provider %s", r.URL.Path, provider)
+	slog.Info("forwarding request to provider", "path", r.URL.Path, "provider", provider)
 
 	proxy.serveHTTP(w, r)
 }
@@ -197,26 +268,26 @@ func (pm *Manager) createProxy(ctx context.Context, provider string) (*Proxy, er
 	if err != nil {
 		return nil, err
 	}
+	groupIDPrefix, err := pm.dispatcher.GroupIDPrefixForAuthProvider(ctx, parts[0], parts[1])
+	if err != nil {
+		return nil, err
+	}
 
-	return newProxy(parts[0], parts[1], providerURL.String())
+	return newProxy(parts[0], parts[1], providerURL.String(), groupIDPrefix)
 }
 
-type Proxy struct {
-	proxy                *httputil.ReverseProxy
-	url, name, namespace string
-}
-
-func newProxy(providerNamespace, providerName, providerURL string) (*Proxy, error) {
+func newProxy(providerNamespace, providerName, providerURL, groupIDPrefix string) (*Proxy, error) {
 	u, err := url.Parse(providerURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse provider URL: %w", err)
 	}
 
 	return &Proxy{
-		proxy:     httputil.NewSingleHostReverseProxy(u),
-		url:       providerURL,
-		name:      providerName,
-		namespace: providerNamespace,
+		proxy:         httputil.NewSingleHostReverseProxy(u),
+		url:           providerURL,
+		name:          providerName,
+		namespace:     providerNamespace,
+		groupIDPrefix: groupIDPrefix,
 	}, nil
 }
 
@@ -233,25 +304,6 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.proxy.ServeHTTP(w, r)
-}
-
-// serializableRequest represents an HTTP request that can be serialized for authentication flows
-type serializableRequest struct {
-	Method string              `json:"method"`
-	URL    string              `json:"url"`
-	Header map[string][]string `json:"header"`
-}
-
-// serializableState represents the authentication state returned from auth providers
-type serializableState struct {
-	ExpiresOn         *time.Time `json:"expiresOn"`
-	AccessToken       string     `json:"accessToken"`
-	PreferredUsername string     `json:"preferredUsername"`
-	User              string     `json:"user"`
-	Email             string     `json:"email"`
-	Issuer            string     `json:"issuer,omitempty"`
-	EmailVerified     *bool      `json:"emailVerified,omitempty"`
-	SetCookies        []string   `json:"setCookies"`
 }
 
 func (p *Proxy) authenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
@@ -304,21 +356,21 @@ func (p *Proxy) authenticateRequest(req *http.Request) (*authenticator.Response,
 			"auth_provider_user_id":   {ss.User},
 		},
 	}
+	if ss.RequirePasswordChange {
+		u.Extra["password_change_required"] = []string{"true"}
+	}
 
 	if len(ss.SetCookies) != 0 {
 		// This is set if the auth provider needed to refresh the token.
 		u.Extra["set-cookies"] = ss.SetCookies
 	}
-	if ss.Issuer != "" {
-		u.Extra["auth_provider_issuer"] = []string{ss.Issuer}
-	}
-	if ss.EmailVerified != nil {
-		u.Extra["auth_provider_email_verified"] = []string{strconv.FormatBool(*ss.EmailVerified)}
-	}
 
-	// Put the access token and provider URL on the context so that the profile icon and group info can be fetched.
-	*req = *req.WithContext(accesstoken.ContextWithAccessToken(req.Context(), ss.AccessToken))
-	*req = *req.WithContext(auth.ContextWithProviderURL(req.Context(), p.url))
+	// Put the access token and provider metadata on the context so that the profile icon and group
+	// info can be fetched and validated.
+	providerContext := accesstoken.ContextWithAccessToken(req.Context(), ss.AccessToken)
+	providerContext = auth.ContextWithProviderURL(providerContext, p.url)
+	providerContext = auth.ContextWithProviderGroupIDPrefix(providerContext, p.groupIDPrefix)
+	*req = *req.WithContext(providerContext)
 
 	return &authenticator.Response{
 		User: u,

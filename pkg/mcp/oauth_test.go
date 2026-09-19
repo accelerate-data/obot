@@ -16,11 +16,30 @@ import (
 	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
 )
+
+type oauthTestClientCredLookup struct {
+	clientID     string
+	clientSecret string
+	calls        int
+}
+
+type recordingTokenStorage struct {
+	setCalls  int
+	setErr    error
+	lastConf  *oauth2.Config
+	lastToken *oauth2.Token
+}
+
+type oauthAuthorizeCallbackHandler struct {
+	authURL     string
+	verifier    string
+	resourceURL string
+	callback    chan CallbackPayload
+}
 
 func TestRequiresStaticOAuth(t *testing.T) {
 	server := v1.MCPServer{}
@@ -35,10 +54,18 @@ func TestRequiresStaticOAuth(t *testing.T) {
 	server.Status.UserHasAuthenticated = false
 	server.Spec.Manifest.RemoteConfig.StaticOAuthRequired = false
 	require.False(t, RequiresStaticOAuth(server))
+}
 
-	server.Spec.Manifest.Runtime = types.RuntimeComposite
-	server.Spec.Manifest.RemoteConfig.StaticOAuthRequired = true
-	require.False(t, RequiresStaticOAuth(server))
+func TestServerConfigHeadersCanonicalizesNames(t *testing.T) {
+	headers := serverConfigHeaders(ServerConfig{
+		PassthroughHeaderNames:  []string{"x-request-id"},
+		PassthroughHeaderValues: []string{"request-1"},
+		Headers:                 []string{"AUTHORIZATION=Bearer token"},
+	})
+
+	require.Equal(t, []string{"Bearer token"}, headers["Authorization"])
+	require.Equal(t, []string{"request-1"}, headers["X-Request-Id"])
+	require.NotContains(t, headers, "AUTHORIZATION")
 }
 
 func TestGetOAuthMetadataAssumesOAuthAfterSuccessfulInitialize(t *testing.T) {
@@ -116,6 +143,7 @@ func TestGetOAuthMetadataPathAndRootFallbackUsesMetadataScope(t *testing.T) {
 
 	metadata, err := GetOAuthMetadataWithClient(t.Context(), server.Client(), ServerConfig{URL: server.URL + "/mcp"}, clientName, redirectURL)
 	require.NoError(t, err)
+	require.Equal(t, server.URL, metadata.ResourceURL)
 	require.Equal(t, server.URL+"/.well-known/oauth-protected-resource", metadata.ProtectedResourceMetadataURL)
 	require.True(t, pathMetadataRequested.Load(), "expected path-specific metadata URL to be attempted")
 	require.True(t, rootMetadataRequested.Load(), "expected root metadata URL to be attempted")
@@ -186,13 +214,7 @@ func TestGetOAuthMetadataAuthorizationServerOIDCFallbackWithoutDynamicRegistrati
 	require.False(t, metadata.DynamicClientRegistration)
 }
 
-type oauthTestClientCredLookup struct {
-	clientID     string
-	clientSecret string
-	calls        int
-}
-
-func (l *oauthTestClientCredLookup) Lookup(context.Context, string) (string, string, error) {
+func (l *oauthTestClientCredLookup) Lookup(context.Context) (string, string, error) {
 	l.calls++
 	return l.clientID, l.clientSecret, nil
 }
@@ -207,7 +229,7 @@ func TestResolveClientInfoUsesClientIDMetadataDocument(t *testing.T) {
 		clientLookup:             lookup,
 	}
 
-	clientInfo, err := o.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
+	clientInfo, staticClient, err := o.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
 		ProtectedResourceMetadata: protectedResourceMetadata{
 			AuthorizationServers: []string{"https://issuer.example"},
 		},
@@ -218,6 +240,7 @@ func TestResolveClientInfoUsesClientIDMetadataDocument(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, o.clientIDMetadataDocument, clientInfo.ClientID)
 	require.Empty(t, clientInfo.ClientSecret)
+	require.False(t, staticClient)
 	require.Zero(t, lookup.calls)
 }
 
@@ -228,7 +251,7 @@ func TestResolveClientInfoUsesStaticClientLookup(t *testing.T) {
 	}
 	o := &oauth{clientLookup: lookup}
 
-	clientInfo, err := o.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
+	clientInfo, staticClient, err := o.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
 		ProtectedResourceMetadata: protectedResourceMetadata{
 			AuthorizationServers: []string{"https://issuer.example"},
 		},
@@ -237,6 +260,7 @@ func TestResolveClientInfoUsesStaticClientLookup(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, lookup.clientID, clientInfo.ClientID)
 	require.Equal(t, lookup.clientSecret, clientInfo.ClientSecret)
+	require.True(t, staticClient)
 	require.Equal(t, 1, lookup.calls)
 }
 
@@ -244,7 +268,7 @@ func TestResolveClientInfoUsesPublicStaticClientLookup(t *testing.T) {
 	lookup := &oauthTestClientCredLookup{clientID: "public-client-id"}
 	o := &oauth{clientLookup: lookup}
 
-	clientInfo, err := o.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
+	clientInfo, staticClient, err := o.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
 		ProtectedResourceMetadata: protectedResourceMetadata{
 			AuthorizationServers: []string{"https://issuer.example"},
 		},
@@ -253,6 +277,7 @@ func TestResolveClientInfoUsesPublicStaticClientLookup(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, lookup.clientID, clientInfo.ClientID)
 	require.Empty(t, clientInfo.ClientSecret)
+	require.True(t, staticClient)
 	require.Equal(t, 1, lookup.calls)
 }
 
@@ -278,13 +303,14 @@ func TestResolveClientInfoNilLookupFallsThroughToDynamicRegistration(t *testing.
 	}
 
 	var (
-		clientInfo clientRegistrationResponse
-		err        error
-		panicValue any
+		clientInfo   clientRegistrationResponse
+		staticClient bool
+		err          error
+		panicValue   any
 	)
 	func() {
 		defer func() { panicValue = recover() }()
-		clientInfo, err = o.resolveClientInfo(t.Context(), "test-server", discovery)
+		clientInfo, staticClient, err = o.resolveClientInfo(t.Context(), "test-server", discovery)
 	}()
 	if panicValue != nil {
 		t.Fatalf("resolveClientInfo panicked with nil client lookup: %v", panicValue)
@@ -292,6 +318,7 @@ func TestResolveClientInfoNilLookupFallsThroughToDynamicRegistration(t *testing.
 	require.NoError(t, err)
 	require.Equal(t, "dynamic-client-id", clientInfo.ClientID)
 	require.Equal(t, "dynamic-client-secret", clientInfo.ClientSecret)
+	require.False(t, staticClient)
 }
 
 func TestTokenEndpointAuthStyle(t *testing.T) {
@@ -299,16 +326,49 @@ func TestTokenEndpointAuthStyle(t *testing.T) {
 		name            string
 		method          string
 		hasClientSecret bool
+		staticClient    bool
 		want            oauth2.AuthStyle
 	}{
-		{name: "no client secret", method: "client_secret_basic", want: oauth2.AuthStyleInParams},
-		{name: "basic", method: "client_secret_basic", hasClientSecret: true, want: oauth2.AuthStyleInHeader},
-		{name: "post", method: "client_secret_post", hasClientSecret: true, want: oauth2.AuthStyleInParams},
-		{name: "unknown", method: "", hasClientSecret: true, want: oauth2.AuthStyleAutoDetect},
+		{
+			name:            "static confidential client",
+			method:          "client_secret_basic",
+			hasClientSecret: true,
+			staticClient:    true,
+			want:            oauth2.AuthStyleAutoDetect,
+		},
+		{
+			name:         "static public client",
+			method:       "client_secret_basic",
+			staticClient: true,
+			want:         oauth2.AuthStyleAutoDetect,
+		},
+		{
+			name:   "dynamic client without secret",
+			method: "client_secret_basic",
+			want:   oauth2.AuthStyleInParams,
+		},
+		{
+			name:            "dynamic basic client",
+			method:          "client_secret_basic",
+			hasClientSecret: true,
+			want:            oauth2.AuthStyleInHeader,
+		},
+		{
+			name:            "dynamic post client",
+			method:          "client_secret_post",
+			hasClientSecret: true,
+			want:            oauth2.AuthStyleInParams,
+		},
+		{
+			name:            "dynamic client with unknown method",
+			method:          "",
+			hasClientSecret: true,
+			want:            oauth2.AuthStyleAutoDetect,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, tokenEndpointAuthStyle(tt.method, tt.hasClientSecret))
+			require.Equal(t, tt.want, tokenEndpointAuthStyle(tt.method, tt.hasClientSecret, tt.staticClient))
 		})
 	}
 }
@@ -318,8 +378,14 @@ func TestParseProtectedResourceMetadataResourceForms(t *testing.T) {
 		name string
 		json string
 	}{
-		{name: "string", json: `{"resource":"https://example.com/mcp"}`},
-		{name: "singleton array", json: `{"resource":["https://example.com/mcp"]}`},
+		{
+			name: "string",
+			json: `{"resource":"https://example.com/mcp"}`,
+		},
+		{
+			name: "singleton array",
+			json: `{"resource":["https://example.com/mcp"]}`,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			metadata, err := parseProtectedResourceMetadata(strings.NewReader(tt.json))
@@ -342,16 +408,46 @@ func TestParseProtectedResourceMetadataRejectsInvalidResourceShapes(t *testing.T
 		name     string
 		resource string
 	}{
-		{name: "empty string", resource: `""`},
-		{name: "empty array", resource: `[]`},
-		{name: "multiple resources", resource: `["https://example.com/one","https://example.com/two"]`},
-		{name: "empty array resource", resource: `[""]`},
-		{name: "number", resource: `42`},
-		{name: "boolean", resource: `true`},
-		{name: "null", resource: `null`},
-		{name: "object", resource: `{}`},
-		{name: "non-string array element", resource: `[42]`},
-		{name: "null array element", resource: `[null]`},
+		{
+			name:     "empty string",
+			resource: `""`,
+		},
+		{
+			name:     "empty array",
+			resource: `[]`,
+		},
+		{
+			name:     "multiple resources",
+			resource: `["https://example.com/one","https://example.com/two"]`,
+		},
+		{
+			name:     "empty array resource",
+			resource: `[""]`,
+		},
+		{
+			name:     "number",
+			resource: `42`,
+		},
+		{
+			name:     "boolean",
+			resource: `true`,
+		},
+		{
+			name:     "null",
+			resource: `null`,
+		},
+		{
+			name:     "object",
+			resource: `{}`,
+		},
+		{
+			name:     "non-string array element",
+			resource: `[42]`,
+		},
+		{
+			name:     "null array element",
+			resource: `[null]`,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := parseProtectedResourceMetadata(strings.NewReader(`{"resource":` + tt.resource + `}`))
@@ -415,9 +511,20 @@ func TestAuthServerMetadataToClientRegistrationFiltersGrantTypes(t *testing.T) {
 		supported []string
 		want      []string
 	}{
-		{name: "keeps only authorization code and refresh token", supported: []string{"client_credentials", "refresh_token", "authorization_code", "implicit"}, want: []string{"authorization_code", "refresh_token"}},
-		{name: "omits unsupported grant types", supported: []string{"client_credentials", "implicit"}},
-		{name: "keeps refresh token when advertised", supported: []string{"refresh_token"}, want: []string{"refresh_token"}},
+		{
+			name:      "keeps only authorization code and refresh token",
+			supported: []string{"client_credentials", "refresh_token", "authorization_code", "implicit"},
+			want:      []string{"authorization_code", "refresh_token"},
+		},
+		{
+			name:      "omits unsupported grant types",
+			supported: []string{"client_credentials", "implicit"},
+		},
+		{
+			name:      "keeps refresh token when advertised",
+			supported: []string{"refresh_token"},
+			want:      []string{"refresh_token"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -427,15 +534,8 @@ func TestAuthServerMetadataToClientRegistrationFiltersGrantTypes(t *testing.T) {
 	}
 }
 
-type recordingTokenStorage struct {
-	setCalls  int
-	setErr    error
-	lastConf  *oauth2.Config
-	lastToken *oauth2.Token
-}
-
-func (*recordingTokenStorage) NewTokenSource(_ context.Context, _ *oauth2.Config, token *oauth2.Token) (oauth2.TokenSource, error) {
-	return oauth2.StaticTokenSource(token), nil
+func (*recordingTokenStorage) TokenSource(context.Context) (oauth2.TokenSource, error) {
+	return nil, nil
 }
 
 func (*recordingTokenStorage) GetTokenConfig(context.Context) (*oauth2.Config, *oauth2.Token, error) {
@@ -478,7 +578,7 @@ func TestStorageBackedTokenSourcePersistsRefreshedToken(t *testing.T) {
 		Expiry:       time.Now().Add(-time.Hour),
 	}
 
-	tok, err := newStorageBackedTokenSource(storage, conf, initial, server.Client()).Token()
+	tok, err := newStorageBackedTokenSource(storage, conf, initial).Token()
 	require.NoError(t, err)
 	require.Equal(t, "new-access-token", tok.AccessToken)
 	require.Equal(t, "new-refresh-token", tok.RefreshToken)
@@ -487,15 +587,83 @@ func TestStorageBackedTokenSourcePersistsRefreshedToken(t *testing.T) {
 	require.Same(t, tok, storage.lastToken)
 }
 
+func TestOAuthResourceHandlingByAuthorizationServer(t *testing.T) {
+	const resourceURL = "https://resource.example.com/mcp"
+	tests := []struct {
+		name             string
+		authorizationURL string
+		expectedResource string
+	}{
+		{
+			name:             "Entra global",
+			authorizationURL: "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize",
+		},
+		{
+			name:             "Entra US Government",
+			authorizationURL: "https://login.microsoftonline.us/tenant/oauth2/v2.0/authorize",
+		},
+		{
+			name:             "Entra China",
+			authorizationURL: "https://login.partner.microsoftonline.cn/tenant/oauth2/v2.0/authorize",
+		},
+		{
+			name:             "non-Entra China authority",
+			authorizationURL: "https://login.chinacloudapi.cn/tenant/oauth2/v2.0/authorize",
+			expectedResource: resourceURL,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callback := &oauthAuthorizeCallbackHandler{}
+			tokenServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				require.NoError(t, req.ParseForm())
+				require.Equal(t, tt.expectedResource, req.Form.Get("resource"))
+				rw.Header().Set("Content-Type", "application/json")
+				_, _ = rw.Write([]byte(`{"access_token":"access-token","token_type":"Bearer","expires_in":3600}`))
+			}))
+			defer tokenServer.Close()
+
+			conf := &oauth2.Config{
+				ClientID:    "client-id",
+				RedirectURL: "https://obot.example.com/callback",
+				Endpoint: oauth2.Endpoint{
+					AuthURL:  tt.authorizationURL,
+					TokenURL: tokenServer.URL,
+				},
+			}
+
+			authURL, _, verifier, err := GetOAuthAuthorizationURL(t.Context(), callback, conf, conf.Endpoint.AuthURL, resourceURL)
+			require.NoError(t, err)
+			parsedAuthURL, err := url.Parse(authURL)
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedResource, parsedAuthURL.Query().Get("resource"))
+			require.Equal(t, tt.expectedResource, callback.resourceURL)
+
+			_, err = ExchangeOAuthToken(t.Context(), conf, "authorization-code", verifier, resourceURL)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestResolveOAuthResourceURL(t *testing.T) {
+	require.Equal(t,
+		"https://connection.example.com/mcp",
+		ResolveOAuthResourceURL("https://auth.example.com/authorize", "", "https://connection.example.com/mcp"),
+	)
+	require.Equal(t,
+		"https://resource.example.com/mcp",
+		ResolveOAuthResourceURL("https://auth.example.com/authorize", "https://resource.example.com/mcp", "https://connection.example.com/mcp"),
+	)
+	require.Empty(t,
+		ResolveOAuthResourceURL("https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize", "", "https://connection.example.com/mcp"),
+	)
+}
+
 func TestStorageBackedTokenSourceDoesNotPersistUnchangedToken(t *testing.T) {
 	tok := &oauth2.Token{AccessToken: "access-token", RefreshToken: "refresh-token", Expiry: time.Now().Add(time.Hour)}
 	storage := &recordingTokenStorage{}
-	ts := &storageBackedTokenSource{
-		tokenStorage: storage,
-		conf:         &oauth2.Config{},
-		tok:          tok,
-		tokenSource:  oauth2.StaticTokenSource(tok),
-	}
+	ts := newStorageBackedTokenSource(storage, &oauth2.Config{}, tok)
 
 	got, err := ts.Token()
 	require.NoError(t, err)
@@ -504,27 +672,27 @@ func TestStorageBackedTokenSourceDoesNotPersistUnchangedToken(t *testing.T) {
 }
 
 func TestStorageBackedTokenSourcePropagatesPersistenceError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write([]byte(`{"access_token":"new-access-token","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer server.Close()
+
 	persistenceErr := errors.New("persistence failed")
-	old := &oauth2.Token{AccessToken: "old-access-token", Expiry: time.Now().Add(-time.Hour)}
-	newToken := &oauth2.Token{AccessToken: "new-access-token", Expiry: time.Now().Add(time.Hour)}
+	old := &oauth2.Token{AccessToken: "old-access-token", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
 	storage := &recordingTokenStorage{setErr: persistenceErr}
-	ts := &storageBackedTokenSource{
-		tokenStorage: storage,
-		conf:         &oauth2.Config{},
-		tok:          old,
-		tokenSource:  oauth2.StaticTokenSource(newToken),
+	conf := &oauth2.Config{
+		Endpoint: oauth2.Endpoint{
+			TokenURL:  server.URL,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
 	}
+	ts := newStorageBackedTokenSource(storage, conf, old)
 
 	got, err := ts.Token()
 	require.ErrorIs(t, err, persistenceErr)
 	require.Nil(t, got)
 	require.Equal(t, 1, storage.setCalls)
-}
-
-type oauthAuthorizeCallbackHandler struct {
-	authURL  string
-	verifier string
-	callback chan CallbackPayload
 }
 
 func (h *oauthAuthorizeCallbackHandler) HandleAuthURL(_ context.Context, _ string, authURL string) (bool, error) {
@@ -533,8 +701,9 @@ func (h *oauthAuthorizeCallbackHandler) HandleAuthURL(_ context.Context, _ strin
 	return true, nil
 }
 
-func (h *oauthAuthorizeCallbackHandler) NewState(_ context.Context, _ *oauth2.Config, verifier string) (string, <-chan CallbackPayload, error) {
+func (h *oauthAuthorizeCallbackHandler) NewState(_ context.Context, _ *oauth2.Config, resourceURL, verifier string) (string, <-chan CallbackPayload, error) {
 	h.verifier = verifier
+	h.resourceURL = resourceURL
 	h.callback = make(chan CallbackPayload, 1)
 	return "state", h.callback, nil
 }
@@ -542,6 +711,7 @@ func (h *oauthAuthorizeCallbackHandler) NewState(_ context.Context, _ *oauth2.Co
 func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 	var serverURL string
 	var registrationCalled, tokenCalled atomic.Bool
+	const redirectURL = "https://obot.example.com/callback"
 	callback := &oauthAuthorizeCallbackHandler{}
 	storage := &recordingTokenStorage{}
 	lookup := &oauthTestClientCredLookup{}
@@ -550,7 +720,7 @@ func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 		switch req.URL.Path {
 		case "/.well-known/oauth-protected-resource":
 			_ = json.NewEncoder(rw).Encode(map[string]any{
-				"resource":              serverURL + "/mcp",
+				"resource":              serverURL + "/protected-resource",
 				"authorization_servers": []string{serverURL},
 				"scopes_supported":      []string{"read"},
 			})
@@ -561,13 +731,14 @@ func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 				"token_endpoint":                        serverURL + "/token",
 				"registration_endpoint":                 serverURL + "/register",
 				"response_types_supported":              []string{"code"},
-				"token_endpoint_auth_methods_supported": []string{"client_secret_post"},
+				"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+				"token_endpoint_auth_methods_supported": []string{"none"},
 			})
 		case "/register":
 			registrationCalled.Store(true)
 			require.Equal(t, http.MethodPost, req.Method)
 			rw.Header().Set("Content-Type", "application/json")
-			_, _ = rw.Write([]byte(`{"client_id":"dynamic-client","client_secret":"dynamic-secret"}`))
+			_, _ = rw.Write([]byte(`{"client_id":"dynamic-client"}`))
 		case "/token":
 			tokenCalled.Store(true)
 			require.Equal(t, http.MethodPost, req.Method)
@@ -575,7 +746,9 @@ func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 			require.Equal(t, "authorization-code", req.Form.Get("code"))
 			require.Equal(t, hVerifier(callback), req.Form.Get("code_verifier"))
 			require.Equal(t, "dynamic-client", req.Form.Get("client_id"))
-			require.Equal(t, "dynamic-secret", req.Form.Get("client_secret"))
+			require.Equal(t, redirectURL, req.Form.Get("redirect_uri"))
+			require.Equal(t, serverURL+"/protected-resource", req.Form.Get("resource"))
+			require.Empty(t, req.Form.Get("client_secret"))
 			rw.Header().Set("Content-Type", "application/json")
 			_, _ = rw.Write([]byte(`{"access_token":"access-token","refresh_token":"refresh-token","token_type":"Bearer","expires_in":3600}`))
 		default:
@@ -593,170 +766,68 @@ func TestOAuthAuthorizeDiscoversRegistersExchangesAndPersists(t *testing.T) {
 		},
 		Body: io.NopCloser(strings.NewReader("")),
 	}
-	o := newOAuth(server.Client(), callback, lookup, storage, "test-server", "test-client", "https://obot.example.com/callback", "")
+	o := newOAuth(server.Client(), callback, lookup, storage, "test-server", "test-client", redirectURL, "")
 	require.NoError(t, o.Authorize(t.Context(), request, response))
 	require.True(t, registrationCalled.Load())
 	require.True(t, tokenCalled.Load())
 	require.NotEmpty(t, callback.authURL)
 	require.Contains(t, callback.authURL, "code_challenge=")
+	authorizationRequest, err := http.NewRequest(http.MethodGet, callback.authURL, nil)
+	require.NoError(t, err)
+	require.Equal(t, serverURL+"/protected-resource", authorizationRequest.URL.Query().Get("resource"))
 	require.Equal(t, "access-token", o.currentToken.AccessToken)
 	require.Equal(t, 1, storage.setCalls)
 	require.Equal(t, "access-token", storage.lastToken.AccessToken)
 }
 
-func hVerifier(callback *oauthAuthorizeCallbackHandler) string {
-	return callback.verifier
-}
+func TestOAuthAuthorizeFallsBackToConnectURLWithoutProtectedResourceMetadata(t *testing.T) {
+	var serverURL string
+	const redirectURL = "https://obot.example.com/callback"
+	callback := &oauthAuthorizeCallbackHandler{}
+	tokenRequest := make(chan url.Values, 1)
 
-func TestStorageBackedTokenSourceUsesSuppliedHTTPClient(t *testing.T) {
-	// A TLS server the default client cannot verify: a successful refresh proves
-	// the supplied client carried the request, not http.DefaultClient.
-	server := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("Content-Type", "application/json")
-		_, _ = rw.Write([]byte(`{"access_token":"new-access-token","refresh_token":"new-refresh-token","token_type":"Bearer","expires_in":3600}`))
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource":
+			http.NotFound(rw, req)
+		case "/.well-known/oauth-authorization-server":
+			_ = json.NewEncoder(rw).Encode(map[string]any{
+				"issuer":                                serverURL,
+				"authorization_endpoint":                serverURL + "/authorize",
+				"token_endpoint":                        serverURL + "/token",
+				"response_types_supported":              []string{"code"},
+				"grant_types_supported":                 []string{"authorization_code"},
+				"token_endpoint_auth_methods_supported": []string{"none"},
+			})
+		case "/token":
+			require.NoError(t, req.ParseForm())
+			tokenRequest <- req.Form
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write([]byte(`{"access_token":"access-token","token_type":"Bearer","expires_in":3600}`))
+		default:
+			http.NotFound(rw, req)
+		}
 	}))
 	defer server.Close()
+	serverURL = server.URL
+	connectURL := server.URL + "/mcp"
 
-	conf := &oauth2.Config{
-		ClientID:     "client-id",
-		ClientSecret: "client-secret",
-		Endpoint:     oauth2.Endpoint{TokenURL: server.URL, AuthStyle: oauth2.AuthStyleInParams},
+	request := httptest.NewRequest(http.MethodGet, connectURL, nil)
+	response := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("")),
 	}
-	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
+	o := newOAuth(server.Client(), callback, &oauthTestClientCredLookup{clientID: "static-client", clientSecret: "static-secret"}, nil, "test-server", "test-client", redirectURL, "")
+	require.NoError(t, o.Authorize(t.Context(), request, response))
 
-	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, nil).Token()
-	require.Error(t, err, "refresh without a supplied client must not reach the TLS token endpoint")
-
-	tok, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, server.Client()).Token()
+	authorizationRequest, err := http.NewRequest(http.MethodGet, callback.authURL, nil)
 	require.NoError(t, err)
-	require.Equal(t, "new-access-token", tok.AccessToken)
+	require.Equal(t, connectURL, callback.resourceURL)
+	require.Equal(t, connectURL, authorizationRequest.URL.Query().Get("resource"))
+	require.Equal(t, connectURL, (<-tokenRequest).Get("resource"))
 }
 
-func TestNoRedirectClientRejectsRedirect(t *testing.T) {
-	var reachedTarget atomic.Bool
-	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
-		reachedTarget.Store(true)
-		rw.Header().Set("Content-Type", "application/json")
-		_, _ = rw.Write([]byte(`{"access_token":"leaked","token_type":"Bearer"}`))
-	}))
-	defer target.Close()
-
-	redirector := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		http.Redirect(rw, req, target.URL, http.StatusTemporaryRedirect)
-	}))
-	defer redirector.Close()
-
-	conf := &oauth2.Config{
-		ClientID:     "client-id",
-		ClientSecret: "client-secret",
-		Endpoint:     oauth2.Endpoint{TokenURL: redirector.URL, AuthStyle: oauth2.AuthStyleInParams},
-	}
-	initial := &oauth2.Token{AccessToken: "old", RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
-
-	_, err := newStorageBackedTokenSource(&recordingTokenStorage{}, conf, initial, NoRedirectClient(http.DefaultClient)).Token()
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "redirect")
-	require.NotContains(t, err.Error(), "refresh-token")
-	require.NotContains(t, err.Error(), "client-secret")
-	require.False(t, reachedTarget.Load(), "redirect target must never receive the refresh credentials")
-}
-
-// AC5(a): a reachable authorization server can advertise a token endpoint inside
-// the estate. The token URL therefore comes from provider-controlled metadata,
-// not from operator configuration, and the remote-network policy has to reject it
-// at exchange time. The metadata host stands in for a public one by being
-// allow-listed; the token endpoint it names is not.
-func TestDiscoveredInternalTokenEndpointIsRejectedAtExchange(t *testing.T) {
-	var tokenEndpointReached atomic.Bool
-	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		tokenEndpointReached.Store(true)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"access_token":"leaked","token_type":"Bearer"}`)
-	}))
-	t.Cleanup(tokenEndpoint.Close)
-
-	authServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.URL.Path, "/.well-known/") {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":"%s/authorize","token_endpoint":%q,"response_types_supported":["code"]}`,
-			"http://"+r.Host, "http://"+r.Host, tokenEndpoint.URL)
-	}))
-	t.Cleanup(authServer.Close)
-
-	metadataClient := safehttp.NewClient(safehttp.ClientOptions{
-		BlockLoopback: true, BlockPrivateIP: true, BlockLinkLocal: true,
-		AllowList: []string{strings.TrimPrefix(authServer.URL, "http://")},
-	})
-	metadata, _, _, _, err := getAuthServerMetadata(t.Context(), metadataClient, authServer.URL)
-	require.NoError(t, err)
-	require.Equal(t, tokenEndpoint.URL, metadata.TokenEndpoint, "discovery must yield the provider-named token endpoint")
-
-	conf := &oauth2.Config{
-		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
-		Endpoint: oauth2.Endpoint{AuthURL: metadata.AuthorizationEndpoint, TokenURL: metadata.TokenEndpoint},
-	}
-	exchangeClient := safehttp.NewClient(safehttp.ClientOptions{
-		BlockLoopback: true, BlockPrivateIP: true, BlockLinkLocal: true, BlockRedirects: true,
-	})
-
-	_, err = ExchangeOAuthToken(WithOAuthHTTPClient(t.Context(), exchangeClient), conf, "code-1", "verifier-1")
-	require.Error(t, err)
-	require.False(t, tokenEndpointReached.Load(), "the internal token endpoint must never be contacted")
-	for _, secret := range []string{"code-1", "verifier-1", "dynamic-secret"} {
-		require.NotContains(t, err.Error(), secret)
-	}
-}
-
-// SafeOAuthErrorCode is the only guard on the provider-controlled `error`
-// parameter, which reaches a log line and an API error message at three call
-// sites. A provider that puts its payload in the code rather than the
-// description gets nothing else in the way.
-func TestSafeOAuthErrorCode(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		code string
-		want string
-	}{
-		{"rfc 6749 code kept whole", "access_denied", "access_denied"},
-		{"dotted and dashed codes kept", "invalid-request.v2", "invalid-request.v2"},
-		{"markup stripped", "access_denied<script>alert(1)</script>", "access_deniedscriptalert1script"},
-		{"newlines stripped so a code cannot forge a log line", "access_denied\r\nlevel=info msg=ok", "access_deniedlevelinfomsgok"},
-		{"spaces and punctuation stripped", "access denied: trace req/abc", "accessdeniedtracereqabc"},
-		{"truncated at 64 characters", strings.Repeat("a", 100), strings.Repeat("a", 64)},
-		{"empty falls back", "", "unspecified_error"},
-		{"all-invalid falls back", "<<< >>>", "unspecified_error"},
-		{"truncation happens before filtering", strings.Repeat("<", 64) + "leaked", "unspecified_error"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, SafeOAuthErrorCode(tt.code))
-		})
-	}
-}
-
-// Callers distinguish an aborted exchange from a rejected one, so the sanitizer
-// must not flatten a cancellation into its generic message.
-func TestSanitizeTokenExchangeErrorPreservesCancellation(t *testing.T) {
-	for name, err := range map[string]error{
-		"bare":    context.Canceled,
-		"wrapped": fmt.Errorf("exchange aborted: %w", context.Canceled),
-		"urlErr":  &url.Error{Op: "Post", URL: "https://provider.example/token", Err: context.Canceled},
-	} {
-		t.Run(name, func(t *testing.T) {
-			sanitized := SanitizeTokenExchangeError(err)
-			if !errors.Is(sanitized, context.Canceled) {
-				t.Fatalf("cancellation was flattened: %v", sanitized)
-			}
-			if strings.Contains(sanitized.Error(), "provider.example") {
-				t.Fatalf("sanitized error leaked the token endpoint: %v", sanitized)
-			}
-		})
-	}
-
-	deadline := SanitizeTokenExchangeError(fmt.Errorf("exchange timed out: %w", context.DeadlineExceeded))
-	if !errors.Is(deadline, context.DeadlineExceeded) {
-		t.Fatalf("deadline was flattened: %v", deadline)
-	}
+func hVerifier(callback *oauthAuthorizeCallbackHandler) string {
+	return callback.verifier
 }

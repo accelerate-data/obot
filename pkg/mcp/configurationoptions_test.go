@@ -16,11 +16,10 @@ func testConfigurationOptions() []types.MCPConfigurationOption {
 
 func TestValidateCatalogEntryManifestConfigurationOptions(t *testing.T) {
 	base := types.MCPServerCatalogEntryManifest{
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeNPX,
-		NPXConfig:      &types.NPXRuntimeConfig{Package: "test-server"},
-		Env: []types.MCPEnv{{
-			Key: "REGION", Name: "Region", Required: true, Options: testConfigurationOptions()}},
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
+		Config: []types.MCPConfig{{
+			Key: "REGION", Name: "Region", Usage: types.Env, Required: true, Options: testConfigurationOptions()}},
 	}
 
 	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), base, true, ValidationOptions{}))
@@ -33,29 +32,29 @@ func TestValidateCatalogEntryManifestConfigurationOptions(t *testing.T) {
 	}{
 		{
 			name:    "static value",
-			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Env[0].Value = "us" },
+			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Config[0].Value = "us" },
 			wantErr: "value and options are mutually exclusive",
 		},
 		{
 			name: "secret binding",
 			mutate: func(m *types.MCPServerCatalogEntryManifest) {
-				m.Env[0].SecretBinding = &types.MCPSecretBinding{Name: "secret", Key: "region"}
+				m.Config[0].SecretBinding = &types.MCPSecretBinding{Name: "secret", Key: "region"}
 			},
 			wantErr: "secretBinding and options are mutually exclusive",
 		},
 		{
 			name:    "blank name",
-			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Env[0].Options[0].Name = " " },
+			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Config[0].Options[0].Name = " " },
 			wantErr: "name cannot be empty",
 		},
 		{
 			name:    "blank value",
-			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Env[0].Options[0].Value = " " },
+			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Config[0].Options[0].Value = " " },
 			wantErr: "value cannot be empty",
 		},
 		{
 			name:    "duplicate value",
-			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Env[0].Options[1].Value = "us" },
+			mutate:  func(m *types.MCPServerCatalogEntryManifest) { m.Config[0].Options[1].Value = "us" },
 			wantErr: "duplicate value",
 		},
 	}
@@ -69,47 +68,160 @@ func TestValidateCatalogEntryManifestConfigurationOptions(t *testing.T) {
 	}
 }
 
-// ValidateServerManifest is a second, independently wired call site for the same
-// checks; a malformed declaration must fail there too.
-func TestValidateServerManifestConfigurationOptions(t *testing.T) {
-	base := types.MCPServerManifest{
-		Runtime:   types.RuntimeNPX,
-		NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
-		Env: []types.MCPEnv{{
-			Key: "REGION", Name: "Region", Required: true, Options: testConfigurationOptions()}},
-	}
-
-	require.NoError(t, ValidateServerManifest(t.Context(), base, false, ValidationOptions{}))
-
-	manifest := *base.DeepCopy()
-	manifest.Env[0].Options[1].Value = "us"
-	require.ErrorContains(t, ValidateServerManifest(t.Context(), manifest, false, ValidationOptions{}), "duplicate value")
-}
-
-// A composite component's configuration fields are validated through the
-// recursive descent, not only the top-level manifest's own fields.
-func TestValidateCatalogEntryManifestCompositeConfigurationOptions(t *testing.T) {
-	manifest := types.MCPServerCatalogEntryManifest{
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{{
-				CatalogEntryID: "component-entry",
-				Manifest: types.MCPServerCatalogEntryManifest{
-					ServerUserType: types.ServerUserTypeSingleUser,
-					Runtime:        types.RuntimeNPX,
-					NPXConfig:      &types.NPXRuntimeConfig{Package: "test-server"},
-					Env: []types.MCPEnv{{
-						Key: "REGION", Name: "Region", Required: true, Options: []types.MCPConfigurationOption{
-							{Name: "United States", Value: "us"},
-							{Name: "Europe", Value: "us"},
-						}}},
+func TestValidateCatalogEntryManifestConfigUsage(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest types.MCPServerCatalogEntryManifest
+		wantErr  string
+	}{
+		{
+			name: "header is allowed for remote runtime",
+			manifest: types.MCPServerCatalogEntryManifest{
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp"},
+				Config:       []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+			},
+		},
+		{
+			name: "header is allowed for npx runtime",
+			manifest: types.MCPServerCatalogEntryManifest{
+				Runtime:   types.RuntimeNPX,
+				NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
+				Config:    []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+			},
+		},
+		{
+			name: "header is allowed for uvx runtime",
+			manifest: types.MCPServerCatalogEntryManifest{
+				Runtime:   types.RuntimeUVX,
+				UVXConfig: &types.UVXRuntimeConfig{Package: "test-server"},
+				Config:    []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+			},
+		},
+		{
+			name: "header is allowed for containerized runtime",
+			manifest: types.MCPServerCatalogEntryManifest{
+				Runtime: types.RuntimeContainerized,
+				ContainerizedConfig: &types.ContainerizedRuntimeConfig{
+					Image: "test-server:latest",
+					Port:  8080,
+					Path:  "/mcp",
 				},
-			}},
+				Config: []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+			},
+		},
+		{
+			name: "sensitive static header is allowed",
+			manifest: types.MCPServerCatalogEntryManifest{
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp"},
+				Config:       []types.MCPConfig{{Key: "Authorization", Usage: types.Header, Value: "Bearer token", Sensitive: true}},
+			},
 		},
 	}
 
-	err := ValidateCatalogEntryManifest(t.Context(), manifest, false, ValidationOptions{})
-	require.ErrorContains(t, err, "duplicate value")
-	require.ErrorContains(t, err, "compositeConfig.componentServers[0].manifest.env[0].options")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCatalogEntryManifest(t.Context(), tt.manifest, false, ValidationOptions{})
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestSystemManifestsAllowSensitiveStaticValues(t *testing.T) {
+	config := []types.MCPConfig{
+		{
+			Key:       "Authorization",
+			Usage:     types.Header,
+			Value:     "Bearer token",
+			Sensitive: true,
+		},
+		{
+			Key:       "API_KEY",
+			Usage:     types.Env,
+			Value:     "token",
+			Sensitive: true,
+		},
+	}
+	require.NoError(t, ValidateSystemMCPServerCatalogEntryManifest(t.Context(), types.SystemMCPServerCatalogEntryManifest{
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
+		Config:    config,
+	}, ValidationOptions{}))
+	require.NoError(t, ValidateSystemMCPServerManifest(t.Context(), types.SystemMCPServerManifest{
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
+		Config:    config,
+	}, ValidationOptions{}))
+}
+
+func TestValidateConfiguredOptions(t *testing.T) {
+	field := types.MCPConfig{Usage: types.Env, Key: "REGION", Required: true, Options: testConfigurationOptions()}
+
+	missing, err := ValidateConfiguredOptions([]types.MCPConfig{field}, map[string]string{"REGION": "eu"})
+	require.NoError(t, err)
+	require.Empty(t, missing)
+
+	missing, err = ValidateConfiguredOptions([]types.MCPConfig{field}, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"REGION"}, missing)
+
+	_, err = ValidateConfiguredOptions([]types.MCPConfig{field}, map[string]string{"REGION": "ap"})
+	require.EqualError(t, err, `env "REGION" value "ap" is not one of the configured options`)
+
+	field.Required = false
+	missing, err = ValidateConfiguredOptions([]types.MCPConfig{field}, nil)
+	require.NoError(t, err)
+	require.Empty(t, missing)
+	require.True(t, ConfigurationOptionValueValid(field.ToHeader(), nil))
+	require.False(t, ConfigurationOptionValueValid(field.ToHeader(), map[string]string{"REGION": "stale"}))
+
+	header := types.MCPConfig{Usage: types.Header, Key: "X-REGION", Required: true, Options: testConfigurationOptions()}
+	missing, err = ValidateConfiguredOptions([]types.MCPConfig{header}, map[string]string{"X-REGION": "us"})
+	require.NoError(t, err)
+	require.Empty(t, missing)
+	_, err = ValidateConfiguredOptions([]types.MCPConfig{header}, map[string]string{"X-REGION": "stale"})
+	require.EqualError(t, err, `header "X-REGION" value "stale" is not one of the configured options`)
+}
+
+func TestValidateCatalogConfigurationConstraints(t *testing.T) {
+	catalog := types.MCPServerCatalogEntryManifest{
+		Runtime: types.RuntimeRemote,
+		Config: []types.MCPConfig{{
+			Key: "REGION", Usage: types.Env, Prefix: "region-", Required: true, Sensitive: true, Options: testConfigurationOptions()}},
+		RemoteConfig: &types.RemoteCatalogConfig{URLTemplate: "https://${REGION}.example.com/mcp"},
+	}
+	server, err := types.MapCatalogEntryToServer(catalog, "", false)
+	require.NoError(t, err)
+	require.NoError(t, ValidateCatalogConfigurationConstraints(server, catalog))
+
+	t.Run("option definition changed", func(t *testing.T) {
+		changed := *server.DeepCopy()
+		changed.Config[0].Options = []types.MCPConfigurationOption{{Name: "Anything", Value: "anything"}}
+		require.ErrorContains(t, ValidateCatalogConfigurationConstraints(changed, catalog), `config "REGION" configuration must match`)
+	})
+
+	t.Run("option semantics changed", func(t *testing.T) {
+		changed := *server.DeepCopy()
+		changed.Config[0].Required = false
+		require.ErrorContains(t, ValidateCatalogConfigurationConstraints(changed, catalog), `config "REGION" configuration must match`)
+	})
+
+	t.Run("option field injected", func(t *testing.T) {
+		changed := *server.DeepCopy()
+		changed.Config = append(changed.Config, types.MCPConfig{Usage: types.Env,
+			Key: "INJECTED", Options: []types.MCPConfigurationOption{{Name: "Injected", Value: "injected"}}})
+		require.ErrorContains(t, ValidateCatalogConfigurationConstraints(changed, catalog), `config "INJECTED" configuration must match`)
+	})
+
+	t.Run("unrelated remote fields are not constrained", func(t *testing.T) {
+		changed := *server.DeepCopy()
+		changed.RemoteConfig.URL = "https://changed.example.com/mcp"
+		changed.RemoteConfig.URLTemplate = "https://changed.example.com/${REGION}"
+		require.NoError(t, ValidateCatalogConfigurationConstraints(changed, catalog))
+	})
 }

@@ -43,7 +43,12 @@ func (h *Handler) CleanupResources(req router.Request, _ router.Response) error 
 		case types.ResourceTypeSelector:
 			newResources = append(newResources, resource)
 		case types.ResourceTypeMCPServer:
-			if err = req.Get(&mcpServer, req.Namespace, resource.ID); err == nil {
+			if system.IsVMCPID(resource.ID) {
+				err = req.Get(&v1.VMCP{}, req.Namespace, resource.ID)
+			} else {
+				err = req.Get(&mcpServer, req.Namespace, resource.ID)
+			}
+			if err == nil {
 				newResources = append(newResources, resource)
 			} else if !apierrors.IsNotFound(err) {
 				return fmt.Errorf("failed to get mcp server %s: %w", resource.ID, err)
@@ -125,17 +130,21 @@ func desiredSystemServer(webhookValidation *v1.MCPWebhookValidation, image strin
 				Port:  8099,
 				Path:  "/mcp",
 			},
-			Env: []types.MCPEnv{
-				{
-					Key: "WEBHOOK_URL", Value: webhookValidation.Spec.Manifest.URL,
-				},
-				{
-					Key: "WEBHOOK_SECRET", Sensitive: true,
-				},
-				{
-					Key: "PORT", Value: "8099",
-				},
+			Config: []types.MCPConfig{{
+				Key:   "WEBHOOK_URL",
+				Value: webhookValidation.Spec.Manifest.URL,
+				Usage: types.Env,
 			},
+				{
+					Key:       "WEBHOOK_SECRET",
+					Sensitive: true,
+					Usage:     types.Env,
+				},
+				{
+					Key:   "PORT",
+					Value: "8099",
+					Usage: types.Env,
+				}},
 		}
 	}
 

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"cmp"
 	"errors"
 	"net/url"
 	"strconv"
@@ -11,12 +12,13 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gtypes "github.com/obot-platform/obot/pkg/gateway/types"
-	"github.com/obot-platform/obot/pkg/utils"
 	"gorm.io/gorm"
 )
 
 // dashboardWindowDefault is the default rolling window applied to GetScanStats.
-const dashboardWindowDefault = 60 * 24 * time.Hour
+const (
+	dashboardWindowDefault = 60 * 24 * time.Hour
+)
 
 // DeviceScansHandler serves the `obot scan` ingest + read API
 type DeviceScansHandler struct{}
@@ -46,7 +48,7 @@ func (*DeviceScansHandler) Submit(req api.Context) error {
 	}
 
 	scan := gtypes.DeviceScanFromManifest(manifest)
-	if deviceID := utils.FirstSet(req.User.GetExtra()["device_id"]...); deviceID != "" {
+	if deviceID := cmp.Or(req.User.GetExtra()["device_id"]...); deviceID != "" {
 		// Device submission: no user submitter, so SubmittedBy stays empty.
 		scan.DeviceID = deviceID
 	} else {

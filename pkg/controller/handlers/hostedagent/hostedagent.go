@@ -8,13 +8,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/agentbackend"
 	"github.com/obot-platform/obot/pkg/hash"
 	"github.com/obot-platform/obot/pkg/hostedagentrefs"
@@ -24,8 +24,6 @@ import (
 	kfields "k8s.io/apimachinery/pkg/fields"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
-
-var log = logger.Package()
 
 const (
 	transitionalPollInterval = 10 * time.Second
@@ -82,6 +80,25 @@ type Handler struct {
 	builder     DesiredBuilder
 	credentials CredentialIssuer
 	now         func() time.Time
+}
+
+// defaultDesiredBuilder renders the sandbox's runtime contract.
+//
+// It holds the server URL because every endpoint it writes into the config is
+// absolute: the sandbox is told where to connect, never how to work it out.
+//
+// Two addresses, because the sandbox and the browser do not reach Obot the same
+// way. Writing one into both roles breaks whichever it is not: the public
+// address is commonly unroutable from inside the cluster, and the internal one
+// is meaningless to a browser.
+type defaultDesiredBuilder struct {
+	// ServerURL is Obot's public address, and so the only one a published
+	// agent can build links from.
+	ServerURL string
+	// InternalURL is Obot's address as a sandbox reaches it -- its models, its
+	// MCP servers, its own API. Empty means the two are the same.
+	InternalURL string
+	Skills      *skillFetcher
 }
 
 func New(backend agentbackend.InstanceBackend, credentials CredentialIssuer, serverURL, internalURL string) *Handler {
@@ -456,25 +473,6 @@ func pollInterval(state types.HostedAgentState) time.Duration {
 	return transitionalPollInterval
 }
 
-// defaultDesiredBuilder renders the sandbox's runtime contract.
-//
-// It holds the server URL because every endpoint it writes into the config is
-// absolute: the sandbox is told where to connect, never how to work it out.
-//
-// Two addresses, because the sandbox and the browser do not reach Obot the same
-// way. Writing one into both roles breaks whichever it is not: the public
-// address is commonly unroutable from inside the cluster, and the internal one
-// is meaningless to a browser.
-type defaultDesiredBuilder struct {
-	// ServerURL is Obot's public address, and so the only one a published
-	// agent can build links from.
-	ServerURL string
-	// InternalURL is Obot's address as a sandbox reaches it -- its models, its
-	// MCP servers, its own API. Empty means the two are the same.
-	InternalURL string
-	Skills      *skillFetcher
-}
-
 // internal is the address the sandbox calls back on, falling back to the public
 // one so a caller that knows of only a single address still builds a usable
 // config.
@@ -524,7 +522,7 @@ func (b defaultDesiredBuilder) Build(ctx context.Context, in BuildInput) (agentb
 		mcpIDs, unresolvedMCP = resolver.MCPServers(ctx, mcpIDs)
 		skillIDs, unresolvedSkills = resolver.Skills(ctx, skillIDs)
 		for _, ref := range append(unresolvedMCP, unresolvedSkills...) {
-			log.Warnf("hosted agent %s: %q names nothing installed here; leaving it out", instance.Name, ref)
+			slog.Warn("Hosted agent reference names nothing installed here; leaving it out", "instance", instance.Name, "ref", ref)
 		}
 	}
 

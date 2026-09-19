@@ -4,16 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api/server/audit/store"
 )
-
-var log = logger.Package()
 
 const (
 	ModeOff  = "off"
@@ -30,10 +28,6 @@ type LogEntry struct {
 	SourceIP     string    `json:"sourceIP"`
 	ResponseCode int       `json:"responseCode"`
 	Host         string    `json:"host"`
-}
-
-func (e LogEntry) bytes() ([]byte, error) {
-	return json.Marshal(e)
 }
 
 type Options struct {
@@ -58,6 +52,12 @@ type persistentLogger struct {
 	buffer      []byte
 	spare       []byte // reusable buffer from previous successful persist
 	maxSize     int    // flush trigger threshold (= AuditLogsMaxFileSize)
+}
+
+type noOpLogger struct{}
+
+func (e LogEntry) bytes() ([]byte, error) {
+	return json.Marshal(e)
 }
 
 func New(ctx context.Context, options Options) (Logger, error) {
@@ -138,12 +138,12 @@ func (l *persistentLogger) runPersistenceLoop(ctx context.Context, flushInterval
 		case <-l.kickPersist:
 			ticker.Stop()
 			if err = l.persist(); err != nil {
-				log.Errorf("Failed to persist audit log: %v", err)
+				slog.Error("Failed to persist audit log", "error", err)
 			}
 			ticker.Reset(flushInterval)
 		case <-ticker.C:
 			if err = l.persist(); err != nil {
-				log.Errorf("Failed to persist audit log: %v", err)
+				slog.Error("Failed to persist audit log", "error", err)
 			}
 		}
 	}
@@ -176,8 +176,6 @@ func (l *persistentLogger) persist() error {
 
 	return nil
 }
-
-type noOpLogger struct{}
 
 func (*noOpLogger) LogEntry(LogEntry) error {
 	return nil

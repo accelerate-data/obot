@@ -62,7 +62,7 @@ func (h *ServerInstancesHandler) ListServerInstances(req api.Context) error {
 	convertedInstances := make([]types.MCPServerInstance, 0, len(instances.Items))
 	for _, instance := range instances.Items {
 		// Hide template and component instances from user list view
-		if instance.Spec.Template || instance.Spec.CompositeName != "" {
+		if instance.Spec.Template || instance.Spec.CompositeName != "" || instance.Spec.VMCPInstanceID != "" {
 			continue
 		}
 
@@ -131,7 +131,6 @@ func (h *ServerInstancesHandler) CreateServerInstance(req api.Context) error {
 		} else if server.Spec.IsPowerUserWorkspaceServer() {
 			hasAccess, err = h.acrHelper.UserHasAccessToMCPServerInWorkspace(req.User, server.Name, server.Spec.PowerUserWorkspaceID, server.Spec.UserID)
 		}
-
 		if err != nil {
 			return err
 		}
@@ -159,7 +158,7 @@ func (h *ServerInstancesHandler) CreateServerInstance(req api.Context) error {
 			MCPCatalogName:            server.Spec.MCPCatalogID,
 			MCPServerCatalogEntryName: entryName,
 			PowerUserWorkspaceID:      server.Spec.PowerUserWorkspaceID,
-			MultiUserConfig:           server.Spec.Manifest.MultiUserConfig,
+			Config:                    server.Spec.Manifest.UserConfig(),
 		},
 	}
 
@@ -179,6 +178,15 @@ func (h *ServerInstancesHandler) CreateServerInstance(req api.Context) error {
 }
 
 func (h *ServerInstancesHandler) DeleteServerInstance(req api.Context) error {
+	var mcpServerInstance v1.MCPServerInstance
+	if err := kclient.IgnoreNotFound(req.Get(&mcpServerInstance, req.PathValue("mcp_server_instance_id"))); err != nil {
+		return fmt.Errorf("failed to get MCP server instance: %v", err)
+	}
+
+	if mcpServerInstance.Spec.CompositeName != "" {
+		return types.NewErrBadRequest("cannot delete MCP server instance with associated to composite %q; delete the composite instead", mcpServerInstance.Spec.CompositeName)
+	}
+
 	return req.Delete(&v1.MCPServerInstance{
 		Name:      req.PathValue("mcp_server_instance_id"),
 		Namespace: req.Namespace(),
@@ -253,10 +261,22 @@ func (h *ServerInstancesHandler) ConfigureServerInstance(req api.Context) error 
 	if err := req.Get(&mcpServerInstance, req.PathValue("mcp_server_instance_id")); err != nil {
 		return err
 	}
+	if mcpServerInstance.Spec.VMCPInstanceID != "" {
+		return types.NewErrBadRequest("configure this component through its vMCP instance")
+	}
 
 	var envVars map[string]string
 	if err := req.Read(&envVars); err != nil {
 		return err
+	}
+	if mcpServerInstance.Spec.Config != nil {
+		missing, err := mcp.ValidateConfiguredOptions(mcpServerInstance.Spec.Config, envVars)
+		if err != nil {
+			return types.NewErrBadRequest("invalid configuration: %v", err)
+		}
+		if len(missing) > 0 {
+			return types.NewErrBadRequest("invalid configuration: %q requires a selection", missing[0])
+		}
 	}
 
 	for key, val := range envVars {
@@ -286,6 +306,9 @@ func (h *ServerInstancesHandler) DeconfigureServerInstance(req api.Context) erro
 	var mcpServerInstance v1.MCPServerInstance
 	if err := req.Get(&mcpServerInstance, req.PathValue("mcp_server_instance_id")); err != nil {
 		return err
+	}
+	if mcpServerInstance.Spec.VMCPInstanceID != "" {
+		return types.NewErrBadRequest("configure this component through its vMCP instance")
 	}
 
 	if _, err := req.GatewayClient.DeleteCredential(
@@ -317,7 +340,7 @@ func (h *ServerInstancesHandler) RevealConfig(req api.Context) error {
 }
 
 func ConvertMCPServerInstance(instance v1.MCPServerInstance, credEnv map[string]string, serverURL, slug string) types.MCPServerInstance {
-	_, _, missingHeaders := mcpServerInstanceHeaders(instance, credEnv)
+	missingHeaders := mcpServerInstanceMissingHeaders(instance, credEnv)
 
 	return types.MCPServerInstance{
 		Metadata:                MetadataFrom(&instance),
@@ -329,7 +352,7 @@ func ConvertMCPServerInstance(instance v1.MCPServerInstance, credEnv map[string]
 		MCPServerCatalogEntryID: instance.Spec.MCPServerCatalogEntryName,
 		PowerUserWorkspaceID:    instance.Spec.PowerUserWorkspaceID,
 		ConnectURL:              fmt.Sprintf("%s/mcp-connect/%s", serverURL, slug),
-		MultiUserConfig:         instance.Spec.MultiUserConfig,
+		Config:                  instance.Spec.Config,
 	}
 }
 
@@ -349,31 +372,21 @@ func MCPServerInstanceCredentialContext(instance v1.MCPServerInstance) string {
 	return fmt.Sprintf("%s-%s", instance.Spec.UserID, instance.Name)
 }
 
-func mcpServerInstanceHeaders(instance v1.MCPServerInstance, credEnv map[string]string) ([]string, []string, []string) {
-	if instance.Spec.MultiUserConfig == nil {
-		return nil, nil, nil
+func mcpServerInstanceMissingHeaders(instance v1.MCPServerInstance, credEnv map[string]string) []string {
+	if instance.Spec.Config == nil {
+		return nil
 	}
 
-	var headerNames, headerValues, missingHeaders []string
+	var missingHeaders []string
 
-	for _, header := range instance.Spec.MultiUserConfig.UserDefinedHeaders {
+	for _, header := range instance.Spec.Config {
 		val := credEnv[header.Key]
-		if val != "" {
-			headerNames = append(headerNames, header.Key)
-			headerValues = append(headerValues, applyMCPServerInstanceHeaderPrefix(val, header.Prefix))
-		} else if header.Required {
+		if (val == "" || !mcp.ConfigurationOptionValueValid(header.ToHeader(), credEnv)) && (header.Required || val != "") {
 			missingHeaders = append(missingHeaders, header.Key)
 		}
 	}
 
-	return headerNames, headerValues, missingHeaders
-}
-
-func applyMCPServerInstanceHeaderPrefix(value, prefix string) string {
-	if value == "" || strings.HasPrefix(value, prefix) {
-		return value
-	}
-	return prefix + value
+	return missingHeaders
 }
 
 func (h *ServerInstancesHandler) ListServerInstancesForServer(req api.Context) error {
@@ -405,7 +418,7 @@ func (h *ServerInstancesHandler) ListServerInstancesForServer(req api.Context) e
 	convertedInstances := make([]types.MCPServerInstance, 0, len(instances.Items))
 	for _, instance := range instances.Items {
 		// Hide component instances
-		if instance.Spec.CompositeName != "" {
+		if instance.Spec.CompositeName != "" || instance.Spec.VMCPInstanceID != "" {
 			continue
 		}
 		slug, err := SlugForMCPServerInstance(req.Context(), req.Storage, instance)
@@ -425,6 +438,9 @@ func (h *ServerInstancesHandler) ListServerInstancesForServer(req api.Context) e
 }
 
 func SlugForMCPServerInstance(ctx context.Context, client kclient.Client, instance v1.MCPServerInstance) (string, error) {
+	if instance.Spec.VMCPInstanceID != "" {
+		return instance.Name, nil
+	}
 	var instancesWithServerName v1.MCPServerInstanceList
 	if err := client.List(ctx, &instancesWithServerName, &kclient.ListOptions{
 		FieldSelector: fields.SelectorFromSet(map[string]string{

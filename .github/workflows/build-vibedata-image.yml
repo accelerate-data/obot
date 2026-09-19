@@ -153,11 +153,11 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Create and push manifest list
+      - name: Create staging manifest
         id: manifest
         env:
           IMAGE: ${{ needs.resolve.outputs.image }}
-          VERSIONED_TAG: ${{ needs.resolve.outputs.versioned_tag }}
+          STAGING_TAG: build-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           SRCS=()
@@ -165,25 +165,46 @@ jobs:
             SRCS+=("${IMAGE}@$(cat "$f")")
           done
           docker buildx imagetools create \
-            -t "${IMAGE}:${VERSIONED_TAG}" \
-            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${STAGING_TAG}" \
             "${SRCS[@]}"
-          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:latest" \
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${STAGING_TAG}" \
             --format '{{println .Manifest.Digest}}' | head -1 | tr -d '[:space:]')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify both arches present
+      - name: Verify staging manifest architectures
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          STAGING_TAG: build-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          INSPECT="$(docker buildx imagetools inspect "${IMAGE}:${STAGING_TAG}")"
+          echo "$INSPECT"
+          echo "$INSPECT" | grep -q 'linux/amd64' || { echo "::error::staging manifest missing linux/amd64"; exit 1; }
+          echo "$INSPECT" | grep -q 'linux/arm64' || { echo "::error::staging manifest missing linux/arm64"; exit 1; }
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.8.1
+        with:
+          cosign-release: "v2.4.3"
+
+      - name: Sign immutable digest
+        env:
+          IMAGE: ${{ needs.resolve.outputs.image }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Promote consumer tags
         env:
           IMAGE: ${{ needs.resolve.outputs.image }}
           VERSIONED_TAG: ${{ needs.resolve.outputs.versioned_tag }}
+          DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
           set -euo pipefail
-          for tag in "$VERSIONED_TAG" latest; do
-            INSPECT="$(docker buildx imagetools inspect "${IMAGE}:${tag}")"
-            echo "$INSPECT"
-            echo "$INSPECT" | grep -q 'linux/amd64' || { echo "::error::${tag} missing linux/amd64"; exit 1; }
-            echo "$INSPECT" | grep -q 'linux/arm64' || { echo "::error::${tag} missing linux/arm64"; exit 1; }
-          done
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSIONED_TAG}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}@${DIGEST}"
 
       - name: Write summary
         env:
@@ -211,17 +232,3 @@ jobs:
             echo "| Tags | \`${IMAGE}:${VERSIONED_TAG}\`, \`${IMAGE}:latest\` |"
             echo "| Run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.8.1
-        with:
-          cosign-release: "v2.4.3"
-
-      - name: Sign images
-        env:
-          IMAGE: ${{ needs.resolve.outputs.image }}
-          VERSIONED_TAG: ${{ needs.resolve.outputs.versioned_tag }}
-          DIGEST: ${{ steps.manifest.outputs.digest }}
-        run: |
-          cosign sign --yes "${IMAGE}:${VERSIONED_TAG}@${DIGEST}"
-          cosign sign --yes "${IMAGE}:latest@${DIGEST}"

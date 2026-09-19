@@ -1,8 +1,12 @@
 package auditlog
 
 import (
+	"fmt"
+	"strings"
+
 	api "github.com/obot-platform/obot/apiclient/types"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/principal"
 )
 
 // PresentOptions controls which authorized portions of an audit event are exposed by Present.
@@ -64,7 +68,9 @@ func presentMCP(event *api.AuditLogEvent, log gatewaytypes.MCPAuditLog, opts Pre
 	}
 
 	event.EventType = api.AuditLogEventTypeMCPCall
-	event.Actor = mcpActor(log.UserID, mcp.APIKey)
+	// MCPFields.APIKey is a legacy field that may contain the bearer token. Only expose the
+	// event-time, non-secret display snapshot through the normalized audit-log API.
+	event.Actor = mcpActor(log.UserID, apiKeyDisplayName(log.UserID, log.APIKeyID, log.APIKeyName), log.APIKeyRevoked)
 	event.Action = api.AuditLogAction{
 		Operation: mcp.CallType,
 		Name:      mcp.CallIdentifier,
@@ -127,18 +133,32 @@ func presentMCP(event *api.AuditLogEvent, log gatewaytypes.MCPAuditLog, opts Pre
 	}
 }
 
-func mcpActor(userID, credentialID string) api.AuditLogActor {
+func apiKeyDisplayName(userID string, apiKeyID *uint, name string) string {
+	if name == "" || userID == "" || apiKeyID == nil || strings.HasPrefix(userID, "hosted-agent:") {
+		return name
+	}
+
+	maskedKey := principal.MaskedAPIKeyName(userID, *apiKeyID)
+	if name == maskedKey {
+		return name
+	}
+	return fmt.Sprintf("%s (%s)", name, maskedKey)
+}
+
+func mcpActor(userID, credentialID string, apiKeyRevoked bool) api.AuditLogActor {
 	if userID != "" {
 		return api.AuditLogActor{
-			ActorType:    api.AuditLogActorTypeUser,
-			ID:           userID,
-			CredentialID: credentialID,
+			ActorType:     api.AuditLogActorTypeUser,
+			ID:            userID,
+			CredentialID:  credentialID,
+			APIKeyRevoked: apiKeyRevoked,
 		}
 	}
 	if credentialID != "" {
 		return api.AuditLogActor{
-			ActorType: api.AuditLogActorTypeCredential,
-			ID:        credentialID,
+			ActorType:     api.AuditLogActorTypeCredential,
+			ID:            credentialID,
+			APIKeyRevoked: apiKeyRevoked,
 		}
 	}
 	return api.AuditLogActor{ActorType: api.AuditLogActorTypeUnknown}
@@ -187,8 +207,10 @@ func presentLocalAgent(event *api.AuditLogEvent, log gatewaytypes.MCPAuditLog, o
 	event.Timestamp.Source = api.AuditLogTimestampSourceClientReported
 	event.Timestamp.OccurredAt = *api.NewTime(local.OccurredAt)
 	event.Actor = api.AuditLogActor{
-		ActorType: local.ActorType,
-		ID:        local.ActorID,
+		ActorType:     local.ActorType,
+		ID:            local.ActorID,
+		CredentialID:  apiKeyDisplayName(log.UserID, log.APIKeyID, log.APIKeyName),
+		APIKeyRevoked: log.APIKeyRevoked,
 	}
 	event.Action = api.AuditLogAction{
 		Operation: "tools/call",

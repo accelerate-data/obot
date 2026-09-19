@@ -20,12 +20,161 @@ import (
 	"k8s.io/apiserver/pkg/storage/value"
 )
 
+const (
+	// effectiveAuditLogTimeSQL selects the timestamp used to order and time-filter a row. For MCP
+	// rows this is the server-assigned created_at, but for local-agent rows it is occurred_at, which
+	// is client-reported. This is intentional so an event sorts by when it actually happened on the
+	// client, but it means a skewed or hostile client can position its local-agent events anywhere in
+	// the merged timeline relative to server-timestamped MCP rows. The server-controlled created_at is
+	// preserved separately (and surfaced as RecordedAt) so this ordering is never mistaken for a
+	// tamper-resistant record of when Obot received the event.
+	effectiveAuditLogTimeSQL = "CASE WHEN source_type = 'local_agent_tool_call' THEN occurred_at ELSE created_at END"
+)
+
 var (
 	mcpAuditLogGroupResource = schema.GroupResource{
 		Group:    "obot.obot.ai",
 		Resource: "mcpauditlogs",
 	}
+
+	mcpAuditLogSortColumns = map[string]string{
+		"created_at":                    "created_at",
+		"mcp_id":                        "mcp_id",
+		"mcp_server_display_name":       "mcp_server_display_name",
+		"mcp_server_catalog_entry_name": "mcp_server_catalog_entry_name",
+		"call_type":                     "call_type",
+		"call_identifier":               "call_identifier",
+		"processing_time_ms":            "processing_time_ms",
+		"client_name":                   "client_name",
+		"client_version":                "client_version",
+		"response_status":               "response_status",
+		"client_ip":                     "client_ip",
+	}
+	localAgentAuditLogSortColumns = map[string]string{
+		"created_at":     "created_at",
+		"occurred_at":    "occurred_at",
+		"agent_provider": "agent_provider",
+		"status":         "outcome_status",
+		"tool_name":      "action_name",
+		"tool_kind":      "action_kind",
+		"duration_ms":    "duration_ms",
+		"client_ip":      "client_ip",
+	}
+
+	// mcpAuditLogSensitiveColumns are the large/sensitive columns dropped when payloads are not
+	// requested: request/response bodies, the raw local-agent event, and the encrypted local-agent
+	// metadata that blankLocalAgentSensitiveFields clears. Columns for both source types are listed
+	// because a single query can span both.
+	mcpAuditLogSensitiveColumns = []string{
+		// MCP fields
+		"request_body", "mutated_request_body", "response_body", "original_response_body",
+		// Local-agent fields
+		"local_agent_error", "hostname", "local_username", "reported_user_email", "cwd",
+		"git_root", "git_remotes", "git_branch", "transcript_path",
+		"local_agent_request_body", "local_agent_response_body", "local_agent_raw_event",
+	}
+
+	// mcpAuditLogHeaderColumns hold MCP request/response headers. The list view drops them, but the
+	// single-log detail view keeps them (their sensitive values are redacted at write time).
+	mcpAuditLogHeaderColumns = []string{"request_headers", "response_headers"}
+
+	// auditLogUnifiedFilterOptionExpr maps a source-agnostic UI filter key to the SQL expression that
+	// yields its per-row value, so distinct options can be gathered across both sources in one query.
+	auditLogUnifiedFilterOptionExpr = map[string]string{
+		"actor":      "CASE WHEN COALESCE(device_id, '') <> '' THEN device_id ELSE user_id END",
+		"operation":  "CASE WHEN source_type = 'local_agent_tool_call' THEN 'tools/call' ELSE call_type END",
+		"mcp_server": "CASE WHEN source_type = 'local_agent_tool_call' THEN target_parent_name ELSE mcp_server_display_name END",
+		"tool":       "CASE WHEN source_type = 'local_agent_tool_call' THEN action_name ELSE call_identifier END",
+		"client":     "CASE WHEN source_type = 'local_agent_tool_call' THEN agent_provider ELSE client_name END",
+	}
+
+	localAgentFilterOptionColumns = map[string]string{
+		"agent_provider": "agent_provider", "status": "outcome_status", "tool_name": "action_name",
+		"tool_kind": "action_kind", "device_id": "device_id",
+	}
 )
+
+// MCPAuditLogOptions configures audit-row queries across MCP and local-agent catalogs. Common
+// filters apply to every selected source. MCP-only and local-agent-only filters are mutually
+// exclusive; ValidateAuditLogOptions enforces those rules before a query runs.
+type MCPAuditLogOptions struct {
+	// WithRequestAndResponse requests decrypted payload and sensitive environment fields. It must
+	// only be set after the caller has passed the corresponding authorization check.
+	WithRequestAndResponse bool
+	// SourceTypes selects the persisted source kinds. Empty preserves the MCP-only default.
+	SourceTypes []types2.AuditLogSourceType
+	// PowerUserWorkspaceID and OwnServerMCPIDs define the authorized MCP-server scope. When both
+	// are present, a row may match either scope.
+	PowerUserWorkspaceID []string
+	OwnServerMCPIDs      []string
+	// APIKeyID, UserID, SessionID, and ClientIP are common filters shared by both sources.
+	APIKeyID  []uint
+	UserID    []string
+	SessionID []string
+	ClientIP  []string
+	// ProcessingTimeMin and ProcessingTimeMax filter the normalized duration field, using MCP
+	// processing time or local-agent duration as appropriate.
+	ProcessingTimeMin int64
+	ProcessingTimeMax int64
+
+	// MCP-only filters.
+	MCPID                     []string
+	MCPServerDisplayName      []string
+	MCPServerCatalogEntryName []string
+	CallType                  []string
+	CallIdentifier            []string
+	ClientName                []string
+	ClientVersion             []string
+	ResponseStatus            []string
+
+	// Local-agent tool-call filters.
+	AgentProvider []string
+	Status        []string
+	ToolName      []string
+	ToolKind      []string
+	DeviceID      []string
+
+	// Unified, source-agnostic filters used by the audit log UI.
+	//
+	//   Actor     matches user_id OR device_id (users and enrolled devices).
+	//   Operation matches MCP call_type; local-agent rows have the implicit operation tools/call.
+	//   MCPServer matches MCP mcp_id/mcp_server_display_name, or a local-agent row's MCP parent.
+	//   Tool      matches MCP call_identifier or a local-agent action_name.
+	//   Outcome   matches the normalized outcome (success/failure/denied/timeout/unknown); MCP rows
+	//             are classified from response_status/error the same way ClassifyMCPOutcome does.
+	//   Client    matches MCP client_name or local-agent agent_provider.
+	Actor     []string
+	Operation []string
+	MCPServer []string
+	Tool      []string
+	Outcome   []string
+	Client    []string
+
+	// Query searches the non-sensitive text columns of every selected source and matching user
+	// display names.
+	Query     string
+	StartTime time.Time
+	EndTime   time.Time
+	Limit     int
+	Offset    int
+	// SortBy accepts timestamp, event_type, outcome, and duration for mixed queries. A single-source
+	// query may additionally use that source's allowlisted storage columns.
+	SortBy string
+	// SortOrder accepts asc or desc. Empty defaults to descending.
+	SortOrder string
+}
+
+// MCPUsageStatsOptions represents options for querying MCP usage statistics
+type MCPUsageStatsOptions struct {
+	MCPID                      string
+	PowerUserWorkspaceID       []string // Workspace filtering support (same as audit logs)
+	OwnServerMCPIDs            []string // MCPIDs for user's own servers (union with PowerUserWorkspaceID)
+	UserIDs                    []string
+	MCPServerDisplayNames      []string
+	MCPServerCatalogEntryNames []string
+	StartTime                  time.Time
+	EndTime                    time.Time
+}
 
 func (c *Client) insertMCPAuditLogs(ctx context.Context, logs []types.MCPAuditLog) error {
 	if len(logs) == 0 {
@@ -69,9 +218,24 @@ func (c *Client) insertMCPAuditLogs(ctx context.Context, logs []types.MCPAuditLo
 		// Process response-only logs
 		for _, responseLog := range responseOnlyLogs {
 			responseMCP := responseLog.MCP()
-			// Find matching request log by RequestID and SessionID
+			// Find and lock the pending request from the same proxied HTTP exchange.
+			// Legacy cross-request responses do not have an exchange ID, so they
+			// continue to use protocol session metadata as a fallback.
+			query := tx.Where("request_id = ? AND mcp_id = ? AND user_id = ? AND response_received = ? AND source_type = ?",
+				responseMCP.RequestID, responseMCP.MCPID, responseLog.UserID, false, types2.AuditLogSourceTypeMCP)
+			if responseMCP.ProxyExchangeID != "" {
+				query = query.Where("proxy_exchange_id = ?", responseMCP.ProxyExchangeID)
+			} else if responseMCP.SessionID == "" {
+				query = query.Where("COALESCE(session_id, '') = ''")
+			} else {
+				query = query.Where("session_id = ? OR (COALESCE(session_id, '') = '' AND call_type = ?)",
+					responseMCP.SessionID, "initialize")
+			}
 			var existingLog types.MCPAuditLog
-			err := tx.Where("request_id = ? AND session_id = ? AND response_received = ? AND source_type = ?", responseMCP.RequestID, responseMCP.SessionID, false, types2.AuditLogSourceTypeMCP).
+			err := query.
+				Clauses(clause.Locking{Strength: "UPDATE"}).
+				Order(clause.Expr{SQL: "CASE WHEN session_id = ? THEN 0 ELSE 1 END", Vars: []any{responseMCP.SessionID}}).
+				Order("created_at DESC").
 				First(&existingLog).Error
 
 			if err == nil {
@@ -116,6 +280,9 @@ func (c *Client) insertMCPAuditLogs(ctx context.Context, logs []types.MCPAuditLo
 				}
 				if existingMCP.ClientVersion == "" {
 					updates["client_version"] = responseMCP.ClientVersion
+				}
+				if existingMCP.SessionID == "" && responseMCP.SessionID != "" {
+					updates["session_id"] = responseMCP.SessionID
 				}
 
 				// Calculate processing time as difference between response and request timestamps
@@ -171,43 +338,6 @@ func (c *Client) InsertLocalAgentAuditLogs(ctx context.Context, logs []types.MCP
 		CreateInBatches(toInsert, 100).Error
 }
 
-const (
-	// effectiveAuditLogTimeSQL selects the timestamp used to order and time-filter a row. For MCP
-	// rows this is the server-assigned created_at, but for local-agent rows it is occurred_at, which
-	// is client-reported. This is intentional so an event sorts by when it actually happened on the
-	// client, but it means a skewed or hostile client can position its local-agent events anywhere in
-	// the merged timeline relative to server-timestamped MCP rows. The server-controlled created_at is
-	// preserved separately (and surfaced as RecordedAt) so this ordering is never mistaken for a
-	// tamper-resistant record of when Obot received the event.
-	effectiveAuditLogTimeSQL = "CASE WHEN source_type = 'local_agent_tool_call' THEN occurred_at ELSE created_at END"
-)
-
-var (
-	mcpAuditLogSortColumns = map[string]string{
-		"created_at":                    "created_at",
-		"mcp_id":                        "mcp_id",
-		"mcp_server_display_name":       "mcp_server_display_name",
-		"mcp_server_catalog_entry_name": "mcp_server_catalog_entry_name",
-		"call_type":                     "call_type",
-		"call_identifier":               "call_identifier",
-		"processing_time_ms":            "processing_time_ms",
-		"client_name":                   "client_name",
-		"client_version":                "client_version",
-		"response_status":               "response_status",
-		"client_ip":                     "client_ip",
-	}
-	localAgentAuditLogSortColumns = map[string]string{
-		"created_at":     "created_at",
-		"occurred_at":    "occurred_at",
-		"agent_provider": "agent_provider",
-		"status":         "outcome_status",
-		"tool_name":      "action_name",
-		"tool_kind":      "action_kind",
-		"duration_ms":    "duration_ms",
-		"client_ip":      "client_ip",
-	}
-)
-
 // GetMCPAuditLogs retrieves a single, globally ordered page of audit rows from the selected
 // sources. An empty SourceTypes selection preserves the MCP-only default. Mixed-source queries use
 // each source's effective event time before applying one count, order, limit, and offset window.
@@ -218,39 +348,9 @@ func (c *Client) GetMCPAuditLogs(ctx context.Context, opts MCPAuditLogOptions) (
 		return nil, 0, err
 	}
 
-	db := c.db.WithContext(ctx).Model(&types.MCPAuditLog{}).Where("source_type IN ?", sources)
-	if opts.Query != "" {
-		var err error
-		db, err = c.applyAuditLogSearch(ctx, db, opts.Query)
-		if err != nil {
-			return nil, 0, err
-		}
-	}
-
-	if len(opts.UserID) > 0 {
-		db = db.Where("user_id IN ?", opts.UserID)
-	}
-	if len(opts.SessionID) > 0 {
-		db = db.Where("session_id IN ?", opts.SessionID)
-	}
-	if len(opts.ClientIP) > 0 {
-		db = db.Where("client_ip IN ?", opts.ClientIP)
-	}
-
-	eventTime := auditLogEventTimeExpression(sources)
-	if !opts.StartTime.IsZero() {
-		db = db.Where(eventTime+" >= ?", opts.StartTime.UTC())
-	}
-	if !opts.EndTime.IsZero() {
-		db = db.Where(eventTime+" < ?", opts.EndTime.UTC())
-	}
-	if opts.ProcessingTimeMin > 0 {
-		db = db.Where("CASE WHEN source_type = ? THEN duration_ms ELSE processing_time_ms END >= ?",
-			types2.AuditLogSourceTypeLocalAgentToolCall, opts.ProcessingTimeMin)
-	}
-	if opts.ProcessingTimeMax > 0 {
-		db = db.Where("CASE WHEN source_type = ? THEN duration_ms ELSE processing_time_ms END <= ?",
-			types2.AuditLogSourceTypeLocalAgentToolCall, opts.ProcessingTimeMax)
+	db, eventTime, err := c.auditLogBaseQuery(ctx, opts, sources)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	if hasMCPAuditLogFilters(opts) {
@@ -272,7 +372,7 @@ func (c *Client) GetMCPAuditLogs(ctx context.Context, opts MCPAuditLogOptions) (
 		return nil, 0, err
 	}
 
-	sortExpression, err := auditLogSortExpression(opts, sources)
+	sortExpression, err := auditLogSortExpression(opts, sources, eventTime)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -296,12 +396,47 @@ func (c *Client) GetMCPAuditLogs(ctx context.Context, opts MCPAuditLogOptions) (
 	if err := db.Find(&logs).Error; err != nil {
 		return nil, 0, err
 	}
+	if err := c.enrichMCPAuditLogAPIKeyRevocation(ctx, logs); err != nil {
+		return nil, 0, err
+	}
 	for i := range logs {
 		if err := c.prepareAuditLogPayload(ctx, &logs[i], opts.WithRequestAndResponse); err != nil {
 			return nil, 0, err
 		}
 	}
 	return logs, total, nil
+}
+
+// auditLogBaseQuery applies the source, search, shared-column, time, and duration filters common
+// to audit-log list and filter-option queries. It also returns the effective event-time expression
+// used by the time filters so list queries can reuse it for ordering. Callers add source-specific
+// and unified filters.
+func (c *Client) auditLogBaseQuery(ctx context.Context, opts MCPAuditLogOptions, sources []types2.AuditLogSourceType) (*gorm.DB, string, error) {
+	db := c.db.WithContext(ctx).Model(&types.MCPAuditLog{}).Where("source_type IN ?", sources)
+	db = applySharedAuditLogFilters(db, opts)
+	if opts.Query != "" {
+		var err error
+		if db, err = c.applyAuditLogSearch(ctx, db, opts.Query); err != nil {
+			return nil, "", err
+		}
+	}
+
+	eventTime := auditLogEventTimeExpression(sources)
+	if !opts.StartTime.IsZero() {
+		db = db.Where(eventTime+" >= ?", opts.StartTime.UTC())
+	}
+	if !opts.EndTime.IsZero() {
+		db = db.Where(eventTime+" < ?", opts.EndTime.UTC())
+	}
+	if opts.ProcessingTimeMin > 0 {
+		db = db.Where("CASE WHEN source_type = ? THEN duration_ms ELSE processing_time_ms END >= ?",
+			types2.AuditLogSourceTypeLocalAgentToolCall, opts.ProcessingTimeMin)
+	}
+	if opts.ProcessingTimeMax > 0 {
+		db = db.Where("CASE WHEN source_type = ? THEN duration_ms ELSE processing_time_ms END <= ?",
+			types2.AuditLogSourceTypeLocalAgentToolCall, opts.ProcessingTimeMax)
+	}
+	return db, eventTime, nil
 }
 
 // ValidateAuditLogOptions verifies source selection, source-specific filter compatibility, and sort
@@ -336,7 +471,8 @@ func ValidateAuditLogOptions(opts MCPAuditLogOptions, sources []types2.AuditLogS
 	if opts.SortOrder != "" && opts.SortOrder != "asc" && opts.SortOrder != "desc" {
 		return fmt.Errorf("invalid audit log sort direction %q", opts.SortOrder)
 	}
-	_, err := auditLogSortExpression(opts, sources)
+	eventTime := auditLogEventTimeExpression(sources)
+	_, err := auditLogSortExpression(opts, sources, eventTime)
 	return err
 }
 
@@ -348,6 +484,22 @@ func hasMCPAuditLogFilters(opts MCPAuditLogOptions) bool {
 
 func hasLocalAgentAuditLogFilters(opts MCPAuditLogOptions) bool {
 	return len(opts.AgentProvider) > 0 || len(opts.Status) > 0 || len(opts.ToolName) > 0 || len(opts.ToolKind) > 0 || len(opts.DeviceID) > 0
+}
+
+func applySharedAuditLogFilters(db *gorm.DB, opts MCPAuditLogOptions) *gorm.DB {
+	if len(opts.APIKeyID) > 0 {
+		db = db.Where("api_key_id IN ?", opts.APIKeyID)
+	}
+	if len(opts.UserID) > 0 {
+		db = db.Where("user_id IN ?", opts.UserID)
+	}
+	if len(opts.SessionID) > 0 {
+		db = db.Where("session_id IN ?", opts.SessionID)
+	}
+	if len(opts.ClientIP) > 0 {
+		db = db.Where("client_ip IN ?", opts.ClientIP)
+	}
+	return db
 }
 
 func applyMCPAuditLogFilters(db *gorm.DB, opts MCPAuditLogOptions) *gorm.DB {
@@ -517,10 +669,10 @@ func (c *Client) applyAuditLogSearch(ctx context.Context, db *gorm.DB, queryValu
 	return db.Where("("+strings.Join(parts, " OR ")+")", args...), nil
 }
 
-func auditLogSortExpression(opts MCPAuditLogOptions, sources []types2.AuditLogSourceType) (string, error) {
+func auditLogSortExpression(opts MCPAuditLogOptions, sources []types2.AuditLogSourceType, eventTime string) (string, error) {
 	sortBy := opts.SortBy
 	if sortBy == "" || sortBy == "timestamp" {
-		return auditLogEventTimeExpression(sources), nil
+		return eventTime, nil
 	}
 	switch sortBy {
 	case "event_type":
@@ -594,23 +746,6 @@ func blankLocalAgentSensitiveFields(local *types.LocalAgentToolCallAuditLogField
 	local.RawEvent = nil
 }
 
-// mcpAuditLogSensitiveColumns are the large/sensitive columns dropped when payloads are not
-// requested: request/response bodies, the raw local-agent event, and the encrypted local-agent
-// metadata that blankLocalAgentSensitiveFields clears. Columns for both source types are listed
-// because a single query can span both.
-var mcpAuditLogSensitiveColumns = []string{
-	// MCP fields
-	"request_body", "mutated_request_body", "response_body", "original_response_body",
-	// Local-agent fields
-	"local_agent_error", "hostname", "local_username", "reported_user_email", "cwd",
-	"git_root", "git_remotes", "git_branch", "transcript_path",
-	"local_agent_request_body", "local_agent_response_body", "local_agent_raw_event",
-}
-
-// mcpAuditLogHeaderColumns hold MCP request/response headers. The list view drops them, but the
-// single-log detail view keeps them (their sensitive values are redacted at write time).
-var mcpAuditLogHeaderColumns = []string{"request_headers", "response_headers"}
-
 // omitMCPAuditLogSensitiveFields excludes the large/sensitive payload columns from the SELECT so
 // they are never read from or transferred by the DB when payloads are not requested. It mirrors the
 // fields that prepareAuditLogPayload and blankLocalAgentSensitiveFields blank; that blanking is
@@ -638,6 +773,11 @@ func (c *Client) GetMCPAuditLog(ctx context.Context, id uint, withRequestAndResp
 	if err := db.Where("id = ?", id).First(&log).Error; err != nil {
 		return nil, err
 	}
+	logs := []types.MCPAuditLog{log}
+	if err := c.enrichMCPAuditLogAPIKeyRevocation(ctx, logs); err != nil {
+		return nil, err
+	}
+	log = logs[0]
 	if log.SourceType == types2.AuditLogSourceTypeLocalAgentToolCall {
 		log.MCPFields = nil
 	} else {
@@ -666,16 +806,6 @@ func (c *Client) GetMCPAuditLog(ctx context.Context, id uint, withRequestAndResp
 	return &log, nil
 }
 
-// auditLogUnifiedFilterOptionExpr maps a source-agnostic UI filter key to the SQL expression that
-// yields its per-row value, so distinct options can be gathered across both sources in one query.
-var auditLogUnifiedFilterOptionExpr = map[string]string{
-	"actor":      "CASE WHEN COALESCE(device_id, '') <> '' THEN device_id ELSE user_id END",
-	"operation":  "CASE WHEN source_type = 'local_agent_tool_call' THEN 'tools/call' ELSE call_type END",
-	"mcp_server": "CASE WHEN source_type = 'local_agent_tool_call' THEN target_parent_name ELSE mcp_server_display_name END",
-	"tool":       "CASE WHEN source_type = 'local_agent_tool_call' THEN action_name ELSE call_identifier END",
-	"client":     "CASE WHEN source_type = 'local_agent_tool_call' THEN agent_provider ELSE client_name END",
-}
-
 // isUnifiedFilterOption reports whether option is one of the reworked UI's source-agnostic filters.
 func isUnifiedFilterOption(option string) bool {
 	_, ok := auditLogUnifiedFilterOptionExpr[option]
@@ -689,28 +819,9 @@ func (c *Client) getUnifiedAuditLogFilterOptions(ctx context.Context, option str
 	expr := auditLogUnifiedFilterOptionExpr[option]
 	sources := auditlog.NormalizeSourceTypes(opts.SourceTypes)
 
-	db := c.db.WithContext(ctx).Model(&types.MCPAuditLog{}).Where("source_type IN ?", sources)
-	if opts.Query != "" {
-		var err error
-		if db, err = c.applyAuditLogSearch(ctx, db, opts.Query); err != nil {
-			return nil, err
-		}
-	}
-
-	eventTime := auditLogEventTimeExpression(sources)
-	if !opts.StartTime.IsZero() {
-		db = db.Where(eventTime+" >= ?", opts.StartTime.UTC())
-	}
-	if !opts.EndTime.IsZero() {
-		db = db.Where(eventTime+" < ?", opts.EndTime.UTC())
-	}
-	if opts.ProcessingTimeMin > 0 {
-		db = db.Where("CASE WHEN source_type = ? THEN duration_ms ELSE processing_time_ms END >= ?",
-			types2.AuditLogSourceTypeLocalAgentToolCall, opts.ProcessingTimeMin)
-	}
-	if opts.ProcessingTimeMax > 0 {
-		db = db.Where("CASE WHEN source_type = ? THEN duration_ms ELSE processing_time_ms END <= ?",
-			types2.AuditLogSourceTypeLocalAgentToolCall, opts.ProcessingTimeMax)
+	db, _, err := c.auditLogBaseQuery(ctx, opts, sources)
+	if err != nil {
+		return nil, err
 	}
 
 	// Authorized scope (role-based own-server / workspace, and embedded-view server props). Reusing
@@ -761,9 +872,7 @@ func (c *Client) GetAuditLogFilterOptions(ctx context.Context, option string, op
 	db := c.db.WithContext(ctx).Model(&types.MCPAuditLog{}).Where("source_type = ?", types2.AuditLogSourceTypeMCP).Distinct(option)
 
 	// Apply the same filters as GetMCPAuditLogs (excluding sorting, offset)
-	if len(opts.UserID) > 0 {
-		db = db.Where("user_id IN (?)", opts.UserID)
-	}
+	db = applySharedAuditLogFilters(db, opts)
 	if len(opts.MCPID) > 0 {
 		db = db.Where("mcp_id IN (?)", opts.MCPID)
 	}
@@ -779,9 +888,6 @@ func (c *Client) GetAuditLogFilterOptions(ctx context.Context, option string, op
 	if len(opts.CallIdentifier) > 0 {
 		db = db.Where("call_identifier IN (?)", opts.CallIdentifier)
 	}
-	if len(opts.SessionID) > 0 {
-		db = db.Where("session_id IN (?)", opts.SessionID)
-	}
 	if len(opts.ClientName) > 0 {
 		db = db.Where("client_name IN (?)", opts.ClientName)
 	}
@@ -790,9 +896,6 @@ func (c *Client) GetAuditLogFilterOptions(ctx context.Context, option string, op
 	}
 	if len(opts.ResponseStatus) > 0 {
 		db = db.Where("response_status IN (?)", opts.ResponseStatus)
-	}
-	if len(opts.ClientIP) > 0 {
-		db = db.Where("client_ip IN (?)", opts.ClientIP)
 	}
 	// Apply scope filtering (union of workspace servers OR own servers)
 	if len(opts.PowerUserWorkspaceID) > 0 || len(opts.OwnServerMCPIDs) > 0 {
@@ -830,11 +933,6 @@ func (c *Client) GetAuditLogFilterOptions(ctx context.Context, option string, op
 	return result, db.Select(option).Scan(&result).Error
 }
 
-var localAgentFilterOptionColumns = map[string]string{
-	"agent_provider": "agent_provider", "status": "outcome_status", "tool_name": "action_name",
-	"tool_kind": "action_kind", "device_id": "device_id",
-}
-
 func isLocalAgentFilterOption(option string) bool {
 	_, ok := localAgentFilterOptionColumns[option]
 	return ok
@@ -843,15 +941,7 @@ func isLocalAgentFilterOption(option string) bool {
 func (c *Client) getMixedAuditLogFilterOptions(ctx context.Context, option string, opts MCPAuditLogOptions, exclude ...any) ([]string, error) {
 	db := c.db.WithContext(ctx).Model(&types.MCPAuditLog{}).
 		Where("source_type IN ?", auditlog.NormalizeSourceTypes(opts.SourceTypes)).Distinct(option)
-	if len(opts.UserID) > 0 {
-		db = db.Where("user_id IN ?", opts.UserID)
-	}
-	if len(opts.SessionID) > 0 {
-		db = db.Where("session_id IN ?", opts.SessionID)
-	}
-	if len(opts.ClientIP) > 0 {
-		db = db.Where("client_ip IN ?", opts.ClientIP)
-	}
+	db = applySharedAuditLogFilters(db, opts)
 	if !opts.StartTime.IsZero() {
 		db = db.Where("((source_type = ? AND created_at >= ?) OR (source_type = ? AND occurred_at >= ?))",
 			types2.AuditLogSourceTypeMCP, opts.StartTime.UTC(), types2.AuditLogSourceTypeLocalAgentToolCall, opts.StartTime.UTC())
@@ -878,15 +968,7 @@ func (c *Client) getLocalAgentAuditLogFilterOptions(ctx context.Context, option 
 	}
 	db := c.db.WithContext(ctx).Model(&types.MCPAuditLog{}).Where("source_type = ?", types2.AuditLogSourceTypeLocalAgentToolCall).Distinct(column)
 
-	if len(opts.UserID) > 0 {
-		db = db.Where("user_id IN ?", opts.UserID)
-	}
-	if len(opts.ClientIP) > 0 {
-		db = db.Where("client_ip IN ?", opts.ClientIP)
-	}
-	if len(opts.SessionID) > 0 {
-		db = db.Where("session_id IN ?", opts.SessionID)
-	}
+	db = applySharedAuditLogFilters(db, opts)
 	if len(opts.AgentProvider) > 0 {
 		db = db.Where("agent_provider IN ?", opts.AgentProvider)
 	}
@@ -1061,87 +1143,6 @@ func (c *Client) GetMCPUsageStats(ctx context.Context, opts MCPUsageStatsOptions
 		UniqueUsers: callsAndUsers.UniqueUsers,
 		Items:       stats,
 	}, nil
-}
-
-// MCPAuditLogOptions configures audit-row queries across MCP and local-agent catalogs. Common
-// filters apply to every selected source. MCP-only and local-agent-only filters are mutually
-// exclusive; ValidateAuditLogOptions enforces those rules before a query runs.
-type MCPAuditLogOptions struct {
-	// WithRequestAndResponse requests decrypted payload and sensitive environment fields. It must
-	// only be set after the caller has passed the corresponding authorization check.
-	WithRequestAndResponse bool
-	// SourceTypes selects the persisted source kinds. Empty preserves the MCP-only default.
-	SourceTypes []types2.AuditLogSourceType
-	// PowerUserWorkspaceID and OwnServerMCPIDs define the authorized MCP-server scope. When both
-	// are present, a row may match either scope.
-	PowerUserWorkspaceID []string
-	OwnServerMCPIDs      []string
-	// UserID, SessionID, and ClientIP are common filters shared by both sources.
-	UserID    []string
-	SessionID []string
-	ClientIP  []string
-	// ProcessingTimeMin and ProcessingTimeMax filter the normalized duration field, using MCP
-	// processing time or local-agent duration as appropriate.
-	ProcessingTimeMin int64
-	ProcessingTimeMax int64
-
-	// MCP-only filters.
-	MCPID                     []string
-	MCPServerDisplayName      []string
-	MCPServerCatalogEntryName []string
-	CallType                  []string
-	CallIdentifier            []string
-	ClientName                []string
-	ClientVersion             []string
-	ResponseStatus            []string
-
-	// Local-agent tool-call filters.
-	AgentProvider []string
-	Status        []string
-	ToolName      []string
-	ToolKind      []string
-	DeviceID      []string
-
-	// Unified, source-agnostic filters used by the audit log UI.
-	//
-	//   Actor     matches user_id OR device_id (users and enrolled devices).
-	//   Operation matches MCP call_type; local-agent rows have the implicit operation tools/call.
-	//   MCPServer matches MCP mcp_id/mcp_server_display_name, or a local-agent row's MCP parent.
-	//   Tool      matches MCP call_identifier or a local-agent action_name.
-	//   Outcome   matches the normalized outcome (success/failure/denied/timeout/unknown); MCP rows
-	//             are classified from response_status/error the same way ClassifyMCPOutcome does.
-	//   Client    matches MCP client_name or local-agent agent_provider.
-	Actor     []string
-	Operation []string
-	MCPServer []string
-	Tool      []string
-	Outcome   []string
-	Client    []string
-
-	// Query searches the non-sensitive text columns of every selected source and matching user
-	// display names.
-	Query     string
-	StartTime time.Time
-	EndTime   time.Time
-	Limit     int
-	Offset    int
-	// SortBy accepts timestamp, event_type, outcome, and duration for mixed queries. A single-source
-	// query may additionally use that source's allowlisted storage columns.
-	SortBy string
-	// SortOrder accepts asc or desc. Empty defaults to descending.
-	SortOrder string
-}
-
-// MCPUsageStatsOptions represents options for querying MCP usage statistics
-type MCPUsageStatsOptions struct {
-	MCPID                      string
-	PowerUserWorkspaceID       []string // Workspace filtering support (same as audit logs)
-	OwnServerMCPIDs            []string // MCPIDs for user's own servers (union with PowerUserWorkspaceID)
-	UserIDs                    []string
-	MCPServerDisplayNames      []string
-	MCPServerCatalogEntryNames []string
-	StartTime                  time.Time
-	EndTime                    time.Time
 }
 
 func (c *Client) encryptMCPAuditLog(ctx context.Context, log *types.MCPAuditLog) error {

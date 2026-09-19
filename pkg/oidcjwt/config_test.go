@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestLoadConfigFromEnv_AllFieldsPresent(t *testing.T) {
@@ -16,8 +15,7 @@ func TestLoadConfigFromEnv_AllFieldsPresent(t *testing.T) {
 		"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ADMIN_ROLES":            "admin,owner",
 		"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_OWNER_ROLES":            "owner,platform-owner",
 	}
-	cfg, err := LoadConfigFromEnv(envGetter(env))
-	require.NoError(t, err)
+	cfg := LoadConfigFromEnv(envGetter(env))
 	assert.Equal(t, "https://studio.example.com/api/auth", cfg.IssuerURL)
 	assert.Equal(t, "obot-default", cfg.Audience)
 	assert.Equal(t, "eligible", cfg.EligibilityClaimName)
@@ -31,8 +29,7 @@ func TestLoadConfigFromEnv_DefaultsAndDisabled(t *testing.T) {
 	env := map[string]string{
 		"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER": "https://studio.example.com/api/auth",
 	}
-	cfg, err := LoadConfigFromEnv(envGetter(env))
-	require.NoError(t, err)
+	cfg := LoadConfigFromEnv(envGetter(env))
 	assert.False(t, cfg.Enabled())
 	assert.Equal(t, "eligible", cfg.EligibilityClaimName)
 	assert.Equal(t, "roles", cfg.RolesClaimName)
@@ -47,11 +44,10 @@ func TestNormalizeIssuer(t *testing.T) {
 }
 
 func TestLoadConfigFromEnv_NormalizesIssuer(t *testing.T) {
-	cfg, err := LoadConfigFromEnv(envGetter(map[string]string{
+	cfg := LoadConfigFromEnv(envGetter(map[string]string{
 		"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER":   "https://issuer.example.com/",
 		"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_AUDIENCE": "obot-default",
 	}))
-	require.NoError(t, err)
 	assert.Equal(t, "https://issuer.example.com", cfg.IssuerURL)
 }
 

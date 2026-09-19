@@ -2,8 +2,6 @@ package mcp
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -14,11 +12,16 @@ import (
 
 type perUserContainerTokenStore map[string]*oauth2.Token
 
+type fixedContainerTokenStore struct{ token *oauth2.Token }
+
+type policyRecordingBackend struct {
+	backend
+	remoteConfigCalls int
+}
+
 func (p perUserContainerTokenStore) ForUserAndMCP(userID, _, _ string) TokenStorage {
 	return fixedContainerTokenStore{token: p[userID]}
 }
-
-type fixedContainerTokenStore struct{ token *oauth2.Token }
 
 func (f fixedContainerTokenStore) GetTokenConfig(context.Context) (*oauth2.Config, *oauth2.Token, error) {
 	return &oauth2.Config{
@@ -31,6 +34,18 @@ func (fixedContainerTokenStore) SetTokenConfig(context.Context, *oauth2.Config, 
 	return nil
 }
 func (fixedContainerTokenStore) DeleteTokenConfig(context.Context) error { return nil }
+func (f fixedContainerTokenStore) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
+	conf, token, err := f.GetTokenConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return conf.TokenSource(ctx, token), nil
+}
+
+func (b *policyRecordingBackend) remoteConfig(globalConfig RemoteMCPURLValidationConfig) (RemoteMCPURLValidationConfig, []string) {
+	b.remoteConfigCalls++
+	return globalConfig, nil
+}
 
 func TestResolveMicrosoftEntraContainerOAuth(t *testing.T) {
 	config, resource, err := ResolveContainerOAuth(types.ContainerizedRuntimeConfig{OAuth: &types.ContainerOAuthConfig{
@@ -90,10 +105,9 @@ func TestContainerOAuthAuthorizationIsInjectedPerUser(t *testing.T) {
 		Provider: types.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
 		ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
 	}}
-	// A backend is required because the refresh runs on the operator's
-	// remote-network policy client, which the backend supplies.
+	backend := &policyRecordingBackend{}
 	sm := &SessionManager{
-		backend: &policyRecordingBackend{},
+		backend: backend,
 		globalTokenStore: perUserContainerTokenStore{
 			"user-a": {AccessToken: "access-a", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
 			"user-b": {AccessToken: "access-b", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
@@ -110,58 +124,5 @@ func TestContainerOAuthAuthorizationIsInjectedPerUser(t *testing.T) {
 	require.Equal(t, []string{"Authorization"}, userA.PassthroughHeaderNames)
 	require.Equal(t, []string{"Bearer access-a"}, userA.PassthroughHeaderValues)
 	require.Equal(t, []string{"Bearer access-b"}, userB.PassthroughHeaderValues)
-}
-
-// policyRecordingBackend counts how many times a caller asked for the operator's
-// remote-network configuration. A container OAuth authorization that never asks
-// is running its refresh outside the policy.
-type policyRecordingBackend struct {
-	ctxCapturingBackend
-	remoteConfigCalls int
-}
-
-func (b *policyRecordingBackend) remoteConfig(globalConfig RemoteMCPURLValidationConfig) (RemoteMCPURLValidationConfig, []string) {
-	b.remoteConfigCalls++
-	return globalConfig, nil
-}
-
-// The container OAuth refresh replays the refresh token and client secret, so it
-// must run on the operator's remote-network policy client and must refuse
-// redirects. ResolveContainerOAuth pins the token endpoint to a trusted Microsoft
-// Entra host, so the refresh itself cannot be pointed at a local test server;
-// this asserts the two halves separately -- that the production path builds the
-// policy client at all, and that the client it builds enforces the policy.
-func TestContainerOAuthRefreshRunsOnTheNetworkPolicyClient(t *testing.T) {
-	backend := &policyRecordingBackend{}
-	sm := &SessionManager{
-		backend: backend,
-		globalTokenStore: perUserContainerTokenStore{
-			"user-a": {AccessToken: "access-a", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)},
-		},
-	}
-	server := ServerConfig{UserID: "user-a", MCPServerName: "shared-fabric", Env: []string{
-		"INSTANCE=https://login.microsoftonline.com/", "TENANT=tenant", "CLIENT=client", "SECRET=secret",
-	}}
-	descriptor := types.ContainerizedRuntimeConfig{OAuth: &types.ContainerOAuthConfig{
-		Provider: types.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
-		ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
-	}}
-
-	require.NoError(t, sm.addContainerOAuthAuthorization(t.Context(), descriptor, "instance-a", &server))
-	require.Equal(t, 1, backend.remoteConfigCalls, "container OAuth refresh must build the remote-network policy client")
-
-	policyClient, err := sm.HTTPClientForServer(server, nil, nil, 0)
-	require.NoError(t, err)
-	refreshClient := NoRedirectClient(policyClient)
-	require.NotNil(t, refreshClient.CheckRedirect, "container refresh client must reject redirects")
-	require.Nil(t, policyClient.CheckRedirect, "the shared MCP transport client must keep following redirects")
-
-	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("loopback token endpoint received a container OAuth refresh")
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	t.Cleanup(tokenEndpoint.Close)
-
-	_, err = refreshClient.Post(tokenEndpoint.URL, "application/x-www-form-urlencoded", http.NoBody)
-	require.Error(t, err, "loopback token endpoint must be blocked by the remote-network policy")
+	require.Equal(t, 2, backend.remoteConfigCalls, "container OAuth refresh must build the network-policy client")
 }

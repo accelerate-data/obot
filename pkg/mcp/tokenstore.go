@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -19,25 +20,11 @@ type TokenStorage interface {
 	GetTokenConfig(context.Context) (*oauth2.Config, *oauth2.Token, error)
 	SetTokenConfig(context.Context, *oauth2.Config, *oauth2.Token) error
 	DeleteTokenConfig(context.Context) error
-}
-
-func NewGlobalTokenStore(gatewayClient *gateway.Client) GlobalTokenStore {
-	return &globalTokenStore{
-		gatewayClient: gatewayClient,
-	}
+	TokenSource(context.Context) (oauth2.TokenSource, error)
 }
 
 type globalTokenStore struct {
 	gatewayClient *gateway.Client
-}
-
-func (g *globalTokenStore) ForUserAndMCP(userID, mcpID, mcpURL string) TokenStorage {
-	return &tokenStore{
-		gatewayClient: g.gatewayClient,
-		mcpID:         mcpID,
-		userID:        userID,
-		mcpURL:        mcpURL,
-	}
 }
 
 type tokenStore struct {
@@ -51,6 +38,29 @@ type tokenStore struct {
 type catalogCredentialFence struct {
 	entryName  string
 	generation string
+}
+
+// storageBackedTokenSource implements the oauth2.TokenSource interface to store new tokens in the TokenStorage.
+type storageBackedTokenSource struct {
+	lock         sync.Mutex
+	tokenStorage TokenStorage
+	conf         *oauth2.Config
+	tok          *oauth2.Token
+}
+
+func NewGlobalTokenStore(gatewayClient *gateway.Client) GlobalTokenStore {
+	return &globalTokenStore{
+		gatewayClient: gatewayClient,
+	}
+}
+
+func (g *globalTokenStore) ForUserAndMCP(userID, mcpID, mcpURL string) TokenStorage {
+	return &tokenStore{
+		gatewayClient: g.gatewayClient,
+		mcpID:         mcpID,
+		userID:        userID,
+		mcpURL:        mcpURL,
+	}
 }
 
 func (t *tokenStore) GetTokenConfig(ctx context.Context) (*oauth2.Config, *oauth2.Token, error) {
@@ -77,9 +87,7 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context) (*oauth2.Config, *oauth
 	}
 
 	catalogEntryName := mcpToken.CatalogEntryName
-	// Container OAuth grants are fenced by their stable deployment resource,
-	// not a remote static-OAuth catalog credential.
-	if !IsContainerOAuthResource(t.mcpURL) {
+	if !gateway.IsContainerOAuthResource(t.mcpURL) {
 		if catalogEntryName == "" {
 			catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, t.mcpURL, conf)
 			if err != nil {
@@ -105,11 +113,10 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context) (*oauth2.Config, *oauth
 
 func (t *tokenStore) SetTokenConfig(ctx context.Context, config *oauth2.Config, token *oauth2.Token) error {
 	t.mu.Lock()
-	fence := t.catalogEntry
-	captured := t.catalogEntryCaptured
+	fence, captured := t.catalogEntry, t.catalogEntryCaptured
 	t.mu.Unlock()
 	if !captured {
-		if IsContainerOAuthResource(t.mcpURL) {
+		if gateway.IsContainerOAuthResource(t.mcpURL) {
 			return t.gatewayClient.ReplaceMCPOAuthToken(ctx, t.userID, t.mcpID, t.mcpURL, "", config, token)
 		}
 		var err error
@@ -123,4 +130,47 @@ func (t *tokenStore) SetTokenConfig(ctx context.Context, config *oauth2.Config, 
 
 func (t *tokenStore) DeleteTokenConfig(ctx context.Context) error {
 	return t.gatewayClient.DeleteMCPOAuthTokenForURL(ctx, t.userID, t.mcpID, t.mcpURL)
+}
+
+func (t *tokenStore) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
+	config, token, err := t.GetTokenConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get token config: %w", err)
+	}
+
+	if config == nil || token == nil {
+		return nil, nil
+	}
+	return newStorageBackedTokenSource(t, config, token), nil
+}
+
+func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token) oauth2.TokenSource {
+	return oauth2.ReuseTokenSource(tok, &storageBackedTokenSource{
+		tokenStorage: tokenStorage,
+		conf:         conf,
+		tok:          tok,
+	})
+}
+
+func (ts *storageBackedTokenSource) Token() (*oauth2.Token, error) {
+	ctx := context.Background()
+	tok, err := ts.conf.TokenSource(ctx, ts.tok).Token()
+	if err != nil {
+		return nil, err
+	}
+
+	ts.lock.Lock()
+	defer ts.lock.Unlock()
+
+	if tok.AccessToken != ts.tok.AccessToken || tok.RefreshToken != ts.tok.RefreshToken || tok.Expiry.Unix() != ts.tok.Expiry.Unix() {
+		ts.tok = tok
+
+		if ts.tokenStorage != nil {
+			if err = ts.tokenStorage.SetTokenConfig(context.Background(), ts.conf, ts.tok); err != nil {
+				return nil, fmt.Errorf("failed to store token: %w", err)
+			}
+		}
+	}
+
+	return ts.tok, nil
 }

@@ -7,10 +7,8 @@ import (
 	"net/http"
 	"slices"
 	"sort"
-	"strings"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
@@ -272,7 +270,7 @@ func convertMCPWebhookValidation(validation v1.MCPWebhookValidation, credEnv map
 
 	if manifest := validation.Spec.Manifest.SystemMCPServerManifest; manifest != nil {
 		result.Configured = true
-		for _, env := range manifest.Env {
+		for _, env := range manifest.Config {
 			if env.Required && env.Value == "" && credEnv[env.Key] == "" {
 				result.MissingRequiredEnvVars = append(result.MissingRequiredEnvVars, env.Key)
 				result.Configured = false
@@ -319,7 +317,7 @@ func (m *MCPWebhookValidationHandler) Restart(req api.Context) error {
 		return err
 	}
 
-	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote || systemServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote {
 		return types.NewErrBadRequest("webhook validation %s has runtime %s, which does not support restart", systemServer.Name, systemServer.Spec.Manifest.Runtime)
 	}
 
@@ -327,13 +325,13 @@ func (m *MCPWebhookValidationHandler) Restart(req api.Context) error {
 		return err
 	}
 
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
 
 	if err := m.mcpSessionManager.RestartServerDeployment(req.Context(), serverConfig); err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrNotFound(nse.Error())
 		}
 		return fmt.Errorf("failed to restart mcp webhook validation: %w", err)
@@ -353,7 +351,7 @@ func (m *MCPWebhookValidationHandler) Launch(req api.Context) error {
 		return err
 	}
 
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
@@ -367,13 +365,10 @@ func (m *MCPWebhookValidationHandler) Launch(req api.Context) error {
 		if errors.Is(err, mcp.ErrHealthCheckFailed) || errors.Is(err, mcp.ErrHealthCheckTimeout) {
 			return types.NewErrHTTP(http.StatusServiceUnavailable, "MCP webhook validation is not healthy, check configuration for errors")
 		}
-		if errors.Is(err, nmcp.ErrNoResult) || strings.HasSuffix(err.Error(), nmcp.ErrNoResult.Error()) {
-			return types.NewErrHTTP(http.StatusServiceUnavailable, "No response from MCP webhook validation, check configuration for errors")
-		}
 		if errors.Is(err, mcp.ErrInsufficientCapacity) {
 			return types.NewErrHTTP(http.StatusServiceUnavailable, "Insufficient capacity to deploy MCP webhook validation. Please contact your administrator.")
 		}
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrHTTP(http.StatusBadRequest, nse.Error())
 		}
 		return fmt.Errorf("failed to launch mcp webhook validation: %w", err)
@@ -388,7 +383,7 @@ func (m *MCPWebhookValidationHandler) Logs(req api.Context) error {
 		return err
 	}
 
-	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote || systemServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote {
 		return types.NewErrBadRequest("webhook validation %s has runtime %s, which does not support log retrieval", systemServer.Name, systemServer.Spec.Manifest.Runtime)
 	}
 
@@ -396,14 +391,14 @@ func (m *MCPWebhookValidationHandler) Logs(req api.Context) error {
 		return err
 	}
 
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
 
 	logs, err := m.mcpSessionManager.StreamServerLogs(req.Context(), serverConfig)
 	if err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrNotFound(nse.Error())
 		}
 		return err
@@ -422,7 +417,7 @@ func (m *MCPWebhookValidationHandler) GetDetails(req api.Context) error {
 		return err
 	}
 
-	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote || systemServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote {
 		return types.NewErrBadRequest("webhook validation %s has runtime %s, which does not support details retrieval", systemServer.Name, systemServer.Spec.Manifest.Runtime)
 	}
 
@@ -430,14 +425,14 @@ func (m *MCPWebhookValidationHandler) GetDetails(req api.Context) error {
 		return err
 	}
 
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
 
 	details, err := m.mcpSessionManager.GetServerDetails(req.Context(), serverConfig)
 	if err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrNotFound(nse.Error())
 		}
 		return fmt.Errorf("failed to get server details: %w", err)
@@ -492,8 +487,9 @@ func systemMCPServerManifestFromCatalogEntry(entry types.SystemMCPServerCatalogE
 		UVXConfig:           entry.UVXConfig,
 		NPXConfig:           entry.NPXConfig,
 		ContainerizedConfig: entry.ContainerizedConfig,
-		Env:                 entry.Env,
-		Resources:           entry.Resources,
+
+		Resources: entry.Resources,
+		Config:    entry.Config,
 	}
 
 	if entry.RemoteConfig != nil {
@@ -502,7 +498,6 @@ func systemMCPServerManifestFromCatalogEntry(entry types.SystemMCPServerCatalogE
 			IsTemplate:          entry.RemoteConfig.URLTemplate != "",
 			URLTemplate:         entry.RemoteConfig.URLTemplate,
 			Hostname:            entry.RemoteConfig.Hostname,
-			Headers:             entry.RemoteConfig.Headers,
 			StaticOAuthRequired: entry.RemoteConfig.StaticOAuthRequired,
 		}
 	}
@@ -512,12 +507,21 @@ func systemMCPServerManifestFromCatalogEntry(entry types.SystemMCPServerCatalogE
 
 func applyRemoteURLTemplateToWebhookValidation(ctx context.Context, webhookValidation *v1.MCPWebhookValidation, envVars map[string]string, options mcp.ValidationOptions) error {
 	manifest := webhookValidation.Spec.Manifest.SystemMCPServerManifest
-	if manifest == nil || manifest.Runtime != types.RuntimeRemote || manifest.RemoteConfig == nil || manifest.RemoteConfig.URLTemplate == "" {
+	if manifest == nil {
+		return nil
+	}
+	if err := validateConfiguredOptions(manifest.Config, envVars); err != nil {
+		return types.NewErrBadRequest("invalid configuration: %v", err)
+	}
+	if manifest.Runtime != types.RuntimeRemote || manifest.RemoteConfig == nil || manifest.RemoteConfig.URLTemplate == "" {
 		return nil
 	}
 
-	finalURL, err := applyURLTemplate(manifest.RemoteConfig.URLTemplate, envVars)
+	finalURL, err := applyURLTemplate(manifest.RemoteConfig.URLTemplate, manifest.Config, envVars)
 	if err != nil {
+		if configErr, ok := errors.AsType[*urlTemplateConfigurationError](err); ok {
+			return types.NewErrBadRequest("invalid configuration: %v", configErr)
+		}
 		return fmt.Errorf("failed to apply URL template: %w", err)
 	}
 

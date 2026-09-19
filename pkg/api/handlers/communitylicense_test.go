@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,15 @@ type fakeCommunityLicenseProvider struct {
 	hasValidCalls     int
 	lastInstalledKey  string
 	validateError     error
+}
+
+type fakeCommunityIssuer struct {
+	lock     sync.Mutex
+	key      string
+	errors   []error
+	requests []upgrade.CommunityLicenseRequest
+	started  chan struct{}
+	release  chan struct{}
 }
 
 func (p *fakeCommunityLicenseProvider) LicenseKey(context.Context) (string, error) {
@@ -82,16 +92,7 @@ func (p *fakeCommunityLicenseProvider) HasValidLicense(context.Context) (bool, e
 func (p *fakeCommunityLicenseProvider) Entitlements(context.Context) ([]string, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
-	return append([]string(nil), p.entitlements...), p.entitlementsError
-}
-
-type fakeCommunityIssuer struct {
-	lock     sync.Mutex
-	key      string
-	errors   []error
-	requests []upgrade.CommunityLicenseRequest
-	started  chan struct{}
-	release  chan struct{}
+	return slices.Clone(p.entitlements), p.entitlementsError
 }
 
 func (i *fakeCommunityIssuer) Issue(ctx context.Context, request upgrade.CommunityLicenseRequest) (string, error) {

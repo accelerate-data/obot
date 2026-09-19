@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,14 +20,15 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/cache"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	gitfs "github.com/go-git/go-git/v5/storage/filesystem"
-	"github.com/obot-platform/obot/logger"
 )
 
-const maxRepoSizeMB = 100
+const (
+	maxRepoSizeMB = 100
+)
 
-var errRepoTooLarge = errors.New("repository too large")
-
-var log = logger.Package()
+var (
+	errRepoTooLarge = errors.New("repository too large")
+)
 
 type cloneAuthAttempt struct {
 	name  string
@@ -38,6 +40,11 @@ type cloneRefAttempt struct {
 	referenceName plumbing.ReferenceName
 	checkoutHash  string
 	depth         int
+}
+
+// githubRepoInfo represents repository information from the GitHub API.
+type githubRepoInfo struct {
+	Size int `json:"size"` // Size in KB
 }
 
 func cloneAuthAttempts(token, fallbackToken string) []cloneAuthAttempt {
@@ -68,14 +75,6 @@ func IsGitRepoURL(repoURL string) bool {
 	// (e.g. /org/repo.git or /org/repo.git/branch).
 	p := strings.TrimSuffix(u.Path, "/")
 	return strings.HasSuffix(p, ".git") || strings.Contains(p, ".git/")
-}
-
-// ResolveToken returns token if non-empty, otherwise falls back to GITHUB_AUTH_TOKEN env var.
-func ResolveToken(token string) string {
-	if token != "" {
-		return token
-	}
-	return os.Getenv("GITHUB_AUTH_TOKEN")
 }
 
 // Clone clones a git repository over HTTPS into a temporary directory.
@@ -127,7 +126,7 @@ func Clone(ctx context.Context, repoURL, token, ref string) (dir string, commitS
 				if shouldAbortRepositorySizeCheck(ctx, err) {
 					return "", "", nil, fmt.Errorf("repository size check failed: %w", err)
 				}
-				log.Warnf("GitHub repository size check failed; continuing with clone-time size limit: repo=%s error=%v", repoPath, err)
+				slog.Warn("GitHub repository size check failed; continuing with clone-time size limit", "repo", repoPath, "error", err)
 			}
 		}
 	case "gitlab.com":
@@ -135,7 +134,7 @@ func Clone(ctx context.Context, repoURL, token, ref string) (dir string, commitS
 			if shouldAbortRepositorySizeCheck(ctx, err) {
 				return "", "", nil, fmt.Errorf("repository size check failed: %w", err)
 			}
-			log.Warnf("GitLab repository size check failed; continuing with clone-time size limit: repo=%s error=%v", repoPath, err)
+			slog.Warn("GitLab repository size check failed; continuing with clone-time size limit", "repo", repoPath, "error", err)
 		}
 	}
 
@@ -327,11 +326,6 @@ func isFullCommitSHA(ref string) bool {
 
 func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// githubRepoInfo represents repository information from the GitHub API.
-type githubRepoInfo struct {
-	Size int `json:"size"` // Size in KB
 }
 
 func shouldAbortRepositorySizeCheck(ctx context.Context, err error) bool {

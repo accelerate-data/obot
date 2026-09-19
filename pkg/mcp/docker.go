@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	neturl "net/url"
@@ -15,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -34,24 +34,32 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-var containerFileNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+// dockerMinMemoryBytes is Docker's own floor for a container memory limit. The
+// daemon rejects anything smaller when it creates the container, so accepting it
+// here would leave Obot running while every MCP server failed to start.
+const (
+	dockerMinMemoryBytes int64 = 6 * 1024 * 1024
+)
+
+var (
+	containerFileNameSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+)
 
 type dockerBackend struct {
-	client                      *client.Client
-	containerEnv                bool
-	network                     string
-	httpListenPort              int
-	hostBaseURL                 string
-	hostBaseURLWithPort         string
-	containerizedBaseImage      string
-	mcpResources                container.Resources
-	authEnabled                 bool
-	deploymentCacheMu           sync.RWMutex
-	deploymentCache             map[string]*dockerDeploymentCacheEntry
-	deploymentCacheEventHealthy atomic.Bool
-	ensureGroup                 singleflight.Group
-	fileSyncMu                  sync.RWMutex
-	syncedFilesHash             map[string]string
+	client                 *client.Client
+	containerEnv           bool
+	network                string
+	httpListenPort         int
+	hostBaseURL            string
+	hostBaseURLWithPort    string
+	containerizedBaseImage string
+	authEnabled            bool
+	deploymentCacheMu      sync.RWMutex
+	deploymentCache        map[string]*dockerDeploymentCacheEntry
+	ensureGroup            singleflight.Group
+	fileSyncMu             sync.RWMutex
+	syncedFilesHash        map[string]string
+	mcpResources           container.Resources
 }
 
 type dockerDeploymentCacheEntry struct {
@@ -136,11 +144,6 @@ func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount, resou
 		Resources: resources,
 	}
 }
-
-// dockerMinMemoryBytes is Docker's own floor for a container memory limit. The
-// daemon rejects anything smaller when it creates the container, so accepting it
-// here would leave Obot running while every MCP server failed to start.
-const dockerMinMemoryBytes int64 = 6 * 1024 * 1024
 
 // mcpDockerResources turns the operator-facing ceiling strings into a resource
 // block for every MCP server container. An empty value leaves that dimension
@@ -319,7 +322,7 @@ func (d *dockerBackend) cleanupDeprecatedContainers(ctx context.Context) error {
 // deployServer will deploy the underlying container for the server.
 // This is only to give users the opportunity to view logs and debug the server they are trying to deploy.
 func (d *dockerBackend) deployServer(ctx context.Context, server ServerConfig) error {
-	if server.Runtime == otypes.RuntimeRemote || server.Runtime == otypes.RuntimeComposite {
+	if server.Runtime == otypes.RuntimeRemote || server.Runtime == otypes.RuntimeVMCP {
 		return nil
 	}
 
@@ -350,7 +353,7 @@ func (d *dockerBackend) ensureServerDeployment(ctx context.Context, server Serve
 		server.Webhooks[i] = webhook
 	}
 
-	if server.Runtime == otypes.RuntimeRemote || server.Runtime == otypes.RuntimeComposite {
+	if server.Runtime == otypes.RuntimeRemote || server.Runtime == otypes.RuntimeVMCP {
 		return server, nil
 	}
 
@@ -397,8 +400,6 @@ func (d *dockerBackend) ensureServerDeploymentSlow(ctx context.Context, server S
 func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfig, mcpServerName string, containerEnv bool) (ServerConfig, error) {
 	if !d.authEnabled {
 		server.Audiences = nil
-		server.TokenExchangeClientID = ""
-		server.TokenExchangeClientSecret = ""
 	}
 
 	configHash := serverID(server)
@@ -449,6 +450,10 @@ func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server Serve
 			// The container is ready now, so fallthrough to the next case.
 			fallthrough
 		case container.StateRunning:
+			if err := d.waitForContainer(ctx, existing.ID); err != nil {
+				return ServerConfig{}, fmt.Errorf("container failed to become ready: %w", err)
+			}
+
 			if err := d.syncContainerFiles(ctx, server, existing); err != nil {
 				return ServerConfig{}, fmt.Errorf("failed syncing container files: %w", err)
 			}
@@ -636,7 +641,7 @@ eventLoop:
 			})
 		case err := <-errs:
 			if err != nil && err != io.EOF {
-				log.Warnf("Error getting container events: %v", err)
+				slog.Warn("Error getting container events", "error", err)
 			}
 			break eventLoop
 		case <-timeout:
@@ -828,7 +833,7 @@ func (d *dockerBackend) removeObjectsForContainer(ctx context.Context, c *contai
 		defer func() {
 			for _, volumeName := range volumeNames {
 				if err := d.client.VolumeRemove(ctx, volumeName, true); err != nil && !cerrdefs.IsNotFound(err) {
-					log.Warnf("Failed to remove volume %s: %v", volumeName, err)
+					slog.Warn("Failed to remove volume", "volumeName", volumeName, "error", err)
 				}
 			}
 		}()
@@ -911,13 +916,11 @@ func (d *dockerBackend) startDeploymentCacheEventWatcher(ctx context.Context) {
 			eventFilters.Add("label", "mcp.deployment.id")
 
 			eventMessages, errs := d.client.Events(ctx, events.ListOptions{Filters: eventFilters})
-			d.deploymentCacheEventHealthy.Store(true)
 
 			var disconnected bool
 			for !disconnected {
 				select {
 				case <-ctx.Done():
-					d.deploymentCacheEventHealthy.Store(false)
 					return
 				case eventMessage, ok := <-eventMessages:
 					if !ok {
@@ -927,13 +930,12 @@ func (d *dockerBackend) startDeploymentCacheEventWatcher(ctx context.Context) {
 					d.handleDeploymentCacheDockerEvent(eventMessage)
 				case err, ok := <-errs:
 					if ok && err != nil && ctx.Err() == nil {
-						log.Warnf("Docker MCP deployment cache event watcher disconnected: %v", err)
+						slog.Warn("Docker MCP deployment cache event watcher disconnected", "error", err)
 					}
 					disconnected = true
 				}
 			}
 
-			d.deploymentCacheEventHealthy.Store(false)
 			d.clearDeploymentCache()
 
 			select {
@@ -977,10 +979,6 @@ func (d *dockerBackend) cachedDeployment(ctx context.Context, serverName, server
 		return ServerConfig{}, false, nil
 	}
 
-	if d.deploymentCacheEventHealthy.Load() {
-		return cachedDeployment.serverConfig, true, nil
-	}
-
 	valid, err := d.deploymentCacheValid(ctx, cachedDeployment)
 	if err != nil {
 		return ServerConfig{}, false, err
@@ -999,11 +997,14 @@ func (d *dockerBackend) deploymentCacheValid(ctx context.Context, entry *dockerD
 	}
 
 	for name, expectedID := range entry.containerIDs {
-		c, err := d.getContainer(ctx, name)
+		inspect, err := d.client.ContainerInspect(ctx, name)
 		if err != nil {
-			return false, fmt.Errorf("failed to get container %s: %w", name, err)
+			if cerrdefs.IsNotFound(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to verify cached container %s: %w", name, err)
 		}
-		if c == nil || c.ID != expectedID || c.State != container.StateRunning {
+		if inspect.ID != expectedID || inspect.State == nil || !inspect.State.Running || inspect.State.Paused {
 			return false, nil
 		}
 	}
@@ -1053,25 +1054,23 @@ func (d *dockerBackend) buildServerConfig(server ServerConfig, c *container.Summ
 	}
 
 	return ServerConfig{
-		URL:                       url,
-		ContainerPort:             containerPort,
-		MCPServerNamespace:        server.MCPServerNamespace,
-		MCPServerName:             server.MCPServerName,
-		MCPServerDisplayName:      server.MCPServerDisplayName,
-		Scope:                     c.ID,
-		UserID:                    server.UserID,
-		OwnerUserID:               server.OwnerUserID,
-		Runtime:                   otypes.RuntimeRemote,
-		Audiences:                 server.Audiences,
-		TokenExchangeClientID:     server.TokenExchangeClientID,
-		TokenExchangeClientSecret: server.TokenExchangeClientSecret,
-		AuditLogMetadata:          server.AuditLogMetadata,
-		ContainerPath:             server.ContainerPath,
-		NanobotAgentName:          server.NanobotAgentName,
-		PassthroughHeaderNames:    server.PassthroughHeaderNames,
-		PassthroughHeaderValues:   server.PassthroughHeaderValues,
-		StartupTimeout:            server.StartupTimeout,
-		Webhooks:                  server.Webhooks,
+		URL:                     url,
+		ContainerPort:           containerPort,
+		MCPServerNamespace:      server.MCPServerNamespace,
+		MCPServerName:           server.MCPServerName,
+		MCPServerDisplayName:    server.MCPServerDisplayName,
+		Scope:                   c.ID,
+		UserID:                  server.UserID,
+		OwnerUserID:             server.OwnerUserID,
+		Runtime:                 otypes.RuntimeRemote,
+		Audiences:               server.Audiences,
+		AuditLogMetadata:        server.AuditLogMetadata,
+		ContainerPath:           server.ContainerPath,
+		AgentName:               server.AgentName,
+		PassthroughHeaderNames:  server.PassthroughHeaderNames,
+		PassthroughHeaderValues: server.PassthroughHeaderValues,
+		StartupTimeout:          server.StartupTimeout,
+		Webhooks:                server.Webhooks,
 	}, nil
 }
 
@@ -1122,7 +1121,7 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 		})
 	}
 
-	if server.NanobotAgentName != "" {
+	if server.IsAgentServer() {
 		workspaceName, err = d.ensureWorkspaceVolume(ctx, server, mcpServerName)
 		if err != nil {
 			return "", 0, fmt.Errorf("failed to create workspace volume: %w", err)
@@ -1131,7 +1130,7 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 			volumeMounts = append(volumeMounts, mount.Mount{
 				Type:   mount.TypeVolume,
 				Source: workspaceName,
-				Target: nanobotWorkspaceMountPath,
+				Target: agentWorkspaceMountPath,
 			})
 		}
 	}
@@ -1159,27 +1158,23 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 	// Configure based on runtime
 	switch server.Runtime {
 	case otypes.RuntimeUVX, otypes.RuntimeNPX:
-		// Use base image with nanobot
+		// Use the mmmcp base image to expose the command-based server over HTTP.
 		image = d.containerizedBaseImage
 
 		containerPort = defaultContainerPort
 
-		nanobotVolumeName, err := d.prepareMCPServerNanobotConfig(ctx, server, fileEnvVars)
+		mmmcpVolumeName, err := d.prepareMCPServerMMMCPConfig(ctx, server, fileEnvVars)
 		if err != nil {
-			return "", 0, fmt.Errorf("failed to prepare MCP server nanobot config: %w", err)
+			return "", 0, fmt.Errorf("failed to prepare MCP server mmmcp config: %w", err)
 		}
 
 		volumeMounts = append(volumeMounts, mount.Mount{
 			Type:   mount.TypeVolume,
-			Source: nanobotVolumeName,
+			Source: mmmcpVolumeName,
 			Target: "/config",
 		})
 
-		// Use nanobot command
-		cmd = []string{"run", "--disable-ui", "--listen-address", fmt.Sprintf(":%d", defaultContainerPort), "--exclude-built-in-agents", "--config", "/config/nanobot.yaml"}
-
-		// Set nanobot environment variables
-		env = append(env, "NANOBOT_RUN_HEALTHZ_PATH=/healthz", "OBOT_KUBERNETES_MODE=true")
+		cmd = []string{"--listen", fmt.Sprintf(":%d", defaultContainerPort), "--config", "/config/mmmcp.yaml"}
 
 	case otypes.RuntimeContainerized:
 		// Use specified container image or base image
@@ -1202,16 +1197,15 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 			k, _, ok := strings.Cut(val, "=")
 			if ok {
 				metaEnvVar = append(metaEnvVar, k)
+				env = append(env, val)
 			}
-			env = append(env, val)
 		}
 		for k, v := range fileEnvVars {
 			env = append(env, fmt.Sprintf("%s=%s", k, v))
 			metaEnvVar = append(metaEnvVar, k)
 		}
 
-		env = append(env, fmt.Sprintf("NANOBOT_META_ENV=%s", strings.Join(metaEnvVar, ",")))
-		env = append(env, "NANOBOT_RUN_HEALTHZ_PATH=/healthz", "OBOT_KUBERNETES_MODE=true")
+		env = append(env, fmt.Sprintf("MMMCP_META_ENV=%s", strings.Join(metaEnvVar, ",")))
 	default:
 		return "", 0, fmt.Errorf("unsupported runtime: %s", server.Runtime)
 	}
@@ -1235,8 +1229,8 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 			"mcp.file.env.keys.hash": fileEnvKeysHash,
 		},
 	}
-	if server.NanobotAgentName != "" {
-		config.WorkingDir = nanobotWorkspaceMountPath
+	if server.IsAgentServer() {
+		config.WorkingDir = agentWorkspaceMountPath
 		config.Env = append(config.Env, "NANOBOT_RUN_HEALTHZ_PATH=/healthz", "OBOT_KUBERNETES_MODE=true")
 
 		for key, value := range OTELEnv("nanobot-agent", d.hostBaseURL) {
@@ -1297,36 +1291,75 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 }
 
 func (d *dockerBackend) waitForContainer(ctx context.Context, containerID string) error {
-	// Wait up to 30 seconds for container to be running
-	timeout := time.After(30 * time.Second)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for container to start")
-		case <-ctx.Done():
-			return fmt.Errorf("%w: timeout waiting for container to start", ErrHealthCheckTimeout)
-		case <-ticker.C:
-			inspect, err := d.client.ContainerInspect(ctx, containerID)
-			if err != nil {
-				return fmt.Errorf("failed to inspect container: %w", err)
-			}
-
-			if inspect.State == nil {
-				continue
-			}
-
-			if inspect.State.Running {
-				// Container is running
-				return nil
-			}
-
-			if inspect.State.Dead || inspect.State.OOMKilled || inspect.State.ExitCode != 0 {
-				return fmt.Errorf("container failed to start: %s", inspect.State.Status)
-			}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: timeout waiting for container to start: %w", ErrHealthCheckTimeout, err)
 		}
+
+		inspect, err := d.client.ContainerInspect(ctx, containerID)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("%w: timeout waiting for container to start: %w", ErrHealthCheckTimeout, ctxErr)
+			}
+			return fmt.Errorf("failed to inspect container: %w", err)
+		}
+
+		shouldRetry, err := analyzeContainerState(inspect.State)
+		if err != nil {
+			return err
+		}
+		if !shouldRetry {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: timeout waiting for container to start: %w", ErrHealthCheckTimeout, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// analyzeContainerState determines whether Docker is still starting the container,
+// or if it has reached either a running or terminal state. It mirrors the pod-state
+// checks used by the Kubernetes backend before the MCP health endpoint is probed.
+func analyzeContainerState(state *container.State) (bool, error) {
+	if state == nil {
+		return true, nil
+	}
+
+	if state.Running && !state.Paused {
+		return false, nil
+	}
+
+	if state.Status == container.StateCreated || state.Status == "" {
+		return true, nil
+	}
+
+	if state.Status == container.StateRestarting {
+		if state.ExitCode == 0 {
+			return true, nil
+		}
+		return false, fmt.Errorf("%w: container is restarting with exit code %d", ErrHealthCheckFailed, state.ExitCode)
+	}
+
+	var detail string
+	if state.Error != "" {
+		detail = ": " + state.Error
+	}
+
+	switch {
+	case state.OOMKilled:
+		return false, fmt.Errorf("%w: container was OOM-killed%s", ErrHealthCheckFailed, detail)
+	case state.Dead:
+		return false, fmt.Errorf("%w: container is dead%s", ErrHealthCheckFailed, detail)
+	case state.Paused:
+		return false, fmt.Errorf("%w: container is paused%s", ErrHealthCheckFailed, detail)
+	default:
+		return false, fmt.Errorf("%w: container is %s with exit code %d%s", ErrHealthCheckFailed, state.Status, state.ExitCode, detail)
 	}
 }
 
@@ -1356,11 +1389,80 @@ func (d *dockerBackend) ensureServerReady(ctx context.Context, c *container.Summ
 		host = "localhost"
 	}
 
-	if err = ensureServerReady(ctx, fmt.Sprintf("http://%s:%d", host, port), server); err != nil {
+	if err = monitorContainerReadiness(ctx, time.Second,
+		func(ctx context.Context) (container.InspectResponse, error) {
+			return d.client.ContainerInspect(ctx, c.ID)
+		},
+		func(ctx context.Context) error {
+			return ensureServerReady(ctx, fmt.Sprintf("http://%s:%d", host, port), server)
+		},
+	); err != nil {
 		return fmt.Errorf("server readiness check failed: %w", err)
 	}
 
 	return nil
+}
+
+// monitorContainerReadiness keeps checking the Docker workload while the MCP
+// health check is running. A container can briefly report running between
+// restart attempts, so a single pre-health inspection is not sufficient.
+func monitorContainerReadiness(
+	ctx context.Context,
+	pollInterval time.Duration,
+	inspectContainer func(context.Context) (container.InspectResponse, error),
+	checkHealth func(context.Context) error,
+) error {
+	healthCtx, cancelHealth := context.WithCancel(ctx)
+	defer cancelHealth()
+
+	healthResult := make(chan error, 1)
+	go func() {
+		healthResult <- checkHealth(healthCtx)
+	}()
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-healthResult:
+			return err
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %w", ErrHealthCheckTimeout, ctx.Err())
+		case <-ticker.C:
+			// Prefer a completed health check over a simultaneous container poll.
+			select {
+			case err := <-healthResult:
+				return err
+			default:
+			}
+
+			inspect, err := inspectContainer(ctx)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return fmt.Errorf("%w: %w", ErrHealthCheckTimeout, ctxErr)
+				}
+				return fmt.Errorf("failed to inspect container while waiting for server readiness: %w", err)
+			}
+
+			if inspect.ContainerJSONBase == nil {
+				continue
+			}
+
+			if inspect.RestartCount > 3 {
+				if inspect.State != nil && inspect.State.ExitCode != 0 {
+					return fmt.Errorf("%w: container repeatedly crashed (exit code %d, %d restarts)",
+						ErrHealthCheckFailed, inspect.State.ExitCode, inspect.RestartCount)
+				}
+				return fmt.Errorf("%w: container repeatedly crashed (%d restarts)", ErrHealthCheckFailed, inspect.RestartCount)
+			}
+
+			_, err = analyzeContainerState(inspect.State)
+			if err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // prepareContainerFiles creates a volume for server.Files and returns volume name and env vars
@@ -1622,9 +1724,9 @@ func (d *dockerBackend) pullImage(ctx context.Context, imageName string, ifNotEx
 	return nil
 }
 
-// prepareMCPServerNanobotConfig creates a volume containing the nanobot.yaml that configures
-// how nanobot proxies to the underlying MCP server (used for UVX/NPX/remote/composite runtimes).
-func (d *dockerBackend) prepareMCPServerNanobotConfig(ctx context.Context, server ServerConfig, envVars map[string]string) (string, error) {
+// prepareMCPServerMMMCPConfig creates a volume containing the mmmcp.yaml that configures
+// how mmmcp proxies to the underlying MCP server (used for UVX and NPX runtimes).
+func (d *dockerBackend) prepareMCPServerMMMCPConfig(ctx context.Context, server ServerConfig, envVars map[string]string) (string, error) {
 	// Create all environment variables map
 	allEnvVars := make(map[string][]byte, len(server.Env)+len(envVars))
 
@@ -1638,33 +1740,25 @@ func (d *dockerBackend) prepareMCPServerNanobotConfig(ctx context.Context, serve
 		allEnvVars[k] = []byte(v)
 	}
 
-	var (
-		nanobotYAML []byte
-		err         error
-	)
-	if server.Runtime == otypes.RuntimeComposite {
-		nanobotYAML, err = constructMCPServerNanobotYAMLForComposite(server)
-	} else {
-		nanobotYAML, err = constructMCPServerNanobotYAML(server, allEnvVars)
-	}
+	mmmcpYAML, err := constructMCPServerMMMCPYAML(server, allEnvVars)
 	if err != nil {
-		return "", fmt.Errorf("failed to construct nanobot YAML: %w", err)
+		return "", fmt.Errorf("failed to construct mmmcp YAML: %w", err)
 	}
 
-	volumeName := server.MCPServerName + "-mcp-server-nanobot-config"
+	volumeName := server.MCPServerName + "-mcp-server-mmmcp-config"
 	_, err = d.client.VolumeCreate(ctx, volume.CreateOptions{
 		Labels: map[string]string{
 			"mcp.server.id": server.MCPServerName,
-			"mcp.purpose":   "mcp-server-nanobot-config",
+			"mcp.purpose":   "mcp-server-mmmcp-config",
 		},
 		Name: volumeName,
 	})
 	if err != nil && !cerrdefs.IsAlreadyExists(err) {
-		return "", fmt.Errorf("failed to create MCP server nanobot config volume: %w", err)
+		return "", fmt.Errorf("failed to create MCP server mmmcp config volume: %w", err)
 	}
 
-	script := fmt.Sprintf("cat > /config/nanobot.yaml << 'EOF'\n%s\nEOF\n", nanobotYAML)
-	if err = d.runInitContainer(ctx, server.MCPServerName+"-nanobot-init", script, []mount.Mount{
+	script := fmt.Sprintf("cat > /config/mmmcp.yaml << 'EOF'\n%s\nEOF\n", mmmcpYAML)
+	if err = d.runInitContainer(ctx, server.MCPServerName+"-mmmcp-init", script, []mount.Mount{
 		{
 			Type:   mount.TypeVolume,
 			Source: volumeName,

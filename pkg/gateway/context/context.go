@@ -3,15 +3,17 @@ package context
 
 import (
 	"context"
-
-	"github.com/google/uuid"
-	"github.com/obot-platform/obot/logger"
+	"log/slog"
+	"uuid"
 )
 
-type reqIDKey struct{}
+type (
+	reqIDKey  struct{}
+	loggerKey struct{}
+)
 
 func WithNewRequestID(ctx context.Context) context.Context {
-	return context.WithValue(ctx, reqIDKey{}, uuid.NewString())
+	return context.WithValue(ctx, reqIDKey{}, uuid.New().String())
 }
 
 func GetRequestID(ctx context.Context) string {
@@ -19,17 +21,14 @@ func GetRequestID(ctx context.Context) string {
 	return s
 }
 
-type loggerKey struct{}
-
-func WithLogger(ctx context.Context, log *logger.Logger) context.Context {
+func WithLogger(ctx context.Context, log *slog.Logger) context.Context {
 	return context.WithValue(ctx, loggerKey{}, log)
 }
 
-func GetLogger(ctx context.Context) *logger.Logger {
-	l, ok := ctx.Value(loggerKey{}).(*logger.Logger)
+func GetLogger(ctx context.Context) *slog.Logger {
+	l, ok := ctx.Value(loggerKey{}).(*slog.Logger)
 	if !ok || l == nil {
-		log := logger.New("")
-		return &log
+		return slog.Default()
 	}
 
 	return l

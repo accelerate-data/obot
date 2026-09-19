@@ -1,17 +1,16 @@
 package services
 
 import (
+	"log/slog"
+
 	"github.com/obot-platform/kinm/pkg/db"
 	"github.com/obot-platform/nah/pkg/randomtoken"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/logutil"
 	"github.com/obot-platform/obot/pkg/storage/authn"
 	"github.com/obot-platform/obot/pkg/storage/authz"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 )
-
-var log = logger.Package()
 
 type Config struct {
 	StorageListenPort int    `usage:"Port to storage backend will listen on (default: random port)"`
@@ -35,17 +34,17 @@ func New(config Config) (_ *Services, err error) {
 
 	// Sanitize DSN for logging (remove credentials)
 	sanitizedDSN := logutil.SanitizeDSN(config.DSN)
-	log.Debugf("Creating database factory. dsn: %v", sanitizedDSN)
+	slog.Debug("Creating database factory", "dsn", sanitizedDSN)
 	dbClient, err := connectDB(
 		func() (*db.Factory, error) { return db.NewFactory(scheme.Scheme, config.DSN) },
 		dbConnectMaxAttempts,
 		dbConnectRetryDelay,
 	)
 	if err != nil {
-		log.Errorf("Failed to create database factory: dsn=%s error=%v", sanitizedDSN, err)
+		slog.Error("Failed to create database factory", "dsn", sanitizedDSN, "error", err)
 		return nil, err
 	}
-	log.Debugf("Database factory created successfully. dsn: %v", sanitizedDSN)
+	slog.Debug("Database factory created successfully", "dsn", sanitizedDSN)
 
 	// Query logging must never write bound parameter values.
 	dbClient.DB.Logger = newParameterizedLogger(dbClient.DB.Logger)

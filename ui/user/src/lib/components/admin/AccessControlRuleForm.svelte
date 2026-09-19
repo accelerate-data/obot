@@ -14,7 +14,6 @@
 		type AccessControlRule,
 		type AccessControlRuleManifest,
 		type AccessControlRuleResource,
-		type AccessControlRuleSubject,
 		type OrgUser,
 		type OrgGroup,
 		type MCPCatalogEntry
@@ -23,6 +22,7 @@
 	import { profile } from '$lib/stores';
 	import { goto } from '$lib/url';
 	import { getUserDisplayName } from '$lib/utils';
+	import { convertSubjectsToTableData, resolveSubjects } from '../../subjectResolver';
 	import Confirm from '../Confirm.svelte';
 	import IconButton from '../primitives/IconButton.svelte';
 	import Table from '../table/Table.svelte';
@@ -105,44 +105,33 @@
 	$effect(() => {
 		// Prevent loading users and groups if acr has no subjects
 		if (!accessControlRule.subjects || accessControlRule.subjects?.length === 0) {
+			loadingUsersAndGroups = false;
 			return;
 		}
 
 		loadingUsersAndGroups = true;
 
-		// Prevent refetching when adding new users or groups
-		const promises: [Promise<OrgUser[] | undefined>, Promise<OrgGroup[] | undefined>] = [
-			Promise.resolve(undefined),
-			Promise.resolve(undefined)
-		];
+		// Groups are resolved by ID, not listed: the directory can hold tens of thousands of them and
+		// only the ones attached here are needed.
+		const controller = new AbortController();
 
-		if (!usersAndGroups?.users) {
-			promises[0] = UserService.listUsers();
-		}
-		if (!usersAndGroups?.groups) {
-			promises[1] = UserService.listGroups();
-		}
-
-		Promise.all(promises)
-			.then(([users, groups]) => {
-				if (!usersAndGroups) {
-					usersAndGroups = { users: [], groups: [] };
-				}
-
-				if (users) {
-					usersAndGroups!.users = users;
-				}
-
-				if (groups) {
-					usersAndGroups!.groups = groups;
-				}
-
+		resolveSubjects(
+			accessControlRule.subjects,
+			untrack(() => usersAndGroups),
+			{ signal: controller.signal }
+		)
+			.then((resolved) => {
+				if (controller.signal.aborted) return;
+				usersAndGroups = resolved;
 				loadingUsersAndGroups = false;
 			})
 			.catch((error) => {
+				if (controller.signal.aborted) return;
 				console.error('Failed to load users and groups:', error);
 				loadingUsersAndGroups = false;
 			});
+
+		return () => controller.abort();
 	});
 
 	$effect(() => {
@@ -160,15 +149,14 @@
 			);
 			if (!existingResourceIds.has(initialAdditionId)) {
 				const entry = mcpEntriesMap.get(initialAdditionId);
+				const workspaceScope = entity === 'workspace' ? `?wid=${id}` : '';
+
 				if (entry) {
 					accessControlRule.resources = [
 						...(accessControlRule.resources ?? []),
 						{ id: entry.id, type: 'mcpServerCatalogEntry' }
 					];
-					redirect =
-						entity === 'workspace'
-							? `/mcp-catalog/c/${entry.id}`
-							: `/admin/mcp-catalog/c/${entry.id}`;
+					redirect = `/mcp-servers/c/${entry.id}${workspaceScope}`;
 				} else {
 					const server = mcpServersMap.get(initialAdditionId);
 					if (server) {
@@ -176,58 +164,13 @@
 							...(accessControlRule.resources ?? []),
 							{ id: server.id, type: 'mcpServer' }
 						];
-						redirect =
-							entity === 'workspace'
-								? `/mcp-catalog/s/${server.id}`
-								: `/admin/mcp-catalog/s/${server.id}`;
+						redirect = `/mcp-servers/s/${server.id}${workspaceScope}`;
 					}
 				}
 			}
 			sessionStorage.removeItem(ADMIN_SESSION_STORAGE.ACCESS_CONTROL_RULE_CREATION);
 		}
 	});
-
-	function convertSubjectsToTableData(
-		subjects: AccessControlRuleSubject[],
-		users: OrgUser[],
-		groups: OrgGroup[]
-	) {
-		const userMap = new Map(users?.map((user) => [user.id, user]));
-		const groupMap = new Map(groups?.map((group) => [group.id, group]));
-
-		return (
-			subjects
-				.map((subject) => {
-					if (subject.type === 'user') {
-						return {
-							id: subject.id,
-							displayName: getUserDisplayName(userMap, subject.id),
-							type: 'User'
-						};
-					}
-
-					if (subject.type === 'group') {
-						const group = groupMap.get(subject.id);
-						if (!group) {
-							return undefined;
-						}
-
-						return {
-							id: subject.id,
-							displayName: group.name,
-							type: 'Group'
-						};
-					}
-
-					return {
-						id: subject.id,
-						displayName: subject.id === '*' ? 'All Obot Users' : subject.id,
-						type: 'Group'
-					};
-				})
-				.filter((subject) => subject !== undefined) ?? []
-		);
-	}
 
 	function convertMcpServersToTableData(resources: AccessControlRuleResource[]) {
 		const owner = initialAccessControlRule?.powerUserID
@@ -452,9 +395,9 @@
 							if (redirect) {
 								goto(redirect);
 							} else if (profile.current.hasAdminAccess?.()) {
-								goto('/admin/mcp-access-policies');
+								goto('/mcp-servers?view=access-policies');
 							} else {
-								goto('/mcp-access-policies');
+								goto('/mcp-servers?view=access-policies');
 							}
 						}}
 					>
@@ -595,7 +538,7 @@
 		await (entity === 'workspace'
 			? UserService.deleteWorkspaceAccessControlRule(id, accessControlRule.id)
 			: AdminService.deleteAccessControlRule(accessControlRule.id));
-		goto('/admin/mcp-access-policies');
+		goto('/mcp-servers?view=access-policies');
 	}}
 	oncancel={() => (deletingRule = false)}
 />

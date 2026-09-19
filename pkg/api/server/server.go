@@ -2,17 +2,19 @@ package server
 
 import (
 	"bufio"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authn"
 	"github.com/obot-platform/obot/pkg/api/authz"
@@ -31,8 +33,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-var log = logger.Package()
-
 type Server struct {
 	storageClient           storage.Client
 	gatewayClient           *gclient.Client
@@ -50,6 +50,22 @@ type Server struct {
 
 	mux         *http.ServeMux
 	otelHandler http.Handler
+}
+
+type headersResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	auditEntry  audit.LogEntry
+	auditLogger audit.Logger
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
 }
 
 func NewServer(storageClient storage.Client, gatewayClient *gclient.Client, localK8sClient kclient.Client, obotNamespace string, authn *authn.Authenticator, authz *authz.Authorizer, proxyManager *proxy.Manager, auditLogger audit.Logger, rateLimiter *ratelimiter.RateLimiter, baseURL string, oauthScopesSupported []string, registryNoAuth bool, licenseProvider *license.Provider) *Server {
@@ -148,7 +164,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 
 				// There was an error applying the rate limit.
 				// Log it and move on so that a failure to apply rate limits doesn't take down the entire API.
-				log.Warnf("Failed to apply rate limits: %v", err)
+				slog.Warn("Failed to apply rate limits", "error", err)
 			}
 		}
 
@@ -172,7 +188,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 			if authenticated {
 				// Best effort
 				if err := s.gatewayClient.AddActivityForToday(req.Context(), user.GetUID()); err != nil {
-					log.Warnf("Failed to add activity tracking for user %s: %v", user.GetName(), err)
+					slog.Warn("Failed to add activity tracking for user", "user", user.GetName(), "error", err)
 				}
 			}
 		}
@@ -181,6 +197,18 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 			for _, setCookie := range user.GetExtra()["set-cookies"] {
 				rw.Header().Add("Set-Cookie", setCookie)
 			}
+		}
+
+		// Enforced after audit logging is installed and refreshed provider cookies are replayed, so
+		// rejected probes stay auditable and a cookie refresh is not lost to a blocked operation.
+		if cmp.Or(user.GetExtra()["password_change_required"]...) == "true" && !passwordChangeRequestAllowed(req) {
+			if req.Pattern != "/" {
+				http.Error(rw, "password change required", http.StatusForbidden)
+			} else {
+				rd := req.URL.RequestURI()
+				http.Redirect(rw, req, "/change-password?rd="+url.QueryEscape(rd), http.StatusSeeOther)
+			}
+			return
 		}
 
 		var shouldLogError bool
@@ -241,14 +269,25 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 		}
 
 		if shouldLogError {
-			log.Errorf("Error handling request for %s: %v", req.URL.Path, err)
+			slog.Error("Error handling request", "path", req.URL.Path, "error", err)
 		}
 	}
 }
 
-type headersResponseWriter struct {
-	http.ResponseWriter
-	wroteHeader bool
+func passwordChangeRequestAllowed(req *http.Request) bool {
+	if isStaticAssetPath(req.URL.Path) || req.URL.Path == "/change-password" || strings.HasPrefix(req.URL.Path, "/change-password/") || req.URL.Path == "/activate" || strings.HasPrefix(req.URL.Path, "/activate/") || req.URL.Path == "/oauth2/sign_out" {
+		return true
+	}
+	return (req.Method == http.MethodGet && slices.Contains([]string{
+		"/api/me",
+		"/api/version",
+		"/api/license",
+		"/api/app-preferences",
+	}, req.URL.Path)) ||
+		(req.Method == http.MethodPost && slices.Contains([]string{
+			"/api/local-auth/activate",
+			"/api/local-auth/change-password",
+		}, req.URL.Path))
 }
 
 func (w *headersResponseWriter) Unwrap() http.ResponseWriter {
@@ -297,17 +336,11 @@ func (w *headersResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func (w *headersResponseWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (w *headersResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	h, ok := w.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
-	}
-	return h.Hijack()
+	return http.NewResponseController(w.ResponseWriter).Hijack()
 }
 
 func (w *headersResponseWriter) Push(target string, opts *http.PushOptions) error {
@@ -320,13 +353,14 @@ func (w *headersResponseWriter) Push(target string, opts *http.PushOptions) erro
 // isStaticAssetPath returns true if the path is a static asset that should be
 // exempt from rate limiting. This includes SvelteKit chunks, CSS, and UI images.
 func isStaticAssetPath(path string) bool {
-	return strings.HasPrefix(path, "/_app/") || strings.HasPrefix(path, "/user/images/")
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-	auditEntry  audit.LogEntry
-	auditLogger audit.Logger
+	return strings.HasPrefix(path, "/_app/") || strings.HasPrefix(path, "/user/images/") || slices.Contains([]string{
+		"/favicon.ico",
+		"/favicon-16x16.png",
+		"/favicon-32x32.png",
+		"/apple-touch-icon.png",
+		"/android-chrome-192x192.png",
+		"/android-chrome-512x512.png",
+	}, path)
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
@@ -334,7 +368,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 
 	if err := rw.auditLogger.LogEntry(rw.auditEntry); err != nil {
-		log.Errorf("Failed to log audit entry: %v", err)
+		slog.Error("Failed to log audit entry", "error", err)
 	}
 }
 
@@ -379,9 +413,8 @@ func accessLog(next http.Handler) http.Handler {
 	})
 }
 
-type statusWriter struct {
-	http.ResponseWriter
-	status int
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (w *statusWriter) WriteHeader(code int) {

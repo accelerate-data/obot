@@ -24,12 +24,48 @@ type MCPServerInstance struct {
 	Spec MCPServerInstanceSpec `json:"spec"`
 }
 
+type MCPServerInstanceSpec struct {
+	// VMCPInstanceID identifies the vMCP connection that owns this component connection.
+	VMCPInstanceID  string `json:"vmcpInstanceID,omitempty"`
+	VMCPComponentID string `json:"vmcpComponentID,omitempty"`
+	// UserID is the user that owns this MCP server instance.
+	UserID string `json:"userID,omitempty"`
+	// MCPServerName is the name of the MCP server this instance is associated with.
+	MCPServerName string `json:"mcpServerName,omitempty"`
+	// MCPCatalogName is the name of the MCP catalog that the server that this instance points to is shared within
+	MCPCatalogName string `json:"mcpCatalogName,omitempty"`
+	// MCPServerCatalogEntryName is the name of the MCP server catalog entry that the server that this instance points to is based on, if there is one.
+	MCPServerCatalogEntryName string `json:"mcpServerCatalogEntryName,omitempty"`
+	// PowerUserWorkspaceID is the name of the PowerUserWorkspace that the server that this instance points to is owned by, if there is one.
+	PowerUserWorkspaceID string `json:"powerUserWorkspaceID,omitempty"`
+	// Template indicates whether this MCP server instance is a template instance.
+	// Template instances are hidden from user views and are used for creating copyable MCP server instances.
+	Template bool `json:"template,omitempty"`
+	// CompositeName is the name of the composite MCP server that this MCP server instance is a component of, if there is one.
+	CompositeName string `json:"compositeName,omitempty"`
+	// Config is the user-allowed configuration required by this instance's server.
+	Config []types.MCPConfig `json:"config,omitempty"`
+	// Deprecated: retained only to migrate per-user headers to Config.
+	DeprecatedMultiUserConfig *types.MultiUserConfig `json:"multiUserConfig,omitempty"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+type MCPServerInstanceList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []MCPServerInstance `json:"items"`
+}
+
 func (in *MCPServerInstance) Has(field string) (exists bool) {
 	return slices.Contains(in.FieldNames(), field)
 }
 
 func (in *MCPServerInstance) Get(field string) (value string) {
 	switch field {
+	case "spec.vmcpInstanceID":
+		return in.Spec.VMCPInstanceID
 	case "spec.userID":
 		return in.Spec.UserID
 	case "spec.mcpServerName":
@@ -50,6 +86,7 @@ func (in *MCPServerInstance) Get(field string) (value string) {
 
 func (in *MCPServerInstance) FieldNames() []string {
 	return []string{
+		"spec.vmcpInstanceID",
 		"spec.userID",
 		"spec.mcpServerName",
 		"spec.mcpCatalogName",
@@ -62,6 +99,7 @@ func (in *MCPServerInstance) FieldNames() []string {
 
 func (in *MCPServerInstance) DeleteRefs() []Ref {
 	return []Ref{
+		{ObjType: &VMCPInstance{}, Name: in.Spec.VMCPInstanceID},
 		{ObjType: &MCPServer{}, Name: in.Spec.MCPServerName},
 		{ObjType: &MCPServer{}, Name: in.Spec.CompositeName},
 		{ObjType: &PowerUserWorkspace{}, Name: in.Spec.PowerUserWorkspaceID},
@@ -73,33 +111,4 @@ func (in *MCPServerInstance) ValidConnectURLs(base string) []string {
 		return []string{system.MCPConnectURL(base, in.Spec.MCPServerName)}
 	}
 	return []string{system.MCPConnectURL(base, in.Name)}
-}
-
-type MCPServerInstanceSpec struct {
-	// UserID is the user that owns this MCP server instance.
-	UserID string `json:"userID,omitempty"`
-	// MCPServerName is the name of the MCP server this instance is associated with.
-	MCPServerName string `json:"mcpServerName,omitempty"`
-	// MCPCatalogName is the name of the MCP catalog that the server that this instance points to is shared within
-	MCPCatalogName string `json:"mcpCatalogName,omitempty"`
-	// MCPServerCatalogEntryName is the name of the MCP server catalog entry that the server that this instance points to is based on, if there is one.
-	MCPServerCatalogEntryName string `json:"mcpServerCatalogEntryName,omitempty"`
-	// PowerUserWorkspaceID is the name of the PowerUserWorkspace that the server that this instance points to is owned by, if there is one.
-	PowerUserWorkspaceID string `json:"powerUserWorkspaceID,omitempty"`
-	// Template indicates whether this MCP server instance is a template instance.
-	// Template instances are hidden from user views and are used for creating copyable MCP server instances.
-	Template bool `json:"template,omitempty"`
-	// CompositeName is the name of the composite MCP server that this MCP server instance is a component of, if there is one.
-	CompositeName string `json:"compositeName,omitempty"`
-	// MultiUserConfig indicates the configuration required from the MCP server that this instance points to.
-	MultiUserConfig *types.MultiUserConfig `json:"multiUserConfig,omitempty"`
-}
-
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-type MCPServerInstanceList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata"`
-
-	Items []MCPServerInstance `json:"items"`
 }

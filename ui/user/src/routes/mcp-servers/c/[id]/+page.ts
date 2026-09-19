@@ -1,27 +1,19 @@
 import { handleRouteError } from '$lib/errors';
-import { UserService } from '$lib/services';
-import { profile } from '$lib/stores';
+import { getMCPCatalogEntry } from '../../utils';
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ params, fetch }) => {
+export const load: PageLoad = async ({ params, url, fetch, parent }) => {
 	const { id } = params;
-	let workspaceId;
+
+	const { profile } = await parent();
 	let catalogEntry;
 	try {
-		workspaceId = await UserService.fetchWorkspaceIDForProfile(profile.current?.id, { fetch });
-	} catch (_err) {
-		// may not have a workspace id if basic user atm
-		workspaceId = undefined;
-	}
-
-	try {
-		catalogEntry = await UserService.getMCP(id, { fetch });
+		catalogEntry = await getMCPCatalogEntry(id, url, profile, fetch);
 	} catch (err) {
-		handleRouteError(err, `/mcp-servers/c/${id}`, profile.current);
+		handleRouteError(err, `/mcp-servers/c/${id}`, profile);
 	}
 
 	return {
-		workspaceId,
 		catalogEntry
 	};
 };

@@ -6,16 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/oasdiff/yaml"
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
-	ntypes "github.com/obot-platform/nanobot/pkg/types"
+	mmmcpconfig "github.com/obot-platform/mmmcp/config"
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/version"
 )
 
 const (
@@ -40,14 +41,15 @@ const (
 	runtimeBackendKubernetesShort = "k8s"
 )
 
-func IsKubernetesBackend(backend string) bool {
-	switch strings.ToLower(strings.TrimSpace(backend)) {
-	case RuntimeBackendKubernetes, runtimeBackendKubernetesShort:
-		return true
-	default:
-		return false
-	}
-}
+var (
+	ErrHealthCheckTimeout     = errors.New("timed out waiting for MCP server to be ready")
+	ErrHealthCheckFailed      = errors.New("MCP server is not healthy")
+	ErrPodCrashLoopBackOff    = errors.New("pod is in CrashLoopBackOff state")
+	ErrImagePullFailed        = errors.New("failed to pull container image")
+	ErrPodSchedulingFailed    = errors.New("pod could not be scheduled")
+	ErrPodConfigurationFailed = errors.New("pod configuration is invalid")
+	ErrInsufficientCapacity   = errors.New("insufficient cluster capacity to deploy MCP server")
+)
 
 type backend interface {
 	// ensureServerDeployment will deploy a server if it is not already deployed, and return the updated ServerConfig
@@ -66,19 +68,34 @@ type ErrNotSupportedByBackend struct {
 	Feature, Backend string
 }
 
+type mmmcpFileConfig struct {
+	Name    string            `json:"name" yaml:"name"`
+	Version string            `json:"version" yaml:"version"`
+	Servers []mmmcpFileServer `json:"servers" yaml:"servers"`
+}
+
+type mmmcpFileServer struct {
+	Name               string            `json:"name" yaml:"name"`
+	URL                string            `json:"url,omitempty" yaml:"url,omitempty"`
+	Headers            map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	PassthroughHeaders []string          `json:"passthroughHeaders,omitempty" yaml:"passthroughHeaders,omitempty"`
+	Command            string            `json:"command,omitempty" yaml:"command,omitempty"`
+	Args               []string          `json:"args,omitempty" yaml:"args,omitempty"`
+	Env                map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+}
+
+func IsKubernetesBackend(backend string) bool {
+	switch strings.ToLower(strings.TrimSpace(backend)) {
+	case RuntimeBackendKubernetes, runtimeBackendKubernetesShort:
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *ErrNotSupportedByBackend) Error() string {
 	return fmt.Sprintf("feature %s is not supported by %s backend", e.Feature, e.Backend)
 }
-
-var (
-	ErrHealthCheckTimeout     = errors.New("timed out waiting for MCP server to be ready")
-	ErrHealthCheckFailed      = errors.New("MCP server is not healthy")
-	ErrPodCrashLoopBackOff    = errors.New("pod is in CrashLoopBackOff state")
-	ErrImagePullFailed        = errors.New("failed to pull container image")
-	ErrPodSchedulingFailed    = errors.New("pod could not be scheduled")
-	ErrPodConfigurationFailed = errors.New("pod configuration is invalid")
-	ErrInsufficientCapacity   = errors.New("insufficient cluster capacity to deploy MCP server")
-)
 
 func ensureServerReady(ctx context.Context, url string, server ServerConfig) error {
 	// Ensure we can actually hit the service URL.
@@ -258,157 +275,195 @@ func urlWithPath(urlStr, path string) string {
 	return u.String()
 }
 
-func compositeMCPServerNanobotConfig(server ServerConfig) ntypes.Config {
-	names := make([]string, 0, len(server.Components))
-	mcpServers := make(map[string]nmcp.Server, len(server.Components))
-
+// ServerHookConfig returns hook mappings and the MCP server configurations used
+// by the native hook runner. The target MCP server itself is intentionally
+// absent: its traffic continues through the reverse proxy.
+func ServerHookConfig(server ServerConfig) (Hooks, HookServerConfigs) {
 	replacer := strings.NewReplacer("/", "-", ":", "-", "?", "-")
+	hooks := hookDefinitions(server.Webhooks, replacer)
+	servers := make(HookServerConfigs, len(server.Webhooks))
+	for _, webhook := range server.Webhooks {
+		servers[webhookServerName(webhook, replacer)] = ServerConfig{
+			Runtime:              types.RuntimeRemote,
+			URL:                  webhook.URL,
+			UserID:               server.UserID,
+			MCPServerName:        system.SystemMCPServerPrefix + webhook.Name,
+			MCPServerDisplayName: webhook.DisplayName,
+			SystemMCPServer:      true,
+			Audiences:            []string{webhook.Audience},
+		}
+	}
+	return hooks, servers
+}
 
-	for _, component := range server.Components {
-		var tools map[string]nmcp.ToolOverride
-		for _, tool := range component.Tools {
-			if !tool.Enabled {
-				continue
+// MMMCPConfig converts a server configuration into mmmcp's runtime configuration.
+func MMMCPConfig(server ServerConfig, env map[string][]byte) *mmmcpconfig.Config {
+	serverName := server.MCPServerDisplayName
+	if serverName == "" {
+		serverName = server.MCPServerName
+	}
+	config := &mmmcpconfig.Config{
+		Name:    serverName,
+		Version: version.Get().String(),
+	}
+
+	if server.Runtime == types.RuntimeVMCP {
+		passthroughHeaders := make([]string, 0, len(server.PassthroughHeaderNames)+1)
+		passthroughHeaders = append(passthroughHeaders, "Authorization")
+		passthroughHeaders = append(passthroughHeaders, server.PassthroughHeaderNames...)
+
+		servers := make([]mmmcpconfig.Server, 0, len(server.Components))
+		for _, component := range server.Components {
+			tools := make([]mmmcpconfig.ToolOverride, 0, len(component.Tools))
+			for _, tool := range component.Tools {
+				tools = append(tools, mmmcpconfig.ToolOverride{
+					Name:                tool.Name,
+					OverrideName:        tool.OverrideName,
+					Description:         tool.Description,
+					OverrideDescription: tool.OverrideDescription,
+					Enabled:             tool.Enabled,
+				})
 			}
-			if tools == nil {
-				tools = make(map[string]nmcp.ToolOverride, len(component.Tools))
-			}
-			tools[tool.Name] = nmcp.ToolOverride{
-				Name:        tool.OverrideName,
-				Description: tool.OverrideDescription,
-			}
+
+			servers = append(servers, mmmcpconfig.Server{
+				DiscoveryRevision:  server.ConfigHash,
+				Name:               component.DisplayName,
+				Prefix:             component.ToolPrefix,
+				URL:                component.URL,
+				PassthroughHeaders: passthroughHeaders,
+				Tools:              tools,
+				DisableTools:       component.DisableTools,
+			})
 		}
 
-		name := replacer.Replace(component.Name)
-		mcpServers[name] = nmcp.Server{
-			BaseURL:       component.URL,
-			ToolOverrides: tools,
-			NoTools:       component.noTools,
-			ToolPrefix:    component.ToolPrefix,
-		}
-
-		names = append(names, name)
+		config.Servers = servers
+		return config
 	}
 
-	return ntypes.Config{
-		Publish: ntypes.Publish{
-			MCPServers:     names,
-			LazyInitialize: new(bool),
-		},
-		MCPServers: mcpServers,
-	}
-}
-
-func constructMCPServerNanobotYAMLForComposite(server ServerConfig) ([]byte, error) {
-	data, err := yaml.Marshal(compositeMCPServerNanobotConfig(server))
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal nanobot.yaml: %w", err)
-	}
-
-	return data, nil
-}
-
-func ServerNanobotConfig(server ServerConfig, isComposite bool) ntypes.Config {
-	var config ntypes.Config
-	if isComposite {
-		config = compositeMCPServerNanobotConfig(server)
-	} else {
-		config = serverNanobotConfig(server, nil)
-	}
-
-	config.Auth = &ntypes.Auth{
-		OAuthClientID:     server.TokenExchangeClientID,
-		OAuthClientSecret: server.TokenExchangeClientSecret,
-	}
-
-	return config
-}
-
-func serverNanobotConfig(server ServerConfig, env map[string][]byte) ntypes.Config {
 	replacer := strings.NewReplacer("/", "-", ":", "-", "?", "-")
-
-	webhookDefinitions, mcpServers := webhookDefinitions(server.Webhooks, replacer)
-
-	completeEnv := maps.Clone(keyValueSliceToMap(server.Env))
-	if completeEnv == nil {
-		completeEnv = make(map[string]string, len(env))
-	}
+	completeEnv := make(map[string]string, len(env))
 
 	for k, v := range env {
 		completeEnv[k] = string(v)
 	}
 
-	name := replacer.Replace(server.MCPServerDisplayName)
-	mcpServers[name] = nmcp.Server{
-		BaseURL:            server.URL,
-		Command:            server.Command,
-		Args:               server.Args,
-		Env:                completeEnv,
+	if server.Runtime == types.RuntimeNPX {
+		// npx audits the installed tree against the registry before it execs the server. The
+		// result is only logged, nothing here can act on it, and the audit endpoint is
+		// intermittently unresponsive.
+		completeEnv["NPM_CONFIG_AUDIT"] = "false"
+	}
+
+	componentName := replacer.Replace(serverName)
+
+	config.Servers = []mmmcpconfig.Server{{
+		Name:               componentName,
+		URL:                server.URL,
 		Headers:            keyValueSliceToMap(server.Headers),
 		PassthroughHeaders: server.PassthroughHeaderNames,
-		Hooks:              webhookDefinitions,
-	}
-
-	return ntypes.Config{
-		Publish: ntypes.Publish{
-			MCPServers: []string{name},
-		},
-		MCPServers: mcpServers,
-	}
+		Command:            server.Command,
+		Args:               slices.Clone(server.Args),
+		Env:                completeEnv,
+	}}
+	return config
 }
 
-func constructMCPServerNanobotYAML(server ServerConfig, env map[string][]byte) ([]byte, error) {
-	// Don't include webhooks in the nanobot.yaml file in the MCP server. They belong in the proxy.
-	server.Webhooks = nil
-	data, err := yaml.Marshal(serverNanobotConfig(server, env))
+func constructMCPServerMMMCPYAML(server ServerConfig, env map[string][]byte) ([]byte, error) {
+	config := MMMCPConfig(server, env)
+	fileConfig := mmmcpFileConfig{
+		Name:    config.Name,
+		Version: config.Version,
+		Servers: make([]mmmcpFileServer, 0, len(config.Servers)),
+	}
+	for _, server := range config.Servers {
+		args := make([]string, len(server.Args))
+		for i, arg := range server.Args {
+			args[i] = escapeMMMCPInterpolation(arg)
+		}
+
+		headers := make(map[string]string, len(server.Headers))
+		for key, value := range server.Headers {
+			headers[key] = escapeMMMCPInterpolation(value)
+		}
+
+		env := make(map[string]string, len(server.Env))
+		for key, value := range server.Env {
+			env[key] = escapeMMMCPInterpolation(value)
+		}
+
+		fileConfig.Servers = append(fileConfig.Servers, mmmcpFileServer{
+			Name:               server.Name,
+			URL:                escapeMMMCPInterpolation(server.URL),
+			Headers:            headers,
+			PassthroughHeaders: server.PassthroughHeaders,
+			Command:            escapeMMMCPInterpolation(server.Command),
+			Args:               args,
+			Env:                env,
+		})
+	}
+
+	data, err := yaml.Marshal(fileConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal nanobot.yaml: %w", err)
+		return nil, fmt.Errorf("failed to marshal mmmcp.yaml: %w", err)
 	}
 
 	return data, nil
 }
 
-func webhookDefinitions(webhooks []Webhook, replacer *strings.Replacer) (nmcp.Hooks, map[string]nmcp.Server) {
-	webhookDefinitions := make(nmcp.Hooks, 0, len(webhooks))
-	mcpServers := make(map[string]nmcp.Server, len(webhooks)+1)
+// mmmcp treats ${NAME} as an environment reference and $$ as a literal dollar.
+// Values in ServerConfig are already resolved, so preserve them literally.
+func escapeMMMCPInterpolation(value string) string {
+	return strings.ReplaceAll(value, "$", "$$")
+}
 
+func hookDefinitions(webhooks []Webhook, replacer *strings.Replacer) Hooks {
+	definitions := make(Hooks, 0, len(webhooks))
 	for _, webhook := range webhooks {
-		webhookName := replacer.Replace(webhook.DisplayName)
-		if webhookName == "" {
-			webhookName = replacer.Replace(webhook.Name)
-		}
-		mcpServers[webhookName] = nmcp.Server{
-			BaseURL: webhook.URL,
-		}
-
+		webhookName := webhookServerName(webhook, replacer)
 		targetName := webhookName + "/" + webhook.ToolName
 
 		if len(webhook.Definitions) == 0 {
-			webhookDefinitions = append(webhookDefinitions, nmcp.HookMapping{
+			definitions = append(definitions, HookMapping{
 				Name:    "*",
-				Targets: []nmcp.HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
+				Targets: []HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
 			})
 			continue
 		}
 
 		for _, def := range webhook.Definitions {
+			method := def.Method
+			if method == "" {
+				method = "*"
+			}
 			if len(def.Identifiers) == 0 {
-				webhookDefinitions = append(webhookDefinitions, nmcp.HookMapping{
-					Name:    def.Method,
-					Targets: []nmcp.HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
+				definitions = append(definitions, HookMapping{
+					Name:    method,
+					Targets: []HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
 				})
 			}
 			for _, id := range def.Identifiers {
-				webhookDefinitions = append(webhookDefinitions, nmcp.HookMapping{
-					Name:    def.Method,
-					Params:  map[string]string{"name": id},
-					Targets: []nmcp.HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
+				var params map[string]string
+				if id != "*" {
+					params = map[string]string{"name": id}
+				}
+				definitions = append(definitions, HookMapping{
+					Name:    method,
+					Params:  params,
+					Targets: []HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
 				})
 			}
 		}
 	}
 
-	return webhookDefinitions, mcpServers
+	return definitions
+}
+
+func webhookServerName(webhook Webhook, replacer *strings.Replacer) string {
+	name := replacer.Replace(webhook.Name)
+	if name == "" {
+		name = replacer.Replace(webhook.DisplayName)
+	}
+	return name
 }
 
 func keyValueSliceToMap(values []string) map[string]string {

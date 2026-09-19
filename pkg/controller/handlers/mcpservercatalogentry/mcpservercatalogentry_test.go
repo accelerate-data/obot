@@ -1,416 +1,71 @@
 package mcpservercatalogentry
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
-	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
-	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
+	gclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
-	storageservices "github.com/obot-platform/obot/pkg/storage/services"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestDetectCompositeDriftMarksEntryNeedingUpdateWhenMultiUserComponentDrifts(t *testing.T) {
-	componentSnapshot := types.MCPServerCatalogEntryManifest{
-		Name:           "Shared Component",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	}
-	compositeEntry := newMCPServerCatalogEntry("composite-entry", types.MCPServerCatalogEntryManifest{
-		Name:    "Composite Entry",
-		Runtime: types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{
-				{
-					MCPServerID: "shared-server",
-					Manifest:    componentSnapshot,
-				},
-			},
-		},
-	})
-	sharedServer := newMCPServer("shared-server", types.MCPServerManifest{
-		Name:    "Shared Component",
-		Runtime: types.RuntimeContainerized,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:2.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	})
+// fakeCredentialClient counts the queries a reconcile issues, so that "this entry costs nothing
+// to reconcile" is an assertion rather than something inferred from the absence of a panic.
+type fakeCredentialClient struct {
+	// exists is whether the store holds a credential for the entry under test.
+	exists    bool
+	revealErr error
+	deleteErr error
 
-	client := newFakeClient(compositeEntry, sharedServer)
-	err := (&Handler{}).DetectCompositeDrift(router.Request{
-		Client:    client,
-		Ctx:       t.Context(),
-		Object:    compositeEntry,
-		Namespace: compositeEntry.Namespace,
-		Name:      compositeEntry.Name,
-	}, &router.ResponseWrapper{})
-	require.NoError(t, err)
-
-	var updated v1.MCPServerCatalogEntry
-	require.NoError(t, client.Get(t.Context(), router.Key(compositeEntry.Namespace, compositeEntry.Name), &updated))
-	assert.True(t, updated.Status.NeedsUpdate)
+	reveals int
+	deletes int
 }
 
-func TestStaticOAuthControllerCleanupScopesGrantRemovalByLifecycle(t *testing.T) {
-	for _, tt := range []struct {
-		name                     string
-		runtime                  types.Runtime
-		staticRequired           bool
-		wantDeploymentGrantCount int64
-		cleanup                  func(*Handler, router.Request) error
-	}{
-		{
-			name:                     "provider no longer requires static OAuth",
-			runtime:                  types.RuntimeRemote,
-			staticRequired:           false,
-			wantDeploymentGrantCount: 2,
-			cleanup: func(handler *Handler, req router.Request) error {
-				return handler.CleanupUnusedOAuthCredentials(req, &router.ResponseWrapper{})
-			},
-		},
-		{
-			name:                     "provider changed to a non-remote runtime",
-			runtime:                  types.RuntimeContainerized,
-			wantDeploymentGrantCount: 2,
-			cleanup: func(handler *Handler, req router.Request) error {
-				return handler.CleanupUnusedOAuthCredentials(req, &router.ResponseWrapper{})
-			},
-		},
-		{
-			name:           "catalog entry deletion",
-			runtime:        types.RuntimeRemote,
-			staticRequired: true,
-			cleanup: func(handler *Handler, req router.Request) error {
-				return handler.RemoveOAuthCredentials(req, &router.ResponseWrapper{})
-			},
-		},
-		{
-			name:    "catalog entry deletion after a non-remote transition",
-			runtime: types.RuntimeContainerized,
-			cleanup: func(handler *Handler, req router.Request) error {
-				return handler.RemoveOAuthCredentials(req, &router.ResponseWrapper{})
-			},
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			manifest := types.MCPServerCatalogEntryManifest{Runtime: tt.runtime}
-			if tt.runtime == types.RuntimeRemote {
-				manifest.RemoteConfig = &types.RemoteCatalogConfig{
-					FixedURL:            "https://mcp.example/api",
-					StaticOAuthRequired: tt.staticRequired,
-				}
-			} else {
-				manifest.ContainerizedConfig = &types.ContainerizedRuntimeConfig{Image: "example/mcp:latest"}
+func TestStaticOAuthCredentialsRetainedForVMCPSnapshots(t *testing.T) {
+	for _, explicit := range []bool{true, false} {
+		t.Run(fmt.Sprint("explicit reference=", explicit), func(t *testing.T) {
+			entry := remoteEntry(true)
+			entry.Status.OAuthCredentialConfigured = true
+			component := types.VMCPComponent{
+				MCPServerCatalogEntryID: entry.Name,
+				CatalogEntry:            types.MCPServerCatalogEntrySnapshot{Manifest: entry.Spec.Manifest},
 			}
-			entry := newMCPServerCatalogEntry("entry-1", manifest)
-			server := newMCPServer("server-1", types.MCPServerManifest{Runtime: types.RuntimeRemote})
-			server.Spec.MCPServerCatalogEntryName = entry.Name
-			instance := &v1.MCPServerInstance{
-				Name: "instance-1", Namespace: entry.Namespace,
-				Spec: v1.MCPServerInstanceSpec{MCPServerCatalogEntryName: entry.Name},
+			if explicit {
+				component.OAuthCredentialID = system.MCPOAuthCredentialName(entry.Name)
 			}
-			storageClient := newFakeClient(entry, server, instance)
-
-			services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
-			require.NoError(t, err)
-			database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
-			require.NoError(t, err)
-			require.NoError(t, database.AutoMigrate())
-			gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
-			t.Cleanup(func() { require.NoError(t, gateway.Close()) })
-
-			require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
-				Context: system.MCPOAuthCredentialName(entry.Name),
-				Name:    "oauth",
-				Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
-			}))
-			require.NoError(t, services.DB.DB.Create(&[]gatewaytypes.MCPOAuthToken{
-				{MCPID: "fenced-grant", UserID: "user-1", CatalogEntryName: entry.Name},
-				{MCPID: server.Name, UserID: "user-2"},
-				{MCPID: instance.Name, UserID: "user-3"},
-				{MCPID: "unrelated", UserID: "user-4", CatalogEntryName: "other-entry"},
-			}).Error)
-			require.NoError(t, services.DB.DB.Create(&gatewaytypes.MCPOAuthPendingState{
-				HashedState: "pending-hash", MCPID: entry.Name, StaticOAuthTest: true,
-			}).Error)
-
-			req := router.Request{Client: storageClient, Ctx: t.Context(), Object: entry, Namespace: entry.Namespace, Name: entry.Name}
-			require.NoError(t, tt.cleanup(NewHandler(gateway), req))
-
-			_, err = gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(entry.Name)}, "oauth")
-			require.Error(t, err)
-			var ownedGrants int64
-			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
-				Where("catalog_entry_name = ?", entry.Name).Count(&ownedGrants).Error)
-			require.Zero(t, ownedGrants)
-			var deploymentGrants int64
-			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
-				Where("mcp_id IN ?", []string{server.Name, instance.Name}).Count(&deploymentGrants).Error)
-			require.Equal(t, tt.wantDeploymentGrantCount, deploymentGrants)
-			var pendingProofs int64
-			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthPendingState{}).
-				Where("mcp_id = ? AND static_o_auth_test = ?", entry.Name, true).
-				Count(&pendingProofs).Error)
-			require.Zero(t, pendingProofs)
-			var unrelatedGrants int64
-			require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
-				Where("mcp_id = ?", "unrelated").Count(&unrelatedGrants).Error)
-			require.EqualValues(t, 1, unrelatedGrants)
+			vmcp := &v1.VMCP{
+				Name:      "vmcp1retained",
+				Namespace: entry.Namespace,
+				Spec:      v1.VMCPSpec{Manifest: types.VMCPManifest{Components: []types.VMCPComponent{component}}},
+			}
+			storage := newFakeClient(entry, vmcp)
+			creds := &fakeCredentialClient{exists: true}
+			req := router.Request{Ctx: t.Context(), Client: storage, Object: entry}
+			require.NoError(t, removeOAuthCredentials(req, creds))
+			assert.Zero(t, creds.deletes)
+			// Editing the source away from static OAuth also must not revoke a snapshot's credential.
+			entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = false
+			require.NoError(t, storage.Update(t.Context(), entry))
+			require.NoError(t, reconcileOAuthCredential(req, creds))
+			assert.Zero(t, creds.deletes)
+			assert.Zero(t, creds.reveals)
+			require.NoError(t, storage.Delete(t.Context(), vmcp))
+			require.NoError(t, removeOAuthCredentials(req, creds))
+			assert.Equal(t, 1, creds.deletes)
 		})
 	}
-}
-
-func TestStaticOAuthControllerCleanupPreservesRestoredProviderState(t *testing.T) {
-	staleEntry := newMCPServerCatalogEntry("entry-1", types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeRemote,
-		RemoteConfig: &types.RemoteCatalogConfig{
-			FixedURL: "https://mcp.example/api",
-		},
-	})
-	storageClient := newFakeClient(staleEntry)
-	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
-	require.NoError(t, err)
-	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
-	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate())
-	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
-	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
-
-	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(staleEntry.Name),
-		Name:    "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret"},
-	}))
-	require.NoError(t, services.DB.DB.Create(&gatewaytypes.MCPOAuthToken{
-		MCPID: "deployment-1", UserID: "user-1", CatalogEntryName: staleEntry.Name,
-	}).Error)
-
-	releaseCatalogMutationLock, err := gateway.AcquireCredentialLock(t.Context(), system.MCPStaticOAuthCatalogMutationLock)
-	require.NoError(t, err)
-	defer releaseCatalogMutationLock()
-
-	cleanupDone := make(chan error, 1)
-	go func() {
-		cleanupDone <- NewHandler(gateway).CleanupUnusedOAuthCredentials(router.Request{
-			Client: storageClient, Ctx: t.Context(), Object: staleEntry,
-			Namespace: staleEntry.Namespace, Name: staleEntry.Name,
-		}, &router.ResponseWrapper{})
-	}()
-
-	restoredEntry := staleEntry.DeepCopy()
-	restoredEntry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = true
-	require.NoError(t, storageClient.Update(t.Context(), restoredEntry))
-	releaseCatalogMutationLock()
-	require.NoError(t, <-cleanupDone)
-
-	_, err = gateway.RevealCredential(t.Context(), []string{system.MCPOAuthCredentialName(staleEntry.Name)}, "oauth")
-	require.NoError(t, err)
-	var retainedGrants int64
-	require.NoError(t, services.DB.DB.Model(&gatewaytypes.MCPOAuthToken{}).
-		Where("catalog_entry_name = ?", staleEntry.Name).Count(&retainedGrants).Error)
-	require.EqualValues(t, 1, retainedGrants)
-}
-
-func TestEnsureOAuthCredentialStatusFailsClosedForIncompleteCredential(t *testing.T) {
-	entry := newMCPServerCatalogEntry("entry-1", types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeRemote,
-		RemoteConfig: &types.RemoteCatalogConfig{
-			FixedURL: "https://mcp.example/api", StaticOAuthRequired: true,
-		},
-	})
-	entry.Status.OAuthCredentialConfigured = true
-	storageClient := newFakeClient(entry)
-	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
-	require.NoError(t, err)
-	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
-	require.NoError(t, err)
-	require.NoError(t, database.AutoMigrate())
-	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
-	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
-	require.NoError(t, gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID": "client", "MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
-		},
-	}))
-
-	req := router.Request{Client: storageClient, Ctx: t.Context(), Object: entry, Namespace: entry.Namespace, Name: entry.Name}
-	require.NoError(t, NewHandler(gateway).EnsureOAuthCredentialStatus(req, &router.ResponseWrapper{}))
-
-	var updated v1.MCPServerCatalogEntry
-	require.NoError(t, storageClient.Get(t.Context(), router.Key(entry.Namespace, entry.Name), &updated))
-	require.False(t, updated.Status.OAuthCredentialConfigured)
-}
-
-func TestDetectCompositeDriftIgnoresCatalogOnlyComponentFields(t *testing.T) {
-	componentSnapshot := types.MCPServerCatalogEntryManifest{
-		Name:    "Catalog Component",
-		Runtime: types.RuntimeContainerized,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	}
-	compositeEntry := newMCPServerCatalogEntry("composite-entry", types.MCPServerCatalogEntryManifest{
-		Name:    "Composite Entry",
-		Runtime: types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{{
-				CatalogEntryID: "component-entry",
-				Manifest:       componentSnapshot,
-			}},
-		},
-	})
-	compositeEntry.Status.NeedsUpdate = true
-	componentEntry := newMCPServerCatalogEntry("component-entry", types.MCPServerCatalogEntryManifest{
-		EntryKey:       "catalog-only-entry-key",
-		Name:           "Catalog Component",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeSingleUser,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	})
-
-	client := newFakeClient(compositeEntry, componentEntry)
-	err := (&Handler{}).DetectCompositeDrift(router.Request{
-		Client:    client,
-		Ctx:       t.Context(),
-		Object:    compositeEntry,
-		Namespace: compositeEntry.Namespace,
-		Name:      compositeEntry.Name,
-	}, &router.ResponseWrapper{})
-	require.NoError(t, err)
-
-	var updated v1.MCPServerCatalogEntry
-	require.NoError(t, client.Get(t.Context(), router.Key(compositeEntry.Namespace, compositeEntry.Name), &updated))
-	assert.False(t, updated.Status.NeedsUpdate)
-}
-
-func TestDetectCompositeDriftIgnoresAdminAddedSecretBindings(t *testing.T) {
-	binding := &types.MCPSecretBinding{Name: "admin-secret", Key: "api-key", AdminAdded: true}
-	componentSnapshot := types.MCPServerCatalogEntryManifest{
-		Name:           "Shared Component",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-		Env: []types.MCPEnv{{
-			Key:       "API_KEY",
-			Name:      "API Key",
-			Required:  true,
-			Sensitive: true}},
-	}
-	compositeEntry := newMCPServerCatalogEntry("composite-entry", types.MCPServerCatalogEntryManifest{
-		Name:    "Composite Entry",
-		Runtime: types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{{
-				MCPServerID: "shared-server",
-				Manifest:    componentSnapshot,
-			}},
-		},
-	})
-	compositeEntry.Status.NeedsUpdate = true
-	sharedServer := newMCPServer("shared-server", types.MCPServerManifest{
-		Name:    "Shared Component",
-		Runtime: types.RuntimeContainerized,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-		Env: []types.MCPEnv{{
-			Key:           "API_KEY",
-			Name:          "API Key",
-			Required:      true,
-			Sensitive:     true,
-			SecretBinding: binding}},
-	})
-	client := newFakeClient(compositeEntry, sharedServer)
-	err := (&Handler{}).DetectCompositeDrift(router.Request{
-		Client:    client,
-		Ctx:       t.Context(),
-		Object:    compositeEntry,
-		Namespace: compositeEntry.Namespace,
-		Name:      compositeEntry.Name,
-	}, &router.ResponseWrapper{})
-	require.NoError(t, err)
-
-	var updated v1.MCPServerCatalogEntry
-	require.NoError(t, client.Get(t.Context(), router.Key(compositeEntry.Namespace, compositeEntry.Name), &updated))
-	assert.False(t, updated.Status.NeedsUpdate)
-}
-
-func TestDetectCompositeDriftClearsEntryWhenMultiUserComponentMatches(t *testing.T) {
-	componentSnapshot := types.MCPServerCatalogEntryManifest{
-		Name:           "Shared Component",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	}
-	compositeEntry := newMCPServerCatalogEntry("composite-entry", types.MCPServerCatalogEntryManifest{
-		Name:    "Composite Entry",
-		Runtime: types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{
-				{
-					MCPServerID: "shared-server",
-					Manifest:    componentSnapshot,
-				},
-			},
-		},
-	})
-	compositeEntry.Status.NeedsUpdate = true
-	sharedServer := newMCPServer("shared-server", types.MCPServerManifest{
-		Name:    "Shared Component",
-		Runtime: types.RuntimeContainerized,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/component:1.0.0",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	})
-
-	client := newFakeClient(compositeEntry, sharedServer)
-	err := (&Handler{}).DetectCompositeDrift(router.Request{
-		Client:    client,
-		Ctx:       t.Context(),
-		Object:    compositeEntry,
-		Namespace: compositeEntry.Namespace,
-		Name:      compositeEntry.Name,
-	}, &router.ResponseWrapper{})
-	require.NoError(t, err)
-
-	var updated v1.MCPServerCatalogEntry
-	require.NoError(t, client.Get(t.Context(), router.Key(compositeEntry.Namespace, compositeEntry.Name), &updated))
-	assert.False(t, updated.Status.NeedsUpdate)
 }
 
 func newFakeClient(objects ...kclient.Object) kclient.WithWatch {
@@ -423,13 +78,6 @@ func newFakeClient(objects ...kclient.Object) kclient.WithWatch {
 				return nil
 			}
 			return []string{server.Spec.MCPServerCatalogEntryName}
-		}).
-		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(obj kclient.Object) []string {
-			instance := obj.(*v1.MCPServerInstance)
-			if instance.Spec.MCPServerCatalogEntryName == "" {
-				return nil
-			}
-			return []string{instance.Spec.MCPServerCatalogEntryName}
 		}).
 		WithObjects(objects...).
 		Build()
@@ -449,9 +97,8 @@ func newMCPServerCatalogEntry(name string, manifest types.MCPServerCatalogEntryM
 
 func TestEnsureUserCountMultiUserEntry(t *testing.T) {
 	entry := newMCPServerCatalogEntry("multi-entry", types.MCPServerCatalogEntryManifest{
-		Name:           "Multi User Template",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
+		Name:    "Multi User Template",
+		Runtime: types.RuntimeContainerized,
 		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 			Image: "example/mcp:1.0.0",
 			Port:  8080,
@@ -467,6 +114,7 @@ func TestEnsureUserCountMultiUserEntry(t *testing.T) {
 	})
 	server1.Spec.MCPServerCatalogEntryName = entry.Name
 	server1.Spec.UserID = "admin1"
+	server1.Spec.MCPCatalogID = "default"
 	server1.Status.MCPServerInstanceUserCount = new(2)
 
 	server2 := newMCPServer("server-2", types.MCPServerManifest{
@@ -477,6 +125,7 @@ func TestEnsureUserCountMultiUserEntry(t *testing.T) {
 	})
 	server2.Spec.MCPServerCatalogEntryName = entry.Name
 	server2.Spec.UserID = "admin2"
+	server2.Spec.MCPCatalogID = "default"
 	server2.Status.MCPServerInstanceUserCount = new(1)
 
 	client := newFakeClient(entry, server1, server2)
@@ -496,9 +145,8 @@ func TestEnsureUserCountMultiUserEntry(t *testing.T) {
 
 func TestEnsureUserCountMultiUserEntryExcludesComposite(t *testing.T) {
 	entry := newMCPServerCatalogEntry("multi-entry", types.MCPServerCatalogEntryManifest{
-		Name:           "Multi User Template",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
+		Name:    "Multi User Template",
+		Runtime: types.RuntimeContainerized,
 		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 			Image: "example/mcp:1.0.0",
 			Port:  8080,
@@ -514,6 +162,7 @@ func TestEnsureUserCountMultiUserEntryExcludesComposite(t *testing.T) {
 	})
 	activeServer.Spec.MCPServerCatalogEntryName = entry.Name
 	activeServer.Spec.UserID = "admin1"
+	activeServer.Spec.MCPCatalogID = "default"
 	activeServer.Status.MCPServerInstanceUserCount = new(1)
 
 	compositeChild := newMCPServer("composite-child", types.MCPServerManifest{
@@ -524,6 +173,7 @@ func TestEnsureUserCountMultiUserEntryExcludesComposite(t *testing.T) {
 	})
 	compositeChild.Spec.MCPServerCatalogEntryName = entry.Name
 	compositeChild.Spec.UserID = "admin2"
+	compositeChild.Spec.MCPCatalogID = "default"
 	compositeChild.Spec.CompositeName = "parent-composite"
 	compositeChild.Status.MCPServerInstanceUserCount = new(1)
 
@@ -544,9 +194,8 @@ func TestEnsureUserCountMultiUserEntryExcludesComposite(t *testing.T) {
 
 func TestEnsureUserCountSingleUserEntryCountsUniqueServerUsers(t *testing.T) {
 	entry := newMCPServerCatalogEntry("single-entry", types.MCPServerCatalogEntryManifest{
-		Name:           "Single User Template",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeSingleUser,
+		Name:    "Single User Template",
+		Runtime: types.RuntimeContainerized,
 		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 			Image: "example/mcp:1.0.0",
 			Port:  8080,
@@ -590,5 +239,288 @@ func newMCPServer(name string, manifest types.MCPServerManifest) *v1.MCPServer {
 		Spec: v1.MCPServerSpec{
 			Manifest: manifest,
 		},
+	}
+}
+
+func (f *fakeCredentialClient) RevealCredential(_ context.Context, contexts []string, name string) (gatewaytypes.Credential, error) {
+	f.reveals++
+	if f.revealErr != nil {
+		return gatewaytypes.Credential{}, f.revealErr
+	}
+	if !f.exists {
+		return gatewaytypes.Credential{}, gclient.CredentialNotFoundError{Contexts: contexts, Name: name}
+	}
+	return gatewaytypes.Credential{Context: contexts[0], Name: name}, nil
+}
+
+func (f *fakeCredentialClient) DeleteCredential(_ context.Context, _, _ string) (bool, error) {
+	f.deletes++
+	if f.deleteErr != nil {
+		return false, f.deleteErr
+	}
+	deleted := f.exists
+	f.exists = false
+	return deleted, nil
+}
+
+func remoteEntry(staticOAuthRequired bool) *v1.MCPServerCatalogEntry {
+	return newMCPServerCatalogEntry("remote-entry", types.MCPServerCatalogEntryManifest{
+		Name:    "Remote Template",
+		Runtime: types.RuntimeRemote,
+		RemoteConfig: &types.RemoteCatalogConfig{
+			FixedURL:            "https://example.com/mcp",
+			StaticOAuthRequired: staticOAuthRequired,
+		},
+	})
+}
+
+// runOAuthReconcile runs the handler against a fake API and returns the entry as it was
+// left in storage.
+func runOAuthReconcile(t *testing.T, creds *fakeCredentialClient, entry *v1.MCPServerCatalogEntry) (v1.MCPServerCatalogEntry, error) {
+	t.Helper()
+
+	client := newFakeClient(entry)
+	err := reconcileOAuthCredential(router.Request{
+		Client:    client,
+		Ctx:       t.Context(),
+		Object:    entry,
+		Namespace: entry.Namespace,
+		Name:      entry.Name,
+	}, creds)
+
+	var stored v1.MCPServerCatalogEntry
+	require.NoError(t, client.Get(t.Context(), router.Key(entry.Namespace, entry.Name), &stored))
+	return stored, err
+}
+
+func TestReconcileOAuthCredential(t *testing.T) {
+	tests := []struct {
+		name string
+		// entry is the object as the controller sees it at the start of the pass.
+		entry func() *v1.MCPServerCatalogEntry
+		// exists is whether the credential store already holds a credential for it.
+		exists         bool
+		wantReveals    int
+		wantDeletes    int
+		wantConfigured bool
+	}{
+		{
+			// The steady state for most of a catalog, and the case this handler exists to keep
+			// free: a remote entry that never had a static OAuth credential.
+			name:  "entry with no credential recorded is left alone",
+			entry: func() *v1.MCPServerCatalogEntry { return remoteEntry(false) },
+		},
+		{
+			// The other steady state: a configured entry that still requires static OAuth. The
+			// status already answers the question, so the store is not read.
+			name: "configured entry that still requires static OAuth is left alone",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := remoteEntry(true)
+				e.Status.OAuthCredentialConfigured = true
+				return e
+			},
+			exists:         true,
+			wantConfigured: true,
+		},
+		{
+			name: "credential is deleted once the entry stops requiring static OAuth",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := remoteEntry(false)
+				e.Status.OAuthCredentialConfigured = true
+				return e
+			},
+			exists:      true,
+			wantDeletes: 1,
+		},
+		{
+			// An entry converted away from the remote runtime keeps its credential under the same
+			// name, and nothing else would ever remove it.
+			name: "credential is deleted once the entry stops being remote",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := newMCPServerCatalogEntry("converted-entry", types.MCPServerCatalogEntryManifest{
+					Name:    "Converted Template",
+					Runtime: types.RuntimeContainerized,
+					ContainerizedConfig: &types.ContainerizedRuntimeConfig{
+						Image: "example/mcp:1.0.0",
+					},
+				})
+				e.Status.OAuthCredentialConfigured = true
+				return e
+			},
+			exists:      true,
+			wantDeletes: 1,
+		},
+		{
+			// SetOAuthCredentials writes the credential before it sets the annotation, so a
+			// failure in between leaves a credential the controller has no record of. Reading the
+			// store whenever the status is clear is what repairs that.
+			name:           "credential written without the annotation landing is recorded",
+			entry:          func() *v1.MCPServerCatalogEntry { return remoteEntry(true) },
+			exists:         true,
+			wantReveals:    1,
+			wantConfigured: true,
+		},
+		{
+			name:        "entry that requires static OAuth but has no credential stays unconfigured",
+			entry:       func() *v1.MCPServerCatalogEntry { return remoteEntry(true) },
+			wantReveals: 1,
+		},
+		{
+			// How a delete through the API reaches the status: the annotation forces a read of a
+			// store the status would otherwise be trusted for.
+			name: "sync annotation rechecks an entry recorded as configured",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := remoteEntry(true)
+				e.Status.OAuthCredentialConfigured = true
+				e.Annotations = map[string]string{v1.MCPServerCatalogEntrySyncAnnotation: "true"}
+				return e
+			},
+			wantReveals: 1,
+		},
+		{
+			// The race the annotation covers on the cleanup side: the manifest stops requiring
+			// static OAuth between the API writing a credential and this handler observing it, so
+			// the status is clear even though a credential exists.
+			name: "sync annotation cleans up a credential the status never recorded",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := remoteEntry(false)
+				e.Annotations = map[string]string{v1.MCPServerCatalogEntrySyncAnnotation: "true"}
+				return e
+			},
+			exists:      true,
+			wantDeletes: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := tt.entry()
+			_, hadAnnotation := entry.Annotations[v1.MCPServerCatalogEntrySyncAnnotation]
+			creds := &fakeCredentialClient{exists: tt.exists}
+
+			stored, err := runOAuthReconcile(t, creds, entry)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantReveals, creds.reveals, "credential reads")
+			assert.Equal(t, tt.wantDeletes, creds.deletes, "credential deletes")
+			assert.Equal(t, tt.wantConfigured, stored.Status.OAuthCredentialConfigured)
+			if hadAnnotation {
+				assert.NotEmpty(t, stored.Annotations[v1.OAuthCredentialRevisionAnnotation], "dependent vMCPs must observe the completed recheck")
+				assert.NotContains(t, stored.Annotations, v1.MCPServerCatalogEntrySyncAnnotation,
+					"a completed recheck should clear the annotation")
+			}
+		})
+	}
+}
+
+// The status is the only record that a credential exists, so it must not be cleared on a pass
+// where the delete did not happen. nah runs every handler registered for a type even after an
+// earlier one returns an error, which is why the delete and the status update have to be one
+// handler rather than two.
+func TestReconcileOAuthCredentialKeepsStatusWhenDeleteFails(t *testing.T) {
+	entry := remoteEntry(false)
+	entry.Status.OAuthCredentialConfigured = true
+	creds := &fakeCredentialClient{exists: true, deleteErr: errors.New("connection refused")}
+
+	stored, err := runOAuthReconcile(t, creds, entry)
+
+	require.ErrorContains(t, err, "connection refused")
+	assert.Equal(t, 1, creds.deletes)
+	assert.True(t, stored.Status.OAuthCredentialConfigured,
+		"status must survive a failed delete so the next pass retries it")
+}
+
+// Same reasoning for the annotation: it is the only signal that the status cannot be trusted, so
+// a pass that fails has to leave it in place.
+func TestReconcileOAuthCredentialKeepsSyncAnnotationWhenRecheckFails(t *testing.T) {
+	entry := remoteEntry(true)
+	entry.Status.OAuthCredentialConfigured = true
+	entry.Annotations = map[string]string{v1.MCPServerCatalogEntrySyncAnnotation: "true"}
+	creds := &fakeCredentialClient{revealErr: errors.New("connection refused")}
+
+	stored, err := runOAuthReconcile(t, creds, entry)
+
+	require.ErrorContains(t, err, "connection refused")
+	assert.Contains(t, stored.Annotations, v1.MCPServerCatalogEntrySyncAnnotation,
+		"annotation must survive a failed recheck so the next pass retries it")
+	assert.Empty(t, stored.Annotations[v1.OAuthCredentialRevisionAnnotation])
+}
+
+// The sync annotation is the only sign a credential exists on an entry the controller has not
+// reconciled since the API wrote one, so the finalizer has to honor it too. Otherwise an entry
+// that is set up, converted away from remote, and deleted before any reconcile runs takes its
+// credential with it and nothing is left to delete it.
+func TestRemoveOAuthCredentialsOnDeletedEntry(t *testing.T) {
+	converted := func() *v1.MCPServerCatalogEntry {
+		return newMCPServerCatalogEntry("converted-entry", types.MCPServerCatalogEntryManifest{
+			Name:    "Converted Template",
+			Runtime: types.RuntimeContainerized,
+			ContainerizedConfig: &types.ContainerizedRuntimeConfig{
+				Image: "example/mcp:1.0.0",
+			},
+		})
+	}
+
+	tests := []struct {
+		name        string
+		entry       func() *v1.MCPServerCatalogEntry
+		wantDeletes int
+	}{
+		{
+			name:        "remote entry is always swept",
+			entry:       func() *v1.MCPServerCatalogEntry { return remoteEntry(false) },
+			wantDeletes: 1,
+		},
+		{
+			name:        "ordinary entry of another runtime is left alone",
+			entry:       converted,
+			wantDeletes: 0,
+		},
+		{
+			name: "entry of another runtime recorded as configured is swept",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := converted()
+				e.Status.OAuthCredentialConfigured = true
+				return e
+			},
+			wantDeletes: 1,
+		},
+		{
+			name: "entry of another runtime being deleted is swept",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := converted()
+				e.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+				e.Finalizers = []string{v1.MCPServerCatalogEntryFinalizer}
+				return e
+			},
+			wantDeletes: 1,
+		},
+		{
+			name: "entry of another runtime with a pending recheck is swept",
+			entry: func() *v1.MCPServerCatalogEntry {
+				e := converted()
+				e.Annotations = map[string]string{v1.MCPServerCatalogEntrySyncAnnotation: "true"}
+				return e
+			},
+			wantDeletes: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := tt.entry()
+			creds := &fakeCredentialClient{exists: true}
+
+			err := removeOAuthCredentials(router.Request{
+				Client:    newFakeClient(entry),
+				Ctx:       t.Context(),
+				Object:    entry,
+				Namespace: entry.Namespace,
+				Name:      entry.Name,
+			}, creds)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDeletes, creds.deletes)
+		})
 	}
 }

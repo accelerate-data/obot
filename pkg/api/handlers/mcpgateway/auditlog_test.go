@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/obot-platform/nanobot/pkg/mcp/auditlogs"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp/auditlogs"
 	"github.com/obot-platform/obot/pkg/principal"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -29,6 +29,16 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestParseAuditLogOptsParsesAPIKeyIDs(t *testing.T) {
+	opts := parseAuditLogOpts(map[string][]string{
+		"api_key_id": {"42, 7", "9", "invalid", "0"},
+	})
+
+	if !slices.Equal(opts.APIKeyID, []uint{42, 7, 9}) {
+		t.Fatalf("APIKeyID = %v, want [42 7 9]", opts.APIKeyID)
+	}
+}
 
 func TestAuditLogInputUnmarshalFlatMCPFields(t *testing.T) {
 	var input auditLogInput
@@ -157,6 +167,76 @@ func TestAttributeMCPAuditLogAPIKeyPreservesPrincipalSnapshot(t *testing.T) {
 
 	if input.APIKeyID == nil || *input.APIKeyID != 42 || input.APIKeyName != "event-time name" {
 		t.Fatalf("principal attribution was overwritten: ID=%v name=%q", input.APIKeyID, input.APIKeyName)
+	}
+}
+
+func TestListAuditLogAPIKeyFilterOptionsReturnsStructuredOptions(t *testing.T) {
+	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
+	created, err := gatewayClient.CreateAPIKey(t.Context(), 7, "CLI token", "", nil, gatewaytypes.APIKeyScopes{CanAccessLLMProxy: true})
+	if err != nil {
+		t.Fatalf("create API key: %v", err)
+	}
+	seedMCPAuditLogs(t, gatewayClient, gatewaytypes.MCPAuditLog{
+		CreatedAt: time.Now().UTC(), SourceType: types.AuditLogSourceTypeMCP,
+		UserID: "7", APIKeyID: &created.ID, APIKeyName: "CLI token",
+		MCPFields: &gatewaytypes.MCPAuditLogFields{MCPID: "mcp-1", CallType: "tools/call"},
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx := newAuditLogListContextWithRecorder(t, gatewayClient, "event_type=mcp_call", &user.DefaultInfo{
+		UID: "1", Groups: []string{types.GroupAuthenticated, types.GroupAdmin},
+	}, recorder)
+	ctx.SetPathValue("filter", "api_key_id")
+	if err := NewAuditLogHandler(gatewayClient).ListAuditLogFilterOptions(ctx); err != nil {
+		t.Fatalf("list API-key filter options: %v", err)
+	}
+
+	var response struct {
+		Options []types.AuditLogAPIKeyFilterOption `json:"options"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Options) != 1 || response.Options[0].Value != fmt.Sprint(created.ID) || response.Options[0].Name != "CLI token" || response.Options[0].MaskedKey != fmt.Sprintf("ok1-7-%d-*****", created.ID) {
+		t.Fatalf("unexpected structured options: %#v", response.Options)
+	}
+}
+
+func TestListAuditLogAPIKeyFilterOptionsIncludesLocalAgentKeysForMixedSources(t *testing.T) {
+	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
+	created, err := gatewayClient.CreateAPIKey(t.Context(), 7, "Local CLI", "", nil, gatewaytypes.APIKeyScopes{CanAccessAPI: true})
+	if err != nil {
+		t.Fatalf("create API key: %v", err)
+	}
+	event := validLocalAgentAuditLogInput(time.Now().UTC(), "local-api-key-filter", types.AuditLogOutcomeStatusSuccess)
+	if err := NewLocalAgentAuditLogHandler().Submit(newLocalAgentAuditLogTestContext(t, gatewayClient, []types.LocalAgentToolCallAuditLogInput{event}, &user.DefaultInfo{
+		UID:    "7",
+		Groups: []string{types.GroupAuthenticated},
+		Extra: map[string][]string{
+			principal.APIKeyIDExtra:   {fmt.Sprint(created.ID)},
+			principal.APIKeyNameExtra: {"Local CLI"},
+		},
+	})); err != nil {
+		t.Fatalf("submit local-agent audit log: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx := newAuditLogListContextWithRecorder(t, gatewayClient, "event_type=mcp_call,local_agent_tool_call", &user.DefaultInfo{
+		UID: "1", Groups: []string{types.GroupAuthenticated, types.GroupAdmin},
+	}, recorder)
+	ctx.SetPathValue("filter", "api_key_id")
+
+	if err := NewAuditLogHandler(gatewayClient).ListAuditLogFilterOptions(ctx); err != nil {
+		t.Fatalf("list mixed-source API-key options: %v", err)
+	}
+	var response struct {
+		Options []types.AuditLogAPIKeyFilterOption `json:"options"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Options) != 1 || response.Options[0].Value != fmt.Sprint(created.ID) || response.Options[0].Name != "Local CLI" {
+		t.Fatalf("unexpected mixed-source options: %#v", response.Options)
 	}
 }
 
@@ -400,7 +480,7 @@ func TestLocalAgentAuditLogSubmitDuplicateIdempotencyKeyIsSuccessNoop(t *testing
 
 func TestListAuditLogsLocalAgentRequiresPrivilege(t *testing.T) {
 	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
-	seedLocalAgentAuditLog(t, gatewayClient, "entry-1")
+	seedLocalAgentAuditLog(t, gatewayClient)
 
 	handler := NewAuditLogHandler(gatewayClient)
 
@@ -432,7 +512,7 @@ func TestListAuditLogsRejectsSourceTypeQuery(t *testing.T) {
 
 func TestListAuditLogsLocalAgentAdminSeesMetadataNoPayload(t *testing.T) {
 	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
-	seedLocalAgentAuditLog(t, gatewayClient, "entry-1")
+	seedLocalAgentAuditLog(t, gatewayClient)
 
 	handler := NewAuditLogHandler(gatewayClient)
 	rec := httptest.NewRecorder()
@@ -460,7 +540,7 @@ func TestListAuditLogsLocalAgentAdminSeesMetadataNoPayload(t *testing.T) {
 
 func TestListAuditLogsAdminGetsOneMixedPage(t *testing.T) {
 	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
-	seedLocalAgentAuditLog(t, gatewayClient, "entry-1")
+	seedLocalAgentAuditLog(t, gatewayClient)
 	gatewayClient.LogMCPAuditEntry(gatewaytypes.MCPAuditLog{
 		CreatedAt:  time.Now().UTC().Add(time.Second),
 		SourceType: types.AuditLogSourceTypeMCP,
@@ -505,7 +585,7 @@ func TestListAuditLogsAdminGetsOneMixedPage(t *testing.T) {
 // admin sees every source they are authorized for (both MCP and local-agent).
 func TestListAuditLogsDefaultsToAllAuthorizedSources(t *testing.T) {
 	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
-	seedLocalAgentAuditLog(t, gatewayClient, "entry-1")
+	seedLocalAgentAuditLog(t, gatewayClient)
 	gatewayClient.LogMCPAuditEntry(gatewaytypes.MCPAuditLog{
 		CreatedAt:  time.Now().UTC().Add(time.Second),
 		SourceType: types.AuditLogSourceTypeMCP,
@@ -554,14 +634,14 @@ func TestListAuditLogsScopesBasicAndPowerUserPlus(t *testing.T) {
 		wantCalls []string
 	}{
 		{
-			name:      "basic user sees only owned server",
+			name:      "basic user sees owned server and owned vMCP",
 			groups:    types.RoleBasic.Groups(),
-			wantCalls: []string{"owned-call"},
+			wantCalls: []string{"vmcp-call", "owned-call"},
 		},
 		{
-			name:      "power user plus sees owned and workspace servers",
+			name:      "power user plus sees owned server, workspace, and owned vMCP",
 			groups:    types.RolePowerUserPlus.Groups(),
-			wantCalls: []string{"workspace-call", "owned-call"},
+			wantCalls: []string{"vmcp-call", "workspace-call", "owned-call"},
 		},
 	}
 
@@ -596,6 +676,34 @@ func TestListAuditLogsScopesBasicAndPowerUserPlus(t *testing.T) {
 	}
 }
 
+// The "View Audit Logs" link on a vMCP deep-links to mcp_id=<vMCP ID>, which an audit row records
+// directly, so a basic user following it sees their own vMCP's calls.
+func TestListAuditLogsVMCPDeepLinkReturnsOwnedVMCPCalls(t *testing.T) {
+	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
+	storageClient, logs := newAuditLogScopeTestFixture(t, "42")
+	seedMCPAuditLogs(t, gatewayClient, logs...)
+
+	recorder := httptest.NewRecorder()
+	ctx := newScopedAuditLogTestContext(t, gatewayClient, storageClient, recorder, "", "mcp_id=vmcp-owned", &user.DefaultInfo{
+		UID:    "42",
+		Groups: types.RoleBasic.Groups(),
+	})
+	if err := NewAuditLogHandler(gatewayClient).ListAuditLogs(ctx); err != nil {
+		t.Fatalf("list audit logs: %v", err)
+	}
+
+	var response types.AuditLogEventResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Total != 1 || len(response.Items) != 1 {
+		t.Fatalf("got total=%d items=%d, want 1; response=%s", response.Total, len(response.Items), recorder.Body.String())
+	}
+	if got := response.Items[0].Action.Name; got != "vmcp-call" {
+		t.Fatalf("action name = %q, want the owned vMCP's call", got)
+	}
+}
+
 func TestAuditLogFilterOptionsScopeBasicAndPowerUserPlus(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -603,14 +711,14 @@ func TestAuditLogFilterOptionsScopeBasicAndPowerUserPlus(t *testing.T) {
 		wantOptions []string
 	}{
 		{
-			name:        "basic user gets options only from owned server",
+			name:        "basic user gets options from owned server and owned vMCP",
 			groups:      types.RoleBasic.Groups(),
-			wantOptions: []string{"Owned Server"},
+			wantOptions: []string{"Owned Server", "Owned vMCP"},
 		},
 		{
-			name:        "power user plus gets options from owned and workspace servers",
+			name:        "power user plus gets options from owned server, workspace, and owned vMCP",
 			groups:      types.RolePowerUserPlus.Groups(),
-			wantOptions: []string{"Owned Server", "Workspace Server"},
+			wantOptions: []string{"Owned Server", "Owned vMCP", "Workspace Server"},
 		},
 	}
 
@@ -644,7 +752,7 @@ func TestAuditLogFilterOptionsScopeBasicAndPowerUserPlus(t *testing.T) {
 
 func TestGetAuditLogLocalAgentAccessByRole(t *testing.T) {
 	gatewayClient := newLocalAgentAuditLogTestGatewayClient(t)
-	seedLocalAgentAuditLog(t, gatewayClient, "entry-1")
+	seedLocalAgentAuditLog(t, gatewayClient)
 
 	handler := NewAuditLogHandler(gatewayClient)
 
@@ -703,9 +811,9 @@ func isBlankJSON(m json.RawMessage) bool {
 	return s == "" || s == "null"
 }
 
-func seedLocalAgentAuditLog(t *testing.T, gatewayClient *gatewayclient.Client, idempotencyKey string) {
+func seedLocalAgentAuditLog(t *testing.T, gatewayClient *gatewayclient.Client) {
 	t.Helper()
-	event := validLocalAgentAuditLogInput(time.Now().UTC(), idempotencyKey, types.AuditLogOutcomeStatusSuccess)
+	event := validLocalAgentAuditLogInput(time.Now().UTC(), "entry-1", types.AuditLogOutcomeStatusSuccess)
 	event.Details.Environment.CWD = "/Users/alice/project"
 	handler := NewLocalAgentAuditLogHandler()
 	if err := handler.Submit(newLocalAgentAuditLogTestContext(t, gatewayClient, []types.LocalAgentToolCallAuditLogInput{event}, &user.DefaultInfo{
@@ -778,6 +886,15 @@ func newAuditLogScopeTestFixture(t *testing.T, userID string) (storage.Client, [
 			Name: "mcp-unrelated", Namespace: system.DefaultNamespace,
 			Spec: v1.MCPServerSpec{UserID: "another-user"},
 		},
+		// vMCPs are scoped like MCP servers: a personal vMCP belongs to the user named in its spec.
+		&v1.VMCP{
+			Name: "vmcp-owned", Namespace: system.DefaultNamespace,
+			Spec: v1.VMCPSpec{UserID: userID},
+		},
+		&v1.VMCP{
+			Name: "vmcp-unrelated", Namespace: system.DefaultNamespace,
+			Spec: v1.VMCPSpec{UserID: "another-user"},
+		},
 	}
 	storageClient := storage.Client(fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
@@ -788,6 +905,13 @@ func newAuditLogScopeTestFixture(t *testing.T, userID string) (storage.Client, [
 			}
 			return []string{server.Spec.UserID}
 		}).
+		WithIndex(&v1.VMCP{}, "spec.userID", func(object kclient.Object) []string {
+			vmcp := object.(*v1.VMCP)
+			if vmcp.Spec.UserID == "" {
+				return nil
+			}
+			return []string{vmcp.Spec.UserID}
+		}).
 		WithObjects(objects...).
 		Build())
 
@@ -796,6 +920,8 @@ func newAuditLogScopeTestFixture(t *testing.T, userID string) (storage.Client, [
 		newAuditLogScopeTestRow(base, "mcp-owned", "Owned Server", "", "owned-call"),
 		newAuditLogScopeTestRow(base.Add(time.Second), "mcp-workspace", "Workspace Server", workspaceID, "workspace-call"),
 		newAuditLogScopeTestRow(base.Add(2*time.Second), "mcp-unrelated", "Unrelated Server", "", "unrelated-call"),
+		newAuditLogScopeTestRow(base.Add(3*time.Second), "vmcp-owned", "Owned vMCP", "", "vmcp-call"),
+		newAuditLogScopeTestRow(base.Add(4*time.Second), "vmcp-unrelated", "Unrelated vMCP", "", "vmcp-unrelated-call"),
 	}
 	return storageClient, logs
 }

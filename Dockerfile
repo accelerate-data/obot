@@ -61,7 +61,7 @@ COPY --from=build-pgvector /usr/share/postgresql17/extension/vector* /usr/share/
 RUN apk add --no-cache git npm nodejs-24 bash tini procps libreoffice docker perl-utils sqlite sqlite-dev curl kubectl jq
 
 ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/accelerate-data/mcp-catalog
-ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog
+ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog/v2-schema
 
 COPY aws-encryption.yaml /
 COPY azure-encryption.yaml /
@@ -77,15 +77,6 @@ COPY --from=encryption-bins /bin/*-encryption-provider /bin/
 COPY --from=bin /app/bin/obot /bin/
 
 ENV PATH=$PATH:/usr/lib/libreoffice/program
-ENV PATH=$PATH:/usr/bin
-
-ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/accelerate-data/mcp-catalog
-ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog
-
-ENV POSTGRES_USER=obot
-ENV POSTGRES_PASSWORD=obot
-ENV POSTGRES_DB=obot
-ENV PGDATA=/data/postgresql
 
 ENV HOME=/data
 ENV XDG_CACHE_HOME=/data/cache

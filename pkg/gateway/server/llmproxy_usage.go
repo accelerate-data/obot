@@ -3,9 +3,9 @@ package server
 import (
 	"sync"
 
-	nanobottypes "github.com/obot-platform/nanobot/pkg/types"
 	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	llmtypes "github.com/obot-platform/obot/pkg/llm"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/tidwall/gjson"
 )
@@ -22,6 +22,21 @@ type threadSafeTokenUsageTracker struct {
 	inner tokenUsageTracker
 }
 
+// messageTokenUsageTracker tracks Anthropic Messages usage.
+type messageTokenUsageTracker struct {
+	cost                                                                 types2.ModelCost
+	inputTokens, cacheRead, cacheWrite5m, cacheWrite1h, output, thinking int
+}
+
+// responseTokenUsageTracker tracks OpenAI Responses usage.
+//
+// Streaming responses emit usage under response.usage on terminal events;
+// non-streaming responses put the same shape at the top-level usage field.
+type responseTokenUsageTracker struct {
+	cost                                         types2.ModelCost
+	inputTokens, cachedTokens, output, reasoning int
+}
+
 // newTokenUsageTracker chooses a parser that matches the upstream usage shape.
 func newTokenUsageTracker(model v1.Model) *threadSafeTokenUsageTracker {
 	var (
@@ -29,10 +44,10 @@ func newTokenUsageTracker(model v1.Model) *threadSafeTokenUsageTracker {
 		inner tokenUsageTracker
 	)
 
-	switch nanobottypes.Dialect(model.Spec.Manifest.Dialect) {
-	case nanobottypes.DialectAnthropicMessages:
+	switch llmtypes.Dialect(model.Spec.Manifest.Dialect) {
+	case llmtypes.DialectAnthropicMessages:
 		inner = &messageTokenUsageTracker{cost: cost}
-	case nanobottypes.DialectOpenAIResponses, nanobottypes.DialectOpenResponses:
+	case llmtypes.DialectOpenAIResponses, llmtypes.DialectOpenResponses:
 		inner = &responseTokenUsageTracker{cost: cost}
 	default:
 		return nil
@@ -61,12 +76,6 @@ func (c *threadSafeTokenUsageTracker) getTokenUsage() types.TokenUsage {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	return c.inner.getTokenUsage()
-}
-
-// messageTokenUsageTracker tracks Anthropic Messages usage.
-type messageTokenUsageTracker struct {
-	cost                                                                 types2.ModelCost
-	inputTokens, cacheRead, cacheWrite5m, cacheWrite1h, output, thinking int
 }
 
 func (t *messageTokenUsageTracker) addTokenUsage(line []byte) {
@@ -122,15 +131,6 @@ func (t *messageTokenUsageTracker) getTokenUsage() types.TokenUsage {
 	u.OutputSpend = spendUSD(t.output, cost.Output)
 	u.TotalSpend = u.InputSpend + u.OutputSpend
 	return u
-}
-
-// responseTokenUsageTracker tracks OpenAI Responses usage.
-//
-// Streaming responses emit usage under response.usage on terminal events;
-// non-streaming responses put the same shape at the top-level usage field.
-type responseTokenUsageTracker struct {
-	cost                                         types2.ModelCost
-	inputTokens, cachedTokens, output, reasoning int
 }
 
 func (t *responseTokenUsageTracker) addTokenUsage(line []byte) {

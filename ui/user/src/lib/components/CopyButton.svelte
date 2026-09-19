@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { tooltip } from '$lib/actions/tooltip.svelte';
-	import { Copy } from '@lucide/svelte';
+	import { Check, Copy } from '@lucide/svelte';
 	import { untrack } from 'svelte';
 	import { twMerge } from 'tailwind-merge';
 
@@ -15,6 +15,7 @@
 			button?: string;
 		};
 		showTextLeft?: boolean;
+		noButtonText?: boolean;
 	}
 
 	let {
@@ -25,10 +26,15 @@
 		buttonText,
 		disabled,
 		classes,
-		showTextLeft
+		showTextLeft,
+		noButtonText
 	}: Props = $props();
 	let message = $state<string>(untrack(() => tooltipText));
 	let buttonTextToShow = $state(untrack(() => buttonText));
+	let copied = $state(false);
+	// Icon-only variants have no accessible name of their own; the tooltip is
+	// rendered in a portal marked aria-hidden, so it cannot supply one either.
+	let visibleText = $derived(noButtonText ? undefined : buttonTextToShow);
 	const COPIED_TEXT = 'Copied!';
 
 	function fallbackCopy(textToCopy: string): boolean {
@@ -72,6 +78,7 @@
 		}
 
 		if (success) {
+			copied = true;
 			message = COPIED_TEXT;
 			buttonTextToShow = COPIED_TEXT;
 			setTimeout(() => {
@@ -91,7 +98,11 @@
 		use:tooltip={disabled ? undefined : message}
 		onclick={() => copy()}
 		{disabled}
-		onmouseenter={() => (buttonTextToShow = buttonText)}
+		aria-label={visibleText ? undefined : tooltipText}
+		onmouseenter={() => {
+			buttonTextToShow = buttonText;
+			copied = false;
+		}}
 		class={twMerge(
 			buttonText && 'btn btn-soft btn-primary',
 			'flex gap-1 text-xs items-center',
@@ -99,7 +110,13 @@
 		)}
 		type="button"
 	>
-		{#if showTextLeft}
+		{#if noButtonText}
+			{#if copied}
+				<Check class="size-4" />
+			{:else}
+				<Copy class="size-4" />
+			{/if}
+		{:else if showTextLeft}
 			{buttonTextToShow}
 			<Copy class={twMerge('size-4', clazz)} />
 		{:else}

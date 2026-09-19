@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -20,13 +21,12 @@ import (
 	"sync"
 	"time"
 
-	nanobottypes "github.com/obot-platform/nanobot/pkg/types"
 	types2 "github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	llmtypes "github.com/obot-platform/obot/pkg/llm"
 	"github.com/obot-platform/obot/pkg/messagepolicy"
 	"github.com/obot-platform/obot/pkg/modelaccesspolicy"
 	"github.com/obot-platform/obot/pkg/principal"
@@ -36,18 +36,69 @@ import (
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 )
 
-const tokenUsageTimePeriod = 24 * time.Hour
+const (
+	tokenUsageTimePeriod = 24 * time.Hour
+
+	internalRequestTypeHeader = "X-Nanobot-Internal-Request-Type"
+	threadTitleRequestType    = "nanobot.summary.thread_title"
+)
 
 var (
-	log              = logger.Package()
 	openAIBaseURL    = "https://api.openai.com/v1"
 	anthropicBaseURL = "https://api.anthropic.com/v1"
 )
 
-const (
-	internalRequestTypeHeader = "X-Nanobot-Internal-Request-Type"
-	threadTitleRequestType    = "nanobot.summary.thread_title"
-)
+type responseModifier struct {
+	user                kuser.Info
+	model               string
+	modelProvider       string
+	routeDialect        llmtypes.Dialect
+	projectID, threadID string
+	client              *client.Client
+	b                   *bufio.Reader
+	c                   io.Closer
+	stream              bool
+	leftover            []byte
+	// Non-streaming JSON is accumulated while forwarded, then parsed once at EOF or Close.
+	nonStreamResponse bytes.Buffer
+	nonStreamParsed   bool
+
+	// Token usage and model access gating
+	tokenUsageTracker *threadSafeTokenUsageTracker
+	mapHelper         *modelaccesspolicy.Helper
+
+	// Input policy violation: replacement text to send back via response header.
+	inputPolicyReplacement string
+
+	// Output (tool-call) policy evaluation fields.
+	messagePolicyHelper *messagepolicy.Helper
+	outputPolicies      []messagepolicy.ApplicablePolicy
+	conversationHistory []messagepolicy.ConversationMessage
+	pipeReader          *io.PipeReader // set when output policies are active; Read() reads from this
+	audit               *llmAuditRecorder
+}
+
+type preparedLLMProxyRequest struct {
+	body              []byte
+	model             string
+	tokenUsageTracker *threadSafeTokenUsageTracker
+}
+
+type llmProviderProxyBackend interface {
+	modelProviderName() string
+	upstreamURL(req *http.Request, credEnv map[string]string) (url.URL, llmtypes.Dialect, error)
+	transport(provider v1.ModelProvider, credEnv map[string]string) (http.RoundTripper, error)
+}
+
+type llmProviderProxy struct {
+	dailyUserInputTokenLimit  int
+	dailyUserOutputTokenLimit int
+	backend                   llmProviderProxyBackend
+	modelProvider             *v1.ModelProvider
+	mapHelper                 *modelaccesspolicy.Helper
+	messagePolicyHelper       *messagepolicy.Helper
+	lock                      sync.RWMutex
+}
 
 func init() {
 	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
@@ -108,36 +159,6 @@ func copyBody(body *io.ReadCloser) ([]byte, error) {
 	// Read was successful, restore the body with a copy.
 	*body = io.NopCloser(bytes.NewReader(slices.Clone(b)))
 	return b, nil
-}
-
-type responseModifier struct {
-	user                kuser.Info
-	model               string
-	modelProvider       string
-	routeDialect        nanobottypes.Dialect
-	projectID, threadID string
-	client              *client.Client
-	b                   *bufio.Reader
-	c                   io.Closer
-	stream              bool
-	leftover            []byte
-	// Non-streaming JSON is accumulated while forwarded, then parsed once at EOF or Close.
-	nonStreamResponse bytes.Buffer
-	nonStreamParsed   bool
-
-	// Token usage and model access gating
-	tokenUsageTracker *threadSafeTokenUsageTracker
-	mapHelper         *modelaccesspolicy.Helper
-
-	// Input policy violation: replacement text to send back via response header.
-	inputPolicyReplacement string
-
-	// Output (tool-call) policy evaluation fields.
-	messagePolicyHelper *messagepolicy.Helper
-	outputPolicies      []messagepolicy.ApplicablePolicy
-	conversationHistory []messagepolicy.ConversationMessage
-	pipeReader          *io.PipeReader // set when output policies are active; Read() reads from this
-	audit               *llmAuditRecorder
 }
 
 func (r *responseModifier) modifyResponse(resp *http.Response) error {
@@ -419,7 +440,7 @@ func (r *responseModifier) streamAndEvaluateToolCallsSSE(ctx context.Context, pw
 		// Once we see the first tool_call chunk, buffer everything remaining
 		// so we can evaluate policies before deciding what to send.
 		if seenToolCalls {
-			buffered = append(buffered, append([]byte(nil), line...))
+			buffered = append(buffered, slices.Clone(line))
 
 			rest, isData := bytes.CutPrefix(line, []byte("data: "))
 			if isData {
@@ -452,13 +473,13 @@ func (r *responseModifier) streamAndEvaluateToolCallsSSE(ctx context.Context, pw
 			// Anthropic-format tool calls (content_block_start with type "tool_use").
 			seenToolCalls = true
 			anthropicBlockToTool = make(map[int]int)
-			buffered = append(buffered, append([]byte(nil), line...))
+			buffered = append(buffered, slices.Clone(line))
 			accumulateAnthropicToolCallInfo(rest, &toolCalls, anthropicBlockToTool)
 		} else if isResponsesAPIToolCallEvent(rest) {
 			// OpenAI Responses API tool calls (response.output_item.added with function_call).
 			seenToolCalls = true
 			responsesItemToTool = make(map[int]int)
-			buffered = append(buffered, append([]byte(nil), line...))
+			buffered = append(buffered, slices.Clone(line))
 			accumulateResponsesAPIToolCallInfo(rest, &toolCalls, responsesItemToTool)
 		} else {
 			_, _ = pw.Write(line)
@@ -478,7 +499,7 @@ func (r *responseModifier) streamAndEvaluateToolCallsSSE(ctx context.Context, pw
 
 	// Evaluate policies against tool calls.
 	targetMessage := buildToolCallTargetMessage(toolCalls)
-	log.Infof("evaluating %d tool calls against %d policies", len(toolCalls), len(r.outputPolicies))
+	slog.Info("evaluating tool calls against policies", "toolCalls", len(toolCalls), "policies", len(r.outputPolicies))
 	violations := r.messagePolicyHelper.EvaluateMessage(ctx, r.outputPolicies, r.conversationHistory, targetMessage, types2.PolicyDirectionToolCalls)
 
 	if len(violations) == 0 {
@@ -695,7 +716,7 @@ func logViolation(ctx context.Context, c *client.Client, v messagepolicy.Message
 		ProjectID:            projectID,
 		ThreadID:             threadID,
 	}); err != nil {
-		log.Warnf("failed to log policy violation for policy %s: %v", v.PolicyID, err)
+		slog.Warn("failed to log policy violation", "policyID", v.PolicyID, "error", err)
 	}
 }
 
@@ -720,7 +741,7 @@ func (r *responseModifier) Close() error {
 		// should still land on whoever created it.
 		activity := newRunTokenActivity(r.user, r.model, usage)
 		if err := r.client.InsertTokenUsage(context.Background(), activity); err != nil {
-			log.Warnf("failed to save token usage for user %s: %v", r.user.GetUID(), err)
+			slog.Warn("failed to save token usage for user", "userID", r.user.GetUID(), "error", err)
 		}
 	}
 	// ReverseProxy does not return body-copy errors to the handler, so Close is
@@ -911,28 +932,6 @@ func extractContentString(content any) string {
 	}
 }
 
-type preparedLLMProxyRequest struct {
-	body              []byte
-	model             string
-	tokenUsageTracker *threadSafeTokenUsageTracker
-}
-
-type llmProviderProxyBackend interface {
-	modelProviderName() string
-	upstreamURL(req *http.Request, credEnv map[string]string) (url.URL, nanobottypes.Dialect, error)
-	transport(provider v1.ModelProvider, credEnv map[string]string) (http.RoundTripper, error)
-}
-
-type llmProviderProxy struct {
-	dailyUserInputTokenLimit  int
-	dailyUserOutputTokenLimit int
-	backend                   llmProviderProxyBackend
-	modelProvider             *v1.ModelProvider
-	mapHelper                 *modelaccesspolicy.Helper
-	messagePolicyHelper       *messagepolicy.Helper
-	lock                      sync.RWMutex
-}
-
 func (s *Server) newLLMProviderProxy(u *url.URL, modelProviderName string) *llmProviderProxy {
 	return &llmProviderProxy{
 		dailyUserInputTokenLimit:  s.dailyUserInputTokenLimit,
@@ -1108,7 +1107,7 @@ func (l *llmProviderProxy) proxy(req api.Context) (retErr error) {
 			proxyErr = err
 			audit.recordResponseStatus(http.StatusBadGateway)
 			audit.finish(req.GatewayClient, err)
-			log.Warnf("LLM provider proxy error: %v", err)
+			slog.Warn("LLM provider proxy error", "error", err)
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		},
 		ModifyResponse: modifier.modifyResponse,

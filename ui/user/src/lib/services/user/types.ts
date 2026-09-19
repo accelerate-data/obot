@@ -15,6 +15,7 @@
  * 3. **New sections** — Add a section header, place it in alphabetical order among other sections,
  *    and keep all types for that domain inside it.
  */
+import type { MCPCatalogEntryServerManifest, MCPConfig } from '../admin/types';
 
 // Access control rules
 
@@ -118,6 +119,17 @@ export type AuditLogTargetType =
 	| 'local_tool';
 export type AuditLogOutcomeStatus = 'success' | 'failure' | 'denied' | 'timeout' | 'unknown';
 
+export type AuditLogAPIKeyFilterOption = {
+	maskedKey: string;
+	name: string;
+	revoked: boolean;
+	userDisplayName: string;
+	userID: string;
+	value: string;
+};
+
+export type AuditLogFilterOption = string | AuditLogAPIKeyFilterOption;
+
 export type AuditLogTargetRef = {
 	targetType: AuditLogTargetType;
 	id?: string;
@@ -200,6 +212,8 @@ export interface AuditLogEvent {
 		id?: string;
 		/** Redacted authentication credential identifier when the actor is a known user. */
 		credentialID?: string;
+		/** Current lifecycle state of the API key represented by credentialID, or by id for credential actors. */
+		apiKeyRevoked?: boolean;
 	};
 	action: { operation: string; name?: string; kind?: string };
 	target: AuditLogTargetRef & { parent?: AuditLogTargetRef };
@@ -254,6 +268,7 @@ export interface McpAuditLogUsageStats {
 	uniqueUsers: number;
 }
 export type AuditLogURLFilters = {
+	api_key_id?: string | null;
 	event_type?: string | null;
 
 	// Unified, source-agnostic filters used by the audit log UI. These map to the correct
@@ -500,6 +515,7 @@ export interface MCPCatalogServer {
 	catalogEntryID: string;
 	missingRequiredEnvVars: string[];
 	missingRequiredHeader?: string[];
+	missingOAuthCredentials?: boolean;
 	mcpCatalogID: string;
 	created: string;
 	deleted?: string;
@@ -516,7 +532,12 @@ export interface MCPCatalogServer {
 	lastUpdated?: string;
 	powerUserWorkspaceID?: string;
 	deploymentStatus?: string;
+	// Retained while legacy composite child deployments can still be migrated.
 	compositeName?: string;
+	vmcpID?: string;
+	vmcpComponentID?: string;
+	vmcpInstanceID?: string;
+	template?: boolean;
 	canConnect?: boolean;
 }
 export interface OAuthMetadata {
@@ -534,7 +555,7 @@ export interface MCPServerInstance {
 	deleted?: string;
 	links?: Record<string, string>;
 	metadata?: Record<string, string>;
-	multiUserConfig?: MultiUserConfig;
+	config?: MCPConfig[];
 	configured: boolean;
 	missingRequiredHeaders?: string[];
 	userID: string;
@@ -543,15 +564,137 @@ export interface MCPServerInstance {
 	connectURL?: string;
 }
 
+// Virtual MCPs
+
+export type VMCPConfigurationPolicyType = 'prohibited' | 'fixed' | 'userAllowed';
+
+export interface VMCPConfigurationPolicy {
+	key: string;
+	policy?: VMCPConfigurationPolicyType;
+	value?: string;
+}
+
+export interface VMCPComponentCatalogEntrySnapshot {
+	manifest: MCPCatalogEntryServerManifest;
+	unsupportedTools?: string[];
+}
+
+export interface VMCPComponent {
+	allowedTools?: string[];
+	catalogEntry: VMCPComponentCatalogEntrySnapshot;
+	configuration?: VMCPConfigurationPolicy[];
+	forceSingleUser?: boolean;
+	id?: string;
+	mcpCatalogID: string;
+	mcpServerCatalogEntryID: string;
+	name: string;
+	oauthCredentialID?: string;
+	sourceDigest?: string;
+	toolOverrides?: ToolOverride[];
+	toolPrefix?: string;
+}
+
+export interface VMCPProfile {
+	name: string;
+	subjects: AccessControlRuleSubject[];
+	vmcpPermissions?: VMCPProfilePermissions;
+}
+
+export interface VMCPProfilePermissions {
+	allowAllComponents?: boolean;
+	allowedComponents?: Record<string, VMCPComponentSet>;
+}
+
+export interface VMCPComponentSet {
+	// Null or omitted means all tools; an empty array grants no tools.
+	allowedTools?: string[] | null;
+}
+
+export interface VMCPManifest {
+	components: VMCPComponent[];
+	description?: string;
+	displayName: string;
+	icon?: string;
+	profiles?: VMCPProfile[];
+}
+
+export interface VMCPStatus {
+	components?: VMCPComponentStatus[];
+	ready?: boolean;
+}
+
+export interface VMCPComponentStatus {
+	error?: string;
+	name: string;
+	ready?: boolean;
+	needsUpdate?: boolean;
+	sourceMissing?: boolean;
+}
+
+export interface VMCP extends VMCPManifest {
+	created: string;
+	creatorUserID?: string;
+	deleted?: string;
+	id: string;
+	links?: Record<string, string>;
+	metadata?: Record<string, string>;
+	staticConfigurationHash?: string;
+	status?: VMCPStatus;
+	type?: string;
+	userID?: string;
+}
+
+export interface VMCPList {
+	items: VMCP[];
+}
+
+export interface VMCPConfiguration {
+	components: Record<string, Record<string, string>>;
+}
+
+export interface VMCPInstanceManifest {
+	// Null or omitted follows the current grant; an empty map selects no tools.
+	componentSet?: Record<string, VMCPComponentSet> | null;
+	vmcpID: string;
+}
+
+export interface VMCPInstanceStatus {
+	configured?: boolean;
+	missingRequiredConfiguration?: string[];
+	userConfigurationHash?: string;
+}
+
+export interface VMCPInstance extends VMCPInstanceManifest {
+	created: string;
+	deleted?: string;
+	id: string;
+	links?: Record<string, string>;
+	metadata?: Record<string, string>;
+	status?: VMCPInstanceStatus;
+	type?: string;
+	userID: string;
+}
+
+export interface VMCPInstanceList {
+	items: VMCPInstance[];
+}
+
 // MCP runtime
 
-export type Runtime = 'npx' | 'uvx' | 'containerized' | 'remote' | 'composite';
+export type Runtime = 'npx' | 'uvx' | 'containerized' | 'remote' | 'vmcp';
+export interface MCPConfigurationOption {
+	name: string;
+	value: string;
+	description?: string;
+}
 export interface MCPSubField {
 	description: string;
 	file?: boolean;
 	dynamicFile?: boolean;
+	interpolated?: boolean;
 	key: string;
 	name: string;
+	options?: MCPConfigurationOption[];
 	required: boolean;
 	sensitive: boolean;
 	value?: string;
@@ -603,7 +746,6 @@ export interface MCPResourceRequirements {
 }
 export interface RemoteRuntimeConfig {
 	fixedURL?: string;
-	headers?: MCPSubField[];
 	hostname?: string;
 	isTemplate?: boolean;
 	tunnelName?: string;
@@ -612,7 +754,6 @@ export interface RemoteRuntimeConfig {
 }
 export interface RemoteCatalogConfig {
 	fixedURL?: string;
-	headers?: MCPSubField[];
 	hostname?: string;
 	tunnelName?: string;
 	urlTemplate?: string;
@@ -620,17 +761,6 @@ export interface RemoteCatalogConfig {
 export type ResourceRuntimeConfig = MCPResourceRequirements;
 export interface MultiUserConfig {
 	userDefinedHeaders?: MCPSubField[];
-}
-export interface CompositeRuntimeConfig {
-	componentServers: ComponentServer[];
-}
-export interface ComponentServer {
-	catalogEntryID?: string;
-	mcpServerID?: string;
-	manifest?: MCPServer;
-	toolOverrides?: ToolOverride[];
-	toolPrefix?: string;
-	disabled?: boolean;
 }
 export interface ToolOverride {
 	name: string;
@@ -640,10 +770,7 @@ export interface ToolOverride {
 	 * still the source of truth unless an overrideDescription is provided.
 	 */
 	description?: string;
-	/**
-	 * Name exposed by the composite server. An empty or undefined value means
-	 * the original tool name should be used.
-	 */
+	/** Name exposed by the virtual MCP. */
 	overrideName?: string;
 	/**
 	 * Optional description override. When empty or undefined, the live description
@@ -651,7 +778,7 @@ export interface ToolOverride {
 	 */
 	overrideDescription?: string;
 	/**
-	 * Whether this tool is included in the composite server's allowlist.
+	 * Whether this tool is included in the virtual MCP's allowlist.
 	 */
 	enabled?: boolean;
 }
@@ -663,7 +790,7 @@ export interface MCPServer {
 	shortDescription?: string;
 	icon?: string;
 	name?: string;
-	env?: MCPSubField[];
+	config?: MCPConfig[];
 	toolPreview?: MCPServerTool[];
 	metadata?: {
 		categories?: string;
@@ -675,8 +802,6 @@ export interface MCPServer {
 	npxConfig?: NPXRuntimeConfig;
 	containerizedConfig?: ContainerizedRuntimeConfig;
 	remoteConfig?: RemoteRuntimeConfig;
-	compositeConfig?: CompositeRuntimeConfig;
-	multiUserConfig?: MultiUserConfig;
 	resources?: MCPResourceRequirements;
 }
 export interface MCPServerTool {
@@ -756,6 +881,7 @@ export interface ModelProviderList {
 export interface Model {
 	id: string;
 	active: boolean;
+	alias?: string;
 	aliasAssigned: boolean;
 	created: number;
 	modelProvider: string;
@@ -805,6 +931,25 @@ export interface OrgGroup {
 	iconURL?: string;
 }
 
+/**
+ * Where a group listing came from. `cache` is Obot's own record of groups, which holds the ones seen
+ * during previous sign-ins plus any resolved by ID for a policy, and is therefore partial.
+ */
+export type OrgGroupSource = 'provider' | 'cache';
+
+export interface OrgGroupPage {
+	items: OrgGroup[];
+	nextCursor?: string;
+	source: OrgGroupSource;
+	/** True when the auth provider could not be listed and this fell back to cached groups. */
+	degraded: boolean;
+	/**
+	 * True when the cursor that was sent could not be honored, so these items are the first page of
+	 * a fresh listing rather than the page that was asked for.
+	 */
+	reset: boolean;
+}
+
 // Profile
 
 export interface Profile {
@@ -818,6 +963,7 @@ export interface Profile {
 	hasAdminAccess?: () => boolean;
 	isAdmin?: () => boolean;
 	isAdminReadonly?: () => boolean;
+	isOwner?: () => boolean;
 	isBootstrapUser?: () => boolean;
 	canImpersonate?: () => boolean;
 	unauthorized?: boolean;
@@ -826,6 +972,7 @@ export interface Profile {
 	expired?: boolean;
 	created?: string;
 	displayName?: string;
+	requirePasswordChange?: boolean;
 }
 
 // Schedule
@@ -881,6 +1028,9 @@ export interface ToolReferenceList {
 // Version
 
 export interface Version {
+	hasModelProvider?: boolean | null;
+	hasValidLicense?: boolean;
+	mcpTesterModelProxyAvailable?: boolean;
 	latestVersion?: string;
 	sessionStore?: string;
 	obot?: string;
@@ -900,6 +1050,7 @@ export interface Version {
 	mcpDefaultDenyAllEgress?: boolean;
 	messagePoliciesEnabled?: boolean;
 	agentsEnabled?: boolean;
+	hostedAgentsEnabled?: boolean;
 	hideK8sDetails?: boolean;
 	disableLegacyChat?: boolean;
 }
@@ -913,4 +1064,5 @@ export type Workspace = {
 	role: number;
 	type: string;
 };
-export type LaunchServerType = 'hosted' | 'multi' | 'remote' | 'composite';
+export type LaunchType = 'hosted' | 'remote';
+export type LaunchServerType = LaunchType | 'multi';

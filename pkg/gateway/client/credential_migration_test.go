@@ -1,6 +1,7 @@
 package client
 
 import (
+	"crypto/aes"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	"k8s.io/apiserver/pkg/storage/value"
+	encryptaes "k8s.io/apiserver/pkg/storage/value/encrypt/aes"
 )
 
 func TestMigrateIfNotRunRollsBackMarkerOnFailureAndRunsOnce(t *testing.T) {
@@ -47,9 +49,17 @@ func TestMigrateIfNotRunRollsBackMarkerOnFailureAndRunsOnce(t *testing.T) {
 
 func TestMigrateUnencryptedCredentialsPreservesAndEncryptsLegacyRows(t *testing.T) {
 	c := newTestClient(t)
+	block, err := aes.NewCipher(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("create AES cipher: %v", err)
+	}
+	transformer, err := encryptaes.NewGCMTransformer(block)
+	if err != nil {
+		t.Fatalf("create AES-GCM transformer: %v", err)
+	}
 	c.encryptionConfig = &encryptionconfig.EncryptionConfiguration{
 		Transformers: map[schema.GroupResource]value.Transformer{
-			credentialGroupResource: staticOAuthTestTransformer{},
+			credentialGroupResource: transformer,
 		},
 	}
 	legacy := gatewaytypes.Credential{

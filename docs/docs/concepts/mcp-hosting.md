@@ -4,7 +4,7 @@ title: MCP Hosting
 
 # MCP Hosting
 
-The MCP Hosting layer runs and manages MCP servers directly within Obot. It handles deployment, lifecycle management, and runtime isolation for MCP servers.
+Obot deploys and manages hosted MCP server workloads on the underlying Kubernetes or Docker runtime.
 
 ## Runtime Types
 
@@ -17,7 +17,12 @@ The MCP Hosting layer runs and manages MCP servers directly within Obot. It hand
 - **[Single-user](../functionality/mcp-servers.md#single-user-server)**: Each user gets their own isolated instance with separate credentials
 - **[Multi-user](../functionality/mcp-servers.md#multi-user-server)**: A shared instance serves multiple users with shared or per-user credentials
 - **[Remote](../functionality/mcp-servers.md#remote-server)**: External MCP servers accessed via HTTP, not hosted by Obot
-- **[Composite](../functionality/mcp-servers.md#composite-server)**: Combines multiple servers into a single virtual server with curated tools
+
+## Virtual MCPs (vMCPs)
+
+Clients connect to new MCP endpoints through a virtual MCP (vMCP), which exposes tools from one or more catalog components through a single endpoint. A vMCP controls which tools users can access, while its backing servers use shared or per-user runtimes according to the component configuration.
+
+vMCPs replace the legacy standalone connection and composite server models. Existing endpoints remain available for migration compatibility in this release; Obot will migrate them in a future release. See [Virtual MCPs](../functionality/virtual-mcps.md) for creation, access, configuration, and migration guidance.
 
 ## Deployment Environments
 
@@ -42,7 +47,7 @@ For production deployments, Obot can deploy MCP servers to Kubernetes:
 
 Obot handles OAuth 2.1 flows for MCP servers that require authentication:
 
-- OAuth credentials stored securely with encryption at rest
+- OAuth credentials encrypted at rest when an [encryption provider](../configuration/encryption-providers/overview.md) is configured; encryption is disabled by default
 - Automatic token refresh
 - Per-user credential isolation
 - Supports custom OAuth configurations

@@ -12,9 +12,13 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-var ErrNotMyToken = errors.New("oidcjwt: token not for this authenticator")
+const (
+	discoveryTimeout = 10 * time.Second
+)
 
-const discoveryTimeout = 10 * time.Second
+var (
+	ErrNotMyToken = errors.New("oidcjwt: token not for this authenticator")
+)
 
 type Claims struct {
 	Issuer  string

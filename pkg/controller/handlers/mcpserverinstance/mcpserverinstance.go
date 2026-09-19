@@ -1,15 +1,14 @@
 package mcpserverinstance
 
 import (
+	"log/slog"
+
 	"github.com/obot-platform/nah/pkg/router"
-	"github.com/obot-platform/obot/logger"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
-
-var log = logger.Package()
 
 type Handler struct {
 	gatewayClient *gateway.Client
@@ -32,7 +31,7 @@ func (h *Handler) MigrationDeleteSingleUserInstances(req router.Request, _ route
 	if server.Spec.IsSingleUser() {
 		// This server is single-user, so it should not have any server instances.
 		// Delete this instance.
-		log.Infof("Deleting invalid single-user MCPServerInstance for unshared server: instance=%s server=%s", instance.Name, server.Name)
+		slog.Info("Deleting invalid single-user MCPServerInstance for unshared server", "instance", instance.Name, "server", server.Name)
 		return req.Delete(instance)
 	}
 
@@ -41,6 +40,9 @@ func (h *Handler) MigrationDeleteSingleUserInstances(req router.Request, _ route
 
 func (h *Handler) UpdateMultiUserConfig(req router.Request, _ router.Response) error {
 	instance := req.Object.(*v1.MCPServerInstance)
+	if instance.Spec.VMCPInstanceID != "" {
+		return nil
+	}
 
 	var server v1.MCPServer
 	if err := req.Get(&server, req.Namespace, instance.Spec.MCPServerName); apierrors.IsNotFound(err) {
@@ -51,8 +53,8 @@ func (h *Handler) UpdateMultiUserConfig(req router.Request, _ router.Response) e
 	}
 
 	if !server.Spec.IsSingleUser() {
-		if !equality.Semantic.DeepEqual(instance.Spec.MultiUserConfig, server.Spec.Manifest.MultiUserConfig) {
-			instance.Spec.MultiUserConfig = server.Spec.Manifest.MultiUserConfig
+		if !equality.Semantic.DeepEqual(instance.Spec.Config, server.Spec.Manifest.UserConfig()) {
+			instance.Spec.Config = server.Spec.Manifest.UserConfig()
 			return req.Client.Update(req.Ctx, instance)
 		}
 	}

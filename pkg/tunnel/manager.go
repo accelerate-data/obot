@@ -25,6 +25,7 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/rancher/remotedialer"
+	"golang.org/x/oauth2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
@@ -33,7 +34,9 @@ import (
 
 const (
 	bridgePathPrefix          = "/tunnel/bridge/"
+	compositeRegisterPath     = "/tunnel/composite/register/"
 	bridgeAuthorizationHeader = "X-Obot-Tunnel-Bridge-Authorization"
+	compositeOwnerHeader      = "X-Obot-MCP-Composite-Owner"
 	bridgePrincipalName       = "obot-tunnel-bridge"
 	tunnelPeerPrincipalName   = "obot-tunnel-peer"
 	tunnelNameHeader          = "X-Obot-Tunnel-Name"
@@ -42,6 +45,8 @@ const (
 	forwardErrorHeader  = "X-Obot-Tunnel-Error"
 	forwardNetwork      = "obot-http"
 	forwardAddress      = "request"
+	compositeNetwork    = "obot-mcp-composite"
+	compositeAddress    = "request"
 	disconnectNetwork   = "obot-control"
 	disconnectAddress   = "disconnect"
 )
@@ -61,6 +66,9 @@ type Manager struct {
 	mu          sync.RWMutex
 	connections map[string]map[*localTunnelConnection]struct{}
 
+	compositeMu            sync.Mutex
+	compositeRegistrations map[string]*compositeRegistration
+
 	peerMu          sync.Mutex
 	peers           map[string]struct{}
 	peerConnections map[net.Conn]string
@@ -70,6 +78,34 @@ type Manager struct {
 type localTunnelConnection struct {
 	key  string
 	conn net.Conn
+}
+
+type bridgeTarget struct {
+	TunnelName string `json:"tunnelName"`
+	URL        string `json:"url"`
+}
+
+type bridgeRoundTripper struct {
+	manager     *Manager
+	tunnelName  string
+	transport   http.RoundTripper
+	headers     http.Header
+	tokenSource oauth2.TokenSource
+}
+
+type HTTPClientOptions struct {
+	Headers     http.Header
+	TokenSource oauth2.TokenSource
+	Timeout     time.Duration
+}
+
+type hijackTrackingResponseWriter struct {
+	http.ResponseWriter
+	onHijack func(net.Conn) bool
+}
+
+type noCloseReadCloser struct {
+	io.Reader
 }
 
 // NewManager creates a tunnel manager whose bridge is served from
@@ -106,21 +142,23 @@ func NewManager(ctx context.Context, bridgeBaseURL string, tunnels kclient.Reade
 		return nil, err
 	}
 	m := &Manager{
-		PeerConfig:          peerConfig,
-		bridgeBaseURL:       parsedBaseURL.Scheme + "://" + parsedBaseURL.Host,
-		bridgeHost:          parsedBaseURL.Host,
-		bridgeAuthorization: "Bearer " + base64.RawURLEncoding.EncodeToString(bridgeAuthorization),
-		tunnels:             tunnels,
-		connections:         make(map[string]map[*localTunnelConnection]struct{}),
-		peers:               make(map[string]struct{}),
-		peerConnections:     make(map[net.Conn]string),
+		PeerConfig:             peerConfig,
+		bridgeBaseURL:          parsedBaseURL.Scheme + "://" + parsedBaseURL.Host,
+		bridgeHost:             parsedBaseURL.Host,
+		bridgeAuthorization:    "Bearer " + base64.RawURLEncoding.EncodeToString(bridgeAuthorization),
+		tunnels:                tunnels,
+		connections:            make(map[string]map[*localTunnelConnection]struct{}),
+		compositeRegistrations: make(map[string]*compositeRegistration),
+		peers:                  make(map[string]struct{}),
+		peerConnections:        make(map[net.Conn]string),
 	}
 	m.remoteDialer = remotedialer.New(m.authorizeRemoteDialer, remoteDialerErrorWriter)
 	m.remoteDialer.PeerID = peerConfig.ID
 	m.remoteDialer.PeerToken = peerConfig.Token
 	m.remoteDialer.ClientConnectAuthorizer = func(network, address string) bool {
 		return network == forwardNetwork && address == forwardAddress ||
-			network == disconnectNetwork && address == disconnectAddress
+			network == disconnectNetwork && address == disconnectAddress ||
+			network == compositeNetwork && address == compositeAddress
 	}
 
 	go func() {
@@ -199,29 +237,22 @@ func (m *Manager) peerRequestAuthorized(req *http.Request) bool {
 	) == 1
 }
 
-type bridgeTarget struct {
-	TunnelName string `json:"tunnelName"`
-	URL        string `json:"url"`
-}
-
-type bridgeRoundTripper struct {
-	manager    *Manager
-	tunnelName string
-	transport  http.RoundTripper
-	headers    http.Header
-}
-
 func (b *bridgeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
-	if request == nil || request.URL == nil {
-		return nil, errors.New("tunnel bridge request URL is required")
+	targetURL := request.URL
+	if bridgedTarget, ok := b.manager.bridgeTargetURLForTunnel(request.URL, b.tunnelName); ok {
+		targetURL = bridgedTarget
 	}
+	preserveAuthorization := b.sameOriginAsInitialRequest(request, targetURL)
 
 	outbound := request.Clone(request.Context())
 	if outbound.Header == nil {
-		outbound.Header = make(http.Header, len(b.headers)+1)
+		outbound.Header = make(http.Header, len(b.headers)+2)
 	}
 
 	maps.Copy(outbound.Header, b.headers)
+	if !preserveAuthorization {
+		outbound.Header.Del("Authorization")
+	}
 
 	if !b.manager.isBridgeURLForTunnel(outbound.URL, b.tunnelName) {
 		bridgeURL, err := b.manager.BridgeURL(b.tunnelName, outbound.URL.String())
@@ -235,48 +266,99 @@ func (b *bridgeRoundTripper) RoundTrip(request *http.Request) (*http.Response, e
 		outbound.Host = ""
 	}
 
+	if b.tokenSource != nil && preserveAuthorization {
+		token, err := b.tokenSource.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to obtain token from source: %w", err)
+		}
+
+		outbound.Header["Authorization"] = []string{"Bearer " + token.AccessToken}
+	}
+
 	name, value := b.manager.BridgeAuthorization()
 	outbound.Header.Set(name, value)
 	return b.transport.RoundTrip(outbound)
 }
 
+func (b *bridgeRoundTripper) sameOriginAsInitialRequest(request *http.Request, target *url.URL) bool {
+	if request == nil || target == nil {
+		return false
+	}
+	initial := request
+	for initial.Response != nil && initial.Response.Request != nil {
+		initial = initial.Response.Request
+	}
+	initialTarget := initial.URL
+	if bridgedTarget, ok := b.manager.bridgeTargetURLForTunnel(initial.URL, b.tunnelName); ok {
+		initialTarget = bridgedTarget
+	}
+	return initialTarget != nil && sameOrigin(initialTarget, target)
+}
+
 // HTTPClient returns an HTTP client that routes every request through the
 // named tunnel. Redirects rewritten by the bridge remain on the same tunnel.
-func (m *Manager) HTTPClient(tunnelName string, headers http.Header, timeout time.Duration) (*http.Client, error) {
+func (m *Manager) HTTPClient(tunnelName string, opts HTTPClientOptions) (*http.Client, error) {
 	if m == nil {
 		return nil, errors.New("tunnel manager is not configured")
 	}
 	if err := apitypes.ValidateTunnelName(tunnelName); err != nil {
 		return nil, err
 	}
+
+	headers := opts.Headers.Clone()
+	if headers == nil {
+		headers = make(http.Header, 1)
+	}
+
+	bridgeAuthorizationName, bridgeAuthorizationValue := m.BridgeAuthorization()
+	headers.Set(bridgeAuthorizationName, bridgeAuthorizationValue)
+
 	return &http.Client{
-		Timeout: timeout,
+		Timeout: opts.Timeout,
 		Transport: &bridgeRoundTripper{
-			manager:    m,
-			tunnelName: tunnelName,
-			transport:  http.DefaultTransport,
-			headers:    headers.Clone(),
+			manager:     m,
+			tunnelName:  tunnelName,
+			transport:   http.DefaultTransport,
+			tokenSource: opts.TokenSource,
+			headers:     headers,
 		},
 	}, nil
 }
 
 func (m *Manager) isBridgeURLForTunnel(targetURL *url.URL, tunnelName string) bool {
+	_, ok := m.bridgeTargetForTunnel(targetURL, tunnelName)
+	return ok
+}
+
+func (m *Manager) bridgeTargetURLForTunnel(targetURL *url.URL, tunnelName string) (*url.URL, bool) {
+	target, ok := m.bridgeTargetForTunnel(targetURL, tunnelName)
+	if !ok {
+		return nil, false
+	}
+	parsed, err := parseTargetURL(target.URL)
+	return parsed, err == nil
+}
+
+func (m *Manager) bridgeTargetForTunnel(targetURL *url.URL, tunnelName string) (bridgeTarget, bool) {
 	if targetURL == nil ||
 		!strings.EqualFold(targetURL.Scheme+"://"+targetURL.Host, m.bridgeBaseURL) ||
 		!strings.HasPrefix(targetURL.Path, bridgePathPrefix) {
-		return false
+		return bridgeTarget{}, false
 	}
 
 	encoded := strings.TrimPrefix(targetURL.Path, bridgePathPrefix)
 	if encoded == "" || strings.Contains(encoded, "/") {
-		return false
+		return bridgeTarget{}, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return false
+		return bridgeTarget{}, false
 	}
 	var target bridgeTarget
-	return json.Unmarshal(payload, &target) == nil && target.TunnelName == tunnelName
+	if json.Unmarshal(payload, &target) != nil || target.TunnelName != tunnelName {
+		return bridgeTarget{}, false
+	}
+	return target, true
 }
 
 // BridgeURL converts an ordinary HTTP(S) target and MCPTunnel name into an
@@ -484,6 +566,7 @@ func (m *Manager) Close() {
 		return
 	}
 	m.CloseAll()
+	m.CloseCompositeSessions()
 
 	m.peerMu.Lock()
 	if m.closed {
@@ -627,11 +710,6 @@ func isTunnelPeerRequest(req *http.Request) bool {
 	return req.Method == http.MethodGet && req.URL.Path == PeerConnectPath
 }
 
-type hijackTrackingResponseWriter struct {
-	http.ResponseWriter
-	onHijack func(net.Conn) bool
-}
-
 func (w *hijackTrackingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	hijacker, ok := w.ResponseWriter.(http.Hijacker)
 	if !ok {
@@ -773,6 +851,10 @@ func (m *Manager) ServeBridge(w http.ResponseWriter, r *http.Request) {
 // HTTP body framing keeps the request and response directions independent
 // without relying on TCP CloseWrite semantics.
 func (m *Manager) roundTrip(ctx context.Context, key, tunnelName, method, target string, header http.Header, contentLength int64, body io.ReadCloser) (*http.Response, error) {
+	return m.roundTripAddress(ctx, key, forwardNetwork, forwardAddress, tunnelName, method, target, header, contentLength, body)
+}
+
+func (m *Manager) roundTripAddress(ctx context.Context, key, network, address, tunnelName, method, target string, header http.Header, contentLength int64, body io.ReadCloser) (*http.Response, error) {
 	outboundBody := body
 	if body != nil && body != http.NoBody {
 		// The inbound HTTP server owns body. The outbound transport may close
@@ -787,7 +869,11 @@ func (m *Manager) roundTrip(ctx context.Context, key, tunnelName, method, target
 	}
 	request.Header = header.Clone()
 	request.Header.Set(forwardTargetHeader, base64.RawURLEncoding.EncodeToString([]byte(target)))
-	request.Header.Set(tunnelNameHeader, tunnelName)
+	if tunnelName != "" {
+		request.Header.Set(tunnelNameHeader, tunnelName)
+	} else {
+		request.Header.Del(tunnelNameHeader)
+	}
 	request.Header.Del(forwardErrorHeader)
 	request.ContentLength = contentLength
 
@@ -795,7 +881,7 @@ func (m *Manager) roundTrip(ctx context.Context, key, tunnelName, method, target
 		DisableCompression: true,
 		DisableKeepAlives:  true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return m.remoteDialer.Dialer(key)(ctx, forwardNetwork, forwardAddress)
+			return m.remoteDialer.Dialer(key)(ctx, network, address)
 		},
 	}
 	response, err := transport.RoundTrip(request)
@@ -811,10 +897,6 @@ func (m *Manager) roundTrip(ctx context.Context, key, tunnelName, method, target
 		return nil, errors.New(string(message))
 	}
 	return response, nil
-}
-
-type noCloseReadCloser struct {
-	io.Reader
 }
 
 func (noCloseReadCloser) Close() error {

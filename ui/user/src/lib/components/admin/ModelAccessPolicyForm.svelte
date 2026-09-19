@@ -6,19 +6,17 @@
 		type ModelAccessPolicy,
 		type ModelAccessPolicyManifest,
 		type ModelResource,
-		type AccessControlRuleSubject,
 		type OrgUser,
 		type OrgGroup,
 		ModelUsage,
 		ModelUsageLabels,
 		ModelAlias,
 		ModelAliasLabels,
-		type Model,
-		UserService
+		type Model
 	} from '$lib/services';
 	import { defaultModelAliases as defaultModelAliasesStore } from '$lib/stores';
 	import { goto } from '$lib/url';
-	import { getUserDisplayName } from '$lib/utils';
+	import { convertSubjectsToTableData, resolveSubjects } from '../../subjectResolver';
 	import Confirm from '../Confirm.svelte';
 	import IconButton from '../primitives/IconButton.svelte';
 	import Table from '../table/Table.svelte';
@@ -186,88 +184,34 @@
 	$effect(() => {
 		// Prevent loading users and groups if rule has no subjects
 		if (!modelAccessPolicy.subjects || modelAccessPolicy.subjects?.length === 0) {
+			loadingUsersAndGroups = false;
 			return;
 		}
 
 		loadingUsersAndGroups = true;
 
-		// Prevent refetching when adding new users or groups
-		const promises: [Promise<OrgUser[] | undefined>, Promise<OrgGroup[] | undefined>] = [
-			Promise.resolve(undefined),
-			Promise.resolve(undefined)
-		];
+		// Groups are resolved by ID, not listed: the directory can hold tens of thousands of them and
+		// only the ones attached here are needed.
+		const controller = new AbortController();
 
-		if (!usersAndGroups?.users) {
-			promises[0] = UserService.listUsers();
-		}
-		if (!usersAndGroups?.groups) {
-			// Load groups when they have not already been fetched.
-			promises[1] = UserService.listGroups();
-		}
-
-		Promise.all(promises)
-			.then(([users, groups]) => {
-				if (!usersAndGroups) {
-					usersAndGroups = { users: [], groups: [] };
-				}
-
-				if (users) {
-					usersAndGroups!.users = users;
-				}
-
-				if (groups) {
-					usersAndGroups!.groups = groups;
-				}
-
+		resolveSubjects(
+			modelAccessPolicy.subjects,
+			untrack(() => usersAndGroups),
+			{ signal: controller.signal }
+		)
+			.then((resolved) => {
+				if (controller.signal.aborted) return;
+				usersAndGroups = resolved;
 				loadingUsersAndGroups = false;
 			})
 			.catch((error) => {
+				if (controller.signal.aborted) return;
 				console.error('Failed to load users and groups:', error);
 				loadingUsersAndGroups = false;
 			});
+
+		return () => controller.abort();
 	});
-
-	function convertSubjectsToTableData(
-		subjects: AccessControlRuleSubject[],
-		users: OrgUser[],
-		groups: OrgGroup[]
-	) {
-		const userMap = new Map(users?.map((user) => [user.id, user]));
-		const groupMap = new Map(groups?.map((group) => [group.id, group]));
-
-		return (
-			subjects
-				.map((subject) => {
-					if (subject.type === 'user') {
-						return {
-							id: subject.id,
-							displayName: getUserDisplayName(userMap, subject.id),
-							type: 'User'
-						};
-					}
-
-					if (subject.type === 'group') {
-						const group = groupMap.get(subject.id);
-						if (!group) {
-							return undefined;
-						}
-
-						return {
-							id: subject.id,
-							displayName: group.name,
-							type: 'Group'
-						};
-					}
-
-					return {
-						id: subject.id,
-						displayName: subject.id === '*' ? 'All Obot Users' : subject.id,
-						type: 'Group'
-					};
-				})
-				.filter((subject) => subject !== undefined) ?? []
-		);
-	}
 
 	function convertModelsToTableData(modelResources: ModelResource[]) {
 		return modelResources.map((model) => {
@@ -553,7 +497,7 @@
 					<button
 						class="btn btn-secondary text-sm"
 						onclick={() => {
-							goto('/admin/model-access-policies');
+							goto('/models?view=access-policies');
 						}}
 					>
 						Cancel
@@ -654,7 +598,7 @@
 		if (!modelAccessPolicy.id) return;
 		saving = true;
 		await AdminService.deleteModelAccessPolicy(modelAccessPolicy.id);
-		goto('/admin/model-access-policies');
+		goto('/models?view=access-policies');
 	}}
 	oncancel={() => (deletingPolicy = false)}
 />

@@ -19,6 +19,9 @@ type LLMAuditLog struct {
 	Duration  int64
 	UserID    string `gorm:"type:text;index:idx_llm_audit_user_created,priority:1"`
 	APIKeyID  *uint  `gorm:"index:idx_llm_audit_api_key_created,priority:1"`
+	// APIKeyRevoked is current lifecycle metadata populated when audit logs are read.
+	// It is not persisted as part of the historical event snapshot.
+	APIKeyRevoked bool `gorm:"-"`
 	// APIKeyName is the event-time display value. Unnamed keys snapshot their
 	// non-secret masked identifier instead of requiring an API-key table join.
 	APIKeyName                string `gorm:"type:text"`
@@ -58,6 +61,7 @@ func ConvertLLMAuditLog(a LLMAuditLog) types2.LLMAuditLog {
 		Duration:                  a.Duration,
 		UserID:                    a.UserID,
 		APIKeyID:                  a.APIKeyID,
+		APIKeyRevoked:             a.APIKeyRevoked,
 		APIKeyName:                a.APIKeyName,
 		ModelProvider:             a.ModelProvider,
 		ModelID:                   a.ModelID,

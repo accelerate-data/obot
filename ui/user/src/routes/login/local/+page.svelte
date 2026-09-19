@@ -10,6 +10,17 @@
 	let params = $derived(browser ? new URL(window.location.href).searchParams : undefined);
 	let rd = $derived(params?.get('rd') ?? '/');
 	let error = $derived(params?.get('error'));
+	// The email is stashed in sessionStorage on submit so it survives the failed-login redirect.
+	// Consume it on every load, and prefill it only on the way back from a failure, so it can't
+	// show up on a later, unrelated visit to this page.
+	const emailKey = 'local-auth-email';
+	function savedEmail() {
+		if (!browser) return '';
+		const saved = sessionStorage.getItem(emailKey);
+		sessionStorage.removeItem(emailKey);
+		return error ? (saved ?? '') : '';
+	}
+	let email = $state(savedEmail());
 </script>
 
 <svelte:head>
@@ -17,12 +28,13 @@
 </svelte:head>
 
 <div
-	class="text-base-content dark:from-base-300 to-base-200 flex h-dvh w-full flex-col items-center justify-center bg-radial-[at_50%_50%] from-gray-50 dark:to-black"
+	class="text-base-content dark:from-base-300 to-base-200 flex h-dvh w-full flex-col items-center justify-center bg-radial-[at_50%_50%] from-gray-50 dark:to-black md:p-0 p-4"
 >
 	<form
 		method="POST"
 		action="/oauth2/start"
-		class="dark:border-base-400 dark:bg-base-200 bg-base-100 flex w-sm flex-col gap-4 rounded-xl border border-transparent p-6 shadow-sm"
+		onsubmit={() => sessionStorage.setItem(emailKey, email)}
+		class="dark:border-base-400 dark:bg-base-200 bg-base-100 flex w-full md:w-sm flex-col gap-4 rounded-xl border border-transparent p-6 shadow-sm"
 	>
 		<Logo class="h-12 self-center" />
 		<h1 class="text-center text-xl font-semibold">Sign in to Obot</h1>
@@ -44,6 +56,7 @@
 				type="email"
 				name="email"
 				autocomplete="username"
+				bind:value={email}
 				required
 			/>
 		</label>

@@ -1,16 +1,69 @@
 import { MDM_DEVICES_CONFIGURATION_FIELD_IDS } from '$lib/constants';
 import { getExpandAdvancedPaneAction } from '../actions';
-import type { GuideStep } from '../types';
+import { SIDEBAR_OPERATIONS_COLLAPSE } from '../mcp/constants';
+import type { GuideAction, GuideStep } from '../types';
 
-const highlightDevicesLink = {
+function getInventoryTabAction(
+	tabId: string,
+	title: string,
+	description: string,
+	next: GuideAction | GuideAction[]
+): GuideAction {
+	return {
+		highlight: {
+			selector: { id: tabId },
+			side: 'left',
+			title,
+			description
+		},
+		listener: {
+			id: tabId,
+			skipClickTargetOnNext: true,
+			action: next
+		}
+	};
+}
+
+function getEnforcementEventsAction(): GuideAction[] {
+	const highlight = {
+		selector: { id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.enforcementEventsLink },
+		side: 'right' as const,
+		title: 'Enforcement Events',
+		description:
+			'When enforcement is enabled and tool calls are made, any actions Obot Sentry takes against them will be recorded and viewable here.'
+	};
+	const listener = {
+		id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.enforcementEventsLink,
+		skipClickTargetOnNext: true,
+		action: { success: true }
+	};
+
+	return [
+		{
+			elementExists: MDM_DEVICES_CONFIGURATION_FIELD_IDS.enforcementEventsLink,
+			highlight,
+			listener
+		},
+		getExpandAdvancedPaneAction({
+			elementMissing: MDM_DEVICES_CONFIGURATION_FIELD_IDS.enforcementEventsLink,
+			highlight,
+			listener,
+			parentID: SIDEBAR_OPERATIONS_COLLAPSE,
+			title: 'Expand Operations',
+			description: 'Expand Operations to access Enforcement Events.'
+		})
+	];
+}
+
+const highlightInventoryLink = {
 	selector: {
 		id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesLink
 	},
-	title: 'Devices',
+	title: 'Inventory',
 	description: 'This is where you can manage devices and install Obot Sentry.'
 };
 
-const listenDevicesLink = {
+const listenInventoryLink = {
 	id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesLink,
 	action: {
 		success: true
@@ -22,21 +75,21 @@ export const steps: GuideStep[] = [
 		content: [
 			'In order to discover shadow AI and enforce policies for unmanaged MCP servers, you will need to install Obot Sentry on your devices.',
 			'**What is Obot Sentry?** Obot Sentry is a lightweight program designed to be used by MDMs for device scanning and agent hook configuration. You can learn more about it [here](https://github.com/obot-platform/obot-sentry).',
-			"To get set up, let's head to the Devices page."
+			"To get set up, let's head to the Inventory page under Operations."
 		],
 		action: [
 			{
 				elementExists: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesLink,
-				highlight: highlightDevicesLink,
-				listener: listenDevicesLink
+				highlight: highlightInventoryLink,
+				listener: listenInventoryLink
 			},
 			getExpandAdvancedPaneAction({
 				elementMissing: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesLink,
-				highlight: highlightDevicesLink,
-				listener: listenDevicesLink,
-				parentID: 'sidebar-collapse-device-management',
-				title: 'Expand Device Management',
-				description: 'This is the "Device Management" section. Let\'s expand it.'
+				highlight: highlightInventoryLink,
+				listener: listenInventoryLink,
+				parentID: SIDEBAR_OPERATIONS_COLLAPSE,
+				title: 'Expand Operations',
+				description: 'Expand Operations to access Inventory.'
 			})
 		]
 	},
@@ -44,7 +97,7 @@ export const steps: GuideStep[] = [
 		content: ['The "Configuration" tab contains all the information needed to set up Obot Sentry.'],
 		action: [
 			{
-				routeContains: '/admin/devices',
+				routeContains: '/inventory',
 				elementExists: MDM_DEVICES_CONFIGURATION_FIELD_IDS.getStartedButton,
 				highlight: {
 					selector: {
@@ -62,7 +115,7 @@ export const steps: GuideStep[] = [
 				}
 			},
 			{
-				routeContains: '/admin/devices',
+				routeContains: '/inventory',
 				elementMissing: MDM_DEVICES_CONFIGURATION_FIELD_IDS.getStartedButton,
 				elementExists: MDM_DEVICES_CONFIGURATION_FIELD_IDS.configurationTab,
 				highlight: {
@@ -208,56 +261,24 @@ export const steps: GuideStep[] = [
 	},
 	{
 		content: [
-			'Once Obot Sentry has been installed and configured on your devices, you can view the results and actions taken in these locations.'
+			'Once Obot Sentry has been installed and configured on your devices, you can view the results across the Inventory tabs — Overview, Devices, Device Clients, Device MCP Servers, and Device Skills — and review enforcement actions under Operations.'
 		],
-		action: {
-			highlight: {
-				selector: {
-					id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesTabOverview
-				},
-				title: 'See Overall Results',
-				side: 'left',
-				description:
-					'View an overall summary of all the scans sent through Obot Sentry over a given time period here.'
-			},
-			listener: {
-				id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesTabOverview,
-				skipClickTargetOnNext: true,
-				action: {
-					highlight: {
-						selector: {
-							id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesTabDevices
-						},
-						side: 'left',
-						title: 'See Individual Device Scans',
-						description:
-							'Go here to view results of an individual device. See the more recent scan or view historical ones.'
-					},
-					listener: {
-						id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesTabDevices,
-						skipClickTargetOnNext: true,
-						action: {
-							highlight: {
-								selector: {
-									id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.enforcementDecisionsLink
-								},
-								side: 'right',
-								title: 'Enforcement Decisions',
-								description:
-									'When enforcement is enabled and tool calls are made, any actions Obot Sentry takes against them will be recorded and viewable here.'
-							},
-							listener: {
-								id: MDM_DEVICES_CONFIGURATION_FIELD_IDS.enforcementDecisionsLink,
-								skipClickTargetOnNext: true,
-								action: {
-									success: true
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		action: getInventoryTabAction(
+			MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesTabOverview,
+			'Overview',
+			'View an overall summary of scans sent through Obot Sentry over a given time period.',
+			getInventoryTabAction(
+				MDM_DEVICES_CONFIGURATION_FIELD_IDS.devicesTabDevices,
+				'Devices',
+				'View results for an individual device, including the most recent scan and historical ones.',
+				getInventoryTabAction(
+					MDM_DEVICES_CONFIGURATION_FIELD_IDS.inventoryTabDeviceMcpServers,
+					'Device MCP Servers',
+					'Browse MCP servers discovered across your enrolled devices.',
+					getEnforcementEventsAction()
+				)
+			)
+		)
 	}
 ];
 

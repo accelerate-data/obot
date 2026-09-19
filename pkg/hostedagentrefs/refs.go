@@ -27,7 +27,19 @@ import (
 // Separator divides the source from the key within it. It matches what the MCP
 // catalog already reserves and validates entry keys against, so a reference
 // written here is the same string that catalog builds internally.
-const Separator = "::"
+const (
+	Separator = "::"
+)
+
+// Resolver resolves many references, remembering what failed.
+//
+// Callers want both halves: the IDs that did resolve, so an agent gets what it
+// can have, and the references that did not, so it can be said why the agent is
+// incomplete.
+type Resolver struct {
+	client    kclient.Client
+	namespace string
+}
 
 // IsReference reports whether a value is a portable reference rather than an
 // ID. Anything without the separator is passed through untouched, so templates
@@ -100,16 +112,6 @@ func ResolveSkill(ctx context.Context, client kclient.Client, namespace, ref str
 		}
 	}
 	return "", fmt.Errorf("no skill %q from %s is installed", path, source)
-}
-
-// Resolver resolves many references, remembering what failed.
-//
-// Callers want both halves: the IDs that did resolve, so an agent gets what it
-// can have, and the references that did not, so it can be said why the agent is
-// incomplete.
-type Resolver struct {
-	client    kclient.Client
-	namespace string
 }
 
 func New(client kclient.Client, namespace string) *Resolver {

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	mmmcpconfig "github.com/obot-platform/mmmcp/config"
 	"github.com/obot-platform/nah/pkg/name"
 	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -23,9 +24,22 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/watch"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+type fakeWithWatch struct {
+	kclient.Client // controller-runtime fake for Get/List/Create etc.
+	watcher        *watch.FakeWatcher
+}
+
+// blockingGetClient blocks forever on Get (until ctx is done), simulating a
+// slow/unresponsive API server call that has no internal self-bound timeout.
+type blockingGetClient struct {
+	kclient.WithWatch
+}
 
 func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 	baseSettings := v1.K8sSettingsSpec{
@@ -37,9 +51,9 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 			corev1.ResourceMemory: resource.MustParse("128Mi"),
 		},
 	}
-	nanobotSettings := *resourceSettings.DeepCopy()
-	nanobotSettings.NanobotWorkspaceSize = "10Gi"
-	nanobotSettings.NanobotAgentResources = &corev1.ResourceRequirements{
+	agentSettings := *resourceSettings.DeepCopy()
+	agentSettings.NanobotWorkspaceSize = "10Gi"
+	agentSettings.NanobotAgentResources = &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
 			corev1.ResourceMemory: resource.MustParse("512Mi"),
 		},
@@ -79,27 +93,7 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 		t.Fatalf("remote server hash = %s, want %s", got, remoteBaseHash)
 	}
 
-	compositeBaseHash := ComputeK8sSettingsHash(
-		baseSettings,
-		nil,
-		types.RuntimeComposite,
-		false,
-		nil,
-	)
-	if got := ComputeK8sSettingsHash(
-		resourceSettings,
-		nil,
-		types.RuntimeComposite,
-		false,
-		nil,
-	); got != compositeBaseHash {
-		t.Fatalf("composite server hash = %s, want %s", got, compositeBaseHash)
-	}
-	if compositeBaseHash != remoteBaseHash {
-		t.Fatalf("composite base hash = %s, want remote base hash %s", compositeBaseHash, remoteBaseHash)
-	}
-
-	nanobotBaseHash := ComputeK8sSettingsHash(
+	agentBaseHash := ComputeK8sSettingsHash(
 		baseSettings,
 		nil,
 		types.RuntimeNPX,
@@ -112,8 +106,8 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 		types.RuntimeNPX,
 		true,
 		nil,
-	); got != nanobotBaseHash {
-		t.Fatalf("nanobot agent server hash = %s, want %s before nanobot-only settings are set", got, nanobotBaseHash)
+	); got != agentBaseHash {
+		t.Fatalf("agent server hash = %s, want %s before agent-only settings are set", got, agentBaseHash)
 	}
 	regularHash := ComputeK8sSettingsHash(
 		resourceSettings,
@@ -123,22 +117,22 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 		nil,
 	)
 	if got := ComputeK8sSettingsHash(
-		nanobotSettings,
+		agentSettings,
 		nil,
 		types.RuntimeNPX,
 		false,
 		nil,
 	); got != regularHash {
-		t.Fatalf("non-nanobot hash = %s, want nanobot-only settings ignored", got)
+		t.Fatalf("non-agent hash = %s, want agent-only settings ignored", got)
 	}
 	if got := ComputeK8sSettingsHash(
-		nanobotSettings,
+		agentSettings,
 		nil,
 		types.RuntimeNPX,
 		true,
 		nil,
-	); got == nanobotBaseHash {
-		t.Fatalf("nanobot hash = %s, want it to differ when nanobot-only settings are set", got)
+	); got == agentBaseHash {
+		t.Fatalf("agent hash = %s, want it to differ when agent-only settings are set", got)
 	}
 
 	serverResources := &corev1.ResourceRequirements{
@@ -407,7 +401,7 @@ func TestNewKubernetesBackend_ServiceFQDN(t *testing.T) {
 	}
 }
 
-func TestK8sObjects_NanobotAgentExcludesAuditLogConfig(t *testing.T) {
+func TestK8sObjects_AgentExcludesAuditLogConfig(t *testing.T) {
 	k := newTestKubernetesBackend(t)
 
 	objs, err := k.k8sObjects(t.Context(), ServerConfig{
@@ -421,7 +415,7 @@ func TestK8sObjects_NanobotAgentExcludesAuditLogConfig(t *testing.T) {
 		ContainerPath:        "/mcp",
 		Command:              "nanobot",
 		Args:                 []string{"run"},
-		NanobotAgentName:     "agent-1",
+		AgentName:            "agent-1",
 		AuditLogMetadata:     map[string]string{"mcpID": "server-1"},
 	})
 	if err != nil {
@@ -476,8 +470,8 @@ func TestK8sObjects_DoesNotCreateShimContainer(t *testing.T) {
 	}
 }
 
-func TestK8sObjects_RemoteAndCompositeCreateNoObjects(t *testing.T) {
-	for _, runtime := range []types.Runtime{types.RuntimeRemote, types.RuntimeComposite} {
+func TestK8sObjects_RemoteAndVMCPCreateNoObjects(t *testing.T) {
+	for _, runtime := range []types.Runtime{types.RuntimeRemote, types.RuntimeVMCP} {
 		t.Run(string(runtime), func(t *testing.T) {
 			k := newTestKubernetesBackend(t)
 
@@ -498,7 +492,7 @@ func TestK8sObjects_RemoteAndCompositeCreateNoObjects(t *testing.T) {
 	}
 }
 
-func TestK8sObjects_UVXAndNPXPassNanobotHealthEnv(t *testing.T) {
+func TestK8sObjects_UVXAndNPXUseMMMCP(t *testing.T) {
 	for _, runtime := range []types.Runtime{types.RuntimeUVX, types.RuntimeNPX} {
 		t.Run(string(runtime), func(t *testing.T) {
 			k := newTestKubernetesBackend(t)
@@ -511,17 +505,39 @@ func TestK8sObjects_UVXAndNPXPassNanobotHealthEnv(t *testing.T) {
 				OwnerUserID:          "user-2",
 				Command:              strings.ToLower(string(runtime)),
 				Args:                 []string{"example"},
+				Env:                  []string{"TOKEN=secret"},
 			})
 			if err != nil {
 				t.Fatalf("k8sObjects() error = %v", err)
 			}
 
 			configSecret := findSecret(t, objs, name.SafeConcatName("test-server", "mcp", "config"))
-			if got := string(configSecret.Data["NANOBOT_RUN_HEALTHZ_PATH"]); got != "/healthz" {
-				t.Fatalf("NANOBOT_RUN_HEALTHZ_PATH = %q, want /healthz", got)
+			if got := string(configSecret.Data["MMMCP_META_ENV"]); got != "TOKEN" {
+				t.Fatalf("MMMCP_META_ENV = %q, want TOKEN", got)
 			}
-			if got := string(configSecret.Data["NANOBOT_RUN_FORCE_FETCH_TOOL_LIST"]); got != "true" {
-				t.Fatalf("NANOBOT_RUN_FORCE_FETCH_TOOL_LIST = %q, want true", got)
+
+			container := findContainer(t, findDeployment(t, objs, "test-server"), "mcp")
+			if container.Image != "ghcr.io/obot-platform/mmmcp:main" {
+				t.Fatalf("container image = %q, want mmmcp base image", container.Image)
+			}
+			if got, want := strings.Join(container.Args, " "), "--listen :8099 --config /config/mmmcp.yaml"; got != want {
+				t.Fatalf("container args = %q, want %q", got, want)
+			}
+			if container.ReadinessProbe == nil || container.ReadinessProbe.TCPSocket == nil {
+				t.Fatal("mmmcp container does not have a TCP readiness probe")
+			}
+
+			runSecret := findSecret(t, objs, name.SafeConcatName("test-server", "mcp", "run"))
+			data, ok := runSecret.Data["mmmcp.yaml"]
+			if !ok {
+				t.Fatalf("mmmcp.yaml missing from run secret: %#v", runSecret.Data)
+			}
+			cfg, err := mmmcpconfig.Load(data, mmmcpconfig.LoadOptions{LookupEnv: func(string) (string, bool) { return "", false }})
+			if err != nil {
+				t.Fatalf("generated mmmcp config is invalid: %v\n%s", err, data)
+			}
+			if len(cfg.Servers) != 1 || cfg.Servers[0].Command != strings.ToLower(string(runtime)) || strings.Join(cfg.Servers[0].Args, " ") != "example" || cfg.Servers[0].Env["TOKEN"] != "secret" {
+				t.Fatalf("unexpected mmmcp config: %#v", cfg)
 			}
 		})
 	}
@@ -530,7 +546,7 @@ func TestK8sObjects_UVXAndNPXPassNanobotHealthEnv(t *testing.T) {
 func TestK8sObjects_ServicePorts(t *testing.T) {
 	tests := []struct {
 		name                   string
-		nanobotAgentName       string
+		agentName              string
 		expectedHTTPPortTarget intstr.IntOrString
 		expectedStrategy       appsv1.DeploymentStrategyType
 	}{
@@ -540,7 +556,7 @@ func TestK8sObjects_ServicePorts(t *testing.T) {
 		},
 		{
 			name:                   "nanobot agent routes http service port to mcp container",
-			nanobotAgentName:       "agent-1",
+			agentName:              "agent-1",
 			expectedHTTPPortTarget: intstr.FromString("mcp"),
 			expectedStrategy:       appsv1.RecreateDeploymentStrategyType,
 		},
@@ -560,7 +576,7 @@ func TestK8sObjects_ServicePorts(t *testing.T) {
 				ContainerPath:        "/mcp",
 				Command:              "server",
 				Args:                 []string{"run"},
-				NanobotAgentName:     tt.nanobotAgentName,
+				AgentName:            tt.agentName,
 			})
 			if err != nil {
 				t.Fatalf("k8sObjects() error = %v", err)
@@ -612,16 +628,16 @@ func TestK8sObjects_MCPContainerResources(t *testing.T) {
 		{
 			name: "nanobot agent default requests 400Mi memory",
 			server: ServerConfig{
-				Runtime:          types.RuntimeContainerized,
-				NanobotAgentName: "agent-1",
+				Runtime:   types.RuntimeContainerized,
+				AgentName: "agent-1",
 			},
 			wantMemoryRequest: "400Mi",
 		},
 		{
 			name: "nanobot agent implicit defaults are capped by maximums",
 			server: ServerConfig{
-				Runtime:          types.RuntimeContainerized,
-				NanobotAgentName: "agent-1",
+				Runtime:   types.RuntimeContainerized,
+				AgentName: "agent-1",
 			},
 			settings: &v1.K8sSettings{
 				Name: system.K8sSettingsName, Namespace: system.DefaultNamespace,
@@ -636,8 +652,8 @@ func TestK8sObjects_MCPContainerResources(t *testing.T) {
 		{
 			name: "nanobot agent uses dedicated resources",
 			server: ServerConfig{
-				Runtime:          types.RuntimeContainerized,
-				NanobotAgentName: "agent-1",
+				Runtime:   types.RuntimeContainerized,
+				AgentName: "agent-1",
 			},
 			settings: &v1.K8sSettings{
 				Name: system.K8sSettingsName, Namespace: system.DefaultNamespace,
@@ -739,7 +755,7 @@ func TestK8sObjectsUsesStoredMaximums(t *testing.T) {
 		settings.Spec,
 		server.Resources,
 		server.Runtime,
-		server.NanobotAgentName != "",
+		server.IsAgentServer(),
 		nil,
 	)
 	if got := deployment.Annotations["obot.ai/k8s-settings-hash"]; got != wantHash {
@@ -844,7 +860,7 @@ func TestAnalyzePodStatus(t *testing.T) {
 					Phase: corev1.PodSucceeded,
 				},
 			},
-			server:          ServerConfig{NanobotAgentName: "agent-1"},
+			server:          ServerConfig{AgentName: "agent-1"},
 			wantRetryable:   true,
 			wantErr:         ErrHealthCheckTimeout,
 			wantErrContains: "pod succeeded and exited",
@@ -882,7 +898,7 @@ func TestAnalyzePodStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			retryable, err := analyzePodStatus(t.Context(), &tt.pod, tt.server)
+			retryable, err := analyzePodStatus(t.Context(), &tt.pod, tt.server, &podHealthCheckState{})
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("analyzePodStatus() error = %v, want %v", err, tt.wantErr)
@@ -900,31 +916,122 @@ func TestAnalyzePodStatus(t *testing.T) {
 	}
 }
 
+func TestGetNewestPodSkipsTerminatingPods(t *testing.T) {
+	now := metav1.Now()
+	oldPod := corev1.Pod{
+		Name:              "old",
+		CreationTimestamp: metav1.NewTime(now.Add(-time.Minute)),
+		DeletionTimestamp: &now,
+	}
+	newPod := corev1.Pod{
+		Name:              "new",
+		CreationTimestamp: now,
+	}
+	terminatingPod := corev1.Pod{
+		Name:              "newest-terminating",
+		CreationTimestamp: metav1.NewTime(now.Add(time.Minute)),
+		DeletionTimestamp: &now,
+	}
+	for _, tt := range []struct {
+		name string
+		pods []corev1.Pod
+		want string
+	}{
+		{
+			name: "no pods",
+		},
+		{
+			name: "replacement not created yet",
+			pods: []corev1.Pod{oldPod},
+		},
+		{
+			name: "replacement created",
+			pods: []corev1.Pod{oldPod, newPod},
+			want: "new",
+		},
+		{
+			name: "newest pod is terminating",
+			pods: []corev1.Pod{newPod, terminatingPod},
+			want: "new",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pod, err := getNewestPod(tt.pods)
+			if tt.want == "" {
+				if err == nil || pod != nil {
+					t.Fatalf("getNewestPod() = %v, %v, want no eligible pod", pod, err)
+				}
+				return
+			}
+			if err != nil || pod == nil || pod.Name != tt.want {
+				t.Fatalf("getNewestPod() = %v, %v, want %s", pod, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestAnalyzePodStatusCommandRuntimeHealthCheck(t *testing.T) {
 	tests := []struct {
 		name              string
 		runtime           types.Runtime
 		podIP             string
 		statusCode        int
+		requestErr        error
 		wantCalls         int
 		wantRetryable     bool
 		wantHealthFailure bool
+		health            podHealthCheckState
 	}{
 		{
-			name:              "NPX fails immediately on health check 500",
+			name:          "connection failure returns to deployment watch after one attempt",
+			runtime:       types.RuntimeNPX,
+			podIP:         "10.0.0.7",
+			requestErr:    io.EOF,
+			wantCalls:     1,
+			wantRetryable: true,
+		},
+		{
+			name:          "503 returns to deployment watch after one attempt",
+			runtime:       types.RuntimeUVX,
+			podIP:         "10.0.0.7",
+			statusCode:    http.StatusServiceUnavailable,
+			wantCalls:     1,
+			wantRetryable: true,
+		},
+		{
+			name:          "425 returns to deployment watch after one attempt",
+			runtime:       types.RuntimeNPX,
+			podIP:         "10.0.0.7",
+			statusCode:    http.StatusTooEarly,
+			wantCalls:     1,
+			wantRetryable: true,
+		},
+		{
+			name:          "NPX tolerates an initial health check 500",
+			runtime:       types.RuntimeNPX,
+			podIP:         "10.0.0.7",
+			statusCode:    http.StatusInternalServerError,
+			wantCalls:     1,
+			wantRetryable: true,
+		},
+		{
+			name:          "UVX tolerates an initial health check 500",
+			runtime:       types.RuntimeUVX,
+			podIP:         "10.0.0.7",
+			statusCode:    http.StatusInternalServerError,
+			wantCalls:     1,
+			wantRetryable: true,
+		},
+		{
+			name:              "persistent health check 500 fails after grace period",
 			runtime:           types.RuntimeNPX,
 			podIP:             "10.0.0.7",
 			statusCode:        http.StatusInternalServerError,
 			wantCalls:         1,
 			wantHealthFailure: true,
-		},
-		{
-			name:              "UVX fails immediately on health check 500",
-			runtime:           types.RuntimeUVX,
-			podIP:             "10.0.0.7",
-			statusCode:        http.StatusInternalServerError,
-			wantCalls:         1,
-			wantHealthFailure: true,
+			health: podHealthCheckState{
+				firstInternalServerError: time.Now().Add(-internalServerErrorGracePeriod - time.Second),
+			},
 		},
 		{
 			name:          "successful command health check remains retryable",
@@ -958,8 +1065,16 @@ func TestAnalyzePodStatusCommandRuntimeHealthCheck(t *testing.T) {
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
 				gotURL = req.URL.String()
+				if calls == 1 && tt.requestErr != nil {
+					return nil, tt.requestErr
+				}
+				statusCode := tt.statusCode
+				if calls > 1 {
+					// Let an accidental retry finish so the call-count assertion reports it.
+					statusCode = http.StatusOK
+				}
 				return &http.Response{
-					StatusCode: tt.statusCode,
+					StatusCode: statusCode,
 					Body:       io.NopCloser(strings.NewReader("tool discovery failed")),
 					Header:     make(http.Header),
 					Request:    req,
@@ -974,10 +1089,13 @@ func TestAnalyzePodStatusCommandRuntimeHealthCheck(t *testing.T) {
 			}, ServerConfig{
 				Runtime:     tt.runtime,
 				HealthzPath: "/healthz",
-			}, client)
+			}, client, &tt.health)
 
 			if retryable != tt.wantRetryable {
 				t.Fatalf("analyzePodStatusWithClient() retryable = %v, want %v", retryable, tt.wantRetryable)
+			}
+			if tt.requestErr != nil && !errors.Is(err, tt.requestErr) {
+				t.Fatalf("analyzePodStatusWithClient() error = %v, want %v", err, tt.requestErr)
 			}
 			if errors.Is(err, ErrHealthCheckFailed) != tt.wantHealthFailure {
 				t.Fatalf("analyzePodStatusWithClient() error = %v, want health failure %v", err, tt.wantHealthFailure)
@@ -995,25 +1113,81 @@ func TestAnalyzePodStatusCommandRuntimeHealthCheck(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+func TestAnalyzePodStatusServiceUnavailableGracePeriod(t *testing.T) {
+	pod := &corev1.Pod{
+		UID: "original",
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: "10.0.0.7",
+		},
+	}
+	server := ServerConfig{
+		Runtime:     types.RuntimeNPX,
+		HealthzPath: "/healthz",
+	}
+	var health podHealthCheckState
+	statusCode := http.StatusServiceUnavailable
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: statusCode,
+			Body:       io.NopCloser(strings.NewReader("tool discovery failed")),
+			Request:    req,
+		}, nil
+	})}
+	probe := func(wantFailure bool) {
+		t.Helper()
+		retryable, err := analyzePodStatusWithClient(t.Context(), pod, server, client, &health)
+		if retryable == wantFailure || errors.Is(err, ErrHealthCheckFailed) != wantFailure {
+			t.Fatalf("probe = (%v, %v), want health failure %v", retryable, err, wantFailure)
+		}
+		if wantFailure && !strings.Contains(err.Error(), "tool discovery failed") {
+			t.Fatalf("probe error = %v, want response body", err)
+		}
+	}
+
+	probe(false)
+	first := health.firstServiceUnavailable
+	if first.IsZero() {
+		t.Fatal("first 503 did not start grace period")
+	}
+	probe(false)
+	if health.firstServiceUnavailable != first {
+		t.Fatal("repeated 503 restarted grace period")
+	}
+	health.firstServiceUnavailable = time.Now().Add(-serviceUnavailableGracePeriod - time.Second)
+	probe(true)
+
+	// A replacement pod gets its own grace period, even at the same IP.
+	pod.UID = "replacement"
+	probe(false)
+	if time.Since(health.firstServiceUnavailable) > serviceUnavailableGracePeriod {
+		t.Fatal("replacement pod inherited expired grace period")
+	}
+
+	for _, code := range []int{http.StatusTooEarly, http.StatusOK} {
+		health.firstServiceUnavailable = time.Now().Add(-serviceUnavailableGracePeriod - time.Second)
+		statusCode = code
+		probe(false)
+		if !health.firstServiceUnavailable.IsZero() {
+			t.Fatalf("status %d did not reset grace period", code)
+		}
+		statusCode = http.StatusServiceUnavailable
+		probe(false)
+	}
+}
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-type fakeWithWatch struct {
-	client.Client // controller-runtime fake for Get/List/Create etc.
-	watcher       *watch.FakeWatcher
-}
-
-func (f *fakeWithWatch) Watch(_ context.Context, _ client.ObjectList, _ ...client.ListOption) (watch.Interface, error) {
+func (f *fakeWithWatch) Watch(_ context.Context, _ kclient.ObjectList, _ ...kclient.ListOption) (watch.Interface, error) {
 	return f.watcher, nil
 }
 
 func TestUpdatedMCPPodName_SucceededPodAgentRetryBehavior(t *testing.T) {
 	tests := []struct {
 		name            string
-		nanobotAgent    string
+		agentName       string
 		wantErrContains string
 	}{
 		{
@@ -1022,7 +1196,7 @@ func TestUpdatedMCPPodName_SucceededPodAgentRetryBehavior(t *testing.T) {
 		},
 		{
 			name:            "agent succeeded pod remains retryable",
-			nanobotAgent:    "agent-1",
+			agentName:       "agent-1",
 			wantErrContains: "watch retries",
 		},
 	}
@@ -1075,9 +1249,9 @@ func TestUpdatedMCPPodName_SucceededPodAgentRetryBehavior(t *testing.T) {
 			}
 
 			_, err := k.updatedMCPPodName(t.Context(), "http://mcp.example.com", "test-server", ServerConfig{
-				Runtime:          types.RuntimeRemote,
-				NanobotAgentName: tt.nanobotAgent,
-				StartupTimeout:   time.Second,
+				Runtime:        types.RuntimeRemote,
+				AgentName:      tt.agentName,
+				StartupTimeout: time.Second,
 			}, "")
 			if !errors.Is(err, ErrHealthCheckTimeout) {
 				t.Fatalf("updatedMCPPodName() error = %v, want %v", err, ErrHealthCheckTimeout)
@@ -1173,7 +1347,7 @@ func TestK8sObjects_ManagedImagePullSecrets(t *testing.T) {
 		},
 	}
 
-	objs := make([]client.Object, 0, len(managedSecrets))
+	objs := make([]kclient.Object, 0, len(managedSecrets))
 	for i := range managedSecrets {
 		objs = append(objs, &managedSecrets[i])
 	}
@@ -1286,7 +1460,7 @@ func TestRestartServerAddsManagedImagePullSecretsToFreshDeployment(t *testing.T)
 	}
 
 	var updated appsv1.Deployment
-	if err := k.client.Get(t.Context(), client.ObjectKey{Name: "test-server", Namespace: "obot-mcp"}, &updated); err != nil {
+	if err := k.client.Get(t.Context(), kclient.ObjectKey{Name: "test-server", Namespace: "obot-mcp"}, &updated); err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
 	assertImagePullSecrets(t, &updated, []string{"managed"})
@@ -1402,7 +1576,7 @@ func TestTolerationsMatchIgnoresExtraActualTolerations(t *testing.T) {
 	}
 }
 
-func newTestKubernetesBackend(t *testing.T, objs ...client.Object) *kubernetesBackend {
+func newTestKubernetesBackend(t *testing.T, objs ...kclient.Object) *kubernetesBackend {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
@@ -1416,7 +1590,7 @@ func newTestKubernetesBackend(t *testing.T, objs ...client.Object) *kubernetesBa
 	}
 
 	return &kubernetesBackend{
-		baseImage:    "ghcr.io/obot-platform/mcp-images/stdio-wrapper:main",
+		baseImage:    "ghcr.io/obot-platform/mmmcp:main",
 		mcpNamespace: "obot-mcp",
 		obotClient:   clientBuilder.Build(),
 	}
@@ -1437,7 +1611,7 @@ func testK8sServerConfig() ServerConfig {
 	}
 }
 
-func findSecret(t *testing.T, objs []client.Object, secretName string) *corev1.Secret {
+func findSecret(t *testing.T, objs []kclient.Object, secretName string) *corev1.Secret {
 	t.Helper()
 
 	for _, obj := range objs {
@@ -1451,7 +1625,7 @@ func findSecret(t *testing.T, objs []client.Object, secretName string) *corev1.S
 	return nil
 }
 
-func findService(t *testing.T, objs []client.Object, serviceName string) *corev1.Service {
+func findService(t *testing.T, objs []kclient.Object, serviceName string) *corev1.Service {
 	t.Helper()
 
 	for _, obj := range objs {
@@ -1465,7 +1639,7 @@ func findService(t *testing.T, objs []client.Object, serviceName string) *corev1
 	return nil
 }
 
-func findDeployment(t *testing.T, objs []client.Object, deploymentName string) *appsv1.Deployment {
+func findDeployment(t *testing.T, objs []kclient.Object, deploymentName string) *appsv1.Deployment {
 	t.Helper()
 
 	for _, obj := range objs {
@@ -1533,13 +1707,7 @@ func assertNoAuditLogEnv(t *testing.T, env map[string][]byte) {
 	}
 }
 
-// blockingGetClient blocks forever on Get (until ctx is done), simulating a
-// slow/unresponsive API server call that has no internal self-bound timeout.
-type blockingGetClient struct {
-	client.WithWatch
-}
-
-func (b *blockingGetClient) Get(ctx context.Context, _ client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+func (b *blockingGetClient) Get(ctx context.Context, _ kclient.ObjectKey, _ kclient.Object, _ ...kclient.GetOption) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -1571,7 +1739,7 @@ func TestEnsureServerDeployment_AppliesOwnStartupTimeoutBound(t *testing.T) {
 		cachedClient: blockingClient,
 		mcpNamespace: "obot-mcp",
 		deploymentCache: map[string]*kubernetesDeploymentCacheEntry{
-			server.MCPServerName: {hash: utils.Digest(server)},
+			server.MCPServerName: {hash: serverID(server) + utils.Digest(server.Files)},
 		},
 	}
 

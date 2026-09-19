@@ -1,16 +1,8 @@
-import { handleRouteError } from '$lib/errors';
-import { AdminService } from '$lib/services';
 import type { PageLoad } from './$types';
+import { redirect } from '@sveltejs/kit';
 
-export const load: PageLoad = async ({ fetch, parent }) => {
-	const { profile } = await parent();
-
-	try {
-		return {
-			gitCredentials: await AdminService.listGitCredentials({ fetch, dontLogErrors: true })
-		};
-	} catch (err) {
-		handleRouteError(err, '/admin/git-credentials', profile);
-		return { gitCredentials: [] };
-	}
+export const load: PageLoad = ({ url }) => {
+	const searchParams = new URLSearchParams(url.searchParams);
+	searchParams.delete('view');
+	throw redirect(301, `/admin/platform?view=git-credentials&${searchParams}`);
 };

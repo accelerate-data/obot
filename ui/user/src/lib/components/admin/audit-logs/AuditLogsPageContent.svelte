@@ -2,21 +2,27 @@
 	import { afterNavigate } from '$app/navigation';
 	import { page } from '$app/state';
 	import { columnResize } from '$lib/actions/resize';
-	import { buildPillSearchParamFilters, buildSearchParamFiltersArray } from '$lib/auditlogs';
+	import {
+		buildPillSearchParamFilters,
+		buildSearchParamFiltersArray,
+		getAuditLogAPIKeyFilterOptionLabel,
+		isAuditLogAPIKeyFilterOption
+	} from '$lib/auditlogs';
 	import { type DateRange } from '$lib/components/Calendar.svelte';
-	import DotDotDot from '$lib/components/DotDotDot.svelte';
+	import FilterPills from '$lib/components/FilterPills.svelte';
 	import Search from '$lib/components/Search.svelte';
 	import AuditLogEventDetails from '$lib/components/admin/audit-logs/AuditLogEventDetails.svelte';
 	import StackedTimeline from '$lib/components/graph/StackedTimeline.svelte';
 	import { setVirtualPageData } from '$lib/components/ui/virtual-page/context';
 	import Loading from '$lib/icons/Loading.svelte';
+	import { parseMultiValue } from '$lib/multiValue';
 	import { localState } from '$lib/runes/localState.svelte';
 	import {
 		type OrgUser,
+		type AuditLogAPIKeyFilterOption,
 		type AuditLogURLFilters,
 		AdminService,
 		type AuditLogEvent,
-		Group,
 		UserService
 	} from '$lib/services';
 	import type { PaginatedResponse } from '$lib/services/http';
@@ -26,7 +32,6 @@
 	import { getUserDisplayName, isBasicUser } from '$lib/utils';
 	import FiltersDrawer from '../filters-drawer/FiltersDrawer.svelte';
 	import AuditLogCalendar from './AuditLogCalendar.svelte';
-	import AuditLogFilterPills from './AuditLogFilterPills.svelte';
 	import AuditLogTableSkeleton from './AuditLogTableSkeleton.svelte';
 	import AuditLogsTable from './AuditLogsTable.svelte';
 	import {
@@ -34,7 +39,7 @@
 		toAuditLogTimelineChartRow,
 		type AuditLogTimelineChartRow
 	} from './timelineUtils';
-	import { ChevronLeft, ChevronRight, Funnel, Captions, Plus, Settings } from '@lucide/svelte';
+	import { ChevronLeft, ChevronRight, Funnel, Captions } from '@lucide/svelte';
 	import { set, endOfDay, isBefore, subDays } from 'date-fns';
 	import { debounce } from 'es-toolkit';
 	import type { Snippet } from 'svelte';
@@ -45,11 +50,23 @@
 		mcpId?: string | null;
 		mcpServerDisplayName?: string | null;
 		mcpServerCatalogEntryName?: string | null;
+		apiKeyId?: string | null;
+		startTime?: Date | null;
+		endTime?: Date | null;
 		emptyContent?: Snippet;
 		entity?: 'workspace' | 'catalog';
 	}
 
-	let { mcpServerDisplayName, mcpServerCatalogEntryName, mcpId, emptyContent }: Props = $props();
+	let {
+		mcpServerDisplayName,
+		mcpServerCatalogEntryName,
+		mcpId,
+		apiKeyId,
+		startTime: startTimeOverride,
+		endTime: endTimeOverride,
+		emptyContent
+	}: Props = $props();
+	const hasDateRangeOverride = $derived(Boolean(startTimeOverride && endTimeOverride));
 
 	let auditLogsResponse = $state<PaginatedResponse<AuditLogEvent>>();
 	const auditLogsTotalItems = $derived(auditLogsResponse?.total ?? 0);
@@ -111,6 +128,7 @@
 	const isReachedMin = $derived(pageIndex <= 0);
 
 	const users = new SvelteMap<string, OrgUser>();
+	const apiKeyFilterOptions = new SvelteMap<string, AuditLogAPIKeyFilterOption>();
 
 	let showLoadingSpinner = $state(true);
 	let showFilters = $state(false);
@@ -147,21 +165,44 @@
 	// intentionally does not force a default so "no Source filter" means "all sources I can see".
 	const selectedEventTypes = $derived(page.url.searchParams.get('event_type') ?? '');
 
-	// In a server-scoped embedded view the MCP server is fixed, so the MCP Server filter is redundant.
+	// Server scoping comes from props (embedded views) or from the URL on the standalone page
+	// (e.g. /audit-logs?mcp_id=...). Either way the MCP server is fixed, so the MCP Server filter is
+	// redundant and the source has to be pinned to MCP: mcp_* are source-specific filters and the
+	// backend rejects them unless a single source is selected.
 	const isServerScoped = $derived(
-		Boolean(mcpId || mcpServerDisplayName || mcpServerCatalogEntryName)
-	);
-
-	const forcedEventType = $derived(isServerScoped ? 'mcp_call' : '');
-	const visibleFilterKeys = $derived(
-		unifiedFilters.filter(
-			(key) => !(isServerScoped && (key === 'mcp_server' || key === 'event_type'))
+		Boolean(
+			mcpId ||
+			mcpServerDisplayName ||
+			mcpServerCatalogEntryName ||
+			page.url.searchParams.get('mcp_id') ||
+			page.url.searchParams.get('mcp_server_display_name')
 		)
 	);
+	const isApiKeyScoped = $derived(Boolean(apiKeyId));
 
-	// supportedFilters also carries the time-range params so they are read from the URL; the drawer
-	// itself only renders unifiedFilters (time is handled by the calendar).
-	const supportedFilters: SupportedFilter[] = [...unifiedFilters, 'start_time', 'end_time'];
+	const forcedEventType = $derived(isServerScoped ? 'mcp_call' : '');
+
+	function getVisibleFilterKeys(): SupportedFilter[] {
+		const [source, ...remainingFilters] = unifiedFilters;
+		const filters: SupportedFilter[] = [source, 'api_key_id', ...remainingFilters];
+		return filters.filter(
+			(key) =>
+				!(isServerScoped && (key === 'mcp_server' || key === 'event_type')) &&
+				!(isApiKeyScoped && key === 'api_key_id')
+		);
+	}
+
+	// supportedFilters also carries the time-range params and the server-scoping params used by deep
+	// links (e.g. /audit-logs?mcp_id=...) so they are read from the URL; the drawer itself only
+	// renders unifiedFilters (time is handled by the calendar, server scoping shows up as a pill).
+	const supportedFilters: SupportedFilter[] = [
+		...unifiedFilters,
+		'api_key_id',
+		'mcp_id',
+		'mcp_server_display_name',
+		'start_time',
+		'end_time'
+	];
 
 	// Duration filter presets (client-side). Each value encodes a millisecond range "min-max"; an
 	// empty bound is unbounded. Translated to processing_time_min/max before querying the backend.
@@ -191,6 +232,12 @@
 	}
 
 	function formatSingleFilterValue(key: string, value: string): string {
+		if (key === 'api_key_id') {
+			const option = apiKeyFilterOptions.get(value);
+			return option
+				? getAuditLogAPIKeyFilterOptionLabel(option, (id) => getUserDisplayName(users, id))
+				: value;
+		}
 		if (key === 'actor') return actorDisplay(value);
 		if (key === 'duration') return durationBucketLabel(value);
 		if (key === 'outcome' && value) return value.charAt(0).toUpperCase() + value.slice(1);
@@ -229,7 +276,8 @@
 		const entries: [key: SupportedFilter, value: string | null | undefined][] = [
 			['mcp_server_display_name', mcpServerDisplayName],
 			['mcp_server_catalog_entry_name', mcpServerCatalogEntryName],
-			['mcp_id', mcpId ?? undefined]
+			['mcp_id', mcpId ?? undefined],
+			['api_key_id', apiKeyId || undefined]
 		];
 
 		return (
@@ -253,11 +301,6 @@
 
 	const hasFilterPills = $derived(Object.keys(pillsSearchParamFilters).length > 0);
 
-	const showAuditExportActions = $derived(
-		!isServerScoped &&
-			(profile.current.groups.includes(Group.ADMIN) || profile.current.groups.includes(Group.OWNER))
-	);
-
 	// Filters to be used in the audit logs slideover
 	// Exclude filters that are set via props and not undefined
 	const auditLogsSlideoverFilters = $derived.by<Partial<AuditLogURLFilters>>(() => {
@@ -270,7 +313,19 @@
 		return { ...clone, ...propsFilters, ...enforcedFilters } as Partial<AuditLogURLFilters>;
 	});
 
+	function rememberAPIKeyFilterOptions(options: unknown[]) {
+		for (const option of options) {
+			if (typeof option !== 'string' && isAuditLogAPIKeyFilterOption(option)) {
+				apiKeyFilterOptions.set(option.value, option);
+			}
+		}
+	}
+
 	let timeRangeFilters = $derived.by(() => {
+		if (startTimeOverride && endTimeOverride) {
+			return { startTime: startTimeOverride, endTime: endTimeOverride };
+		}
+
 		const { start_time, end_time } = searchParamFilters;
 
 		const endTime = set(new Date(end_time || new Date()), { milliseconds: 0, seconds: 59 });
@@ -320,6 +375,26 @@
 		};
 	});
 
+	$effect(() => {
+		const controller = new AbortController();
+		if (!allFilters.api_key_id) {
+			apiKeyFilterOptions.clear();
+			return;
+		}
+		apiKeyFilterOptions.clear();
+		UserService.listAuditLogFilterOptions('api_key_id', {
+			...allFilters,
+			offset: null,
+			signal: controller.signal
+		})
+			.then((response) => rememberAPIKeyFilterOptions(response.options ?? []))
+			.catch((error) => {
+				if (!controller.signal.aborted)
+					console.error('Failed to fetch API key filter options:', error);
+			});
+		return () => controller.abort();
+	});
+
 	afterNavigate(() => {
 		UserService.listUsersIncludeDeleted().then((userData) => {
 			for (const user of userData) {
@@ -333,13 +408,19 @@
 		if (!pageIndexLocal.isReady) return;
 
 		showLoadingSpinner = true;
-		fetchAuditLogs({ ...allFilters }).then((res) => {
-			// Reset page and page fragment indexes when the total results are less than the current page offset
-			if (!res || pageOffset > (res?.total ?? 0)) {
-				pageIndexLocal.current = 0;
-			}
-			showLoadingSpinner = false;
-		});
+		fetchAuditLogs({ ...allFilters })
+			.then((res) => {
+				// Reset page and page fragment indexes when the total results are less than the current page offset
+				if (!res || pageOffset > (res?.total ?? 0)) {
+					pageIndexLocal.current = 0;
+				}
+			})
+			.catch((error) => {
+				console.error('Failed to fetch audit logs:', error);
+			})
+			.finally(() => {
+				showLoadingSpinner = false;
+			});
 	});
 
 	// Throttle query update
@@ -377,9 +458,12 @@
 		const _key = key as keyof AuditLogURLFilters;
 
 		if (_key === 'event_type') return 'Source';
+		if (_key === 'api_key_id') return 'API Key';
 		if (_key === 'actor') return 'Actor';
 		if (_key === 'operation') return 'Operation';
 		if (_key === 'mcp_server') return 'Identifier – MCP Server';
+		if (_key === 'mcp_id') return 'Server ID';
+		if (_key === 'mcp_server_display_name') return 'Server';
 		if (_key === 'tool') return 'Identifier – Tool';
 		if (_key === 'outcome') return 'Status';
 		if (_key === 'client') return 'Client';
@@ -392,10 +476,7 @@
 	// getFilterDisplayValue renders a full (possibly comma-joined) filter value; used by the export
 	// confirmation dialog. Pills call getFilterValue per single value instead.
 	function getFilterDisplayValue(key: string, value: string | number) {
-		return String(value)
-			.split(',')
-			.map((part) => part.trim())
-			.filter(Boolean)
+		return parseMultiValue(value)
 			.map((part) => formatSingleFilterValue(key, part))
 			.join(', ');
 	}
@@ -441,7 +522,7 @@
 		pageIndexLocal.current = 0;
 	}
 
-	async function handleExportRequest(formType: 'export' | 'scheduled') {
+	export async function handleExportRequest(formType: 'export' | 'scheduled') {
 		// Check if there are any active filters. Intentionally skip carrying event_type over.
 		const hasActiveFilters =
 			Object.keys(pillsSearchParamFilters).some((key) => key !== 'event_type') || Boolean(query);
@@ -462,7 +543,7 @@
 			const response = await AdminService.getStorageCredentials();
 
 			// Prepare URL with current filters and time range
-			const url = new URL(window.location.origin + `/admin/audit-logs/exports`);
+			const url = new URL(window.location.origin + `/audit-logs/mcp/exports`);
 			url.searchParams.set('form', formType);
 
 			if (includeFilters) {
@@ -477,7 +558,6 @@
 						url.searchParams.set(key, value.toString());
 					}
 				});
-
 				// Add query if present
 				if (query) {
 					url.searchParams.set('query', query);
@@ -493,7 +573,7 @@
 			}
 		} catch (error) {
 			console.error('Failed to get storage credentials:', error);
-			const url = new URL(window.location.origin + `/admin/audit-logs/exports`);
+			const url = new URL(window.location.origin + `/audit-logs/mcp/exports`);
 			url.searchParams.set('form', 'storage');
 			url.searchParams.set('next', formType);
 
@@ -536,11 +616,13 @@
 
 		<div class="flex flex-col gap-2 self-start @min-[768px]:self-end">
 			<div class="flex gap-4">
-				<AuditLogCalendar
-					start={timeRangeFilters.startTime}
-					end={timeRangeFilters.endTime}
-					onChange={handleDateChange}
-				/>
+				{#if !hasDateRangeOverride}
+					<AuditLogCalendar
+						start={timeRangeFilters.startTime}
+						end={timeRangeFilters.endTime}
+						onChange={handleDateChange}
+					/>
+				{/if}
 
 				<button
 					class="btn btn-neutral h-12.5"
@@ -556,47 +638,8 @@
 			</div>
 		</div>
 	</div>
-	{#if hasFilterPills || showAuditExportActions}
-		<div
-			class={twMerge(
-				showAuditExportActions && '@min-[768px]:mt-4',
-				'flex flex-col flex-nowrap gap-4 @min-[768px]:flex-row'
-			)}
-		>
-			<div class="min-w-0 grow hidden @min-[768px]:block">
-				{@render filters()}
-			</div>
-			{#if showAuditExportActions}
-				<div class="@min-[768px]:ml-auto flex shrink-0 gap-4">
-					<DotDotDot class="btn btn-block btn-primary w-fit text-sm" placement="bottom">
-						{#snippet icon()}
-							<span class="flex items-center justify-center gap-1">
-								<Plus class="size-4" /> Create Export
-							</span>
-						{/snippet}
-						<button class="menu-button" onclick={() => handleExportRequest('export')}>
-							Create One-time Export
-						</button>
-						<button class="menu-button" onclick={() => handleExportRequest('scheduled')}>
-							Create Export Schedule
-						</button>
-					</DotDotDot>
-
-					<button
-						class="btn btn-neutral rounded-4xl"
-						onclick={() => {
-							goto('/admin/audit-logs/exports');
-						}}
-					>
-						<Settings class="size-4" />
-						Manage Exports
-					</button>
-				</div>
-			{/if}
-			<div class="min-w-0 grow block @min-[768px]:hidden">
-				{@render filters()}
-			</div>
-		</div>
+	{#if hasFilterPills}
+		{@render filters()}
 	{/if}
 </div>
 
@@ -699,14 +742,18 @@
 		</div>
 	{/if}
 {:else if !showLoadingSpinner}
-	<div class="mt-12 flex w-md max-w-full flex-col items-center gap-4 self-center text-center">
-		<Captions class="text-muted-content size-24 opacity-50" />
-		<h4 class="text-muted-content text-lg font-semibold">No audit logs</h4>
-		<p class="text-muted-content text-sm font-light">
-			Currently, there are no audit logs for selected range or filters. Try modifying your search
-			criteria or try again later.
-		</p>
-	</div>
+	{#if emptyContent}
+		{@render emptyContent()}
+	{:else}
+		<div class="mt-12 flex w-md max-w-full flex-col items-center gap-4 self-center text-center">
+			<Captions class="text-muted-content size-24 opacity-50" />
+			<h4 class="text-muted-content text-lg font-semibold">No audit logs</h4>
+			<p class="text-muted-content text-sm font-light">
+				Currently, there are no audit logs for selected range or filters. Try modifying your search
+				criteria or try again later.
+			</p>
+		</div>
+	{/if}
 {/if}
 
 <div
@@ -734,7 +781,7 @@
 		<FiltersDrawer
 			onClose={handleRightSidebarClose}
 			filters={auditLogsSlideoverFilters}
-			getVisibleFilterKeys={() => visibleFilterKeys}
+			getVisibleFilterKeys={() => getVisibleFilterKeys()}
 			isFilterMultiSelect={(filterId) => filterId !== 'duration'}
 			isFilterDisabled={(filterId) =>
 				propsFiltersKeys.has(filterId) || enforcedFiltersKeys.has(filterId)}
@@ -752,23 +799,26 @@
 				// A `duration` selection among the other active filters must also narrow the option
 				// list, so translate it to the processing_time_min/max params the backend understands.
 				const { duration, ...rest } = opts as Partial<AuditLogURLFilters>;
-				return await UserService.listAuditLogFilterOptions(filterId, {
+				const response = await UserService.listAuditLogFilterOptions(filterId, {
 					...rest,
 					...(duration ? durationToProcessingParams(String(duration)) : {}),
 					start_time: timeRangeFilters.startTime.toISOString(),
 					end_time: timeRangeFilters.endTime?.toISOString(),
+					query,
 					// In a server-scoped view the source is pinned to MCP; otherwise prefer the event
 					// type(s) currently selected in the drawer (passed via opts) so option lists update
 					// live as the user switches Source, falling back to the URL.
 					event_type: forcedEventType || String(opts.event_type ?? '') || selectedEventTypes
 				});
+				if (filterId === 'api_key_id') rememberAPIKeyFilterOptions(response.options ?? []);
+				return response;
 			}}
 		/>
 	{/if}
 </div>
 
 {#snippet filters()}
-	<AuditLogFilterPills
+	<FilterPills
 		{pillsSearchParamFilters}
 		{getFilterDisplayLabel}
 		{getFilterValue}

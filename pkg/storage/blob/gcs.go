@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 
 	gcsstorage "cloud.google.com/go/storage"
 	"github.com/obot-platform/obot/apiclient/types"
@@ -15,13 +16,19 @@ type GCSStore struct {
 	config types.GCSConfig
 }
 
+// gcsReadCloser wraps a GCS reader and client so both are closed together.
+type gcsReadCloser struct {
+	reader *gcsstorage.Reader
+	client *gcsstorage.Client
+}
+
 // NewGCSStore creates a new GCS blob store.
 func NewGCSStore(config types.GCSConfig) (*GCSStore, error) {
 	return &GCSStore{config: config}, nil
 }
 
 func (g *GCSStore) Upload(ctx context.Context, bucket, key string, data io.Reader) error {
-	log.Debugf("GCS upload: bucket=%s key=%s", bucket, key)
+	slog.Debug("GCS upload", "bucket", bucket, "key", key)
 	client, err := g.createClient(ctx)
 	if err != nil {
 		return err
@@ -37,7 +44,7 @@ func (g *GCSStore) Upload(ctx context.Context, bucket, key string, data io.Reade
 }
 
 func (g *GCSStore) Download(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
-	log.Debugf("GCS download: bucket=%s key=%s", bucket, key)
+	slog.Debug("GCS download", "bucket", bucket, "key", key)
 	client, err := g.createClient(ctx)
 	if err != nil {
 		return nil, err
@@ -53,7 +60,7 @@ func (g *GCSStore) Download(ctx context.Context, bucket, key string) (io.ReadClo
 }
 
 func (g *GCSStore) Delete(ctx context.Context, bucket, key string) error {
-	log.Debugf("GCS delete: bucket=%s key=%s", bucket, key)
+	slog.Debug("GCS delete", "bucket", bucket, "key", key)
 	client, err := g.createClient(ctx)
 	if err != nil {
 		return err
@@ -77,15 +84,9 @@ func (g *GCSStore) Test(ctx context.Context) error {
 
 func (g *GCSStore) createClient(ctx context.Context) (*gcsstorage.Client, error) {
 	if g.config.ServiceAccountJSON != "" {
-		return gcsstorage.NewClient(ctx, option.WithCredentialsJSON([]byte(g.config.ServiceAccountJSON)))
+		return gcsstorage.NewClient(ctx, option.WithAuthCredentialsJSON(option.ServiceAccount, []byte(g.config.ServiceAccountJSON)))
 	}
 	return gcsstorage.NewClient(ctx)
-}
-
-// gcsReadCloser wraps a GCS reader and client so both are closed together.
-type gcsReadCloser struct {
-	reader *gcsstorage.Reader
-	client *gcsstorage.Client
 }
 
 func (r *gcsReadCloser) Read(p []byte) (int, error) {

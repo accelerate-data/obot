@@ -1,8 +1,8 @@
 # Auth Providers
 
 Authentication providers allow your Obot installation to authenticate users with the identity provider of your choice.
-Administrators must configure at least one authentication provider before users can log in.
-Multiple providers can be configured and available for login at the same time.
+Administrators must configure an authentication provider before users can log in. Only one authentication provider can be configured at a time.
+To replace it later, see [Switching Between Auth Providers](#switching-between-auth-providers).
 
 :::note
 In order for authentication to be enabled, the Obot server must be run with the environment variable set:
@@ -63,9 +63,18 @@ You can:
 
 ## Available Auth Providers
 
+| Providers | Availability |
+|-----------|--------------|
+| Local, GitHub, Google | Included in the default Obot edition without registration |
+| Entra, Okta, JumpCloud, Auth0 | Require free Community registration or an Enterprise license |
+
+To register for Community or configure an Enterprise license, use the **License** page in the admin UI. See [Obot Editions](../enterprise/overview.md).
+
 Obot supports the built-in [Local](#local) provider, as well as the following providers that authenticate against an external identity provider using OAuth2. For the OAuth2 providers, you will need to follow the instructions in the auth provider for setting up a new app before getting started. You can get the callback URL from the Obot Admin -> Auth Providers -> \<Auth Provider> -> Configure page. The configuration form will also have fields for the data required.
 
 ### Local
+
+Local passwords are stored as salted Argon2id hashes, independently of optional [database field encryption](./encryption-providers/overview.md#local-passwords).
 
 The Local provider authenticates users with an email address and password stored in Obot's own database. It requires no external identity provider, which makes it a good fit for evaluations, air-gapped installations, and small deployments.
 
@@ -74,12 +83,13 @@ Passwords are hashed with [argon2id](https://en.wikipedia.org/wiki/Argon2) and a
 To set it up:
 
 1. Go to Admin -> Auth Providers and configure the **Local** provider, setting the email domains that local users are allowed to have (`*` allows any domain).
-2. Click the **Manage Users** button on the Local provider card, and create a user. Share the password with them over a secure channel.
-3. Local users sign in from the Obot login page by choosing **Local**, then entering their email and password.
+2. During bootstrap setup, create your first local account. Bootstrap can create only one account at a time.
+3. Save the account and sign in with its email and password. It becomes **Owner** automatically, and you continue in the same session without confirming a handoff or signing in again.
+4. After signing in as Owner, use **Modify** on the Local provider card to create additional users. Assign their roles from the Users page after their first sign-in.
 
-:::note
-Local users cannot change their own password. An administrator resets a password from the same Manage Users dialog, which also signs the user out of all of their existing sessions.
-:::
+The first bootstrap-created account's password is ready to use by default. You can select the option to require a password change before completing setup. Other new and administrator-reset local passwords require a password change at next sign-in by default; the administrator can turn this off in the user management dialog. Until the change is complete, the backend restricts that session to the password-change flow. A successful change signs out the user's other sessions while preserving the current one.
+
+Local users cannot currently rotate their password voluntarily after completing a required change. An administrator must reset it from **Manage Users**; the user will then be prompted to choose a new password at their next sign-in.
 
 Deleting a local user prevents them from signing in again, but it does not delete the Obot user account they created by signing in. Delete that from the Users page, as you would for any other user.
 
@@ -95,37 +105,7 @@ Follow the instructions [here](https://developers.google.com/identity/protocols/
 
 You can view the source code for Google provider in this [repo](https://github.com/obot-platform/tools).
 
-### Custom OAuth / OIDC
-
-Use Custom OAuth / OIDC when your identity provider supports OpenID Connect discovery.
-Obot supports one configured custom provider at a time, following the same one-provider configuration model as the other auth providers.
-
-You can now return to Obot and finish configuring Custom OAuth / OIDC. Use the table below to determine the values to use for each field:
-
-| Obot | Meaning |
-|------|---------|
-| Provider Name | Login button label, such as `Studio` or `Acme SSO`. |
-| Issuer URL | OIDC issuer URL. The issuer must expose `/.well-known/openid-configuration`. |
-| Client ID | OAuth/OIDC client ID. |
-| Client Secret | OAuth/OIDC client secret. |
-| Email Domains | Comma-separated allowed domains, or `*` to allow every domain trusted by the issuer. |
-| Trust this issuer for account linking | Allows this issuer to link logins to existing Obot users by email. |
-| Scope (Optional) | Space-delimited OIDC scopes. Defaults to `openid email profile`. |
-
-Add the callback URL shown in Obot's provider configuration dialog to the identity provider's allowed redirect URI list.
-
-Account linking trust is scoped to the configured issuer. If you change the issuer, Obot treats it as a new identity trust boundary and requires account-linking trust to be re-confirmed.
-
-If the provider returns `email_verified=false`, Obot does not link by email. If the claim is absent, Obot relies on the admin's issuer trust setting.
-
-Example issuer URL formats:
-
-- Entra: `https://login.microsoftonline.com/<tenant-id>/v2.0`
-- Keycloak: `https://keycloak.example.com/realms/<realm>`
-- Okta: `https://<your-okta-domain>`
-- Studio: use the issuer URL published by the Studio deployment
-
-### Entra (Enterprise Only)
+### Entra
 
 Within the [Microsoft Entra admin center](https://entra.microsoft.com), go to App registrations and click New registration.
 
@@ -189,7 +169,7 @@ You can restrict login access to specific Entra users and groups by taking the f
 
 For more details, [see Entra's docs](https://learn.microsoft.com/en-us/entra/identity-platform/howto-restrict-your-app-to-a-set-of-users).
 
-### Okta (Enterprise Only)
+### Okta
 
 :::note
 Only the org-level authorization server is supported (no custom authorization servers).
@@ -221,7 +201,7 @@ You can restrict login access to specific Okta users and groups by taking the fo
 4. Select `Assign` on groups you want to allow Obot access to
 5. Once you've made your selections, click `Done`
 
-### JumpCloud (Enterprise Only)
+### JumpCloud
 
 Create a **Custom OIDC App** in the [JumpCloud Admin Portal](https://console.jumpcloud.com/). When configuring the app:
 
@@ -272,7 +252,7 @@ You can now return to Obot and finish configuring JumpCloud. Use the table below
 The JumpCloud user must resolve to an active, non-suspended JumpCloud system user. Suspended or inactive users will be blocked from logging in.
 :::
 
-### Auth0 (Enterprise Only)
+### Auth0
 
 Create a **Regular Web Application** in the [Auth0 Dashboard](https://manage.auth0.com) by navigating to Applications > Applications > Create Application.
 
@@ -349,78 +329,41 @@ This section describes the steps involved in switching authentication providers 
 
 - Authentication is already enabled.
 - GitHub is configured as the active authentication provider.
-- An initial **Owner** user is already set up.
+- You are logged in as an **Owner**.
+- You are running the Obot Community or Enterprise edition, which include Entra. See [Obot Editions](../enterprise/overview.md) to enable one.
 
-### Step 1: Verify Bootstrap Login is Enabled
+### Step 1: Configure Microsoft Entra
 
-Ensure the following environment variable is set in your Obot installation:
+1. Navigate to **Identity & Access** and select the **Auth Providers** tab.
+2. Locate **Microsoft Entra** and click **Configure**. The **Switch to Microsoft Entra** dialog opens.
+3. Follow the documentation to create and configure the Entra application from [Entra Instructions](#entra).
+4. Click **Continue**.
 
-`OBOT_SERVER_FORCE_ENABLE_BOOTSTRAP=true`
+### Step 2: Sign In Using Microsoft Entra
 
-### Step 2: Deconfigure the Existing Auth Provider (GitHub)
-
-1. Log in to the admin console (`<obot-server>/admin`).
-2. Use the **Sign in with Bootstrap Token** option.
-
-![screenshot of login with bootstrap and github](/img/login_bootstrap_and_github.png)
-
-3. Enter the **Bootstrap Token** and click **Login**.
-4. Navigate to **User Management → Auth Providers**.
-5. In the configured provider (GitHub in this case), click **Deconfigure Provider**.
-
-![screenshot of deconfigure authprovider option](/img/deconfigure_authprovider.png)
-
-6. When prompted for confirmation, click **Yes, I'm sure**.
-
-![screenshot of deconfigure authprovider confirmation](/img/deconfigure_authprovider_confirmation.png)
-
-7. After deconfiguration, you are redirected to the **Welcome to Obot!** page.
-
-![screenshot of welcome obot](/img/welcome_obot_bootstrap.png)
-
-### Step 3: Configure Microsoft Entra as the New Auth Provider
-
-1. On the **Welcome to Obot!** page, click **Get Started**.
-2. You are redirected to the **Auth Providers** page.
-3. Locate **Microsoft Entra** and click **Configure**.
-
-![screenshot of setup entra](/img/setup_entra.png)
-
-4. Follow the documentation to create and configure the Entra application from [Entra Instructions](#entra-enterprise-only).
-5. Enter the required details:
-- Client ID
-- Client Secret
-- Tenant ID
-6. Click **Confirm**.
-7. Log out.
-
-### Step 4: Log In Using Microsoft Entra
-
-1. Log in to the Obot server (`<obot-server>`).
+1. Click **Sign in with Microsoft Entra**.
 2. Authenticate using your Microsoft Entra credentials.
-3. After successful authentication, a user with the default role is created.
-4. Log out.
+3. You are returned to the **Auth Providers** page, and the dialog shows the email address you signed in with as **Verified**.
 
-### Step 5: Promote the Entra User to Owner
-1. Log in to the admin console (`<obot-server>/admin`).
-2. Click **Sign in with Bootstrap Token**.
+:::important
+The account you sign in with is granted the **Owner** role. Use the account that should own Obot after the switch.
+:::
 
-![screenshot of login with bootstrap and entra](/img/login_bootstrap_and_entra.png)
+### Step 3: Complete the Switch
 
-3. Authenticate using the Bootstrap token.
-4. Navigate to **User Management → Users**.
-5. Locate the Entra user account created in the previous step.
-6. Click **Update Role** and change the role to **Owner**.
-7. Log out.
+1. Click **Switch to Microsoft Entra**.
+2. Microsoft Entra becomes the active provider and GitHub is deconfigured.
 
-### Step 6: Final Verification
-1. Log in to the Obot server (`<obot-server>`).
-2. Click **Continue with Microsoft Entra**.
-3. Sign in using the Entra user account that was promoted to Owner in Step 5.
-4. You should now be logged in successfully as an **Owner**.
+All users authenticated via GitHub are immediately logged out and must log in again through Entra. You remain logged in as the Entra account you verified with.
 
 :::note
-User identities are scoped to the authentication provider used during login.
-If a user previously authenticated using GitHub later signs in using Entra with the same email address, Obot creates a new user record.
-As a result, multiple user accounts with the same email address may exist when authentication providers are switched.
+User identities are scoped to the authentication provider used during login. Signing in through Entra creates a new user record, so the work and settings belonging to a user's GitHub account are lost.
 :::
+
+### Leaving and Resuming a Switch
+
+You can close the dialog at any point. The staged provider's card shows **Staged** with a **Resume switch** button that returns you to where you left off, and the dialog also reopens on its own the next time an owner visits the **Auth Providers** tab.
+
+To abandon a switch, click **Unstage**. The staged settings are discarded and the active provider is unchanged.
+
+Only one provider can be staged at a time, and the remaining providers cannot be configured until the switch finishes or is unstaged.

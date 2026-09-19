@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -15,19 +16,43 @@ import (
 	"k8s.io/apiserver/pkg/storage/value"
 )
 
-var llmAuditLogGroupResource = schema.GroupResource{
-	Group:    "obot.obot.ai",
-	Resource: "llmauditlogs",
-}
-
 const (
 	defaultLLMAuditLogBatchSize  = 100
 	defaultLLMAuditLogBufferSize = 3 * defaultLLMAuditLogBatchSize
 )
 
+var (
+	llmAuditLogGroupResource = schema.GroupResource{
+		Group:    "obot.obot.ai",
+		Resource: "llmauditlogs",
+	}
+)
+
 type llmAuditEntry struct {
 	log            types.LLMAuditLog
 	responseStream []byte
+}
+
+type LLMAuditLogOptions struct {
+	WithSensitiveFields    bool
+	HideModelsRequests     bool
+	APIKeyID               []uint
+	UserID                 []string
+	ModelProvider          []string
+	TargetModel            []string
+	RequestPath            []string
+	ResponseStatus         []int
+	Outcome                []string
+	UserAgent              []string
+	ClientSessionID        []string
+	MessagePolicyTriggered []bool
+	Query                  string
+	StartTime              time.Time
+	EndTime                time.Time
+	Limit                  int
+	Offset                 int
+	SortBy                 string
+	SortOrder              string
 }
 
 func (c *Client) LLMAuditLogEnabled() bool {
@@ -39,7 +64,7 @@ func (c *Client) LogLLMAuditEntry(auditLog types.LLMAuditLog, responseStream []b
 		return
 	}
 	if c.llmAuditEntries == nil {
-		log.Warnf("dropping LLM audit log: writer is not configured")
+		slog.Warn("dropping LLM audit log: writer is not configured")
 		return
 	}
 
@@ -48,7 +73,7 @@ func (c *Client) LogLLMAuditEntry(auditLog types.LLMAuditLog, responseStream []b
 	select {
 	case c.llmAuditEntries <- llmAuditEntry{log: auditLog, responseStream: responseStream}:
 	default:
-		log.Warnf("dropping LLM audit log: buffer is full")
+		slog.Warn("dropping LLM audit log: buffer is full")
 	}
 }
 
@@ -103,6 +128,9 @@ func (c *Client) GetLLMAuditLogs(ctx context.Context, opts LLMAuditLogOptions) (
 	if err := db.Find(&logs).Error; err != nil {
 		return nil, 0, err
 	}
+	if err := c.enrichLLMAuditLogAPIKeyRevocation(ctx, logs); err != nil {
+		return nil, 0, err
+	}
 	for i := range logs {
 		if err := c.prepareLLMAuditLog(ctx, &logs[i], opts.WithSensitiveFields); err != nil {
 			return nil, 0, err
@@ -121,6 +149,11 @@ func (c *Client) GetLLMAuditLog(ctx context.Context, id string, withSensitiveFie
 	if err := db.First(&log, "id = ?", id).Error; err != nil {
 		return nil, err
 	}
+	logs := []types.LLMAuditLog{log}
+	if err := c.enrichLLMAuditLogAPIKeyRevocation(ctx, logs); err != nil {
+		return nil, err
+	}
+	log = logs[0]
 	if err := c.prepareLLMAuditLog(ctx, &log, withSensitiveFields); err != nil {
 		return nil, err
 	}
@@ -236,6 +269,9 @@ func applyLLMAuditLogOptions(db *gorm.DB, opts LLMAuditLogOptions) *gorm.DB {
 	if len(opts.UserID) > 0 {
 		db = db.Where("user_id IN (?)", opts.UserID)
 	}
+	if len(opts.APIKeyID) > 0 {
+		db = db.Where("api_key_id IN (?)", opts.APIKeyID)
+	}
 	if len(opts.ModelProvider) > 0 {
 		db = db.Where("model_provider IN (?)", opts.ModelProvider)
 	}
@@ -286,7 +322,7 @@ func (c *Client) flushLLMAuditBatch(batch []llmAuditEntry) []llmAuditEntry {
 		return batch
 	}
 	if err := c.persistLLMAuditLogs(batch); err != nil {
-		log.Errorf("Failed to persist LLM audit logs: %v", err)
+		slog.Error("Failed to persist LLM audit logs", "error", err)
 	}
 	return batch[:0]
 }
@@ -431,25 +467,4 @@ func (c *Client) decryptLLMAuditLog(ctx context.Context, log *types.LLMAuditLog)
 
 func llmAuditLogDataCtx(log *types.LLMAuditLog) value.Context {
 	return value.DefaultContext(fmt.Sprintf("%s/%s/%s", llmAuditLogGroupResource.String(), log.ID, log.UserID))
-}
-
-type LLMAuditLogOptions struct {
-	WithSensitiveFields    bool
-	HideModelsRequests     bool
-	UserID                 []string
-	ModelProvider          []string
-	TargetModel            []string
-	RequestPath            []string
-	ResponseStatus         []int
-	Outcome                []string
-	UserAgent              []string
-	ClientSessionID        []string
-	MessagePolicyTriggered []bool
-	Query                  string
-	StartTime              time.Time
-	EndTime                time.Time
-	Limit                  int
-	Offset                 int
-	SortBy                 string
-	SortOrder              string
 }

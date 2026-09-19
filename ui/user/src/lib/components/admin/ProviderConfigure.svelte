@@ -5,6 +5,7 @@
 	import type { BaseProvider, ProviderParameter } from '$lib/services/admin/types';
 	import { darkMode, profile } from '$lib/stores';
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
+	import type { ResponsiveDialogAnimate } from '../ResponsiveDialog.svelte';
 	import SensitiveInput from '../SensitiveInput.svelte';
 	import { CircleAlert } from '@lucide/svelte';
 	import type { Snippet } from 'svelte';
@@ -18,9 +19,30 @@
 		values?: Record<string, string>;
 		loading?: boolean;
 		readonly?: boolean;
+		animate?: ResponsiveDialogAnimate;
+		// These let a caller drive a multi-step flow through this dialog. A provider switch supplies
+		// them; every other caller supplies none and behaves exactly as before.
+		title?: string;
+		steps?: Snippet;
+		body?: Snippet;
+		// Receives the dialog's own submit so a custom footer can drive the form it replaces.
+		footer?: Snippet<[() => void]>;
 	}
 
-	const { provider, onConfigure, note, values, error, loading, readonly }: Props = $props();
+	const {
+		provider,
+		onConfigure,
+		note,
+		values,
+		error,
+		loading,
+		readonly,
+		animate,
+		title,
+		steps,
+		body,
+		footer
+	}: Props = $props();
 	let dialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let form = $state<Record<string, string>>({});
 	let showRequired = $state(false);
@@ -267,6 +289,7 @@
 	{onClose}
 	{onOpen}
 	classes={{ header: 'p-4 pb-0', content: 'p-0' }}
+	{animate}
 >
 	{#snippet titleContent()}
 		<div class="flex items-center gap-2 pb-0">
@@ -280,10 +303,17 @@
 			{:else}
 				<img src={provider?.icon} alt={provider?.name} class="bg-base-200 size-9 rounded-md p-1" />
 			{/if}
-			Set Up {provider?.name}
+			{title ?? `Set Up ${provider?.name}`}
 		</div>
 	{/snippet}
 	{#if provider}
+		{@render steps?.()}
+	{/if}
+	{#if provider && body}
+		<div class="default-scrollbar-thin flex max-h-[70vh] flex-col gap-4 overflow-y-auto p-4 pt-0">
+			{@render body()}
+		</div>
+	{:else if provider}
 		<form
 			class="default-scrollbar-thin flex max-h-[70vh] flex-col gap-4 overflow-y-auto p-4 pt-0"
 			onsubmit={readonly ? undefined : configure}
@@ -466,7 +496,13 @@
 				</div>
 			{/if}
 		</form>
-		{#if !readonly}
+	{/if}
+	{#if provider}
+		{#if footer && !readonly}
+			<div class="mt-4 flex items-center gap-2 p-4 pt-0">
+				{@render footer(configure)}
+			</div>
+		{:else if !readonly}
 			<div class="mt-4 flex justify-end gap-2 p-4 pt-0">
 				<button
 					class="btn btn-primary"

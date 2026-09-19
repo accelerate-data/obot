@@ -6,7 +6,7 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type AppPreferencesHandler struct{}
@@ -17,7 +17,7 @@ func NewAppPreferencesHandler() *AppPreferencesHandler {
 
 func (*AppPreferencesHandler) Get(req api.Context) error {
 	var prefs v1.AppPreferences
-	err := req.Storage.Get(req.Context(), client.ObjectKey{
+	err := req.Storage.Get(req.Context(), kclient.ObjectKey{
 		Namespace: req.Namespace(),
 		Name:      system.AppPreferencesName,
 	}, &prefs)
@@ -75,8 +75,8 @@ func (*AppPreferencesHandler) Update(req api.Context) error {
 
 func convertAppPreferences(prefs v1.AppPreferences) types.AppPreferences {
 	return types.AppPreferences{
-		Logos:    types.LogoPreferences(prefs.Spec.Logos),
-		Theme:    types.ThemePreferences(prefs.Spec.Theme),
+		Logos:    prefs.Spec.Logos,
+		Theme:    prefs.Spec.Theme,
 		Metadata: MetadataFrom(&prefs),
 	}
 }

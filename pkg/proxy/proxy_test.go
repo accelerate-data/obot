@@ -1,57 +1,63 @@
 package proxy
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/obot-platform/obot/pkg/auth"
 )
 
-func TestAuthenticateRequestPassesGenericOAuthMetadata(t *testing.T) {
-	emailVerified := true
-	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/obot-get-state" {
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-
-		if err := json.NewEncoder(w).Encode(serializableState{
-			AccessToken:       "access-token",
-			PreferredUsername: "alice@example.com",
-			User:              "alice",
-			Email:             "alice@example.com",
-			Issuer:            "https://issuer.example.com/",
-			EmailVerified:     &emailVerified,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}))
-	defer provider.Close()
-
-	p, err := newProxy("default", "generic-oauth-auth-provider", provider.URL)
-	if err != nil {
-		t.Fatal(err)
+// The staged provider is allowed to beat the session's provider only for a browser carrying an
+// open verification. This covers the gate that decides that, before any provider lookup happens:
+// without the cookie the answer must be "no staged provider" regardless of what is staged, so an
+// ordinary request can never be routed to a replacement that is not serving logins yet.
+//
+// The remaining conditions -- that something is staged, and that the cookie names an open
+// verification -- run through the dispatcher, and LoginableAuthProvider is tested against them in
+// its own package.
+func TestStagedVerificationProviderRequiresTheVerifyCookie(t *testing.T) {
+	tests := []struct {
+		name   string
+		path   string
+		cookie string
+	}{
+		{
+			name: "no cookie at all",
+			path: "/oauth2/start",
+		},
+		{
+			name:   "some other cookie",
+			path:   "/oauth2/start",
+			cookie: CurrentAuthProviderCookie,
+		},
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "http://obot.example.com/", nil)
-	resp, ok, err := p.authenticateRequest(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal("expected authentication to succeed")
-	}
+	// A nil dispatcher makes the assertion sharper than an equality check: reaching a provider
+	// lookup at all would panic, so passing proves the gate returned first.
+	pm := &Manager{}
 
-	extra := resp.User.GetExtra()
-	if got := extra["auth_provider_issuer"]; len(got) != 1 || got[0] != "https://issuer.example.com/" {
-		t.Fatalf("expected auth_provider_issuer extra, got %#v", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.cookie != "" {
+				req.AddCookie(&http.Cookie{Name: tt.cookie, Value: "default/google"})
+			}
+			if got := pm.stagedVerificationProvider(req); got != "" {
+				t.Fatalf("stagedVerificationProvider() = %q, want %q", got, "")
+			}
+		})
 	}
-	if resp.User.GetUID() != "alice" {
-		t.Fatalf("expected provider user ID to be raw subject, got %q", resp.User.GetUID())
-	}
-	if got := extra["auth_provider_user_id"]; len(got) != 1 || got[0] != "alice" {
-		t.Fatalf("expected auth_provider_user_id to be raw subject, got %#v", got)
-	}
-	if got := extra["auth_provider_email_verified"]; len(got) != 1 || got[0] != "true" {
-		t.Fatalf("expected auth_provider_email_verified extra, got %#v", got)
+}
+
+// An empty verify cookie is a cookie the browser still sends after it has been cleared, so it must
+// be treated as absent rather than as an open verification.
+func TestStagedVerificationProviderIgnoresAnEmptyVerifyCookie(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/start", nil)
+	req.AddCookie(&http.Cookie{Name: auth.AuthProviderVerifyCookie, Value: ""})
+
+	pm := &Manager{}
+	if got := pm.stagedVerificationProvider(req); got != "" {
+		t.Fatalf("stagedVerificationProvider() = %q, want %q", got, "")
 	}
 }

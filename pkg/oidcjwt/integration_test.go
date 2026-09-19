@@ -19,6 +19,15 @@ import (
 	"k8s.io/apiserver/pkg/authentication/request/union"
 )
 
+var (
+	_ authenticator.Request = (*oidcjwt.Authenticator)(nil)
+)
+
+type integrationAuthzGate struct {
+	authn *apioauthn.Authenticator
+	az    *authz.Authorizer
+}
+
 func buildIntegrationStack(t *testing.T) (http.Handler, *testutil.TestIssuer, func(), *rsa.PrivateKey) {
 	t.Helper()
 
@@ -53,17 +62,12 @@ func buildIntegrationStack(t *testing.T) (http.Handler, *testutil.TestIssuer, fu
 	return mux, issuer, cleanup, priv
 }
 
-func TestIntegration_OwnerRoleReachesOwnerOnlyCatalogOAuthEndpoint(t *testing.T) {
+func TestIntegration_AdminAndOwnerRolesReachCatalogOAuthEndpoint(t *testing.T) {
 	path := "/api/mcp-catalogs/default/entries/slack/oauth-credentials"
 	code, _ := runPathWithRoles(t, path, []string{"owner"})
 	require.Equal(t, http.StatusOK, code)
 	code, _ = runPathWithRoles(t, path, []string{"admin"})
-	require.Equal(t, http.StatusForbidden, code)
-}
-
-type integrationAuthzGate struct {
-	authn *apioauthn.Authenticator
-	az    *authz.Authorizer
+	require.Equal(t, http.StatusOK, code)
 }
 
 func (g integrationAuthzGate) serveJSON(body map[string]any) http.HandlerFunc {
@@ -90,7 +94,7 @@ func runPathWithRoles(t *testing.T, path string, roles []string) (int, map[strin
 	tok := testutil.MintTestJWT(t, priv, "kid-int", issuer.URL, "obot-default", "user-int",
 		60*time.Second, map[string]any{"eligible": true, "roles": roles, "email": "alice@example.com"})
 
-	req := httptest.NewRequest("GET", path, nil)
+	req := httptest.NewRequest(http.MethodGet, path, nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -133,7 +137,7 @@ func TestIntegration_UnauthenticatedForbiddenAtCatalogAndMCP(t *testing.T) {
 	defer cleanup()
 	for _, tt := range integrationRoutes() {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", tt.path, nil)
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, req)
 			assert.Equal(t, http.StatusForbidden, rec.Code)
@@ -156,5 +160,3 @@ func integrationRoutes() []struct {
 		{name: "user mcp server", path: "/api/mcp-servers/test-server", bodyKey: "id"},
 	}
 }
-
-var _ authenticator.Request = (*oidcjwt.Authenticator)(nil)

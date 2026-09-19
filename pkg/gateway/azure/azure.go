@@ -10,7 +10,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	nanobottypes "github.com/obot-platform/nanobot/pkg/types"
+	llmtypes "github.com/obot-platform/obot/pkg/llm"
 	"github.com/obot-platform/obot/pkg/system"
 )
 
@@ -25,18 +25,46 @@ const (
 	EntraScope = "https://ai.azure.com/.default"
 )
 
-var endpointHostSuffixes = []string{
-	".openai.azure.com",
-	".cognitiveservices.azure.com",
-	".services.ai.azure.com",
-	".models.ai.azure.com",
+var (
+	endpointHostSuffixes = []string{
+		".openai.azure.com",
+		".cognitiveservices.azure.com",
+		".services.ai.azure.com",
+		".models.ai.azure.com",
+	}
+)
+
+// EntraCredentialCache preserves the Azure SDK credential between requests so
+// its internal access-token cache can be reused instead of fetching a new token
+// for every transport created by the gateway.
+//
+// The cache holds the most recently used Entra configuration. If any value
+// changes (for example, when a client secret is rotated), get replaces the SDK
+// credential. The mutex makes that comparison and replacement atomic when
+// transports are created concurrently.
+type EntraCredentialCache struct {
+	mu           sync.Mutex
+	tenantID     string
+	clientID     string
+	clientSecret string
+	credential   azcore.TokenCredential
+}
+
+type apiKeyTransport struct {
+	key  string
+	next http.RoundTripper
+}
+
+type entraTransport struct {
+	credential azcore.TokenCredential
+	next       http.RoundTripper
 }
 
 func IsProvider(providerName string) bool {
 	return providerName == system.AzureModelProvider || providerName == system.AzureEntraModelProvider
 }
 
-func BaseURL(providerName string, credentials map[string]string, dialect nanobottypes.Dialect) (url.URL, error) {
+func BaseURL(providerName string, credentials map[string]string, dialect llmtypes.Dialect) (url.URL, error) {
 	endpointEnv := EndpointEnv
 	if providerName == system.AzureEntraModelProvider {
 		endpointEnv = EntraEndpointEnv
@@ -61,30 +89,14 @@ func BaseURL(providerName string, credentials map[string]string, dialect nanobot
 		basePath = strings.TrimSuffix(basePath, suffix)
 	}
 	switch dialect {
-	case nanobottypes.DialectOpenAIResponses:
+	case llmtypes.DialectOpenAIResponses:
 		u.Path = basePath + "/openai/v1"
-	case nanobottypes.DialectAnthropicMessages:
+	case llmtypes.DialectAnthropicMessages:
 		u.Path = basePath + "/anthropic/v1"
 	default:
 		return url.URL{}, fmt.Errorf("unsupported Azure model dialect %q", dialect)
 	}
 	return *u, nil
-}
-
-// EntraCredentialCache preserves the Azure SDK credential between requests so
-// its internal access-token cache can be reused instead of fetching a new token
-// for every transport created by the gateway.
-//
-// The cache holds the most recently used Entra configuration. If any value
-// changes (for example, when a client secret is rotated), get replaces the SDK
-// credential. The mutex makes that comparison and replacement atomic when
-// transports are created concurrently.
-type EntraCredentialCache struct {
-	mu           sync.Mutex
-	tenantID     string
-	clientID     string
-	clientSecret string
-	credential   azcore.TokenCredential
 }
 
 func Transport(providerName string, credentials map[string]string, entraCredentials *EntraCredentialCache) (http.RoundTripper, error) {
@@ -135,18 +147,8 @@ func (c *EntraCredentialCache) get(credentials map[string]string) (azcore.TokenC
 	return credential, nil
 }
 
-type apiKeyTransport struct {
-	key  string
-	next http.RoundTripper
-}
-
 func (t apiKeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return roundTripWithBearerToken(req, t.key, t.next)
-}
-
-type entraTransport struct {
-	credential azcore.TokenCredential
-	next       http.RoundTripper
 }
 
 func (t entraTransport) RoundTrip(req *http.Request) (*http.Response, error) {

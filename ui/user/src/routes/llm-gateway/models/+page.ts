@@ -1,32 +1,8 @@
-import { browser } from '$app/environment';
-import { handleRouteError } from '$lib/errors';
-import { UserService, type Model } from '$lib/services';
-import accessibleModels, { filterAccessibleModels } from '$lib/stores/accessibleModels.svelte';
 import type { PageLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
 
-export const load: PageLoad = async ({ fetch, parent }) => {
-	const { profile, models: initialModels } = await parent();
-	let models: Model[] = [];
-
-	try {
-		const response =
-			browser && accessibleModels.initialized && accessibleModels.current.length > 0
-				? accessibleModels.current
-				: (initialModels ?? (await UserService.listModels({ fetch })));
-
-		models = filterAccessibleModels(response ?? []);
-
-		if (browser) {
-			accessibleModels.set(models);
-		}
-	} catch (err) {
-		handleRouteError(err, '/llm-gateway/models', profile);
-	}
-
-	if (models.length === 0) {
-		throw redirect(302, '/');
-	}
-
-	return { models };
+export const load: PageLoad = ({ url }) => {
+	const searchParams = new URLSearchParams(url.searchParams);
+	searchParams.set('view', 'models');
+	throw redirect(301, `/models?${searchParams}`);
 };

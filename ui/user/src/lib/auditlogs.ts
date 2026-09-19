@@ -1,5 +1,64 @@
 import { page } from '$app/state';
+import type { AuditLogAPIKeyFilterOption, AuditLogFilterOption } from '$lib/services';
 import { isSafe } from './utils';
+
+export function isAuditLogAPIKeyFilterOption(
+	option: unknown
+): option is AuditLogAPIKeyFilterOption {
+	return (
+		typeof option === 'object' &&
+		option !== null &&
+		'value' in option &&
+		typeof option.value === 'string'
+	);
+}
+
+export function getAuditLogAPIKeyFilterOptionLabel(
+	option: AuditLogAPIKeyFilterOption,
+	getUserDisplayName?: (userID: string) => string
+): string {
+	const key = formatAuditLogAPIKeyName(option.name, option.maskedKey);
+	const owner =
+		(option.userID && getUserDisplayName?.(option.userID)) ||
+		option.userDisplayName ||
+		option.userID;
+	return [key, owner, option.revoked ? 'Revoked' : ''].filter(Boolean).join(' · ');
+}
+
+export function formatAuditLogAPIKeyName(name: string, maskedKey: string): string {
+	return name && maskedKey && name !== maskedKey ? `${name} (${maskedKey})` : maskedKey || name;
+}
+
+export function formatAuditLogCredentialLabel(credential: string, revoked: boolean): string {
+	return [credential, revoked ? 'Revoked' : ''].filter(Boolean).join(' · ');
+}
+
+export function getAuditLogAPIKeyMaskedKey(userID: string, apiKeyID: number | undefined): string {
+	return userID && !userID.startsWith('hosted-agent:') && apiKeyID !== undefined
+		? `ok1-${userID}-${apiKeyID}-*****`
+		: '';
+}
+
+export function toAuditLogFilterSelectOption(
+	option: AuditLogFilterOption,
+	getUserDisplayName?: (userID: string) => string
+): {
+	id: string;
+	label: string;
+} {
+	return isAuditLogAPIKeyFilterOption(option)
+		? { id: option.value, label: getAuditLogAPIKeyFilterOptionLabel(option, getUserDisplayName) }
+		: { id: option, label: option };
+}
+
+export function toStringFilterSelectOptions(
+	options: readonly unknown[] | undefined,
+	getOptionLabel?: (option: string) => string
+): { id: string; label: string }[] {
+	return (options ?? [])
+		.filter((option): option is string => typeof option === 'string')
+		.map((option) => ({ id: option, label: getOptionLabel?.(option) ?? option }));
+}
 
 export function buildSearchParamFiltersArray<T>(
 	supportedFilters: (keyof T)[],

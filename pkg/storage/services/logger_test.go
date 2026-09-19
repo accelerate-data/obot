@@ -14,7 +14,9 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-const scanSecret = "oauth-client-secret-value"
+const (
+	scanSecret = "oauth-client-secret-value"
+)
 
 func openTestDB(t *testing.T, logOutput *bytes.Buffer) *gorm.DB {
 	t.Helper()

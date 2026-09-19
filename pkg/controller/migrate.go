@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/modelaccesspolicy"
@@ -124,7 +125,7 @@ func migratePublishedArtifactVisibility(ctx context.Context, client kclient.Clie
 		case "private":
 			subjects = nil
 		default:
-			log.Errorf("invalid legacy visibility %q for published artifact %s", artifact.Spec.LegacyVisibility, artifact.Name)
+			slog.Error("invalid legacy visibility for published artifact", "visibility", artifact.Spec.LegacyVisibility, "artifact", artifact.Name)
 			// Make it private to be safe
 			subjects = nil
 		}
@@ -166,39 +167,26 @@ func deleteToolReferenceOwnedModels(ctx context.Context, client kclient.Client) 
 }
 
 func mcpServerCredentialContext(server v1.MCPServer) string {
-	switch {
-	case server.Spec.MCPCatalogID != "":
-		return fmt.Sprintf("%s-%s", server.Spec.MCPCatalogID, server.Name)
-	case server.Spec.PowerUserWorkspaceID != "":
-		return fmt.Sprintf("%s-%s", server.Spec.PowerUserWorkspaceID, server.Name)
-	default:
-		return ""
+	if server.Spec.IsCatalogServer() || server.Spec.IsPowerUserWorkspaceServer() {
+		return server.CredentialContext(server.Spec.UserID)
 	}
+	return ""
 }
 
 func extractAndClearMCPServerConfigValues(manifest *types.MCPServerManifest) (map[string]string, bool) {
 	configValues := make(map[string]string)
 	var changed bool
 
-	for i := range manifest.Env {
-		if manifest.Env[i].Value != "" {
-			if manifest.Env[i].Key != "" {
-				configValues[manifest.Env[i].Key] = manifest.Env[i].Value
-			}
-			manifest.Env[i].Value = ""
-			changed = true
+	for i := range manifest.Config {
+		if manifest.Config[i].UserAllowed {
+			continue
 		}
-	}
-
-	if manifest.RemoteConfig != nil {
-		for i := range manifest.RemoteConfig.Headers {
-			if manifest.RemoteConfig.Headers[i].Value != "" {
-				if manifest.RemoteConfig.Headers[i].Key != "" {
-					configValues[manifest.RemoteConfig.Headers[i].Key] = manifest.RemoteConfig.Headers[i].Value
-				}
-				manifest.RemoteConfig.Headers[i].Value = ""
-				changed = true
+		if manifest.Config[i].Value != "" {
+			if manifest.Config[i].Key != "" {
+				configValues[manifest.Config[i].Key] = manifest.Config[i].Value
 			}
+			manifest.Config[i].Value = ""
+			changed = true
 		}
 	}
 

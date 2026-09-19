@@ -1,19 +1,8 @@
-import { handleRouteError } from '$lib/errors';
-import { ApiKeysService } from '$lib/services';
-import type { APIKey } from '$lib/services/api-keys/types';
 import type { PageLoad } from './$types';
+import { redirect } from '@sveltejs/kit';
 
-export const load: PageLoad = async ({ fetch, parent }) => {
-	const { profile } = await parent();
-	let apiKeys: APIKey[] = [];
-
-	try {
-		const [keys] = await Promise.all([ApiKeysService.listApiKeys({ fetch })]);
-
-		apiKeys = keys;
-	} catch (err) {
-		handleRouteError(err, '/agent-auth-scopes', profile);
-	}
-
-	return { apiKeys };
+export const load: PageLoad = ({ url }) => {
+	const searchParams = new URLSearchParams(url.searchParams);
+	searchParams.delete('view');
+	throw redirect(301, `/identity-access?view=agents&${searchParams}`);
 };

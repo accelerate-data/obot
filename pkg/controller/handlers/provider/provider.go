@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path"
@@ -19,8 +20,8 @@ import (
 	"github.com/obot-platform/nah/pkg/name"
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api/handlers/providers"
+	"github.com/obot-platform/obot/pkg/auth"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -32,12 +33,15 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var (
-	log           = logger.Package()
-	jsonErrRegexp = regexp.MustCompile(`(?s)\{.*"error":.*}`)
+const (
+	providerRegistryOwnerSubContext = "providers"
+	modelProvidersRegistryDir       = "model-providers"
+	authProvidersRegistryDir        = "auth-providers"
+	providerRegistryMaxFiles        = 1000
 )
 
 var (
+	jsonErrRegexp             = regexp.MustCompile(`(?s)\{.*"error":.*}`)
 	openAIDefaultModelAliases = map[types.DefaultModelAliasType]string{
 		types.DefaultModelAliasTypeLLM:             "gpt-5.4",
 		types.DefaultModelAliasTypeLLMMini:         "gpt-5-mini",
@@ -50,24 +54,6 @@ var (
 		types.DefaultModelAliasTypeLLMMini: "claude-haiku-4-5",
 		types.DefaultModelAliasTypeVision:  "claude-sonnet-4-6",
 	}
-)
-
-func OpenAIDefaultModelAliases() map[types.DefaultModelAliasType]string {
-	return maps.Clone(openAIDefaultModelAliases)
-}
-
-func AnthropicDefaultModelAliases() map[types.DefaultModelAliasType]string {
-	return maps.Clone(anthropicDefaultModelAliases)
-}
-
-const (
-	providerRegistryOwnerSubContext = "providers"
-	modelProvidersRegistryDir       = "model-providers"
-	authProvidersRegistryDir        = "auth-providers"
-	providerRegistryMaxFiles        = 1000
-)
-
-var (
 	providerNameInvalidChars = regexp.MustCompile(`[^a-z0-9-]+`)
 	providerNameDashes       = regexp.MustCompile(`-{2,}`)
 )
@@ -77,6 +63,19 @@ type Handler struct {
 	dispatcher      *dispatcher.Dispatcher
 	licenseProvider *license.Provider
 	registryPaths   []string
+}
+
+type providerFromFile[T types.ModelProviderManifest | types.AuthProviderManifest] struct {
+	Name     string `yaml:"-"`
+	Manifest T      `yaml:",inline"`
+}
+
+func OpenAIDefaultModelAliases() map[types.DefaultModelAliasType]string {
+	return maps.Clone(openAIDefaultModelAliases)
+}
+
+func AnthropicDefaultModelAliases() map[types.DefaultModelAliasType]string {
+	return maps.Clone(anthropicDefaultModelAliases)
 }
 
 func New(gatewayClient *gateway.Client, dispatcher *dispatcher.Dispatcher, licenseProvider *license.Provider, registryPaths []string) *Handler {
@@ -116,11 +115,6 @@ func isYAMLFile(path string) bool {
 	}
 }
 
-type providerFromFile[T types.ModelProviderManifest | types.AuthProviderManifest] struct {
-	Name     string `yaml:"-"`
-	Manifest T      `yaml:",inline"`
-}
-
 func readProviderDirectory[T types.ModelProviderManifest | types.AuthProviderManifest](dir string) ([]providerFromFile[T], error) {
 	fileInfo, err := os.Stat(dir)
 	if err != nil {
@@ -154,7 +148,7 @@ func readProviderDirectory[T types.ModelProviderManifest | types.AuthProviderMan
 
 		providers = append(providers, providerManifest)
 		if len(providers) >= providerRegistryMaxFiles {
-			log.Warnf("Reached maximum number of provider registry files (%d), skipping remaining files in directory %s", providerRegistryMaxFiles, dir)
+			slog.Warn("Reached maximum number of provider registry files, skipping remaining files in directory", "maxFiles", providerRegistryMaxFiles, "dir", dir)
 			break
 		}
 	}
@@ -197,7 +191,7 @@ func appendProviders(registryPath string, authProviderManifests []providerFromFi
 
 	for _, m := range modelProviderManifests {
 		if m.Manifest.Command == "" {
-			log.Warnf("Skipping model provider with missing required fields: name=%s command=%s", m.Name, m.Manifest.Command)
+			slog.Warn("Skipping model provider with missing required fields", "name", m.Name, "command", m.Manifest.Command)
 			continue
 		}
 
@@ -213,7 +207,11 @@ func appendProviders(registryPath string, authProviderManifests []providerFromFi
 
 	for _, a := range authProviderManifests {
 		if a.Manifest.Command == "" {
-			log.Warnf("Skipping auth provider with missing required fields: name=%s command=%s", a.Name, a.Manifest.Command)
+			slog.Warn("Skipping auth provider with missing required fields", "name", a.Name, "command", a.Manifest.Command)
+			continue
+		}
+		if err := auth.ValidateGroupIDPrefix(a.Manifest.GroupIDPrefix); err != nil {
+			slog.Warn("Skipping auth provider with invalid group ID prefix", "name", a.Name, "groupIDPrefix", a.Manifest.GroupIDPrefix, "error", err)
 			continue
 		}
 
@@ -230,6 +228,23 @@ func appendProviders(registryPath string, authProviderManifests []providerFromFi
 	return objs
 }
 
+func validateUniqueAuthProviderGroupIDPrefixes(objs []kclient.Object) error {
+	providersByPrefix := make(map[string]string)
+	for _, obj := range objs {
+		provider, ok := obj.(*v1.AuthProvider)
+		if !ok || provider.Spec.GroupIDPrefix == "" {
+			continue
+		}
+
+		prefix := strings.ToLower(provider.Spec.GroupIDPrefix)
+		if existingProvider, ok := providersByPrefix[prefix]; ok {
+			return fmt.Errorf("auth providers %q and %q declare the same group ID prefix %q", existingProvider, provider.Name, provider.Spec.GroupIDPrefix)
+		}
+		providersByPrefix[prefix] = provider.Name
+	}
+	return nil
+}
+
 func (h *Handler) ReadFromRegistry(ctx context.Context, c kclient.Client) error {
 	var (
 		toAdd []kclient.Object
@@ -241,23 +256,26 @@ func (h *Handler) ReadFromRegistry(ctx context.Context, c kclient.Client) error 
 			errs = append(errs, fmt.Errorf("failed to read provider registry %s: %w", registryPath, err))
 			continue
 		}
-		log.Infof("Loaded provider registry: registry=%s providers=%d", registryPath, len(objs))
+		slog.Info("Loaded provider registry", "registry", registryPath, "providers", len(objs))
 		toAdd = append(toAdd, objs...)
 	}
 
 	if len(errs) > 0 {
 		// Do not accidentally delete providers for registry URLs that failed to be read.
-		log.Infof("Skipping provider registry apply due to registry read errors: failedRegistries=%d", len(errs))
+		slog.Info("Skipping provider registry apply due to registry read errors", "failedRegistries", len(errs))
 		return errors.Join(errs...)
 	}
 
 	if len(toAdd) == 0 {
 		// Do not accidentally delete all the providers.
-		log.Infof("Skipping provider registry apply because no providers were resolved")
+		slog.Info("Skipping provider registry apply because no providers were resolved")
 		return nil
 	}
+	if err := validateUniqueAuthProviderGroupIDPrefixes(toAdd); err != nil {
+		return fmt.Errorf("validate provider registries: %w", err)
+	}
 
-	log.Infof("Applying resolved providers from registries: providers=%d", len(toAdd))
+	slog.Info("Applying resolved providers from registries", "providers", len(toAdd))
 	return apply.New(c).WithOwnerSubContext(providerRegistryOwnerSubContext).WithPruneTypes(&v1.ModelProvider{}, &v1.AuthProvider{}).Apply(ctx, nil, toAdd...)
 }
 
@@ -266,9 +284,9 @@ func (h *Handler) PollRegistries(ctx context.Context, c kclient.Client) {
 	defer t.Stop()
 	for {
 		if err := h.ReadFromRegistry(ctx, c); err != nil {
-			log.Errorf("Failed to read from registries: %v", err)
+			slog.Error("Failed to read from registries", "error", err)
 		} else {
-			log.Infof("Completed periodic provider registry refresh")
+			slog.Info("Completed periodic provider registry refresh")
 		}
 
 		select {
@@ -324,7 +342,7 @@ func (h *Handler) ensureModelProviderCredAndDefaults(ctx context.Context, c kcli
 		}); err != nil {
 			return err
 		}
-		log.Infof("Created model provider credential from environment configuration: provider=%s envVar=%s", modelProviderName, envVarName)
+		slog.Info("Created model provider credential from environment configuration", "provider", modelProviderName, "envVar", envVarName)
 	} else if cred.Secrets[credentialEnvVarName] != apiKey {
 		// If the credential exists, but has a different value, then update it.
 		if err = h.gatewayClient.UpsertCredential(ctx, gatewaytypes.Credential{
@@ -336,11 +354,11 @@ func (h *Handler) ensureModelProviderCredAndDefaults(ctx context.Context, c kcli
 		}); err != nil {
 			return fmt.Errorf("failed to update model provider credential: %w", err)
 		}
-		log.Infof("Updated model provider credential from environment configuration: provider=%s envVar=%s", modelProviderName, envVarName)
+		slog.Info("Updated model provider credential from environment configuration", "provider", modelProviderName, "envVar", envVarName)
 
 		// Stop the model provider if it was started while we were updating the credential.
 		h.dispatcher.StopModelProvider(modelProvider.Namespace, modelProvider.Name)
-		log.Infof("Stopped model provider to force restart after credential update: provider=%s", modelProvider.Name)
+		slog.Info("Stopped model provider to force restart after credential update", "provider", modelProvider.Name)
 	}
 
 	var modelAliases v1.DefaultModelAliasList
@@ -365,7 +383,7 @@ func (h *Handler) ensureModelProviderCredAndDefaults(ctx context.Context, c kcli
 		}
 		updatedAliases++
 	}
-	log.Infof("Populated default model aliases for provider: provider=%s aliases=%d", modelProviderName, updatedAliases)
+	slog.Info("Populated default model aliases for provider", "provider", modelProviderName, "aliases", updatedAliases)
 
 	// Lastly, ensure that the models are populated from the model provider
 	if err := c.Get(ctx, kclient.ObjectKey{Namespace: modelProvider.Namespace, Name: modelProvider.Name}, &modelProvider); err != nil {
@@ -380,7 +398,7 @@ func (h *Handler) ensureModelProviderCredAndDefaults(ctx context.Context, c kcli
 		}
 		modelProvider.Annotations[v1.ModelProviderSyncAnnotation] = "true"
 	}
-	log.Infof("Toggled model provider sync annotation to refresh models: provider=%s", modelProvider.Name)
+	slog.Info("Toggled model provider sync annotation to refresh models", "provider", modelProvider.Name)
 
 	return c.Update(ctx, &modelProvider)
 }
@@ -501,7 +519,7 @@ func BackPopulateModels(ctx context.Context, client kclient.Client, dispatcher *
 			}
 		}
 
-		log.Errorf("%v", err)
+		slog.Error("Failed to list models for model provider", "provider", modelProvider.Name, "error", err)
 		return nil
 	}
 	modelProvider.Status.Error = ""
@@ -535,7 +553,7 @@ func BackPopulateModels(ctx context.Context, client kclient.Client, dispatcher *
 	if err = apply.New(client).Apply(ctx, modelProvider, models...); err != nil {
 		return fmt.Errorf("failed to create models for model provider %q: %w", modelProvider.Name, err)
 	}
-	log.Infof("Back-populated models for model provider: provider=%s models=%d", modelProvider.Name, len(models))
+	slog.Info("Back-populated models for model provider", "provider", modelProvider.Name, "models", len(models))
 
 	return nil
 }
@@ -570,7 +588,7 @@ func removeModelsForProvider(ctx context.Context, c kclient.Client, namespace, n
 		}
 	}
 	if deleted > 0 {
-		log.Infof("Removed stale models for provider: provider=%s models=%d", name, deleted)
+		slog.Info("Removed stale models for provider", "provider", name, "models", deleted)
 	}
 
 	return errors.Join(errs...)
@@ -595,7 +613,7 @@ func (h *Handler) CleanupModelProvider(req router.Request, _ router.Response) er
 			return err
 		}
 		if deleted {
-			log.Infof("Removed model provider credential during cleanup: provider=%s", modelProvider.Name)
+			slog.Info("Removed model provider credential during cleanup", "provider", modelProvider.Name)
 		}
 	}
 

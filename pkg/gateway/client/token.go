@@ -7,10 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -24,7 +25,16 @@ const (
 	tokenCleanupInterval    = 30 * time.Second
 )
 
-var ErrInvalidOrExpiredDeviceCode = errors.New("invalid or expired device code")
+var (
+	ErrInvalidOrExpiredDeviceCode = errors.New("invalid or expired device code")
+
+	// oauthRoundTripPurposes are the token request purposes that drive a browser OAuth round
+	// trip through /api/oauth/start and /api/oauth/redirect.
+	oauthRoundTripPurposes = []string{
+		types.TokenRequestPurposeSetup,
+		types.TokenRequestPurposeAuthProviderVerify,
+	}
+)
 
 // CreateTokenRequest creates a new token request in the database.
 func (c *Client) CreateTokenRequest(ctx context.Context, tr *types.TokenRequest) error {
@@ -41,7 +51,7 @@ func (c *Client) CreateDeviceTokenRequest(ctx context.Context, tr *types.TokenRe
 		}
 
 		digest := digestNormalizedDeviceCode(normalizeDeviceCode(deviceCode))
-		tr.ID = uuid.NewString()
+		tr.ID = uuid.New().String()
 		tr.Purpose = types.TokenRequestPurposeDeviceLogin
 		tr.DeviceCodeDigest = &digest
 		tr.RequestExpiresAt = time.Now().Add(deviceCodeLifetime)
@@ -121,6 +131,42 @@ func (c *Client) DeleteAuthToken(ctx context.Context, userID uint, id string) er
 	return c.db.WithContext(ctx).Where("user_id = ? AND id = ?", userID, id).Delete(new(types.AuthToken)).Error
 }
 
+// AuthProviderVerificationActive reports whether this staged-provider verification is still open.
+// It is possession-based because it guards the return leg of the OAuth round trip, where the caller
+// is the replacement provider's identity rather than the owner who started the switch. Use
+// AuthProviderVerificationStartableBy for the outbound leg.
+func (c *Client) AuthProviderVerificationActive(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, nil
+	}
+
+	var count int64
+	if err := c.db.WithContext(ctx).Model(new(types.TokenRequest)).
+		Where("id = ? AND purpose = ? AND request_expires_at > ?", id, types.TokenRequestPurposeAuthProviderVerify, time.Now()).
+		Count(&count).Error; err != nil {
+		return false, fmt.Errorf("failed to check for auth provider verification: %w", err)
+	}
+	return count > 0, nil
+}
+
+// AuthProviderVerificationStartableBy reports whether userID may open the login for this
+// verification. A verification belongs to the owner who started the switch, so another signed-in
+// user holding the ID must not be able to use it.
+func (c *Client) AuthProviderVerificationStartableBy(ctx context.Context, id string, userID uint) (bool, error) {
+	if id == "" || userID == 0 {
+		return false, nil
+	}
+
+	var count int64
+	if err := c.db.WithContext(ctx).Model(new(types.TokenRequest)).
+		Where("id = ? AND purpose = ? AND request_expires_at > ? AND owner_user_id = ?",
+			id, types.TokenRequestPurposeAuthProviderVerify, time.Now(), userID).
+		Count(&count).Error; err != nil {
+		return false, fmt.Errorf("failed to check for auth provider verification: %w", err)
+	}
+	return count > 0, nil
+}
+
 // GetSetupTokenRequest returns a setup token request by ID.
 func (c *Client) GetSetupTokenRequest(ctx context.Context, id string) (*types.TokenRequest, error) {
 	tr := new(types.TokenRequest)
@@ -152,11 +198,11 @@ func (c *Client) PollTokenRequest(ctx context.Context, id string) (*types.TokenR
 
 // CreateTokenRequestState creates and stores a fresh OAuth state for a setup token request.
 func (c *Client) CreateTokenRequestState(ctx context.Context, id string) (string, error) {
-	state := strings.ReplaceAll(uuid.NewString(), "-", "")
+	state := strings.ReplaceAll(uuid.New().String(), "-", "")
 
 	if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		tr := new(types.TokenRequest)
-		if err := tx.Where("id = ? AND purpose = ?", id, types.TokenRequestPurposeSetup).First(tr).Error; err != nil {
+		if err := tx.Where("id = ? AND purpose IN ?", id, oauthRoundTripPurposes).First(tr).Error; err != nil {
 			return err
 		}
 		if tr.RequestExpiresAt.IsZero() || !time.Now().Before(tr.RequestExpiresAt) {
@@ -167,7 +213,7 @@ func (c *Client) CreateTokenRequestState(ctx context.Context, id string) (string
 	}); err != nil {
 		return "", fmt.Errorf("failed to create state: %w", err)
 	}
-	log.Infof("Created OAuth state for token request: tokenRequestID=%s", id)
+	slog.Info("Created OAuth state for token request", "tokenRequestID", id)
 
 	return state, nil
 }
@@ -180,7 +226,7 @@ func (c *Client) VerifyTokenRequestState(ctx context.Context, state string) (*ty
 
 	tr := new(types.TokenRequest)
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("state = ? AND purpose = ?", state, types.TokenRequestPurposeSetup).First(tr).Error; err != nil {
+		if err := tx.Where("state = ? AND purpose IN ?", state, oauthRoundTripPurposes).First(tr).Error; err != nil {
 			if tr.ID == "" {
 				return err
 			}
@@ -192,7 +238,7 @@ func (c *Client) VerifyTokenRequestState(ctx context.Context, state string) (*ty
 
 		return tx.Model(tr).Clauses(clause.Returning{}).Updates(map[string]any{"state": "", "error": tr.Error}).Error
 	})
-	log.Infof("Verified OAuth state for token request: tokenRequestID=%s success=%v", tr.ID, err == nil)
+	slog.Info("Verified OAuth state for token request", "tokenRequestID", tr.ID, "success", err == nil)
 	return tr, err
 }
 
@@ -218,7 +264,7 @@ func (c *Client) runTokenCleanup(ctx context.Context) {
 			errs = append(errs, tx.Where("no_expiration = ?", false).Where("expires_at < ?", now).Delete(new(types.AuthToken)).Error)
 			return errors.Join(errs...)
 		}); err != nil {
-			log.Errorf("error cleaning up state: error=%v", err)
+			slog.Error("error cleaning up state", "error", err)
 		}
 
 		timer.Reset(tokenCleanupInterval)

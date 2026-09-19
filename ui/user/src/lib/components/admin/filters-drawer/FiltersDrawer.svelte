@@ -1,7 +1,8 @@
 <script lang="ts" generics="T extends Record<string, string | number | null | undefined>">
 	import { page } from '$app/state';
+	import { isAuditLogAPIKeyFilterOption, toAuditLogFilterSelectOption } from '$lib/auditlogs';
 	import IconButton from '$lib/components/primitives/IconButton.svelte';
-	import { UserService } from '$lib/services';
+	import { UserService, type AuditLogFilterOption } from '$lib/services';
 	import { AUDIT_LOG_FILTER_OPTIONS_LIMIT } from '$lib/services/user/constants';
 	import { goto } from '$lib/url';
 	import AuditFilter, { type FilterInput, type FilterOption } from './FilterField.svelte';
@@ -20,7 +21,7 @@
 	type FilterOptionsEndpoint = (
 		filterId: string,
 		filters?: Partial<T>
-	) => Promise<{ options: string[] } | undefined>;
+	) => Promise<{ options: AuditLogFilterOption[] } | undefined>;
 
 	interface Props {
 		filters?: Partial<T>;
@@ -41,6 +42,9 @@
 		// Filter keys whose value change should wipe the other (clearable) selections. Used so that
 		// switching event types clears filters that no longer apply to the new selection.
 		resetOnChangeKeys?: FilterKey[];
+		// Lets a caller keep related filter values consistent as a selection changes. For example,
+		// selecting a source-specific filter can select its required source at the same time.
+		normalizeFiltersOnChange?: (filters: Partial<T>, changedKey: FilterKey) => Partial<T>;
 		endpoint?: FilterOptionsEndpoint;
 	}
 
@@ -56,6 +60,7 @@
 		getDefaultValue,
 		getVisibleFilterKeys,
 		resetOnChangeKeys,
+		normalizeFiltersOnChange,
 		filterOptions,
 		endpoint = UserService.listAuditLogFilterOptions as FilterOptionsEndpoint
 	}: Props = $props();
@@ -88,7 +93,37 @@
 	}
 
 	type FilterOptions = Record<FilterKey, FilterOption[]>;
-	let filtersOptions: FilterOptions = $state({} as FilterOptions);
+	type RawFilterOptions = Record<FilterKey, AuditLogFilterOption[]>;
+	let rawFilterOptions: RawFilterOptions = $state({} as RawFilterOptions);
+
+	function formatFilterOptions(filterId: FilterKey, options: AuditLogFilterOption[]) {
+		if (['user_id', 'user_ids'].includes(filterId)) {
+			return options
+				.filter((d): d is string => typeof d === 'string')
+				.filter((d) => filterOptions?.(d, filterId) ?? true)
+				.map((d) => ({
+					id: d,
+					label: getUserDisplayName(d, () => options.some((id) => id === d))
+				}));
+		}
+
+		return options
+			.filter((d) => isAuditLogAPIKeyFilterOption(d) || (filterOptions?.(d, filterId) ?? true))
+			.map((d) => {
+				const option = toAuditLogFilterSelectOption(d, getUserDisplayName);
+				return isAuditLogAPIKeyFilterOption(d)
+					? option
+					: { ...option, label: getFilterOptionLabel?.(filterId, d) ?? option.label };
+			});
+	}
+
+	let filtersOptions: FilterOptions = $derived.by(() => {
+		const formatted = {} as FilterOptions;
+		for (const [filterId, options] of Object.entries(rawFilterOptions)) {
+			formatted[filterId as FilterKey] = formatFilterOptions(filterId as FilterKey, options);
+		}
+		return formatted;
+	});
 
 	type FilterInputs = Record<FilterKey, FilterInput>;
 	let filterInputs = $derived(
@@ -112,8 +147,9 @@
 					(filters as Partial<T>)[filterId] = v as T[typeof filterId];
 					// Switching a controlling filter (e.g. event_type) invalidates the other selections.
 					if (changed) wipeOtherFilters(filterId);
-					// Force Component to react
-					filters = { ...filters } as Partial<T>;
+					// Force the component to react and allow callers to maintain dependencies between filters.
+					const nextFilters = { ...filters } as Partial<T>;
+					filters = normalizeFiltersOnChange?.(nextFilters, filterId) ?? nextFilters;
 				},
 				get default() {
 					return getDefaultValue?.(filterId) as string | number | null | undefined;
@@ -139,27 +175,7 @@
 			const otherFilters = Object.fromEntries(
 				Object.entries(filters ?? {}).filter(([k]) => k !== filterId)
 			) as Partial<T>;
-			const response = await endpoint(filterId, otherFilters);
-
-			if (['user_id', 'user_ids'].includes(filterId)) {
-				return (
-					response?.options
-						?.filter((d) => filterOptions?.(d, filterId) ?? true)
-						?.map((d) => ({
-							id: d,
-							label: getUserDisplayName(d, () => response.options.some((id) => id === d))
-						})) ?? []
-				);
-			}
-
-			return (
-				response?.options
-					?.filter((d) => filterOptions?.(d, filterId) ?? true)
-					?.map((d) => ({
-						id: d,
-						label: getFilterOptionLabel?.(filterId, d) ?? d
-					})) ?? []
-			);
+			return (await endpoint(filterId, otherFilters))?.options ?? [];
 		};
 
 		const filterInputKeys = Object.keys(filterInputs) as FilterKey[];
@@ -167,7 +183,7 @@
 		filterInputKeys.forEach((id) => {
 			processLog(id).then((options) => {
 				untrack(() => {
-					filtersOptions[id] = options;
+					rawFilterOptions[id] = options;
 				});
 			});
 		});

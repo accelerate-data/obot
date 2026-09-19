@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { formatAuditLogAPIKeyName, getAuditLogAPIKeyMaskedKey } from '$lib/auditlogs';
 	import { isAbortError } from '$lib/errors';
 	import { AdminService, type LLMAuditLog } from '$lib/services';
 	import AuditLogDetails from './AuditLogDetails.svelte';
@@ -85,6 +86,10 @@
 
 	{#snippet additRequestContent(data)}
 		{@const requestURL = [data.requestMethod, data.requestPath].filter(Boolean).join(' ')}
+		{@const apiKey = formatAuditLogAPIKeyName(
+			data.apiKeyName ?? '',
+			getAuditLogAPIKeyMaskedKey(data.userID, data.apiKeyID)
+		)}
 		{#if requestURL}
 			<p class="break-all grid grid-cols-2 gap-2">
 				<span class="font-medium">Request URL:</span>
@@ -95,6 +100,12 @@
 			<p class="break-all grid grid-cols-2 gap-2">
 				<span class="font-medium">User Agent:</span>
 				{data.userAgent}
+			</p>
+		{/if}
+		{#if apiKey}
+			<p class="break-all grid grid-cols-2 gap-2">
+				<span class="font-medium">API Key:</span>
+				{apiKey}
 			</p>
 		{/if}
 	{/snippet}

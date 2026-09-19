@@ -16,6 +16,14 @@ import (
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 )
 
+type fixedInstanceResolver struct {
+	server v1.MCPServer
+}
+
+type fixedOAuthChecker struct {
+	url string
+}
+
 // GetOAuthURL must not leak another user's instance: the ownership guard runs
 // before any server/credential resolution, so a non-owner gets NotFound and the
 // nil mcpOAuthChecker is never reached.
@@ -79,16 +87,8 @@ func TestServerInstanceRedirectOAuthURLRedirectsOwnedInstance(t *testing.T) {
 	assert.Equal(t, "https://oauth.example.test/authorize?state=state-1", rec.Header().Get("Location"))
 }
 
-type fixedInstanceResolver struct {
-	server v1.MCPServer
-}
-
 func (f fixedInstanceResolver) ServerForActionWithConnectIDAllowMissingConfig(context.Context, string, string) (string, v1.MCPServer, mcp.ServerConfig, []string, error) {
 	return f.server.Name, f.server, mcp.ServerConfig{}, nil, nil
-}
-
-type fixedOAuthChecker struct {
-	url string
 }
 
 func (f fixedOAuthChecker) CheckForMCPAuth(api.Context, v1.MCPServer, mcp.ServerConfig, string, string, string) (string, error) {

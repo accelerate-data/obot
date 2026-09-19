@@ -14,6 +14,11 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
+type staticAuthenticator struct {
+	response *authenticator.Response
+	err      error
+}
+
 func TestUserDecoratorPassesGenericOAuthIssuerAndEmailVerified(t *testing.T) {
 	c := newGenericOAuthTestClient(t, "https://studio.example.com/api/auth", "true")
 	existing, err := c.EnsureIdentity(t.Context(), &types.Identity{
@@ -112,11 +117,6 @@ func TestUserDecoratorNoopsWithoutAuthProviderMetadata(t *testing.T) {
 	if resp != nil {
 		t.Fatalf("expected nil response, got %#v", resp)
 	}
-}
-
-type staticAuthenticator struct {
-	response *authenticator.Response
-	err      error
 }
 
 func (s staticAuthenticator) AuthenticateRequest(*http.Request) (*authenticator.Response, bool, error) {

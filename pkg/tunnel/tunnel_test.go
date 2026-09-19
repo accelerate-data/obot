@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,14 +23,34 @@ import (
 
 	"github.com/gorilla/websocket"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/rancher/remotedialer"
-	"github.com/sirupsen/logrus"
-	logrustest "github.com/sirupsen/logrus/hooks/test"
+	"golang.org/x/oauth2"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// capturedEntry is a single log record recorded by captureHandler.
+type capturedEntry struct {
+	message string
+	attrs   map[string]any
+}
+
+// captureHandler records the slog output of the code under test. Handlers
+// returned by WithAttrs share the recorded entries with their parent.
+type captureHandler struct {
+	lock    *sync.Mutex
+	entries *[]capturedEntry
+	attrs   []slog.Attr
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+type allowAllTunnelReader struct{}
+
+type staticTunnelTestReader struct {
+	tunnels map[string]v1.MCPTunnel
+}
 
 func TestConnectURL(t *testing.T) {
 	tests := []struct {
@@ -238,7 +259,7 @@ func TestTunnelForwardsStreamingHTTP(t *testing.T) {
 	}))
 	defer target.Close()
 
-	manager, bridgeClient, cleanup := newConnectedTestTunnel(t, "office")
+	manager, bridgeClient, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 
 	bridgeURL, err := manager.BridgeURL("office", target.URL+"/mcp?base=one")
@@ -278,7 +299,7 @@ func TestTunnelMultiplexesConcurrentRequests(t *testing.T) {
 	}))
 	defer target.Close()
 
-	manager, bridgeClient, cleanup := newConnectedTestTunnel(t, "office")
+	manager, bridgeClient, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 
 	const count = 20
@@ -313,6 +334,48 @@ func TestTunnelMultiplexesConcurrentRequests(t *testing.T) {
 	}
 }
 
+func newCaptureHandler() *captureHandler {
+	return &captureHandler{lock: new(sync.Mutex), entries: new([]capturedEntry)}
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *captureHandler) Handle(_ context.Context, record slog.Record) error {
+	attrs := make(map[string]any, len(h.attrs)+record.NumAttrs())
+	for _, attr := range h.attrs {
+		attrs[attr.Key] = attr.Value.Resolve().Any()
+	}
+	record.Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.Resolve().Any()
+		return true
+	})
+
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	*h.entries = append(*h.entries, capturedEntry{message: record.Message, attrs: attrs})
+	return nil
+}
+
+func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &captureHandler{
+		lock:    h.lock,
+		entries: h.entries,
+		attrs:   append(slices.Clip(h.attrs), attrs...),
+	}
+}
+
+func (h *captureHandler) WithGroup(string) slog.Handler {
+	return h
+}
+
+func (h *captureHandler) allEntries() []capturedEntry {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	return slices.Clone(*h.entries)
+}
+
 func TestTunnelLogsCorrelatedRequestAndResponse(t *testing.T) {
 	target := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "2")
@@ -321,15 +384,12 @@ func TestTunnelLogsCorrelatedRequestAndResponse(t *testing.T) {
 	}))
 	defer target.Close()
 
-	testLogger, hook := logrustest.NewNullLogger()
-	testLogger.SetLevel(logrus.InfoLevel)
-	previousTunnelLog := tunnelLog
-	tunnelLog = logger.NewWithLogger(testLogger, nil)
-	defer func() {
-		tunnelLog = previousTunnelLog
-	}()
+	handler := newCaptureHandler()
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(previousLogger)
 
-	manager, bridgeClient, cleanup := newConnectedTestTunnel(t, "office")
+	manager, bridgeClient, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 
 	bridgeURL, err := manager.BridgeURL("office", target.URL+"/mcp?token=secret")
@@ -343,32 +403,32 @@ func TestTunnelLogsCorrelatedRequestAndResponse(t *testing.T) {
 	_, _ = io.Copy(io.Discard, response.Body)
 	response.Body.Close()
 
-	var requestEntry, responseEntry *logrus.Entry
-	for _, entry := range hook.AllEntries() {
-		switch entry.Message {
+	var requestEntry, responseEntry *capturedEntry
+	for _, entry := range handler.allEntries() {
+		switch entry.message {
 		case "Tunnel request received":
-			requestEntry = entry
+			requestEntry = &entry
 		case "Tunnel response received":
-			responseEntry = entry
+			responseEntry = &entry
 		}
 	}
 	if requestEntry == nil || responseEntry == nil {
 		t.Fatalf("request and response log entries = %#v, %#v", requestEntry, responseEntry)
 	}
-	if requestEntry.Data["request_id"] != responseEntry.Data["request_id"] {
-		t.Fatalf("request IDs = %v and %v", requestEntry.Data["request_id"], responseEntry.Data["request_id"])
+	if requestEntry.attrs["request_id"] != responseEntry.attrs["request_id"] {
+		t.Fatalf("request IDs = %v and %v", requestEntry.attrs["request_id"], responseEntry.attrs["request_id"])
 	}
-	if requestEntry.Data["tunnel"] != "office" || requestEntry.Data["method"] != http.MethodGet {
-		t.Fatalf("request log fields = %#v", requestEntry.Data)
+	if requestEntry.attrs["tunnel"] != "office" || requestEntry.attrs["method"] != http.MethodGet {
+		t.Fatalf("request log fields = %#v", requestEntry.attrs)
 	}
-	if requestEntry.Data["url"] != target.URL+"/mcp" || requestEntry.Data["has_query"] != true {
-		t.Fatalf("request URL fields = %#v", requestEntry.Data)
+	if requestEntry.attrs["url"] != target.URL+"/mcp" || requestEntry.attrs["has_query"] != true {
+		t.Fatalf("request URL fields = %#v", requestEntry.attrs)
 	}
-	if responseEntry.Data["status"] != http.StatusAccepted || responseEntry.Data["response_content_length"] != int64(2) {
-		t.Fatalf("response log fields = %#v", responseEntry.Data)
+	if responseEntry.attrs["status"] != int64(http.StatusAccepted) || responseEntry.attrs["response_content_length"] != int64(2) {
+		t.Fatalf("response log fields = %#v", responseEntry.attrs)
 	}
-	if _, ok := responseEntry.Data["duration"]; !ok {
-		t.Fatalf("response log has no duration: %#v", responseEntry.Data)
+	if _, ok := responseEntry.attrs["duration"]; !ok {
+		t.Fatalf("response log has no duration: %#v", responseEntry.attrs)
 	}
 }
 
@@ -396,7 +456,7 @@ func TestTunnelRewritesRedirectAndLegacySSEEndpoint(t *testing.T) {
 	}))
 	defer target.Close()
 
-	manager, bridgeClient, cleanup := newConnectedTestTunnel(t, "office")
+	manager, bridgeClient, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 
 	redirectBridge, _ := manager.BridgeURL("office", target.URL+"/redirect")
@@ -451,7 +511,7 @@ func TestTunnelRewritesRedirectAndLegacySSEEndpoint(t *testing.T) {
 }
 
 func TestTunnelAcceptsMultipleConnections(t *testing.T) {
-	manager, _, cleanup := newConnectedTestTunnel(t, "office")
+	manager, _, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 	serverURL := manager.bridgeBaseURL
 	connection, err := Dial(t.Context(), serverURL, testTunnelToken("office"))
@@ -473,7 +533,7 @@ func TestTunnelAcceptsMultipleConnections(t *testing.T) {
 }
 
 func TestManagerDisconnectsAllTunnelConnections(t *testing.T) {
-	manager, _, cleanup := newConnectedTestTunnel(t, "office")
+	manager, _, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 	connection, err := Dial(t.Context(), manager.bridgeBaseURL, testTunnelToken("office"))
 	if err != nil {
@@ -598,6 +658,9 @@ func TestHTTPClientRoutesRequestsAndRedirectsThroughBridge(t *testing.T) {
 		if request.Header.Get("X-Override") != "configured" {
 			t.Errorf("overridden header = %q, want configured", request.Header.Get("X-Override"))
 		}
+		if request.Header.Get("Authorization") != "Bearer tunnel-oauth-token" {
+			t.Errorf("authorization = %q, want tunnel OAuth token", request.Header.Get("Authorization"))
+		}
 		if !strings.HasPrefix(request.URL.Path, bridgePathPrefix) {
 			t.Errorf("request path = %q, want bridge path", request.URL.Path)
 			http.Error(w, "not a bridge request", http.StatusBadRequest)
@@ -645,10 +708,14 @@ func TestHTTPClientRoutesRequestsAndRedirectsThroughBridge(t *testing.T) {
 	}
 	defer manager.Close()
 
-	httpClient, err := manager.HTTPClient(tunnelName, http.Header{
-		"X-Injected": {"configured"},
-		"X-Override": {"configured"},
-	}, 3*time.Second)
+	httpClient, err := manager.HTTPClient(tunnelName, HTTPClientOptions{
+		Headers: http.Header{
+			"X-Injected": {"configured"},
+			"X-Override": {"configured"},
+		},
+		TokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tunnel-oauth-token"}),
+		Timeout:     3 * time.Second,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -689,9 +756,90 @@ func TestHTTPClientRoutesRequestsAndRedirectsThroughBridge(t *testing.T) {
 	}
 }
 
+func TestHTTPClientDoesNotForwardOAuthTokenAcrossTargetOrigins(t *testing.T) {
+	const (
+		tunnelName     = "office"
+		trustedStart   = "https://trusted.internal.test/start"
+		untrustedHop   = "https://untrusted.internal.test/hop"
+		untrustedFinal = "https://untrusted.internal.test/final"
+	)
+
+	var (
+		manager       *Manager
+		authorization = make(map[string]string)
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		encoded := strings.TrimPrefix(request.URL.Path, bridgePathPrefix)
+		payload, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			t.Errorf("decode bridge target: %v", err)
+			http.Error(w, "invalid bridge target", http.StatusBadRequest)
+			return
+		}
+		var target bridgeTarget
+		if err := json.Unmarshal(payload, &target); err != nil {
+			t.Errorf("unmarshal bridge target: %v", err)
+			http.Error(w, "invalid bridge target", http.StatusBadRequest)
+			return
+		}
+		authorization[target.URL] = request.Header.Get("Authorization")
+
+		var redirectTarget string
+		switch target.URL {
+		case trustedStart:
+			redirectTarget = untrustedHop
+		case untrustedHop:
+			redirectTarget = untrustedFinal
+		case untrustedFinal:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		default:
+			http.Error(w, "unexpected target", http.StatusBadRequest)
+			return
+		}
+		redirectURL, err := manager.BridgeURL(tunnelName, redirectTarget)
+		if err != nil {
+			t.Errorf("build redirect bridge URL: %v", err)
+			http.Error(w, "failed to redirect", http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, request, redirectURL, http.StatusFound)
+	}))
+	defer server.Close()
+
+	var err error
+	manager, err = NewManager(t.Context(), server.URL, allowAllTunnelReader{}, PeerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	httpClient, err := manager.HTTPClient(tunnelName, HTTPClientOptions{
+		Headers:     http.Header{"Authorization": {"Bearer configured-token"}},
+		TokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "oauth-token"}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := httpClient.Get(trustedStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+
+	if authorization[trustedStart] != "Bearer oauth-token" {
+		t.Fatalf("trusted origin authorization = %q, want OAuth token", authorization[trustedStart])
+	}
+	for _, target := range []string{untrustedHop, untrustedFinal} {
+		if authorization[target] != "" {
+			t.Fatalf("cross-origin target %q received authorization %q", target, authorization[target])
+		}
+	}
+}
+
 func TestHTTPClientRejectsInvalidConfiguration(t *testing.T) {
 	var manager *Manager
-	if _, err := manager.HTTPClient("office", nil, time.Second); err == nil {
+	if _, err := manager.HTTPClient("office", HTTPClientOptions{Timeout: time.Second}); err == nil {
 		t.Fatal("nil manager returned no error")
 	}
 
@@ -700,7 +848,7 @@ func TestHTTPClientRejectsInvalidConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer validManager.Close()
-	if _, err := validManager.HTTPClient("Office", nil, time.Second); err == nil {
+	if _, err := validManager.HTTPClient("Office", HTTPClientOptions{Timeout: time.Second}); err == nil {
 		t.Fatal("invalid tunnel name returned no error")
 	}
 }
@@ -906,8 +1054,9 @@ func TestManagerServeConnectRechecksCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	configuredTunnel := v1.MCPTunnel{
-		Name: tunnelName}
-	configuredTunnel.Spec.Credential = currentCredential
+		Name: tunnelName,
+		Spec: v1.MCPTunnelSpec{Credential: currentCredential},
+	}
 	reader := &staticTunnelTestReader{
 		tunnels: map[string]v1.MCPTunnel{tunnelName: configuredTunnel},
 	}
@@ -1085,7 +1234,7 @@ func TestBridgeURLIsStableAcrossManagerRestarts(t *testing.T) {
 }
 
 func TestManagerConnectionsSnapshot(t *testing.T) {
-	manager, _, cleanup := newConnectedTestTunnel(t, "office")
+	manager, _, cleanup := newConnectedTestTunnel(t)
 	defer cleanup()
 	manager.tunnels = &staticTunnelTestReader{tunnels: map[string]v1.MCPTunnel{
 		"disconnected": testConfiguredTunnel("disconnected"),
@@ -1166,8 +1315,9 @@ func TestClientForwarderRejectsMissingTarget(t *testing.T) {
 	}
 }
 
-func newConnectedTestTunnel(t *testing.T, name string) (*Manager, *http.Client, func()) {
+func newConnectedTestTunnel(t *testing.T) (*Manager, *http.Client, func()) {
 	t.Helper()
+	const name = "office"
 	ctx, cancel := context.WithCancel(context.Background())
 	manager, server := newManagerTestServer(ctx, t)
 	token := testTunnelToken(name)
@@ -1237,6 +1387,7 @@ func newManagerTestServer(ctx context.Context, t *testing.T, readers ...kclient.
 	})
 	mux.HandleFunc("GET "+PeerConnectPath, manager.ServePeer)
 	mux.HandleFunc("/tunnel/bridge/{target}", manager.ServeBridge)
+	mux.HandleFunc("GET /tunnel/composite/register/{key}", manager.ServeCompositeRegistration)
 	server := httptest.NewUnstartedServer(mux)
 	server.Listener = listener
 	server.Start()
@@ -1298,13 +1449,9 @@ func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	return server
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
 }
-
-type allowAllTunnelReader struct{}
 
 func (allowAllTunnelReader) Get(_ context.Context, key kclient.ObjectKey, obj kclient.Object, _ ...kclient.GetOption) error {
 	tunnel := obj.(*v1.MCPTunnel)
@@ -1317,10 +1464,6 @@ func (allowAllTunnelReader) Get(_ context.Context, key kclient.ObjectKey, obj kc
 
 func (allowAllTunnelReader) List(context.Context, kclient.ObjectList, ...kclient.ListOption) error {
 	return nil
-}
-
-type staticTunnelTestReader struct {
-	tunnels map[string]v1.MCPTunnel
 }
 
 func (s *staticTunnelTestReader) Get(_ context.Context, key kclient.ObjectKey, obj kclient.Object, _ ...kclient.GetOption) error {
@@ -1361,13 +1504,17 @@ func testTunnelCredential(name string) string {
 func testConfiguredTunnel(name string) v1.MCPTunnel {
 	credential := testTunnelCredential(name)
 	credentialID, _ := CredentialID(credential)
-	tunnel := v1.MCPTunnel{
+	return v1.MCPTunnel{
 		Name:      name,
-		Namespace: system.DefaultNamespace}
-	tunnel.Spec.Credential = credential
-	tunnel.Spec.CredentialID = credentialID
-	tunnel.Spec.Manifest.AllowedURLs = []string{"*"}
-	return tunnel
+		Namespace: system.DefaultNamespace,
+		Spec: v1.MCPTunnelSpec{
+			Credential:   credential,
+			CredentialID: credentialID,
+			Manifest: apitypes.MCPTunnelManifest{
+				AllowedURLs: []string{"*"},
+			},
+		},
+	}
 }
 
 func testTunnelNameFromRequest(request *http.Request) (string, bool) {

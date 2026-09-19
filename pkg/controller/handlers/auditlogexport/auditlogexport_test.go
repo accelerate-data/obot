@@ -20,6 +20,24 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type testStorageProvider struct {
+	bucket string
+	key    string
+	data   string
+	err    error
+}
+
+type failingStorageProvider struct {
+	err error
+}
+
+type failingAfterReadStorageProvider struct {
+	data string
+	err  error
+}
+
+type successWithoutReadStorageProvider struct{}
+
 func TestLLMAuditLogOptionsFromExport(t *testing.T) {
 	start := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
@@ -29,6 +47,7 @@ func TestLLMAuditLogOptionsFromExport(t *testing.T) {
 		EndTime:                metav1.NewTime(end),
 		WithRequestAndResponse: true,
 		LLMFilters: &types.LLMAuditLogExportFilters{
+			APIKeyIDs:              []uint{12, 34},
 			UserIDs:                []string{"user-1"},
 			ModelProviders:         []string{"openai"},
 			TargetModels:           []string{"gpt-4o"},
@@ -52,11 +71,26 @@ func TestLLMAuditLogOptionsFromExport(t *testing.T) {
 	if !reflect.DeepEqual(got.UserID, export.Spec.LLMFilters.UserIDs) || !reflect.DeepEqual(got.ResponseStatus, export.Spec.LLMFilters.ResponseStatuses) || got.Query != "needle" {
 		t.Fatalf("filters were not mapped: %#v", got)
 	}
+	if !reflect.DeepEqual(got.APIKeyID, export.Spec.LLMFilters.APIKeyIDs) {
+		t.Fatalf("API key filter was not mapped: %#v", got)
+	}
 	if !reflect.DeepEqual(got.MessagePolicyTriggered, export.Spec.LLMFilters.MessagePolicyTriggered) {
 		t.Fatalf("message policy filter was not mapped: %#v", got)
 	}
 	if !reflect.DeepEqual(got.UserAgent, export.Spec.LLMFilters.UserAgents) {
 		t.Fatalf("user agent filter was not mapped: %#v", got)
+	}
+}
+
+func TestMCPAuditLogOptionsMapsAPIKeyIDs(t *testing.T) {
+	export := exportWithFilters(types.AuditLogExportFilters{
+		SourceTypes: []types.AuditLogSourceType{types.AuditLogSourceTypeMCP},
+		APIKeyIDs:   []uint{12, 34},
+	}, false)
+
+	got := mcpAuditLogOptionsFromExport(export, 100, 0)
+	if !reflect.DeepEqual(got.APIKeyID, export.Spec.Filters.APIKeyIDs) {
+		t.Fatalf("API key filter was not mapped: %#v", got)
 	}
 }
 
@@ -72,13 +106,6 @@ func TestAuditLogOptionsFromExportWithoutFilters(t *testing.T) {
 	if llmOptions.Limit != 100 || llmOptions.Offset != 200 {
 		t.Fatalf("unexpected LLM options: %#v", llmOptions)
 	}
-}
-
-type testStorageProvider struct {
-	bucket string
-	key    string
-	data   string
-	err    error
 }
 
 func (t *testStorageProvider) Test(context.Context, types.StorageConfig) error {
@@ -97,21 +124,12 @@ func (t *testStorageProvider) Upload(_ context.Context, _ types.StorageConfig, b
 	return nil
 }
 
-type failingStorageProvider struct {
-	err error
-}
-
 func (f failingStorageProvider) Test(context.Context, types.StorageConfig) error {
 	return nil
 }
 
 func (f failingStorageProvider) Upload(context.Context, types.StorageConfig, string, string, io.Reader) error {
 	return f.err
-}
-
-type failingAfterReadStorageProvider struct {
-	data string
-	err  error
 }
 
 func (f *failingAfterReadStorageProvider) Test(context.Context, types.StorageConfig) error {
@@ -126,8 +144,6 @@ func (f *failingAfterReadStorageProvider) Upload(_ context.Context, _ types.Stor
 	f.data = string(b)
 	return f.err
 }
-
-type successWithoutReadStorageProvider struct{}
 
 func (s successWithoutReadStorageProvider) Test(context.Context, types.StorageConfig) error {
 	return nil

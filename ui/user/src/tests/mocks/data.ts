@@ -291,13 +291,12 @@ export const createMCPCatalogEntryResponse = {
 		description: '',
 		icon: '',
 		runtime: 'npx',
-		serverUserType: 'singleUser',
 		npxConfig: {
 			package: '@modelcontextprotocol/server-everything',
 			args: [],
 			egressDomains: []
 		},
-		env: [
+		config: [
 			{
 				key: 'TEST_API_KEY',
 				name: 'Test API Key',
@@ -305,7 +304,7 @@ export const createMCPCatalogEntryResponse = {
 				required: false,
 				sensitive: false,
 				value: '',
-				file: false
+				usage: 'env'
 			}
 		]
 	},
@@ -418,7 +417,7 @@ export const getServerK8sSettingsResponse = {
 } satisfies ServerK8sSettings;
 
 /**
- * Fixtures for mcp-catalog server details page specs (admin viewing hosted / remote / composite).
+ * Fixtures for mcp-catalog server details page specs.
  */
 export function createMcpServerDetailsFixtures() {
 	const associatedUser = listUsersResponse[0]!;
@@ -426,49 +425,17 @@ export function createMcpServerDetailsFixtures() {
 	const entrySingle = createMCPCatalogEntry({
 		id: 'entry-details-single',
 		name: 'Hosted Single User Entry',
-		runtime: 'npx',
-		serverUserType: 'singleUser'
+		runtime: 'npx'
 	});
 	const entryRemote = createMCPCatalogEntry({
 		id: 'entry-details-remote',
 		name: 'Remote Entry',
-		runtime: 'remote',
-		serverUserType: 'singleUser'
-	});
-	const entryCompositeChild = createMCPCatalogEntry({
-		id: 'entry-details-composite-child',
-		name: 'Composite Child Entry',
-		runtime: 'npx',
-		serverUserType: 'singleUser'
-	});
-	const entryComposite = createMCPCatalogEntry({
-		id: 'entry-details-composite',
-		name: 'Composite Entry',
-		runtime: 'composite',
-		serverUserType: 'singleUser',
-		manifest: {
-			compositeConfig: {
-				componentServers: [
-					{
-						catalogEntryID: entryCompositeChild.id,
-						manifest: {
-							name: 'Composite Child Entry',
-							runtime: 'npx',
-							serverUserType: 'singleUser',
-							icon: '',
-							shortDescription: '',
-							description: ''
-						}
-					}
-				]
-			}
-		}
+		runtime: 'remote'
 	});
 	const entryMulti = createMCPCatalogEntry({
 		id: 'entry-details-multi',
 		name: 'Hosted Multi User Entry',
-		runtime: 'npx',
-		serverUserType: 'multiUser'
+		runtime: 'npx'
 	});
 
 	const serverSingle = createMCPCatalogServer({
@@ -493,41 +460,6 @@ export function createMcpServerDetailsFixtures() {
 			clientIdMetadataDocumentSupported: false
 		}
 	});
-	const serverComposite = createMCPCatalogServer({
-		id: 'server-details-composite',
-		name: 'Composite Server',
-		runtime: 'composite',
-		serverUserType: 'singleUser',
-		catalogEntryID: entryComposite.id,
-		userID: associatedUser.id,
-		manifest: {
-			name: 'Composite Server',
-			runtime: 'composite',
-			compositeConfig: {
-				componentServers: [
-					{
-						catalogEntryID: entryCompositeChild.id,
-						manifest: {
-							name: 'Composite Child Entry',
-							runtime: 'npx',
-							icon: '',
-							shortDescription: '',
-							description: ''
-						}
-					}
-				]
-			}
-		}
-	});
-	const serverCompositeChild = createMCPCatalogServer({
-		id: 'server-details-composite-child',
-		name: 'Composite Child Entry',
-		runtime: 'npx',
-		serverUserType: 'singleUser',
-		catalogEntryID: entryCompositeChild.id,
-		compositeName: serverComposite.id,
-		userID: associatedUser.id
-	});
 	const serverMulti = createMCPCatalogServer({
 		id: 'server-details-multi',
 		name: 'Hosted Multi User Server',
@@ -550,13 +482,9 @@ export function createMcpServerDetailsFixtures() {
 		associatedUser,
 		entrySingle,
 		entryRemote,
-		entryComposite,
-		entryCompositeChild,
 		entryMulti,
 		serverSingle,
 		serverRemote,
-		serverComposite,
-		serverCompositeChild,
 		serverMulti,
 		multiUserInstance
 	};
@@ -570,6 +498,7 @@ export const getVersionResponse = {
 	engine: 'docker',
 	enterprise: false,
 	hideK8sDetails: false,
+	hostedAgentsEnabled: true,
 	latestVersion: 'v0.0.0-dev',
 	licenseEntitlementViolations: undefined,
 	licenseEntitlements: undefined,
@@ -597,46 +526,35 @@ export function createDeploymentsPageFixtures() {
 		id: 'entry-single-update',
 		name: 'Entry Single Update',
 		runtime: 'npx',
-		serverUserType: 'singleUser',
-		env: [editableEnvField]
+		env: [editableEnvField],
+		manifest: {
+			upgradeNote:
+				'## Before upgrading\n\nUse **safe mode**.\n\n- Review settings\n- Restart clients\n\n1. Back up configuration\n2. Verify the upgrade\n\n[Unsafe link](javascript:alert(1))\n\n<script>alert("unsafe")</script>'
+		}
+	});
+	const entryEmptyUpgradeNote = createMCPCatalogEntry({
+		id: 'entry-empty-upgrade-note',
+		name: 'Entry Empty Upgrade Note',
+		runtime: 'npx',
+		manifest: { upgradeNote: '   ' }
 	});
 	const entrySingleK8s = createMCPCatalogEntry({
 		id: 'entry-single-k8s',
 		name: 'Entry Single K8s',
 		runtime: 'npx',
-		serverUserType: 'singleUser',
 		env: [editableEnvField]
 	});
 	const entryMulti = createMCPCatalogEntry({
 		id: 'entry-multi',
 		name: 'Entry Multi User',
 		runtime: 'npx',
-		serverUserType: 'multiUser',
 		env: [editableEnvField]
 	});
 	const entryRemote = createMCPCatalogEntry({
 		id: 'entry-remote',
 		name: 'Entry Remote',
-		runtime: 'remote',
-		serverUserType: 'singleUser'
+		runtime: 'remote'
 	});
-	const entryComposite = createMCPCatalogEntry({
-		id: 'entry-composite',
-		name: 'Entry Composite',
-		runtime: 'composite',
-		serverUserType: 'singleUser'
-	});
-	const entryCompositeChild = createMCPCatalogEntry({
-		id: 'entry-composite-child',
-		name: 'Entry Composite Child',
-		runtime: 'npx',
-		serverUserType: 'singleUser',
-		env: [editableEnvField]
-	});
-
-	const compositeServerId = 'server-composite';
-	const compositeChildId = 'server-composite-child';
-
 	const serverSingleNeedsUpdate = createMCPCatalogServer({
 		id: 'server-single-needs-update',
 		name: 'Npx Single Needs Update',
@@ -646,6 +564,26 @@ export function createDeploymentsPageFixtures() {
 		env: [editableEnvField],
 		needsUpdate: true,
 		created: '2026-01-07T00:00:00.000Z',
+		userID
+	});
+	const serverSingleNeedsUpdateDuplicate = createMCPCatalogServer({
+		id: 'server-single-needs-update-duplicate',
+		name: 'Second Upgrade Deployment',
+		runtime: 'npx',
+		serverUserType: 'singleUser',
+		catalogEntryID: entrySingleUpdate.id,
+		needsUpdate: true,
+		created: '2026-01-08T00:00:00.000Z',
+		userID
+	});
+	const serverEmptyUpgradeNote = createMCPCatalogServer({
+		id: 'server-empty-upgrade-note',
+		name: 'Npx Empty Upgrade Note',
+		runtime: 'npx',
+		serverUserType: 'singleUser',
+		catalogEntryID: entryEmptyUpgradeNote.id,
+		needsUpdate: true,
+		created: '2026-01-09T00:00:00.000Z',
 		userID
 	});
 	const serverSingleNeedsK8s = createMCPCatalogServer({
@@ -677,27 +615,6 @@ export function createDeploymentsPageFixtures() {
 		created: '2026-01-04T00:00:00.000Z',
 		userID
 	});
-	const serverComposite = createMCPCatalogServer({
-		id: compositeServerId,
-		name: 'Composite Parent',
-		runtime: 'composite',
-		serverUserType: 'singleUser',
-		catalogEntryID: entryComposite.id,
-		manifest: {
-			name: 'Composite Parent',
-			runtime: 'composite',
-			compositeConfig: {
-				componentServers: [
-					{
-						catalogEntryID: entryCompositeChild.id,
-						mcpServerID: compositeChildId
-					}
-				]
-			}
-		},
-		created: '2026-01-03T00:00:00.000Z',
-		userID
-	});
 	const serverNoCatalogEntry = createMCPCatalogServer({
 		id: 'server-no-catalog',
 		name: 'Orphan Hosted',
@@ -708,44 +625,33 @@ export function createDeploymentsPageFixtures() {
 		created: '2026-01-02T00:00:00.000Z',
 		userID
 	});
-	const serverCompositeChild = createMCPCatalogServer({
-		id: compositeChildId,
-		name: 'Composite Component',
-		runtime: 'npx',
-		serverUserType: 'singleUser',
-		catalogEntryID: entryCompositeChild.id,
-		compositeName: compositeServerId,
-		created: '2026-01-01T00:00:00.000Z',
-		userID
-	});
 
 	const entries = [
 		entrySingleUpdate,
+		entryEmptyUpgradeNote,
 		entrySingleK8s,
 		entryMulti,
-		entryRemote,
-		entryComposite,
-		entryCompositeChild
+		entryRemote
 	];
 	const servers = [
 		serverSingleNeedsUpdate,
+		serverSingleNeedsUpdateDuplicate,
+		serverEmptyUpgradeNote,
 		serverSingleNeedsK8s,
 		serverMulti,
 		serverRemote,
-		serverComposite,
-		serverNoCatalogEntry,
-		serverCompositeChild
+		serverNoCatalogEntry
 	];
 
 	return {
 		entries,
 		servers,
 		serverSingleNeedsUpdate,
+		serverSingleNeedsUpdateDuplicate,
+		serverEmptyUpgradeNote,
 		serverSingleNeedsK8s,
 		serverMulti,
 		serverRemote,
-		serverComposite,
-		serverNoCatalogEntry,
-		serverCompositeChild
+		serverNoCatalogEntry
 	};
 }

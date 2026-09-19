@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,12 +15,322 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/oauthex"
+	"github.com/obot-platform/mmmcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/version"
 	"golang.org/x/oauth2"
 )
+
+var (
+	resourceMetadataRegex = regexp.MustCompile(`resource_metadata="([^"]*)"`)
+	scopeRegex            = regexp.MustCompile(`scope="([^"]*)"`)
+)
+
+// assumeOAuthRequiredTransport synthesizes the initialize challenge used to
+// begin standard OAuth metadata discovery. All subsequent metadata requests use
+// the original, policy-enforcing transport.
+type assumeOAuthRequiredTransport struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	done bool
+}
+
+type CallbackPayload struct {
+	Code             string `json:"code"`
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
+type AuthURLHandler interface {
+	HandleAuthURL(context.Context, string, string) (bool, error)
+}
+
+type CallbackHandler interface {
+	AuthURLHandler
+	NewState(context.Context, *oauth2.Config, string, string) (string, <-chan CallbackPayload, error)
+}
+
+type ClientCredLookup interface {
+	Lookup(context.Context) (string, string, error)
+}
+
+type oauth struct {
+	redirectURL              string
+	clientName               string
+	serverName               string
+	clientIDMetadataDocument string
+	currentToken             oauth2.Token
+	metadataClient           *http.Client
+	callbackHandler          CallbackHandler
+	clientLookup             ClientCredLookup
+	tokenStorage             TokenStorage
+}
+
+type oauthMetadataDiscovery struct {
+	ProtectedResourceURL              string
+	ResourceURL                       string
+	ProtectedResourceMetadata         protectedResourceMetadata
+	ProtectedResourceMetadataJSON     json.RawMessage
+	AuthorizationServerURL            string
+	AuthorizationServerMetadataURL    string
+	AuthorizationServerMetadata       AuthorizationServerMetadata
+	AuthorizationServerMetadataJSON   json.RawMessage
+	DynamicClientRegistration         bool
+	ClientRegistration                ClientRegistrationMetadata
+	ClientIDMetadataDocumentSupported bool
+}
+
+// OAuthMetadata contains discovered OAuth metadata for an MCP server.
+type OAuthMetadata struct {
+	ProtectedResourceMetadataURL      string          `json:"protectedResourceMetadataUrl,omitempty"`
+	ResourceURL                       string          `json:"resourceUrl,omitempty"`
+	AuthorizationServerMetadataURL    string          `json:"authorizationServerMetadataUrl,omitempty"`
+	ProtectedResourceMetadata         json.RawMessage `json:"protectedResourceMetadata,omitempty"`
+	AuthorizationServerMetadata       json.RawMessage `json:"authorizationServerMetadata,omitempty"`
+	ClientRegistration                json.RawMessage `json:"clientRegistration,omitempty"`
+	DynamicClientRegistration         bool            `json:"dynamicClientRegistration,omitempty"`
+	ClientIDMetadataDocumentSupported bool            `json:"clientIdMetadataDocumentSupported,omitempty"`
+}
+
+type resourceIdentifier string
+
+// protectedResourceMetadata represents OAuth 2.0 Protected Resource Metadata
+// as defined in RFC 8707
+type protectedResourceMetadata struct {
+	// REQUIRED. The protected resource's resource identifier
+	Resource resourceIdentifier `json:"resource"`
+
+	// OPTIONAL. JSON array containing a list of OAuth authorization server issuer identifiers
+	AuthorizationServers []string `json:"authorization_servers,omitempty"`
+
+	// OPTIONAL. URL of the protected resource's JSON Web Key (JWK) Set document
+	JwksURI string `json:"jwks_uri,omitempty"`
+
+	// RECOMMENDED. JSON array containing a list of scope values
+	ScopesSupported []string `json:"scopes_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of the supported methods of sending an OAuth 2.0 bearer token
+	BearerMethodsSupported []string `json:"bearer_methods_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of the JWS signing algorithms supported by the protected resource
+	ResourceSigningAlgValuesSupported []string `json:"resource_signing_alg_values_supported,omitempty"`
+
+	// OPTIONAL. Human-readable name of the protected resource intended for display to the end user
+	ResourceName string `json:"resource_name,omitempty"`
+
+	// OPTIONAL. URL of a page containing human-readable information that developers might want or need to know
+	ResourceDocumentation string `json:"resource_documentation,omitempty"`
+
+	// OPTIONAL. URL of a page containing human-readable information about the protected resource's requirements
+	ResourcePolicyURI string `json:"resource_policy_uri,omitempty"`
+
+	// OPTIONAL. URL of a page containing human-readable information about the protected resource's terms of service
+	ResourceTosURI string `json:"resource_tos_uri,omitempty"`
+
+	// OPTIONAL. Boolean value indicating protected resource support for mutual-TLS client certificate-bound access tokens
+	TLSClientCertificateBoundAccessTokens bool `json:"tls_client_certificate_bound_access_tokens,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of the authorization details type values supported by the resource server
+	AuthorizationDetailsTypesSupported []string `json:"authorization_details_types_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of the JWS alg values supported by the resource server for validating DPoP proof JWTs
+	DPoPSigningAlgValuesSupported []string `json:"dpop_signing_alg_values_supported,omitempty"`
+
+	// OPTIONAL. Boolean value specifying whether the protected resource always requires the use of DPoP-bound access tokens
+	DPoPBoundAccessTokensRequired bool `json:"dpop_bound_access_tokens_required,omitempty"`
+}
+
+// AuthorizationServerMetadata represents OAuth 2.0 Authorization Server Metadata
+// as defined in RFC 8414
+type AuthorizationServerMetadata struct {
+	// REQUIRED. The authorization server's issuer identifier
+	Issuer string `json:"issuer"`
+
+	// URL of the authorization server's authorization endpoint
+	AuthorizationEndpoint string `json:"authorization_endpoint,omitempty"`
+
+	// URL of the authorization server's token endpoint
+	TokenEndpoint string `json:"token_endpoint,omitempty"`
+
+	// OPTIONAL. URL of the authorization server's JWK Set document
+	JwksURI string `json:"jwks_uri,omitempty"`
+
+	// OPTIONAL. URL of the authorization server's OAuth 2.0 Dynamic Client Registration endpoint
+	RegistrationEndpoint string `json:"registration_endpoint,omitempty"`
+
+	// RECOMMENDED. JSON array containing a list of the OAuth 2.0 scope values
+	ScopesSupported []string `json:"scopes_supported,omitempty"`
+
+	// REQUIRED. JSON array containing a list of the OAuth 2.0 response_type values
+	ResponseTypesSupported []string `json:"response_types_supported"`
+
+	// OPTIONAL. JSON array containing a list of the OAuth 2.0 response_mode values
+	ResponseModesSupported []string `json:"response_modes_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of the OAuth 2.0 grant type values
+	GrantTypesSupported []string `json:"grant_types_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of client authentication methods
+	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing a list of the JWS signing algorithms
+	TokenEndpointAuthSigningAlgValuesSupported []string `json:"token_endpoint_auth_signing_alg_values_supported,omitempty"`
+
+	// OPTIONAL. URL of a page containing human-readable information
+	ServiceDocumentation string `json:"service_documentation,omitempty"`
+
+	// OPTIONAL. Languages and scripts supported for the user interface
+	UILocalesSupported []string `json:"ui_locales_supported,omitempty"`
+
+	// OPTIONAL. URL for authorization server's requirements on client data usage
+	OpPolicyURI string `json:"op_policy_uri,omitempty"`
+
+	// OPTIONAL. URL for authorization server's terms of service
+	OpTosURI string `json:"op_tos_uri,omitempty"`
+
+	// OPTIONAL. URL of the authorization server's OAuth 2.0 revocation endpoint
+	RevocationEndpoint string `json:"revocation_endpoint,omitempty"`
+
+	// OPTIONAL. JSON array containing client authentication methods for revocation endpoint
+	RevocationEndpointAuthMethodsSupported []string `json:"revocation_endpoint_auth_methods_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing JWS signing algorithms for revocation endpoint
+	RevocationEndpointAuthSigningAlgValuesSupported []string `json:"revocation_endpoint_auth_signing_alg_values_supported,omitempty"`
+
+	// OPTIONAL. URL of the authorization server's OAuth 2.0 introspection endpoint
+	IntrospectionEndpoint string `json:"introspection_endpoint,omitempty"`
+
+	// OPTIONAL. JSON array containing client authentication methods for introspection endpoint
+	IntrospectionEndpointAuthMethodsSupported []string `json:"introspection_endpoint_auth_methods_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing JWS signing algorithms for introspection endpoint
+	IntrospectionEndpointAuthSigningAlgValuesSupported []string `json:"introspection_endpoint_auth_signing_alg_values_supported,omitempty"`
+
+	// OPTIONAL. JSON array containing PKCE code challenge methods
+	CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported,omitempty"`
+
+	// OPTIONAL. Boolean indicating whether the client ID metadata document is supported
+	ClientIDMetadataDocumentSupported bool `json:"client_id_metadata_document_supported,omitempty"`
+}
+
+// ClientRegistrationMetadata represents OAuth 2.0 Dynamic Client Registration metadata
+// as defined in RFC 7591, merged from protected resource and authorization server metadata
+type ClientRegistrationMetadata struct {
+	// Array of redirection URI strings for use in redirect-based flows
+	RedirectURIs []string `json:"redirect_uris,omitempty"`
+
+	// String indicator of the requested authentication method for the token endpoint
+	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method,omitempty"`
+
+	// Array of OAuth 2.0 grant type strings that the client can use at the token endpoint
+	GrantTypes []string `json:"grant_types,omitempty"`
+
+	// Array of the OAuth 2.0 response type strings that the client can use at the authorization endpoint
+	ResponseTypes []string `json:"response_types,omitempty"`
+
+	// Human-readable string name of the client to be presented to the end-user during authorization
+	ClientName string `json:"client_name,omitempty"`
+
+	// URL string of a web page providing information about the client
+	ClientURI string `json:"client_uri,omitempty"`
+
+	// URL string that references a logo for the client
+	LogoURI string `json:"logo_uri,omitempty"`
+
+	// String containing a space-separated list of scope values
+	Scope string `json:"scope,omitempty"`
+
+	// Array of strings representing ways to contact people responsible for this client
+	Contacts []string `json:"contacts,omitempty"`
+
+	// URL string that points to a human-readable terms of service document for the client
+	TosURI string `json:"tos_uri,omitempty"`
+
+	// URL string that points to a human-readable privacy policy document
+	PolicyURI string `json:"policy_uri,omitempty"`
+
+	// URL string referencing the client's JSON Web Key (JWK) Set document
+	JwksURI string `json:"jwks_uri,omitempty"`
+
+	// Client's JSON Web Key Set document value
+	Jwks any `json:"jwks,omitempty"`
+
+	// A unique identifier string assigned by the client developer or software publisher
+	SoftwareID string `json:"software_id,omitempty"`
+
+	// A version identifier string for the client software identified by "software_id"
+	SoftwareVersion string `json:"software_version,omitempty"`
+}
+
+// clientRegistrationResponse represents OAuth 2.0 Dynamic Client Registration Response
+// as defined in RFC 7591
+type clientRegistrationResponse struct {
+	// REQUIRED. OAuth 2.0 client identifier string. It SHOULD NOT be
+	// currently valid for any other registered client, though an
+	// authorization server MAY issue the same client identifier to
+	// multiple instances of a registered client at its discretion.
+	ClientID string `json:"client_id"`
+
+	// OPTIONAL. OAuth 2.0 client secret string. If issued, this MUST
+	// be unique for each "client_id" and SHOULD be unique for multiple
+	// instances of a client using the same "client_id". This value is
+	// used by confidential clients to authenticate to the token
+	// endpoint, as described in OAuth 2.0 [RFC6749], Section 2.3.1.
+	ClientSecret string `json:"client_secret,omitempty"`
+
+	// OPTIONAL. Time at which the client identifier was issued. The
+	// time is represented as the number of seconds from
+	// 1970-01-01T00:00:00Z as measured in UTC until the date/time of
+	// issuance.
+	ClientIDIssuedAt *int64 `json:"client_id_issued_at,omitempty"`
+
+	// REQUIRED if "client_secret" is issued. Time at which the client
+	// secret will expire or 0 if it will not expire. The time is
+	// represented as the number of seconds from 1970-01-01T00:00:00Z as
+	// measured in UTC until the date/time of expiration.
+	ClientSecretExpiresAt *int64 `json:"client_secret_expires_at,omitempty"`
+}
+
+type authorizationErrorOAuthHandler struct{}
+
+func (authorizationErrorOAuthHandler) TokenSource(context.Context) (oauth2.TokenSource, error) {
+	return nil, nil
+}
+
+func (authorizationErrorOAuthHandler) Authorize(_ context.Context, _ *http.Request, resp *http.Response) error {
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	authErr := &mmmcp.AuthorizationError{StatusCode: resp.StatusCode}
+	challenges, err := oauthex.ParseWWWAuthenticate(resp.Header.Values("WWW-Authenticate"))
+	if err != nil {
+		return authErr
+	}
+	for _, challenge := range challenges {
+		if challenge.Scheme != "bearer" {
+			continue
+		}
+		if authErr.ResourceMetadata == "" {
+			authErr.ResourceMetadata = challenge.Params["resource_metadata"]
+		}
+		if authErr.Scope == "" {
+			authErr.Scope = challenge.Params["scope"]
+			authErr.Scopes = strings.Fields(authErr.Scope)
+		}
+		if authErr.ErrorCode == "" {
+			authErr.ErrorCode = challenge.Params["error"]
+		}
+		if authErr.ErrorDescription == "" {
+			authErr.ErrorDescription = challenge.Params["error_description"]
+		}
+	}
+	return authErr
+}
 
 // RequiresStaticOAuth reports whether a remote MCP server is configured to
 // require static OAuth and has not yet been authenticated by the user.
@@ -39,13 +348,13 @@ func (m *SessionManager) GetOAuthMetadata(ctx context.Context, serverConfig Serv
 	var httpClient *http.Client
 	if serverConfig.TunnelName != "" {
 		var err error
-		httpClient, err = m.HTTPClientForServer(serverConfig, nil, nil, 5*time.Second)
+		httpClient, err = m.HTTPClientForServer(serverConfig, HTTPClientOptions{Timeout: 5 * time.Second, DirectConnect: true})
 		if err != nil {
 			return OAuthMetadata{}, err
 		}
 	} else {
 		blockingConfig := m.RemoteMCPURLValidationConfig()
-		httpClient = safehttp.NewClient(safehttp.ClientOptions{
+		httpClient = safehttp.NewClient(safehttp.Options{
 			BlockLoopback:  !blockingConfig.AllowLocalhostMCP,
 			BlockPrivateIP: !blockingConfig.AllowPrivateIPMCP,
 			BlockLinkLocal: !blockingConfig.AllowLinkLocalMCP,
@@ -74,25 +383,16 @@ func serverConfigHeaders(serverConfig ServerConfig) map[string][]string {
 	result := make(map[string][]string, len(serverConfig.PassthroughHeaderNames)+len(serverConfig.Headers))
 	for i, key := range serverConfig.PassthroughHeaderNames {
 		if i < len(serverConfig.PassthroughHeaderValues) {
-			result[key] = []string{serverConfig.PassthroughHeaderValues[i]}
+			result[http.CanonicalHeaderKey(key)] = []string{serverConfig.PassthroughHeaderValues[i]}
 		}
 	}
 	for _, header := range serverConfig.Headers {
 		key, value, ok := strings.Cut(header, "=")
 		if ok {
-			result[key] = []string{value}
+			result[http.CanonicalHeaderKey(key)] = []string{value}
 		}
 	}
 	return result
-}
-
-// assumeOAuthRequiredTransport synthesizes the initialize challenge used to
-// begin standard OAuth metadata discovery. All subsequent metadata requests use
-// the original, policy-enforcing transport.
-type assumeOAuthRequiredTransport struct {
-	base http.RoundTripper
-	mu   sync.Mutex
-	done bool
 }
 
 func (t *assumeOAuthRequiredTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -112,132 +412,6 @@ func (t *assumeOAuthRequiredTransport) RoundTrip(req *http.Request) (*http.Respo
 	return t.base.RoundTrip(req)
 }
 
-// storageBackedTokenSource implements the oauth2.TokenSource interface to store new tokens in the TokenStorage.
-type storageBackedTokenSource struct {
-	lock         sync.Mutex
-	tokenStorage TokenStorage
-	conf         *oauth2.Config
-	tok          *oauth2.Token
-	tokenSource  oauth2.TokenSource
-}
-
-// newStorageBackedTokenSource builds a token source that persists refreshed
-// tokens. httpClient carries the operator's remote-network policy and must
-// reject redirects, because a refresh replays the refresh token and client
-// secret to whatever origin the token endpoint names.
-func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, httpClient *http.Client) oauth2.TokenSource {
-	return oauth2.ReuseTokenSource(tok, &storageBackedTokenSource{
-		tokenStorage: tokenStorage,
-		conf:         conf,
-		tok:          tok,
-		tokenSource:  conf.TokenSource(WithOAuthHTTPClient(context.Background(), httpClient), tok),
-	})
-}
-
-// WithOAuthHTTPClient binds an HTTP client to the context the oauth2 package
-// reads. Without it, oauth2 falls back to http.DefaultClient and bypasses the
-// operator's remote-network policy entirely.
-func WithOAuthHTTPClient(ctx context.Context, httpClient *http.Client) context.Context {
-	if httpClient == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, oauth2.HTTPClient, httpClient)
-}
-
-// NoRedirectClient copies an HTTP client with redirects rejected. The source
-// client is shared with the MCP transport and metadata discovery, which both
-// still follow redirects, so it is cloned rather than mutated.
-func NoRedirectClient(httpClient *http.Client) *http.Client {
-	if httpClient == nil {
-		return nil
-	}
-	clone := *httpClient
-	clone.CheckRedirect = safehttp.RejectRedirects
-	return &clone
-}
-
-func (ts *storageBackedTokenSource) Token() (*oauth2.Token, error) {
-	tok, err := ts.tokenSource.Token()
-	if err != nil {
-		return nil, SanitizeTokenExchangeError(err)
-	}
-
-	ts.lock.Lock()
-	defer ts.lock.Unlock()
-
-	if tok.AccessToken != ts.tok.AccessToken || tok.RefreshToken != ts.tok.RefreshToken || tok.Expiry.Unix() != ts.tok.Expiry.Unix() {
-		ts.tok = tok
-
-		if ts.tokenStorage != nil {
-			if err = ts.tokenStorage.SetTokenConfig(context.Background(), ts.conf, ts.tok); err != nil {
-				return nil, fmt.Errorf("failed to store token: %w", err)
-			}
-		}
-	}
-
-	return ts.tok, nil
-}
-
-var (
-	resourceMetadataRegex = regexp.MustCompile(`resource_metadata="([^"]*)"`)
-	scopeRegex            = regexp.MustCompile(`scope="([^"]*)"`)
-)
-
-type CallbackPayload struct {
-	Code             string `json:"code"`
-	Error            string `json:"error"`
-	ErrorDescription string `json:"error_description"`
-}
-
-type AuthURLHandler interface {
-	HandleAuthURL(context.Context, string, string) (bool, error)
-}
-
-type CallbackHandler interface {
-	AuthURLHandler
-	NewState(context.Context, *oauth2.Config, string) (string, <-chan CallbackPayload, error)
-}
-
-type ClientCredLookup interface {
-	Lookup(context.Context, string) (string, string, error)
-}
-
-type oauth struct {
-	redirectURL              string
-	clientName               string
-	serverName               string
-	clientIDMetadataDocument string
-	currentToken             oauth2.Token
-	metadataClient           *http.Client
-	callbackHandler          CallbackHandler
-	clientLookup             ClientCredLookup
-	tokenStorage             TokenStorage
-}
-
-type oauthMetadataDiscovery struct {
-	ProtectedResourceURL              string
-	ProtectedResourceMetadata         protectedResourceMetadata
-	ProtectedResourceMetadataJSON     json.RawMessage
-	AuthorizationServerURL            string
-	AuthorizationServerMetadataURL    string
-	AuthorizationServerMetadata       AuthorizationServerMetadata
-	AuthorizationServerMetadataJSON   json.RawMessage
-	DynamicClientRegistration         bool
-	ClientRegistration                ClientRegistrationMetadata
-	ClientIDMetadataDocumentSupported bool
-}
-
-// OAuthMetadata contains discovered OAuth metadata for an MCP server.
-type OAuthMetadata struct {
-	ProtectedResourceMetadataURL      string          `json:"protectedResourceMetadataUrl,omitempty"`
-	AuthorizationServerMetadataURL    string          `json:"authorizationServerMetadataUrl,omitempty"`
-	ProtectedResourceMetadata         json.RawMessage `json:"protectedResourceMetadata,omitempty"`
-	AuthorizationServerMetadata       json.RawMessage `json:"authorizationServerMetadata,omitempty"`
-	ClientRegistration                json.RawMessage `json:"clientRegistration,omitempty"`
-	DynamicClientRegistration         bool            `json:"dynamicClientRegistration,omitempty"`
-	ClientIDMetadataDocumentSupported bool            `json:"clientIdMetadataDocumentSupported,omitempty"`
-}
-
 func newOAuth(metadataClient *http.Client, callbackHandler CallbackHandler, clientLookup ClientCredLookup, tokenStorage TokenStorage, serverName, clientName, redirectURL, clientIDMetadataDocument string) *oauth {
 	return &oauth{
 		serverName:               serverName,
@@ -252,12 +426,7 @@ func newOAuth(metadataClient *http.Client, callbackHandler CallbackHandler, clie
 }
 
 func (o *oauth) TokenSource(ctx context.Context) (oauth2.TokenSource, error) {
-	oauthConfig, token, err := o.tokenStorage.GetTokenConfig(ctx)
-	if err != nil || token == nil {
-		return nil, err
-	}
-
-	return newStorageBackedTokenSource(o.tokenStorage, oauthConfig, token, NoRedirectClient(o.metadataClient)), nil
+	return o.tokenStorage.TokenSource(ctx)
 }
 
 func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Response) error {
@@ -284,7 +453,7 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 	slog.Info("resolved oauth scope for server", "server", o.serverName, "scope", discovery.ClientRegistration.Scope)
 	slog.Info("resolved authorization server", "server", o.serverName, "authorization_server", discovery.AuthorizationServerURL)
 
-	clientInfo, err := o.resolveClientInfo(ctx, o.serverName, discovery)
+	clientInfo, staticClient, err := o.resolveClientInfo(ctx, o.serverName, discovery)
 	if err != nil {
 		return err
 	}
@@ -301,8 +470,9 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 	if discovery.ClientRegistration.Scope != "" {
 		conf.Scopes = strings.Split(discovery.ClientRegistration.Scope, " ")
 	}
-	conf.Endpoint.AuthStyle = tokenEndpointAuthStyle(discovery.ClientRegistration.TokenEndpointAuthMethod, clientInfo.ClientSecret != "")
-	authURL, ch, verifier, err := GetOAuthAuthorizationURL(ctx, o.callbackHandler, conf, authorizationServerMetadata.AuthorizationEndpoint, connectURL)
+	conf.Endpoint.AuthStyle = tokenEndpointAuthStyle(discovery.ClientRegistration.TokenEndpointAuthMethod, clientInfo.ClientSecret != "", staticClient)
+	resourceURL := ResolveOAuthResourceURL(authorizationServerMetadata.AuthorizationEndpoint, discovery.ResourceURL, connectURL)
+	authURL, ch, verifier, err := GetOAuthAuthorizationURL(ctx, o.callbackHandler, conf, authorizationServerMetadata.AuthorizationEndpoint, resourceURL)
 	if err != nil {
 		return err
 	}
@@ -324,10 +494,7 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 	case cb = <-ch:
 		if cb.Error != "" {
 			slog.Warn("oauth callback returned error", "server", o.serverName, "error", cb.Error, "description", cb.ErrorDescription)
-			// error_description is provider-controlled free text that can carry
-			// request identifiers and internal detail. Only the code is safe to
-			// return; the full description stays in the server-side log above.
-			return fmt.Errorf("authorization failed: %s", SafeOAuthErrorCode(cb.Error))
+			return fmt.Errorf("authorization failed: %s, %s", cb.Error, cb.ErrorDescription)
 		}
 		if cb.Code == "" {
 			slog.Warn("oauth callback missing authorization code", "server", o.serverName)
@@ -335,7 +502,7 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 		}
 	}
 
-	tok, err := ExchangeOAuthToken(WithOAuthHTTPClient(ctx, NoRedirectClient(o.metadataClient)), conf, cb.Code, verifier)
+	tok, err := ExchangeOAuthToken(ctx, conf, cb.Code, verifier, resourceURL)
 	if err != nil {
 		slog.Warn("oauth code exchange failed",
 			"server", o.serverName,
@@ -422,6 +589,7 @@ func discoverOAuthMetadata(ctx context.Context, client *http.Client, baseURL, au
 
 	return oauthMetadataDiscovery{
 		ProtectedResourceURL:              finalResourceMetadataURL.String(),
+		ResourceURL:                       string(protectedResourceMetadata.Resource),
 		ProtectedResourceMetadata:         protectedResourceMetadata,
 		ProtectedResourceMetadataJSON:     protectedResourceMetadataJSON,
 		AuthorizationServerURL:            authorizationServerURL,
@@ -474,7 +642,11 @@ func oauthResourceMetadataURLs(baseURL, authenticateHeader string) ([]*url.URL, 
 	return resourceMetadataURLs, scope, nil
 }
 
-func tokenEndpointAuthStyle(tokenEndpointAuthMethod string, hasClientSecret bool) oauth2.AuthStyle {
+func tokenEndpointAuthStyle(tokenEndpointAuthMethod string, hasClientSecret, staticClient bool) oauth2.AuthStyle {
+	if staticClient {
+		return oauth2.AuthStyleAutoDetect
+	}
+
 	if !hasClientSecret {
 		return oauth2.AuthStyleInParams
 	}
@@ -489,7 +661,7 @@ func tokenEndpointAuthStyle(tokenEndpointAuthMethod string, hasClientSecret bool
 	}
 }
 
-func (o *oauth) resolveClientInfo(ctx context.Context, serverName string, discovery oauthMetadataDiscovery) (clientRegistrationResponse, error) {
+func (o *oauth) resolveClientInfo(ctx context.Context, serverName string, discovery oauthMetadataDiscovery) (clientRegistrationResponse, bool, error) {
 	authorizationServerMetadata := discovery.AuthorizationServerMetadata
 	protectedResourceMetadata := discovery.ProtectedResourceMetadata
 
@@ -497,7 +669,7 @@ func (o *oauth) resolveClientInfo(ctx context.Context, serverName string, discov
 		slog.Info("using oauth client ID metadata document", "server", serverName, "client_id", o.clientIDMetadataDocument)
 		return clientRegistrationResponse{
 			ClientID: o.clientIDMetadataDocument,
-		}, nil
+		}, false, nil
 	}
 
 	// Before trying to register a client, check if there is a static client configuration.
@@ -506,11 +678,11 @@ func (o *oauth) resolveClientInfo(ctx context.Context, serverName string, discov
 		lookupErr  error
 	)
 	if o.clientLookup != nil {
-		clientInfo.ClientID, clientInfo.ClientSecret, lookupErr = o.clientLookup.Lookup(ctx, protectedResourceMetadata.AuthorizationServers[0])
+		clientInfo.ClientID, clientInfo.ClientSecret, lookupErr = o.clientLookup.Lookup(ctx)
 	}
 	if lookupErr == nil && clientInfo.ClientID != "" {
 		slog.Info("using static oauth client credentials", "server", serverName, "authorization_server", protectedResourceMetadata.AuthorizationServers[0])
-		return clientInfo, nil
+		return clientInfo, true, nil
 	}
 	if lookupErr != nil {
 		slog.Debug("static oauth client credential lookup failed", "server", serverName, "authorization_server", protectedResourceMetadata.AuthorizationServers[0], "error", lookupErr)
@@ -531,12 +703,12 @@ func (o *oauth) resolveClientInfo(ctx context.Context, serverName string, discov
 			"registration_endpoint", authorizationServerMetadata.RegistrationEndpoint,
 			"error", err)
 		if lookupErr != nil {
-			return clientRegistrationResponse{}, fmt.Errorf("%w - static OAuth client lookup also failed: %v", err, lookupErr)
+			return clientRegistrationResponse{}, false, fmt.Errorf("%w - static OAuth client lookup also failed: %v", err, lookupErr)
 		}
-		return clientRegistrationResponse{}, err
+		return clientRegistrationResponse{}, false, err
 	}
 
-	return clientInfo, nil
+	return clientInfo, false, nil
 }
 
 // GetOAuthMetadataWithClient discovers OAuth protected resource and authorization server
@@ -570,6 +742,7 @@ func GetOAuthMetadataWithClient(ctx context.Context, httpClient *http.Client, se
 
 	return OAuthMetadata{
 		ProtectedResourceMetadataURL:      discovery.ProtectedResourceURL,
+		ResourceURL:                       discovery.ResourceURL,
 		AuthorizationServerMetadataURL:    discovery.AuthorizationServerMetadataURL,
 		ProtectedResourceMetadata:         discovery.ProtectedResourceMetadataJSON,
 		AuthorizationServerMetadata:       discovery.AuthorizationServerMetadataJSON,
@@ -621,17 +794,18 @@ func registerOAuthClient(ctx context.Context, client *http.Client, serverName st
 
 // GetOAuthAuthorizationURL constructs the OAuth authorization URL and callback
 // state for the authorization code flow.
-func GetOAuthAuthorizationURL(ctx context.Context, callbackHandler CallbackHandler, conf *oauth2.Config, authorizationEndpoint, connectURL string) (string, <-chan CallbackPayload, string, error) {
+func GetOAuthAuthorizationURL(ctx context.Context, callbackHandler CallbackHandler, conf *oauth2.Config, authorizationEndpoint, resourceURL string) (string, <-chan CallbackPayload, string, error) {
 	// use PKCE to protect against CSRF attacks
 	// https://www.ietf.org/archive/id/draft-ietf-oauth-security-topics-22.html#name-countermeasures-6
 	verifier := oauth2.GenerateVerifier()
 
-	state, ch, err := callbackHandler.NewState(ctx, conf, verifier)
+	resourceURL = OAuthResourceURL(authorizationEndpoint, resourceURL)
+	state, ch, err := callbackHandler.NewState(ctx, conf, resourceURL, verifier)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("failed to create state: %w", err)
 	}
 
-	authURL, err := AuthCodeURL(conf, authorizationEndpoint, connectURL, state, verifier)
+	authURL, err := AuthCodeURL(conf, authorizationEndpoint, resourceURL, state, verifier)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("failed to generate auth code URL: %w", err)
 	}
@@ -640,10 +814,14 @@ func GetOAuthAuthorizationURL(ctx context.Context, callbackHandler CallbackHandl
 }
 
 // ExchangeOAuthToken exchanges an OAuth authorization code for a token.
-func ExchangeOAuthToken(ctx context.Context, conf *oauth2.Config, code, verifier string) (*oauth2.Token, error) {
-	tok, err := conf.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+func ExchangeOAuthToken(ctx context.Context, conf *oauth2.Config, code, verifier, resourceURL string) (*oauth2.Token, error) {
+	options := []oauth2.AuthCodeOption{oauth2.VerifierOption(verifier)}
+	if resourceURL = OAuthResourceURL(conf.Endpoint.AuthURL, resourceURL); resourceURL != "" {
+		options = append(options, oauth2.SetAuthURLParam("resource", resourceURL))
+	}
+	tok, err := conf.Exchange(ctx, code, options...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to exchange code for token: %w", SanitizeTokenExchangeError(err))
+		return nil, fmt.Errorf("failed to exchange code for token: %w", err)
 	}
 
 	return tok, nil
@@ -862,6 +1040,15 @@ func parseProtectedResourceMetadata(reader io.Reader) (protectedResourceMetadata
 	return metadata, nil
 }
 
+// ParseOAuthResourceURL returns the resource identifier from protected-resource metadata.
+func ParseOAuthResourceURL(metadata json.RawMessage) (string, error) {
+	parsed, err := parseProtectedResourceMetadata(bytes.NewReader(metadata))
+	if err != nil {
+		return "", err
+	}
+	return string(parsed.Resource), nil
+}
+
 // parseResourceMetadata extracts the resource_metadata URL from a Bearer authenticate header
 func parseResourceMetadata(authenticateHeader string) string {
 	// Use regex to find resource_metadata parameter
@@ -895,7 +1082,7 @@ func AuthCodeURL(conf *oauth2.Config, urlFromMetadata, resourceURL, state, verif
 
 	// Redirect user to consent page to ask for permission for the scopes specified above.
 	authCodeURLOpts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(verifier)}
-	if authEndpoint.Host != "login.microsoftonline.com" {
+	if resourceURL = OAuthResourceURL(authEndpoint.String(), resourceURL); resourceURL != "" {
 		// Entra does not like the resource parameter, and including it will often cause things to fail.
 		// VSCode does something similar to this.
 		authCodeURLOpts = append(authCodeURLOpts, oauth2.SetAuthURLParam("resource", resourceURL))
@@ -908,7 +1095,28 @@ func AuthCodeURL(conf *oauth2.Config, urlFromMetadata, resourceURL, state, verif
 	return conf.AuthCodeURL(state, authCodeURLOpts...), nil
 }
 
-type resourceIdentifier string
+// OAuthResourceURL returns the protected resource identifier when the
+// authorization server supports the RFC 8707 resource parameter. Microsoft
+// Entra rejects this parameter, so it must be omitted throughout the flow.
+func OAuthResourceURL(authorizationEndpoint, resourceURL string) string {
+	authEndpoint, err := url.Parse(authorizationEndpoint)
+	if err == nil {
+		switch strings.ToLower(authEndpoint.Hostname()) {
+		case "login.microsoftonline.com", "login.microsoftonline.us", "login.partner.microsoftonline.cn":
+			return ""
+		}
+	}
+	return resourceURL
+}
+
+// ResolveOAuthResourceURL prefers the discovered protected-resource identifier
+// and falls back to the MCP connection URL before applying provider-specific handling.
+func ResolveOAuthResourceURL(authorizationEndpoint, discoveredResourceURL, connectionURL string) string {
+	if discoveredResourceURL == "" {
+		discoveredResourceURL = connectionURL
+	}
+	return OAuthResourceURL(authorizationEndpoint, discoveredResourceURL)
+}
 
 func (r *resourceIdentifier) UnmarshalJSON(data []byte) error {
 	data = bytes.TrimSpace(data)
@@ -933,174 +1141,6 @@ func (r *resourceIdentifier) UnmarshalJSON(data []byte) error {
 
 	*r = resourceIdentifier(resource)
 	return nil
-}
-
-// protectedResourceMetadata represents OAuth 2.0 Protected Resource Metadata
-// as defined in RFC 8707
-type protectedResourceMetadata struct {
-	// REQUIRED. The protected resource's resource identifier
-	Resource resourceIdentifier `json:"resource"`
-
-	// OPTIONAL. JSON array containing a list of OAuth authorization server issuer identifiers
-	AuthorizationServers []string `json:"authorization_servers,omitempty"`
-
-	// OPTIONAL. URL of the protected resource's JSON Web Key (JWK) Set document
-	JwksURI string `json:"jwks_uri,omitempty"`
-
-	// RECOMMENDED. JSON array containing a list of scope values
-	ScopesSupported []string `json:"scopes_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of the supported methods of sending an OAuth 2.0 bearer token
-	BearerMethodsSupported []string `json:"bearer_methods_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of the JWS signing algorithms supported by the protected resource
-	ResourceSigningAlgValuesSupported []string `json:"resource_signing_alg_values_supported,omitempty"`
-
-	// OPTIONAL. Human-readable name of the protected resource intended for display to the end user
-	ResourceName string `json:"resource_name,omitempty"`
-
-	// OPTIONAL. URL of a page containing human-readable information that developers might want or need to know
-	ResourceDocumentation string `json:"resource_documentation,omitempty"`
-
-	// OPTIONAL. URL of a page containing human-readable information about the protected resource's requirements
-	ResourcePolicyURI string `json:"resource_policy_uri,omitempty"`
-
-	// OPTIONAL. URL of a page containing human-readable information about the protected resource's terms of service
-	ResourceTosURI string `json:"resource_tos_uri,omitempty"`
-
-	// OPTIONAL. Boolean value indicating protected resource support for mutual-TLS client certificate-bound access tokens
-	TLSClientCertificateBoundAccessTokens bool `json:"tls_client_certificate_bound_access_tokens,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of the authorization details type values supported by the resource server
-	AuthorizationDetailsTypesSupported []string `json:"authorization_details_types_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of the JWS alg values supported by the resource server for validating DPoP proof JWTs
-	DPoPSigningAlgValuesSupported []string `json:"dpop_signing_alg_values_supported,omitempty"`
-
-	// OPTIONAL. Boolean value specifying whether the protected resource always requires the use of DPoP-bound access tokens
-	DPoPBoundAccessTokensRequired bool `json:"dpop_bound_access_tokens_required,omitempty"`
-}
-
-// AuthorizationServerMetadata represents OAuth 2.0 Authorization Server Metadata
-// as defined in RFC 8414
-type AuthorizationServerMetadata struct {
-	// REQUIRED. The authorization server's issuer identifier
-	Issuer string `json:"issuer"`
-
-	// URL of the authorization server's authorization endpoint
-	AuthorizationEndpoint string `json:"authorization_endpoint,omitempty"`
-
-	// URL of the authorization server's token endpoint
-	TokenEndpoint string `json:"token_endpoint,omitempty"`
-
-	// OPTIONAL. URL of the authorization server's JWK Set document
-	JwksURI string `json:"jwks_uri,omitempty"`
-
-	// OPTIONAL. URL of the authorization server's OAuth 2.0 Dynamic Client Registration endpoint
-	RegistrationEndpoint string `json:"registration_endpoint,omitempty"`
-
-	// RECOMMENDED. JSON array containing a list of the OAuth 2.0 scope values
-	ScopesSupported []string `json:"scopes_supported,omitempty"`
-
-	// REQUIRED. JSON array containing a list of the OAuth 2.0 response_type values
-	ResponseTypesSupported []string `json:"response_types_supported"`
-
-	// OPTIONAL. JSON array containing a list of the OAuth 2.0 response_mode values
-	ResponseModesSupported []string `json:"response_modes_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of the OAuth 2.0 grant type values
-	GrantTypesSupported []string `json:"grant_types_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of client authentication methods
-	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing a list of the JWS signing algorithms
-	TokenEndpointAuthSigningAlgValuesSupported []string `json:"token_endpoint_auth_signing_alg_values_supported,omitempty"`
-
-	// OPTIONAL. URL of a page containing human-readable information
-	ServiceDocumentation string `json:"service_documentation,omitempty"`
-
-	// OPTIONAL. Languages and scripts supported for the user interface
-	UILocalesSupported []string `json:"ui_locales_supported,omitempty"`
-
-	// OPTIONAL. URL for authorization server's requirements on client data usage
-	OpPolicyURI string `json:"op_policy_uri,omitempty"`
-
-	// OPTIONAL. URL for authorization server's terms of service
-	OpTosURI string `json:"op_tos_uri,omitempty"`
-
-	// OPTIONAL. URL of the authorization server's OAuth 2.0 revocation endpoint
-	RevocationEndpoint string `json:"revocation_endpoint,omitempty"`
-
-	// OPTIONAL. JSON array containing client authentication methods for revocation endpoint
-	RevocationEndpointAuthMethodsSupported []string `json:"revocation_endpoint_auth_methods_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing JWS signing algorithms for revocation endpoint
-	RevocationEndpointAuthSigningAlgValuesSupported []string `json:"revocation_endpoint_auth_signing_alg_values_supported,omitempty"`
-
-	// OPTIONAL. URL of the authorization server's OAuth 2.0 introspection endpoint
-	IntrospectionEndpoint string `json:"introspection_endpoint,omitempty"`
-
-	// OPTIONAL. JSON array containing client authentication methods for introspection endpoint
-	IntrospectionEndpointAuthMethodsSupported []string `json:"introspection_endpoint_auth_methods_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing JWS signing algorithms for introspection endpoint
-	IntrospectionEndpointAuthSigningAlgValuesSupported []string `json:"introspection_endpoint_auth_signing_alg_values_supported,omitempty"`
-
-	// OPTIONAL. JSON array containing PKCE code challenge methods
-	CodeChallengeMethodsSupported []string `json:"code_challenge_methods_supported,omitempty"`
-
-	// OPTIONAL. Boolean indicating whether the client ID metadata document is supported
-	ClientIDMetadataDocumentSupported bool `json:"client_id_metadata_document_supported,omitempty"`
-}
-
-// ClientRegistrationMetadata represents OAuth 2.0 Dynamic Client Registration metadata
-// as defined in RFC 7591, merged from protected resource and authorization server metadata
-type ClientRegistrationMetadata struct {
-	// Array of redirection URI strings for use in redirect-based flows
-	RedirectURIs []string `json:"redirect_uris,omitempty"`
-
-	// String indicator of the requested authentication method for the token endpoint
-	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method,omitempty"`
-
-	// Array of OAuth 2.0 grant type strings that the client can use at the token endpoint
-	GrantTypes []string `json:"grant_types,omitempty"`
-
-	// Array of the OAuth 2.0 response type strings that the client can use at the authorization endpoint
-	ResponseTypes []string `json:"response_types,omitempty"`
-
-	// Human-readable string name of the client to be presented to the end-user during authorization
-	ClientName string `json:"client_name,omitempty"`
-
-	// URL string of a web page providing information about the client
-	ClientURI string `json:"client_uri,omitempty"`
-
-	// URL string that references a logo for the client
-	LogoURI string `json:"logo_uri,omitempty"`
-
-	// String containing a space-separated list of scope values
-	Scope string `json:"scope,omitempty"`
-
-	// Array of strings representing ways to contact people responsible for this client
-	Contacts []string `json:"contacts,omitempty"`
-
-	// URL string that points to a human-readable terms of service document for the client
-	TosURI string `json:"tos_uri,omitempty"`
-
-	// URL string that points to a human-readable privacy policy document
-	PolicyURI string `json:"policy_uri,omitempty"`
-
-	// URL string referencing the client's JSON Web Key (JWK) Set document
-	JwksURI string `json:"jwks_uri,omitempty"`
-
-	// Client's JSON Web Key Set document value
-	Jwks any `json:"jwks,omitempty"`
-
-	// A unique identifier string assigned by the client developer or software publisher
-	SoftwareID string `json:"software_id,omitempty"`
-
-	// A version identifier string for the client software identified by "software_id"
-	SoftwareVersion string `json:"software_version,omitempty"`
 }
 
 // AuthServerMetadataToClientRegistration converts an AuthorizationServerMetadata to a ClientRegistrationMetadata for dynamic registration.
@@ -1154,35 +1194,6 @@ func supportedClientGrantTypes(grantTypesSupported []string) []string {
 	return grantTypes
 }
 
-// clientRegistrationResponse represents OAuth 2.0 Dynamic Client Registration Response
-// as defined in RFC 7591
-type clientRegistrationResponse struct {
-	// REQUIRED. OAuth 2.0 client identifier string. It SHOULD NOT be
-	// currently valid for any other registered client, though an
-	// authorization server MAY issue the same client identifier to
-	// multiple instances of a registered client at its discretion.
-	ClientID string `json:"client_id"`
-
-	// OPTIONAL. OAuth 2.0 client secret string. If issued, this MUST
-	// be unique for each "client_id" and SHOULD be unique for multiple
-	// instances of a client using the same "client_id". This value is
-	// used by confidential clients to authenticate to the token
-	// endpoint, as described in OAuth 2.0 [RFC6749], Section 2.3.1.
-	ClientSecret string `json:"client_secret,omitempty"`
-
-	// OPTIONAL. Time at which the client identifier was issued. The
-	// time is represented as the number of seconds from
-	// 1970-01-01T00:00:00Z as measured in UTC until the date/time of
-	// issuance.
-	ClientIDIssuedAt *int64 `json:"client_id_issued_at,omitempty"`
-
-	// REQUIRED if "client_secret" is issued. Time at which the client
-	// secret will expire or 0 if it will not expire. The time is
-	// represented as the number of seconds from 1970-01-01T00:00:00Z as
-	// measured in UTC until the date/time of expiration.
-	ClientSecretExpiresAt *int64 `json:"client_secret_expires_at,omitempty"`
-}
-
 // parseClientRegistrationResponse parses OAuth 2.0 Dynamic Client Registration Response
 // from a reader containing JSON data as defined in RFC 7591
 func parseClientRegistrationResponse(reader io.Reader) (clientRegistrationResponse, error) {
@@ -1197,56 +1208,4 @@ func parseClientRegistrationResponse(reader io.Reader) (clientRegistrationRespon
 	}
 
 	return response, nil
-}
-
-// SafeOAuthErrorCode keeps only the characters RFC 6749 allows in an error code,
-// so a provider cannot smuggle markup, newlines, or free-form detail through it.
-func SafeOAuthErrorCode(code string) string {
-	if len(code) > 64 {
-		code = code[:64]
-	}
-	cleaned := strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-', r == '.':
-			return r
-		default:
-			return -1
-		}
-	}, code)
-	if cleaned == "" {
-		return "unspecified_error"
-	}
-	return cleaned
-}
-
-// SanitizeTokenExchangeError reduces a token-endpoint failure to a stable code or
-// status. The oauth2 package embeds the raw upstream response body in
-// RetrieveError, and that body carries provider request identifiers, workspace
-// identifiers, and echoed request parameters that must never reach a log or an
-// API response.
-func SanitizeTokenExchangeError(err error) error {
-	if retrieveErr, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
-		if retrieveErr.ErrorCode != "" {
-			return fmt.Errorf("token endpoint rejected the exchange: %s", SafeOAuthErrorCode(retrieveErr.ErrorCode))
-		}
-		if retrieveErr.Response != nil {
-			return fmt.Errorf("token endpoint rejected the exchange with status %d", retrieveErr.Response.StatusCode)
-		}
-		return errors.New("token endpoint rejected the exchange")
-	}
-
-	// A transport failure names the full request URL, which repeats the token
-	// endpoint back to the caller. Keep only the underlying cause.
-	if urlErr, ok := errors.AsType[*url.Error](err); ok {
-		return fmt.Errorf("could not reach the token endpoint: %w", urlErr.Err)
-	}
-
-	// A cancelled or timed-out exchange carries no upstream detail, and callers
-	// match on it to tell an aborted request from a rejected one, so the chain
-	// stays intact.
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-
-	return errors.New("token exchange failed")
 }

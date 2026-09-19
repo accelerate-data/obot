@@ -17,6 +17,20 @@ require_literal() {
   fi
 }
 
+literal_line() {
+  local file="$1"
+  local value="$2"
+  local message="$3"
+  local match
+  match="$(grep -nF -- "${value}" "${file}" || true)"
+  if [ -z "${match}" ]; then
+    echo "${message}" >&2
+    exit 1
+  fi
+  match="${match%%:*}"
+  printf '%s\n' "${match}"
+}
+
 require_literal "${sync_workflow}" "issues: write" "Upstream sync must be allowed to create labels"
 for label in upstream-sync sync:clean sync:touches-customized-files sync:conflicts; do
   require_literal "${sync_workflow}" "gh label create \"${label}\"" "Upstream sync must create ${label}"
@@ -37,5 +51,20 @@ require_literal "${verify_workflow}" 'git fetch upstream "$UPSTREAM_BRANCH" --ta
 require_literal "${publish_workflow}" "bash scripts/build-vibedata-image.sh" "Publication must use the version resolver"
 require_literal "${publish_script}" "jq -r '.upstreamObotVersion" "Publication must resolve its version from sync metadata"
 require_literal "${publish_script}" '${UPSTREAM_VERSION}-vibedata' "Publication must create versioned image tags"
+
+consumer_tags_line="$(literal_line "${publish_workflow}" '-t "${IMAGE}:${VERSIONED_TAG}"' "Publication must assign the versioned consumer tag")"
+architecture_verification_line="$(literal_line "${publish_workflow}" "grep -q 'linux/amd64'" "Publication must verify the staging manifest architecture")"
+signing_line="$(literal_line "${publish_workflow}" 'cosign sign --yes' "Publication must sign the staging manifest digest")"
+if [ "${consumer_tags_line}" -le "${architecture_verification_line}" ] || [ "${consumer_tags_line}" -le "${signing_line}" ]; then
+  echo "Consumer tags must advance only after architecture verification and signing" >&2
+  exit 1
+fi
+
+require_literal "${publish_workflow}" 'STAGING_TAG: build-${{ github.run_id }}-${{ github.run_attempt }}' "Publication must use a run-scoped staging tag"
+require_literal "${publish_workflow}" 'cosign sign --yes "${IMAGE}@${DIGEST}"' "Publication must sign the immutable digest exactly once"
+if [ "$(grep -Fc -- 'cosign sign --yes' "${publish_workflow}")" -ne 1 ]; then
+  echo "Publication must issue exactly one cosign signature for the immutable digest" >&2
+  exit 1
+fi
 
 echo "Upstream sync, metadata, and publication workflow contracts are valid"

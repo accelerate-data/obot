@@ -19,8 +19,6 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	kwait "k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -153,18 +151,25 @@ func (h *SystemMCPServerHandler) Configure(req api.Context) error {
 		return err
 	}
 
-	credCtx := systemServer.Name
-
-	// Allow for updating credentials. The only way to update a credential is to delete the existing one and recreate it.
-	if err := DeleteCredentialIfExists(req.Context(), req.GatewayClient, []string{credCtx}, systemServer.Name); err != nil {
-		return err
-	}
-
 	// Remove empty values
 	for key, val := range envVars {
 		if val == "" {
 			delete(envVars, key)
 		}
+	}
+	missing, err := mcp.ValidateConfiguredOptions(systemServer.Spec.Manifest.Config, envVars)
+	if err != nil {
+		return types.NewErrBadRequest("invalid configuration: %v", err)
+	}
+	if len(missing) > 0 {
+		return types.NewErrBadRequest("invalid configuration: %q requires a selection", missing[0])
+	}
+
+	credCtx := systemServer.Name
+
+	// Allow for updating credentials. The only way to update a credential is to delete the existing one and recreate it.
+	if err := DeleteCredentialIfExists(req.Context(), req.GatewayClient, []string{credCtx}, systemServer.Name); err != nil {
+		return err
 	}
 
 	if err := req.GatewayClient.UpsertCredential(req.Context(), gatewaytypes.Credential{
@@ -230,7 +235,7 @@ func (h *SystemMCPServerHandler) Restart(req api.Context) error {
 		return err
 	}
 
-	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote || systemServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote {
 		return types.NewErrBadRequest("system MCP server %s has runtime %s, which does not support restart", systemServer.Name, systemServer.Spec.Manifest.Runtime)
 	}
 
@@ -240,14 +245,14 @@ func (h *SystemMCPServerHandler) Restart(req api.Context) error {
 	}
 
 	// Transform to ServerConfig
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
 
 	// Restart the deployment via the session manager
 	if err := h.mcpSessionManager.RestartServerDeployment(req.Context(), serverConfig); err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrNotFound(nse.Error())
 		}
 		return fmt.Errorf("failed to restart system MCP server: %w", err)
@@ -301,7 +306,7 @@ func (h *SystemMCPServerHandler) RestartNanobotAgentDeployments(req api.Context)
 		}
 
 		if err := h.mcpSessionManager.RestartServerDeployment(req.Context(), serverConfig); err != nil {
-			if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+			if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 				failed = append(failed, map[string]string{
 					"serverID": server.Name,
 					"error":    nse.Error(),
@@ -342,7 +347,7 @@ func (h *SystemMCPServerHandler) Logs(req api.Context) error {
 		return err
 	}
 
-	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote || systemServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote {
 		return types.NewErrBadRequest("system MCP server %s has runtime %s, which does not support logs retrieval", systemServer.Name, systemServer.Spec.Manifest.Runtime)
 	}
 
@@ -352,14 +357,14 @@ func (h *SystemMCPServerHandler) Logs(req api.Context) error {
 	}
 
 	// Transform to ServerConfig
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
 
 	logs, err := h.mcpSessionManager.StreamServerLogs(req.Context(), serverConfig)
 	if err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrNotFound(nse.Error())
 		}
 		return err
@@ -386,7 +391,7 @@ func (h *SystemMCPServerHandler) GetTools(req api.Context) error {
 	}
 
 	// Transform to ServerConfig
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
@@ -394,7 +399,7 @@ func (h *SystemMCPServerHandler) GetTools(req api.Context) error {
 	// Get server capabilities
 	caps, err := h.mcpSessionManager.ServerCapabilities(req.Context(), serverConfig)
 	if err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrHTTP(http.StatusBadRequest, nse.Error())
 		}
 		return err
@@ -407,7 +412,7 @@ func (h *SystemMCPServerHandler) GetTools(req api.Context) error {
 	// List tools from the server
 	tools, err := h.mcpSessionManager.ListTools(req.Context(), serverConfig)
 	if err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrHTTP(http.StatusBadRequest, nse.Error())
 		}
 		return err
@@ -429,7 +434,7 @@ func (h *SystemMCPServerHandler) GetDetails(req api.Context) error {
 		return err
 	}
 
-	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote || systemServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+	if systemServer.Spec.Manifest.Runtime == types.RuntimeRemote {
 		return types.NewErrBadRequest("system MCP server %s has runtime %s, which does not support details retrieval", systemServer.Name, systemServer.Spec.Manifest.Runtime)
 	}
 
@@ -439,7 +444,7 @@ func (h *SystemMCPServerHandler) GetDetails(req api.Context) error {
 	}
 
 	// Transform to ServerConfig
-	serverConfig, _, err := systemServerToServerConfig(req, systemServer)
+	serverConfig, err := systemServerToServerConfig(req, systemServer)
 	if err != nil {
 		return types.NewErrBadRequest("failed to transform system server to config: %v", err)
 	}
@@ -447,7 +452,7 @@ func (h *SystemMCPServerHandler) GetDetails(req api.Context) error {
 	// Get server details from the session manager
 	details, err := h.mcpSessionManager.GetServerDetails(req.Context(), serverConfig)
 	if err != nil {
-		if nse := (*mcp.ErrNotSupportedByBackend)(nil); errors.As(err, &nse) {
+		if nse, ok := errors.AsType[*mcp.ErrNotSupportedByBackend](err); ok {
 			return types.NewErrNotFound(nse.Error())
 		}
 		return fmt.Errorf("failed to get server details: %w", err)
@@ -517,47 +522,29 @@ func convertSystemMCPServer(server v1.SystemMCPServer, credEnv map[string]string
 		})
 	}
 
-	configured := true
-
-	for _, env := range server.Spec.Manifest.Env {
-		if env.Required && env.Value == "" && credEnv[env.Key] == "" {
-			result.MissingRequiredEnvVars = append(result.MissingRequiredEnvVars, env.Key)
-			configured = false
+	for _, field := range server.Spec.Manifest.Config {
+		if (field.Required && field.Value == "" && credEnv[field.Key] == "") || (credEnv[field.Key] != "" && !mcp.ConfigurationOptionValueValid(field.ToHeader(), credEnv)) {
+			if field.Usage == types.Header {
+				result.MissingRequiredHeaders = append(result.MissingRequiredHeaders, field.Key)
+			} else {
+				result.MissingRequiredEnvVars = append(result.MissingRequiredEnvVars, field.Key)
+			}
 		}
 	}
 
-	result.Configured = configured
+	result.Configured = len(result.MissingRequiredEnvVars) == 0 && len(result.MissingRequiredHeaders) == 0
 	return result
 }
 
-func systemServerToServerConfig(req api.Context, server v1.SystemMCPServer) (mcp.ServerConfig, []string, error) {
+func systemServerToServerConfig(req api.Context, server v1.SystemMCPServer) (mcp.ServerConfig, error) {
 	credEnv, err := systemmcpserver.GetCredentialsForSystemServer(req.Context(), req.GatewayClient, server)
 	if err != nil {
-		return mcp.ServerConfig{}, nil, err
+		return mcp.ServerConfig{}, err
 	}
-
-	var (
-		tokenExchangeCred gatewaytypes.Credential
-		tokenCredErr      error
-	)
-	if err = retry.OnError(kwait.Backoff{
-		Steps:    10,
-		Duration: 100 * time.Millisecond,
-		Factor:   2.0,
-		Jitter:   0.1,
-	}, func(err error) bool {
-		return errors.As(err, &gateway.CredentialNotFoundError{})
-	}, func() error {
-		tokenExchangeCred, tokenCredErr = req.GatewayClient.RevealCredential(req.Context(), []string{server.Name}, systemmcpserver.SecretInfoToolName(server.Name))
-		return tokenCredErr
-	}); err != nil {
-		return mcp.ServerConfig{}, nil, fmt.Errorf("failed to find token exchange credential: %w", tokenCredErr)
-	}
-
-	secretsCred := tokenExchangeCred.Secrets
 
 	baseURL := strings.TrimSuffix(req.APIBaseURL, "/api")
 	audiences := server.ValidConnectURLs(baseURL)
 
-	return mcp.SystemServerToServerConfig(server, audiences, req.User.GetUID(), credEnv, secretsCred)
+	config, _, err := mcp.SystemServerToServerConfig(server, audiences, req.User.GetUID(), credEnv)
+	return config, err
 }

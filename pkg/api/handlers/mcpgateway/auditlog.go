@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
-	"net/http"
 	"net/url"
 	"slices"
 	"sort"
@@ -14,15 +14,13 @@ import (
 	"strings"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
-	"github.com/obot-platform/nanobot/pkg/mcp/auditlogs"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/auditlog"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/mcp/auditlogs"
 	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
@@ -32,12 +30,68 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var log = logger.Package()
+var (
+	// filterOptions represent the values that a user can use to filter MCP audit logs.
+	// The values of this map represent the "zero" values that are excluded when looking for options in the database.
+	// For example, "" for strings and 0 for numbers.
+	filterOptions = map[string]any{
+		"user_id":                       "",
+		"mcp_id":                        "",
+		"mcp_server_display_name":       "",
+		"mcp_server_catalog_entry_name": "",
+		"call_type":                     "",
+		"call_identifier":               "",
+		"session_id":                    "",
+		"client_name":                   "",
+		"client_version":                "",
+		"response_status":               0,
+		"client_ip":                     "",
+	}
+
+	// localAgentFilterOptions are the filter columns available for local-agent tool-call audit logs.
+	// As with filterOptions, values are the "zero" values excluded when scanning for options.
+	localAgentFilterOptions = map[string]any{
+		"user_id":        "",
+		"client_ip":      "",
+		"session_id":     "",
+		"agent_provider": "",
+		"status":         "",
+		"tool_name":      "",
+		"tool_kind":      "",
+		"device_id":      "",
+	}
+
+	// defaultFilterOptions will always be present of the given filter, regardless of what is in the database.
+	defaultFilterOptions = map[string][]string{
+		"call_type": {"prompts/list", "resources/read", "tools/list", "tools/call", "prompts/get", "resources/list"},
+		// Unified UI filters.
+		"operation": {"prompts/list", "resources/read", "tools/list", "tools/call", "prompts/get", "resources/list"},
+		"outcome":   {"success", "failure", "denied", "timeout", "unknown"},
+	}
+
+	// unifiedFilterOptions are the source-agnostic filter keys used by the reworked audit-log UI. They
+	// are available regardless of the selected source(s). "outcome" is served entirely from
+	// defaultFilterOptions (a fixed enum); the rest resolve to distinct values across both sources.
+	unifiedFilterOptions = map[string]struct{}{
+		"actor":      {},
+		"operation":  {},
+		"mcp_server": {},
+		"tool":       {},
+		"outcome":    {},
+		"client":     {},
+	}
+)
 
 // AuditLogHandler serves audit-log ingestion, normalized reads, filter options, and MCP usage
 // statistics. Read authorization is applied before rows are presented through pkg/auditlog.
 type AuditLogHandler struct {
 	gatewayClient *gateway.Client
+}
+
+type auditLogInput struct {
+	gatewaytypes.MCPAuditLog `json:",inline"`
+	Metadata                 map[string]string `json:"metadata"`
+	Subject                  string            `json:"subject"`
 }
 
 // NewAuditLogHandler constructs an AuditLogHandler backed by gatewayClient.
@@ -47,15 +101,16 @@ func NewAuditLogHandler(gatewayClient *gateway.Client) *AuditLogHandler {
 	}
 }
 
-// getOwnServerMCPIDs returns the MCP server IDs for servers that the user owns directly
-// (not through a workspace or catalog). These are single-user servers where:
-// - Spec.UserID == user's ID
-// - Spec.IsSingleUser() == true
+// getOwnServerMCPIDs returns the MCP IDs for the servers and vMCPs that the user owns directly
+// (not through a workspace or catalog). These are the single-user MCPServers and the personal
+// VMCPs where Spec.UserID is the user's ID; an audit log records either kind in its MCPID.
 func getOwnServerMCPIDs(req api.Context) ([]string, error) {
-	var mcpServers v1.MCPServerList
-	if err := req.List(&mcpServers, &kclient.ListOptions{
+	ownedByUser := &kclient.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("spec.userID", req.User.GetUID()),
-	}); err != nil {
+	}
+
+	var mcpServers v1.MCPServerList
+	if err := req.List(&mcpServers, ownedByUser); err != nil {
 		return nil, err
 	}
 
@@ -65,11 +120,21 @@ func getOwnServerMCPIDs(req api.Context) ([]string, error) {
 			mcpIDs = append(mcpIDs, server.Name)
 		}
 	}
+
+	var vmcps v1.VMCPList
+	if err := req.List(&vmcps, ownedByUser); err != nil {
+		return nil, err
+	}
+
+	for _, vmcp := range vmcps.Items {
+		mcpIDs = append(mcpIDs, vmcp.Name)
+	}
+
 	return mcpIDs, nil
 }
 
 // parseMultiValueParam parses query parameters that can have multiple values
-// Supports both comma-separated values in single parameter and repeated parameters
+// Supports JSON string arrays, comma-separated values, and repeated parameters.
 func parseMultiValueParam(queryValues map[string][]string, key string) []string {
 	values := queryValues[key]
 	if len(values) == 0 {
@@ -79,6 +144,15 @@ func parseMultiValueParam(queryValues map[string][]string, key string) []string 
 	var result []string
 	for _, value := range values {
 		if value == "" {
+			continue
+		}
+		var items []string
+		if strings.HasPrefix(strings.TrimSpace(value), "[") && json.Unmarshal([]byte(value), &items) == nil {
+			for _, item := range items {
+				if item != "" {
+					result = append(result, item)
+				}
+			}
 			continue
 		}
 		// Split by comma to support comma-separated values
@@ -94,12 +168,6 @@ func parseMultiValueParam(queryValues map[string][]string, key string) []string 
 		return nil
 	}
 	return result
-}
-
-type auditLogInput struct {
-	gatewaytypes.MCPAuditLog `json:",inline"`
-	Metadata                 map[string]string `json:"metadata"`
-	Subject                  string            `json:"subject"`
 }
 
 func (a *auditLogInput) UnmarshalJSON(data []byte) error {
@@ -144,6 +212,7 @@ func (a *auditLogInput) UnmarshalJSON(data []byte) error {
 // Callers are responsible for setting any additional fields (e.g. default Limit, WithRequestAndResponse).
 func parseAuditLogOpts(query url.Values) gateway.MCPAuditLogOptions {
 	opts := gateway.MCPAuditLogOptions{
+		APIKeyID:                  api.ParseUintList(query["api_key_id"]),
 		UserID:                    parseMultiValueParam(query, "user_id"),
 		MCPID:                     parseMultiValueParam(query, "mcp_id"),
 		MCPServerDisplayName:      parseMultiValueParam(query, "mcp_server_display_name"),
@@ -252,90 +321,6 @@ func defaultAuditLogSources(req api.Context) []types.AuditLogSourceType {
 		}
 	}
 	return []types.AuditLogSourceType{types.AuditLogSourceTypeMCP}
-}
-
-// SubmitAuditLogs handles POST /api/mcp-audit-logs
-// This endpoint is not protected by authentication nor authorization. We have to do it in the handler.
-func (h *AuditLogHandler) SubmitAuditLogs(req api.Context) error {
-	token := strings.TrimPrefix(req.Request.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		return types.NewErrHTTP(http.StatusUnauthorized, "no token provided")
-	}
-
-	// Get the MCP server ID from the token
-	tokenHash := utils.Digest(token)
-	var mcpServers v1.MCPServerList
-	if err := req.List(&mcpServers, &kclient.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("auditLogTokenHash", tokenHash),
-	}); err != nil {
-		return err
-	}
-
-	var (
-		mcpServerName  string
-		nanobotAgentID string
-		userID         string
-	)
-	if len(mcpServers.Items) == 1 {
-		mcpServerName = mcpServers.Items[0].Name
-		nanobotAgentID = mcpServers.Items[0].Spec.NanobotAgentID
-		userID = mcpServers.Items[0].Spec.UserID
-	} else {
-		// Also check SystemMCPServer resources (e.g. obot-mcp-server)
-		var systemServers v1.SystemMCPServerList
-		if err := req.List(&systemServers, &kclient.ListOptions{
-			FieldSelector: fields.OneTermEqualSelector("auditLogTokenHash", tokenHash),
-		}); err != nil {
-			return err
-		}
-		if len(systemServers.Items) != 1 {
-			return types.NewErrHTTP(http.StatusUnauthorized, "invalid token")
-		}
-		mcpServerName = systemServers.Items[0].Name
-	}
-
-	var auditLogs []auditLogInput
-	if err := req.Read(&auditLogs); err != nil {
-		return types.NewErrBadRequest("failed to read input: %v", err)
-	}
-
-	for _, auditLog := range auditLogs {
-		if auditLog.Metadata[mcp.AuditLogIgnore] == "true" {
-			continue
-		}
-
-		if auditLog.SourceType != "" && auditLog.SourceType != types.AuditLogSourceTypeMCP {
-			return types.NewErrBadRequest("MCP audit log endpoint only accepts sourceType %q", types.AuditLogSourceTypeMCP)
-		}
-
-		auditLog.NormalizeMCPFields()
-		convertMCPAuditLog(&auditLog)
-		if err := h.attributeMCPAuditLogAPIKey(req.Context(), &auditLog); err != nil {
-			return fmt.Errorf("failed to attribute MCP audit log API key: %w", err)
-		}
-
-		// NanobotAgent containers are single-user; attribute audit logs to the owner
-		// when the container doesn't report a user (no auth middleware configured).
-		if auditLog.UserID == "" && nanobotAgentID != "" {
-			auditLog.UserID = userID
-		}
-
-		if auditLog.MCPFields == nil {
-			return types.NewErrBadRequest("MCP audit log must have MCPFields")
-		}
-
-		if auditLog.MCPFields.MCPID != mcpServerName {
-			return types.NewErrForbidden("audit log does not belong to MCP server %q", mcpServerName)
-		}
-
-		if err := auditLog.ValidateSourceFields(); err != nil {
-			return types.NewErrBadRequest("invalid audit log source fields: %v", err)
-		}
-
-		req.GatewayClient.LogMCPAuditEntry(auditLog.MCPAuditLog)
-	}
-
-	return nil
 }
 
 func authorizeAuditLogSources(req api.Context, sources []types.AuditLogSourceType) error {
@@ -505,56 +490,6 @@ func (h *AuditLogHandler) GetAuditLog(req api.Context) error {
 	return req.Write(result)
 }
 
-// filterOptions represent the values that a user can use to filter MCP audit logs.
-// The values of this map represent the "zero" values that are excluded when looking for options in the database.
-// For example, "" for strings and 0 for numbers.
-var filterOptions = map[string]any{
-	"user_id":                       "",
-	"mcp_id":                        "",
-	"mcp_server_display_name":       "",
-	"mcp_server_catalog_entry_name": "",
-	"call_type":                     "",
-	"call_identifier":               "",
-	"session_id":                    "",
-	"client_name":                   "",
-	"client_version":                "",
-	"response_status":               0,
-	"client_ip":                     "",
-}
-
-// localAgentFilterOptions are the filter columns available for local-agent tool-call audit logs.
-// As with filterOptions, values are the "zero" values excluded when scanning for options.
-var localAgentFilterOptions = map[string]any{
-	"user_id":        "",
-	"client_ip":      "",
-	"session_id":     "",
-	"agent_provider": "",
-	"status":         "",
-	"tool_name":      "",
-	"tool_kind":      "",
-	"device_id":      "",
-}
-
-// defaultFilterOptions will always be present of the given filter, regardless of what is in the database.
-var defaultFilterOptions = map[string][]string{
-	"call_type": {"prompts/list", "resources/read", "tools/list", "tools/call", "prompts/get", "resources/list"},
-	// Unified UI filters.
-	"operation": {"prompts/list", "resources/read", "tools/list", "tools/call", "prompts/get", "resources/list"},
-	"outcome":   {"success", "failure", "denied", "timeout", "unknown"},
-}
-
-// unifiedFilterOptions are the source-agnostic filter keys used by the reworked audit-log UI. They
-// are available regardless of the selected source(s). "outcome" is served entirely from
-// defaultFilterOptions (a fixed enum); the rest resolve to distinct values across both sources.
-var unifiedFilterOptions = map[string]struct{}{
-	"actor":      {},
-	"operation":  {},
-	"mcp_server": {},
-	"tool":       {},
-	"outcome":    {},
-	"client":     {},
-}
-
 func (h *AuditLogHandler) ListAuditLogFilterOptions(req api.Context) error {
 	filter := req.PathValue("filter")
 	if filter == "" {
@@ -608,6 +543,16 @@ func (h *AuditLogHandler) ListAuditLogFilterOptions(req api.Context) error {
 				"options": []string{},
 			})
 		}
+	}
+	if filter == "api_key_id" {
+		if err := validateAuditLogOptions(opts); err != nil {
+			return err
+		}
+		options, err := req.GatewayClient.GetMCPAuditLogAPIKeyFilterOptions(req.Context(), opts)
+		if err != nil {
+			return err
+		}
+		return req.Write(map[string]any{"options": options})
 	}
 
 	availableOptions := make(map[string]any, len(filterOptions)+len(localAgentFilterOptions))
@@ -753,6 +698,17 @@ func (h *AuditLogHandler) CollectMCPAuditEntry(entry auditlogs.MCPAuditLog) {
 }
 
 func (h *AuditLogHandler) collectMCPAuditEntry(ctx context.Context, entry auditlogs.MCPAuditLog) {
+	h.collectMCPProxyAuditEntry(ctx, entry, false, "")
+}
+
+// CollectMCPProxyAuditEntry records proxy-only persistence metadata. The
+// nanobot audit type predates ResponseReceived and has no internal exchange ID,
+// so the proxy passes both values separately.
+func (h *AuditLogHandler) CollectMCPProxyAuditEntry(entry auditlogs.MCPAuditLog, responseReceived bool, proxyExchangeID string) {
+	h.collectMCPProxyAuditEntry(context.Background(), entry, responseReceived, proxyExchangeID)
+}
+
+func (h *AuditLogHandler) collectMCPProxyAuditEntry(ctx context.Context, entry auditlogs.MCPAuditLog, responseReceived bool, proxyExchangeID string) {
 	if entry.Metadata[mcp.AuditLogIgnore] == "true" || entry.CallType == "" {
 		// If the call type is empty, then this is a response to a request.
 		// The audit log will be handled elsewhere.
@@ -761,15 +717,17 @@ func (h *AuditLogHandler) collectMCPAuditEntry(ctx context.Context, entry auditl
 	}
 
 	var auditLog auditLogInput
-	if err := nmcp.JSONCoerce(entry, &auditLog); err != nil {
-		log.Warnf("failed to convert audit log entry: %v", err)
+	if err := utils.JSONCoerce(entry, &auditLog); err != nil {
+		slog.Warn("failed to convert audit log entry", "error", err)
 		return
 	}
 
 	convertMCPAuditLog(&auditLog)
 	if err := h.attributeMCPAuditLogAPIKey(ctx, &auditLog); err != nil {
-		log.Warnf("failed to attribute MCP audit log API key: %v", err)
+		slog.Warn("failed to attribute MCP audit log API key", "error", err)
 	}
+	auditLog.MCP().ResponseReceived = responseReceived
+	auditLog.MCP().ProxyExchangeID = proxyExchangeID
 	h.gatewayClient.LogMCPAuditEntry(auditLog.MCPAuditLog)
 }
 

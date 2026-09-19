@@ -1,8 +1,7 @@
 package system
 
-import nanobottypes "github.com/obot-platform/nanobot/pkg/types"
-
 const (
+	ModelProxyModelProvider          = "model-proxy"
 	OpenAIModelProvider              = "openai-model-provider"
 	AnthropicModelProvider           = "anthropic-model-provider"
 	GenericResponsesModelProvider    = "generic-responses-model-provider"
@@ -32,18 +31,18 @@ const (
 	AppPreferencesName     = "app-preferences"
 	AppNotificationName    = "app-notification"
 
-	ModelProviderCredential = "sys.model.provider.credential"
-
 	GenericModelProviderCredentialContext = "model-provider"
 	GenericAuthProviderCredentialContext  = "auth-provider"
 	StagedProviderCredentialContext       = "provider-staged"
+
+	// ReplacementAuthProviderCredentialContext holds the settings of a replacement auth provider
+	// while the current one keeps serving logins, persisting until an owner activates or discards
+	// it. StagedProviderCredentialContext, by contrast, only parks a credential until the
+	// controller applies it. It is its own context because isAuthProviderConfigured reads only a
+	// provider's own context and the generic one, so a replacement is never the login provider.
+	ReplacementAuthProviderCredentialContext = "replacement-auth-provider"
 
 	MCPWebhookValidationCredentialContext = "mcp-webhook-context"
 
 	JWKCredentialContext = "jwk"
 )
-
-// IsResponsesDialect reports whether dialect uses the Responses API format.
-func IsResponsesDialect(dialect string) bool {
-	return dialect == string(nanobottypes.DialectOpenAIResponses) || dialect == string(nanobottypes.DialectOpenResponses)
-}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -13,11 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/obot-platform/obot/logger"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 )
-
-var log = logger.Package()
 
 type Options struct {
 	AWSKMSKeyARN          string `usage:"The ARN of the AWS KMS key to use for encrypting credential storage. Only used with the AWS encryption provider." env:"OBOT_AWS_KMS_KEY_ARN" name:"aws-kms-key-arn"`
@@ -92,12 +90,12 @@ func Init(ctx context.Context, opts Options) (*encryptionconfig.EncryptionConfig
 	}
 
 	if opts.EncryptionConfigFile != "" {
-		log.Infof("Encryption: Using encryption config file: %s", opts.EncryptionConfigFile)
+		slog.Info("Encryption: Using encryption config file", "encryptionConfigFile", opts.EncryptionConfigFile)
 		ec, err := encryptionconfig.LoadEncryptionConfig(ctx, opts.EncryptionConfigFile, false, "obot")
 		return ec, err
 	}
 
-	log.Warnf("Encryption: No encryption config file provided, using unencrypted storage")
+	slog.Warn("Encryption: No encryption config file provided, using unencrypted storage")
 	return nil, nil
 }
 
@@ -227,7 +225,8 @@ func setUpAzureKeyVault(ctx context.Context, keyvaultName, keyName, keyVersion s
 		case <-ctx.Done():
 			// ignore error if we are shutting down
 		default:
-			log.Fatalf("azure-encryption-provider exited: %v", err)
+			slog.Error("azure-encryption-provider exited", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -256,7 +255,8 @@ func setUpGoogleKMS(ctx context.Context, kmsKeyURI string) error {
 		case <-ctx.Done():
 			// ignore error if we are shutting down
 		default:
-			log.Fatalf("gcp-encryption-provider exited: %v", err)
+			slog.Error("gcp-encryption-provider exited", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -272,7 +272,7 @@ func setUpGoogleKMS(ctx context.Context, kmsKeyURI string) error {
 				break
 			}
 			body, _ := io.ReadAll(resp.Body)
-			log.Errorf("gcp-encryption-provider health check failed: %s", body)
+			slog.Error("gcp-encryption-provider health check failed", "body", string(body))
 			_ = resp.Body.Close()
 			return fmt.Errorf("gcp-encryption-provider health check failed: %d", resp.StatusCode)
 		}
@@ -309,7 +309,8 @@ func setUpAWSKMS(ctx context.Context, arn string) error {
 		case <-ctx.Done():
 			// ignore error if we are shutting down
 		default:
-			log.Fatalf("aws-encryption-provider exited: %v", err)
+			slog.Error("aws-encryption-provider exited", "error", err)
+			os.Exit(1)
 		}
 	}()
 

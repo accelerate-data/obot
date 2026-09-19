@@ -11,6 +11,9 @@ import (
 const (
 	TokenRequestPurposeDeviceLogin = "device-login"
 	TokenRequestPurposeSetup       = "setup"
+	// TokenRequestPurposeAuthProviderVerify backs the one-time login used to prove a staged
+	// replacement auth provider works before it is activated.
+	TokenRequestPurposeAuthProviderVerify = "auth-provider-verify"
 )
 
 type AuthToken struct {
@@ -34,7 +37,6 @@ type TokenRequest struct {
 	RequestExpiresAt      time.Time `gorm:"index"`
 	DeviceCodeVerifiedAt  *time.Time
 	State                 string `gorm:"index"`
-	Nonce                 string
 	Name                  string
 	Description           string
 	Scopes                APIKeyScopes `gorm:"embedded"`
@@ -44,6 +46,9 @@ type TokenRequest struct {
 	CompletionRedirectURL string
 	Error                 string
 	TokenRetrieved        bool
+	// OwnerUserID is the user who started a staged auth provider verification. Only they may open
+	// the resulting login, so a verification cannot be picked up by another signed-in user.
+	OwnerUserID *uint
 }
 
 type MCPOAuthToken struct {
@@ -73,8 +78,9 @@ type MCPOAuthPendingState struct {
 	State                          string
 	Verifier                       string
 	UserID                         string `gorm:"index:idx_pending_user_mcp"`
-	MCPID                          string `gorm:"index:idx_pending_user_mcp;index:idx_pending_mcp_static_test,priority:1"`
+	MCPID                          string `gorm:"index:idx_pending_user_mcp"`
 	URL                            string
+	ResourceURL                    string
 	CatalogEntryName               string
 	CatalogCredentialGeneration    string
 	OAuthAuthRequestID             string
@@ -89,16 +95,9 @@ type MCPOAuthPendingState struct {
 	StaticOAuthTestStateHash       string `gorm:"index"`
 	StaticOAuthTestStatus          apitypes.MCPStaticOAuthTestStatus
 	StaticOAuthTestFailureCategory apitypes.MCPStaticOAuthTestFailureCategory
-	// StaticOAuthTestClaimedAt bounds how long an admitted callback may hold the test.
-	// Nil only on a row claimed before this column existed, which is treated as abandoned;
-	// claiming stamps the status and this column in one statement.
-	StaticOAuthTestClaimedAt   *time.Time
-	StaticOAuthTestCompletedAt time.Time
-	StaticOAuthSaveProofHash   string `gorm:"index"`
-	StaticOAuthSaveProof       string
-	Encrypted                  bool
-	CreatedAt                  time.Time
-	// ClaimedAt is nil until a callback claims the row for exchange. A claim is
-	// terminal: the row can never be consumed again, whatever the outcome.
-	ClaimedAt *time.Time
+	StaticOAuthTestCompletedAt     time.Time
+	StaticOAuthSaveProofHash       string `gorm:"index"`
+	StaticOAuthSaveProof           string
+	Encrypted                      bool
+	CreatedAt                      time.Time
 }

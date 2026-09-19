@@ -1,6 +1,5 @@
 import { BOOTSTRAP_USER_ID } from '$lib/constants';
 import { HttpError } from '$lib/errors';
-import { mcpServerDeleteResponseHandler } from '$lib/services/admin/operations';
 import { Group } from '$lib/services/admin/types';
 import { buildQueryString } from '$lib/url';
 import type {
@@ -29,10 +28,12 @@ import {
 	type Fetcher,
 	type PaginatedResponse
 } from '../http';
+import type { Skill } from '../nanobot/types';
 import { AUDIT_LOG_FILTER_OPTIONS_LIMIT } from './constants';
 import {
 	type AppNotification,
 	type AppPreferences,
+	type AuditLogFilterOption,
 	type AuditLogEvent,
 	type AuditLogURLFilters,
 	type McpAuditLogUsageFilters,
@@ -53,6 +54,7 @@ import {
 	type Model,
 	type ModelProviderList,
 	type OrgGroup,
+	type OrgGroupPage,
 	type OrgUser,
 	type Profile,
 	type McpServerOrInstanceAuditLogStatsFilters,
@@ -61,10 +63,153 @@ import {
 	type AccessControlRule,
 	type AccessControlRuleManifest,
 	type K8sServerDetail,
-	type MCPSubField
+	type MCPSubField,
+	type VMCP,
+	type VMCPComponent,
+	type VMCPInstance,
+	type VMCPManifest,
+	type VMCPConfiguration
 } from './types';
 
 type ItemsResponse<T> = { items: T[] | null };
+
+export async function activateInitialLocalAuthOwner(setupToken: string): Promise<void> {
+	// The activation page renders setup-link failures inline, so they stay off the global toast store.
+	await doPost('/local-auth/activate', { setupToken }, { dontLogErrors: true });
+}
+
+export async function changeLocalAuthPassword(password: string): Promise<void> {
+	await doPost('/local-auth/change-password', { password });
+}
+
+// Shared UI actions use each resource’s own API routes.
+function mcpActionPath(id: string, legacyCollection = 'mcp-servers'): string {
+	return `/${id.startsWith('vmcp1') ? 'vmcps' : legacyCollection}/${id}`;
+}
+
+// Virtual MCPs
+
+export async function listVMCPs(opts?: { fetch?: Fetcher; all?: boolean }): Promise<VMCP[]> {
+	const response = (await doGet(
+		opts?.all ? '/vmcps?all=true' : '/vmcps',
+		opts
+	)) as ItemsResponse<VMCP>;
+	return response.items ?? [];
+}
+
+export async function getVMCP(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean; signal?: AbortSignal }
+): Promise<VMCP> {
+	return (await doGet(`/vmcps/${id}`, opts)) as VMCP;
+}
+
+export async function getMCPServerOrVMCP(
+	id: string,
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
+): Promise<MCPCatalogServer | VMCP> {
+	const path = id.startsWith('vmcp1') ? `/vmcps/${id}` : `/mcp-servers/${id}`;
+	return (await doGet(path, opts)) as MCPCatalogServer | VMCP;
+}
+
+export async function createVMCP(
+	manifest: VMCPManifest,
+	opts?: { fetch?: Fetcher }
+): Promise<VMCP> {
+	return (await doPost('/vmcps', manifest, opts)) as VMCP;
+}
+
+export async function revealVMCP(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<VMCPConfiguration> {
+	return (await doPost(`/vmcps/${id}/reveal`, {}, opts)) as VMCPConfiguration;
+}
+
+export async function updateVMCP(
+	id: string,
+	manifest: VMCPManifest,
+	opts?: { fetch?: Fetcher }
+): Promise<VMCP> {
+	return (await doPut(`/vmcps/${id}`, manifest, opts)) as VMCP;
+}
+
+export async function deleteVMCP(id: string, opts?: { fetch?: Fetcher }): Promise<void> {
+	await doDelete(`/vmcps/${id}`, opts);
+}
+
+export async function triggerVMCPUpdate(id: string, opts?: { fetch?: Fetcher }): Promise<void> {
+	await doPost(`/vmcps/${id}/trigger-update`, {}, opts);
+}
+
+export async function generateVMCPComponentToolPreviews(
+	vmcpID: string,
+	componentID: string,
+	opts?: { fetch?: Fetcher; signal?: AbortSignal; config?: Record<string, string> }
+): Promise<MCPCatalogEntry> {
+	const response = await doPost(
+		`/vmcps/${vmcpID}/components/${componentID}/generate-tool-previews`,
+		opts?.config ?? {},
+		{
+			...opts,
+			dontLogErrors: true
+		}
+	);
+	return response as MCPCatalogEntry;
+}
+
+export async function getVMCPComponentToolPreviewsOauth(
+	vmcpID: string,
+	componentID: string,
+	opts?: { fetch?: Fetcher; signal?: AbortSignal; config?: Record<string, string> }
+): Promise<string> {
+	const response = (await doPost(
+		`/vmcps/${vmcpID}/components/${componentID}/generate-tool-previews/oauth-url`,
+		opts?.config ?? {},
+		{
+			...opts,
+			dontLogErrors: true
+		}
+	)) as { oauthURL?: string };
+	return response.oauthURL ?? '';
+}
+
+export async function listVMCPInstances(opts?: {
+	fetch?: Fetcher;
+	dontLogErrors?: boolean;
+}): Promise<VMCPInstance[]> {
+	const response = (await doGet('/vmcp-instances', opts)) as ItemsResponse<VMCPInstance>;
+	return response.items ?? [];
+}
+
+export async function getVMCPInstance(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<VMCPInstance> {
+	return (await doGet(`/vmcp-instances/${id}`, opts)) as VMCPInstance;
+}
+
+export async function createVMCPInstance(vmcpID: string): Promise<VMCPInstance> {
+	return (await doPost('/vmcp-instances', { vmcpID })) as VMCPInstance;
+}
+
+export async function configureVMCPInstance(
+	id: string,
+	configuration: VMCPConfiguration
+): Promise<VMCPInstance> {
+	return (await doPost(`/vmcp-instances/${id}/configure`, configuration)) as VMCPInstance;
+}
+
+export async function revealVMCPInstance(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<VMCPConfiguration> {
+	return (await doPost(`/vmcp-instances/${id}/reveal`, {}, opts)) as VMCPConfiguration;
+}
+
+export async function deleteVMCPInstance(id: string): Promise<void> {
+	await doDelete(`/vmcp-instances/${id}`);
+}
 
 export async function listTunnelConnections(opts?: {
 	fetch?: Fetcher;
@@ -94,7 +239,10 @@ export async function listMCPs(opts?: {
 	);
 }
 
-export async function getMCP(id: string, opts?: { fetch?: Fetcher }): Promise<MCPCatalogEntry> {
+export async function getMCP(
+	id: string,
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
+): Promise<MCPCatalogEntry> {
 	const response = (await doGet(`/all-mcps/entries/${id}`, opts)) as MCPCatalogEntry;
 	return {
 		...response,
@@ -120,22 +268,43 @@ export async function getMcpCatalogServer(
 	return (await doGet(`/all-mcps/servers/${id}`, opts)) as MCPCatalogServer;
 }
 
+// Returns a deployment only when it appears in the current user's
+// authorization-filtered server listings. Management-only visibility is not a
+// connection grant and is intentionally not consulted here.
+export async function getMCPTesterServer(
+	id: string,
+	opts?: { fetch?: Fetcher }
+): Promise<MCPCatalogServer> {
+	const [personalServers, sharedServers] = await Promise.all([
+		listSingleOrRemoteMcpServers(opts),
+		listMCPCatalogServers(opts)
+	]);
+	const server = [...personalServers, ...sharedServers].find(
+		(candidate) =>
+			candidate.id === id && !candidate.deleted && !candidate.template && !candidate.compositeName
+	);
+	if (!server) {
+		throw new HttpError(404, `404 /mcp-servers/test/${id}: MCP server not found`);
+	}
+	return {
+		...server,
+		canConnect: true
+	};
+}
+
 export async function listMcpCatalogServerTools(
 	id: string,
 	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<MCPServerTool[]> {
 	try {
-		return (await doGet(`/all-mcps/servers/${id}/tools`, {
+		return (await doGet(`${mcpActionPath(id, 'all-mcps/servers')}/tools`, {
 			...opts,
 			dontLogErrors: true
 		})) as MCPServerTool[];
 	} catch (error) {
-		if (error instanceof Error && error.message.startsWith('424')) {
-			return [];
-		}
 		if (
 			error instanceof Error &&
-			error.message.includes('oauth callback server is not configured')
+			(error.message.startsWith('424') || error.message.startsWith('412'))
 		) {
 			return [];
 		}
@@ -148,7 +317,7 @@ export async function listMcpCatalogServerPrompts(
 	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<MCPServerPrompt[]> {
 	try {
-		return (await doGet(`/all-mcps/servers/${id}/prompts`, {
+		return (await doGet(`${mcpActionPath(id, 'all-mcps/servers')}/prompts`, {
 			...opts,
 			dontLogErrors: true
 		})) as MCPServerPrompt[];
@@ -165,7 +334,7 @@ export async function listMcpCatalogServerResources(
 	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<McpServerResource[]> {
 	try {
-		return (await doGet(`/all-mcps/servers/${id}/resources`, {
+		return (await doGet(`${mcpActionPath(id, 'all-mcps/servers')}/resources`, {
 			...opts,
 			dontLogErrors: true
 		})) as McpServerResource[];
@@ -202,15 +371,15 @@ export async function getAuditLog(id: string | number, opts?: { fetch?: Fetcher 
 
 export async function listAuditLogFilterOptions(
 	filterId: string,
-	opts?: { fetch?: Fetcher } & Partial<AuditLogURLFilters>
+	opts?: { fetch?: Fetcher; signal?: AbortSignal } & Partial<AuditLogURLFilters>
 ) {
-	const { fetch: fetchFn, ...filters } = opts ?? {};
+	const { fetch: fetchFn, signal, ...filters } = opts ?? {};
 	const queryString = buildQueryString({ ...filters, limit: AUDIT_LOG_FILTER_OPTIONS_LIMIT });
 	const response = (await doGet(
 		`/mcp-audit-logs/filter-options/${filterId}${queryString ? `?${queryString}` : ''}`,
-		{ fetch: fetchFn }
+		{ fetch: fetchFn, signal }
 	)) as {
-		options: string[];
+		options: AuditLogFilterOption[];
 	};
 	return response;
 }
@@ -370,6 +539,21 @@ export async function deleteMcpServerInstance(id: string): Promise<void> {
 	await doDelete(`/mcp-server-instances/${id}`);
 }
 
+export async function getMcpServerInstanceOauthURL(
+	id: string,
+	opts?: { signal?: AbortSignal }
+): Promise<string> {
+	try {
+		const response = (await doGet(`/mcp-server-instances/${id}/oauth-url`, {
+			dontLogErrors: true,
+			signal: opts?.signal
+		})) as { oauthURL: string };
+		return response.oauthURL;
+	} catch (_err) {
+		return '';
+	}
+}
+
 // MCP servers
 
 export async function listSingleOrRemoteMcpServers(opts?: {
@@ -400,28 +584,6 @@ export async function createSingleOrRemoteMcpServer(server: {
 	return response;
 }
 
-export async function createCompositeMcpServer(server: {
-	catalogEntryID?: string;
-	manifest?: {
-		compositeConfig?: {
-			componentServers: Array<{
-				catalogEntryID?: string;
-				mcpServerID?: string;
-				manifest?: {
-					remoteConfig?: {
-						url?: string;
-					};
-				};
-				disabled?: boolean;
-			}>;
-		};
-	};
-	alias?: string;
-}): Promise<MCPCatalogServer> {
-	const response = (await doPost('/mcp-servers', server)) as MCPCatalogServer;
-	return response;
-}
-
 export async function updateSingleOrRemoteMcpServerAlias(id: string, alias: string): Promise<void> {
 	await doPut(`/mcp-servers/${id}/alias`, { alias });
 }
@@ -430,7 +592,6 @@ export async function updateRemoteMcpServerUrl(id: string, url: string): Promise
 	await doPost(`/mcp-servers/${id}/update-url`, { url });
 }
 
-// Update any MCP server manifest (used for composite skips)
 export async function updateMcpServerManifest(
 	id: string,
 	manifest: MCPCatalogServerManifest
@@ -451,25 +612,8 @@ export async function configureSingleOrRemoteMcpServer(
 	return response;
 }
 
-export async function configureCompositeMcpServer(
-	id: string,
-	componentConfigs: Record<
-		string,
-		{ config: Record<string, string>; url?: string; disabled?: boolean }
-	>
-): Promise<MCPCatalogServer> {
-	const response = (await doPost(`/mcp-servers/${id}/configure`, {
-		componentConfigs
-	})) as MCPCatalogServer;
-	return response;
-}
-
 export async function deconfigureSingleOrRemoteMcpServer(id: string): Promise<void> {
 	await doPost(`/mcp-servers/${id}/deconfigure`, {});
-}
-
-export async function deconfigureCompositeMcpServer(id: string): Promise<void> {
-	return deconfigureSingleOrRemoteMcpServer(id);
 }
 
 export async function revealSingleOrRemoteMcpServer(
@@ -479,28 +623,11 @@ export async function revealSingleOrRemoteMcpServer(
 	return doPost(`/mcp-servers/${id}/reveal`, {}, opts) as Promise<Record<string, string>>;
 }
 
-export async function revealCompositeMcpServer(
-	id: string,
-	opts?: { dontLogErrors?: boolean }
-): Promise<{
-	componentConfigs: Record<
-		string,
-		{ config: Record<string, string>; url?: string; disabled?: boolean }
-	>;
-}> {
-	return doPost(`/mcp-servers/${id}/reveal`, {}, opts) as Promise<{
-		componentConfigs: Record<
-			string,
-			{ config: Record<string, string>; url?: string; disabled?: boolean }
-		>;
-	}>;
-}
-
 export async function clearMcpServerOAuth(
 	id: string,
 	opts?: { signal?: AbortSignal }
 ): Promise<void> {
-	await doDelete(`/mcp-servers/${id}/oauth`, opts);
+	await doDelete(`${mcpActionPath(id)}/oauth`, opts);
 }
 
 // 412 means oauth is needed
@@ -509,7 +636,7 @@ export async function getMcpServerOauthURL(
 	opts?: { signal?: AbortSignal }
 ): Promise<string> {
 	try {
-		const response = (await doGet(`/mcp-servers/${id}/oauth-url`, {
+		const response = (await doGet(`${mcpActionPath(id)}/oauth-url`, {
 			dontLogErrors: true,
 			signal: opts?.signal
 		})) as {
@@ -526,7 +653,7 @@ export async function isMcpServerOauthNeeded(
 	opts?: { signal?: AbortSignal }
 ): Promise<boolean> {
 	try {
-		await doPost(`/mcp-servers/${id}/check-oauth`, {
+		await doPost(`${mcpActionPath(id)}/check-oauth`, {
 			dontLogErrors: true,
 			signal: opts?.signal
 		});
@@ -567,7 +694,7 @@ export async function validateSingleOrRemoteMcpServerLaunched(mcpServerId: strin
 	code?: number;
 }> {
 	try {
-		await doPost(`/mcp-servers/${mcpServerId}/launch`, {}, { dontLogErrors: true });
+		await doPost(`${mcpActionPath(mcpServerId)}/launch`, {}, { dontLogErrors: true });
 		return {
 			success: true
 		};
@@ -593,7 +720,7 @@ export async function listSingleOrRemoteMcpServerLogs(mcpServerId: string): Prom
 
 export async function listSingleOrRemoteMcpServerPrompts(id: string): Promise<MCPServerPrompt[]> {
 	try {
-		const response = (await doGet(`/mcp-servers/${id}/prompts`, {
+		const response = (await doGet(`${mcpActionPath(id)}/prompts`, {
 			dontLogErrors: true
 		})) as ItemsResponse<MCPServerPrompt>;
 		return response.items ?? [];
@@ -609,7 +736,7 @@ export async function listSingleOrRemoteMcpServerResources(
 	id: string
 ): Promise<McpServerResource[]> {
 	try {
-		const response = (await doGet(`/mcp-servers/${id}/resources`, {
+		const response = (await doGet(`${mcpActionPath(id)}/resources`, {
 			dontLogErrors: true
 		})) as ItemsResponse<McpServerResource>;
 		return response.items ?? [];
@@ -637,17 +764,86 @@ export async function listGlobalModelProviders(opts?: {
 
 // Organization
 
-export async function listGroups(opts?: { fetch?: Fetcher; query?: string }): Promise<OrgGroup[]> {
-	const params: string[] = [];
-	if (opts?.query !== undefined) {
-		params.push(`name=${encodeURIComponent(opts.query)}`);
-	}
-	const queryString = params.length ? `?${params.join('&')}` : '';
-	const response = (await doGet(`/groups${queryString}`, opts)) as OrgGroup[];
-	return response ?? [];
+/**
+ * Fetches one page of the auth provider's groups.
+ *
+ * A directory can hold tens of thousands of groups, so callers must page rather than expect the
+ * whole collection. Paging is by opaque cursor, forwarded to the identity provider, so there is no
+ * total and no way to jump to an arbitrary page. Use `resolveGroups` instead when you already know
+ * which group IDs you need.
+ */
+export async function listGroups(opts?: {
+	fetch?: Fetcher;
+	query?: string;
+	limit?: number;
+	cursor?: string;
+	signal?: AbortSignal;
+}): Promise<OrgGroupPage> {
+	const queryString = buildQueryString({
+		name: opts?.query,
+		limit: opts?.limit,
+		cursor: opts?.cursor
+	});
+	const response = (await doGet(
+		`/groups${queryString ? `?${queryString}` : ''}`,
+		opts
+	)) as OrgGroupPage;
+
+	return {
+		items: response?.items ?? [],
+		nextCursor: response?.nextCursor || undefined,
+		source: response?.source ?? 'provider',
+		degraded: response?.degraded ?? false,
+		reset: response?.reset ?? false
+	};
 }
 
-export async function listUsers(opts?: { fetch?: Fetcher }): Promise<OrgUser[]> {
+const RESOLVE_GROUPS_CHUNK_SIZE = 100;
+const RESOLVE_GROUPS_MAX_CONCURRENCY = 4;
+
+/**
+ * Resolves specific group IDs to their display names.
+ *
+ * Larger inputs are split across several requests and recombined, so a caller never has to think
+ * about the batch limit. IDs that cannot be resolved come back named after themselves.
+ */
+export async function resolveGroups(
+	ids: string[],
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
+): Promise<OrgGroup[]> {
+	if (ids.length === 0) return [];
+
+	const batches: string[][] = [];
+	for (let i = 0; i < ids.length; i += RESOLVE_GROUPS_CHUNK_SIZE) {
+		batches.push(ids.slice(i, i + RESOLVE_GROUPS_CHUNK_SIZE));
+	}
+
+	// Indexed rather than appended, so the result stays in the order the IDs were asked for however
+	// the requests interleave.
+	const pages: OrgGroupPage[] = new Array(batches.length);
+	let next = 0;
+
+	async function worker() {
+		while (next < batches.length) {
+			const index = next++;
+			pages[index] = (await doGet(
+				`/groups?${buildQueryString({ ids: batches[index] })}`,
+				opts
+			)) as OrgGroupPage;
+		}
+	}
+
+	await Promise.all(
+		Array.from({ length: Math.min(RESOLVE_GROUPS_MAX_CONCURRENCY, batches.length) }, () => worker())
+	);
+
+	return pages.flatMap((page) => page?.items ?? []);
+}
+
+export async function listUsers(opts?: {
+	fetch?: Fetcher;
+	signal?: AbortSignal;
+}): Promise<OrgUser[]> {
 	const response = (await doGet('/users', opts)) as ItemsResponse<OrgUser>;
 	return response.items ?? [];
 }
@@ -672,6 +868,9 @@ export async function getProfile(opts?: { fetch?: Fetcher }): Promise<Profile> {
 	};
 	obj.isAdminReadonly = () => {
 		return !obj.groups.includes(Group.ADMIN) && obj.groups.includes(Group.AUDITOR);
+	};
+	obj.isOwner = () => {
+		return obj.groups.includes(Group.OWNER);
 	};
 	obj.isBootstrapUser = () => {
 		return obj.username === BOOTSTRAP_USER_ID;
@@ -802,7 +1001,7 @@ export async function listWorkspaceMCPCatalogEntries(
 export async function getWorkspaceMCPCatalogEntry(
 	workspaceID: string,
 	entryID: string,
-	opts?: { fetch?: Fetcher }
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<MCPCatalogEntry> {
 	const response = (await doGet(
 		`/workspaces/${workspaceID}/entries/${entryID}`,
@@ -873,7 +1072,7 @@ export async function startWorkspaceMCPCatalogEntryOAuthCredentialTest(
 	opts?: { fetch?: Fetcher }
 ): Promise<MCPServerOAuthCredentialTestStart> {
 	return (await doPost(
-		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credential-tests`,
+		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credentials/test`,
 		credentials,
 		opts
 	)) as MCPServerOAuthCredentialTestStart;
@@ -886,7 +1085,7 @@ export async function getWorkspaceMCPCatalogEntryOAuthCredentialTest(
 	opts?: { fetch?: Fetcher }
 ): Promise<MCPServerOAuthCredentialTestResult> {
 	return (await doPost(
-		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credential-tests/status`,
+		`/workspaces/${workspaceID}/entries/${entryID}/oauth-credentials/test/status`,
 		{ testState },
 		opts
 	)) as MCPServerOAuthCredentialTestResult;
@@ -1036,6 +1235,8 @@ export async function getWorkspaceCatalogEntryServerK8sDetails(
 export type PendingCompositeAuth = {
 	catalogEntryID?: string;
 	mcpServerID: string;
+	name?: string;
+	icon?: string;
 	authURL: string;
 };
 
@@ -1043,19 +1244,25 @@ export async function checkCompositeOAuth(
 	compositeMcpId: string,
 	opts?: { oauthAuthRequestID?: string; signal?: AbortSignal }
 ): Promise<PendingCompositeAuth[]> {
-	let url = `/oauth/composite/${compositeMcpId}`;
+	let url = `/oauth/vmcp/${compositeMcpId}`;
 	if (opts?.oauthAuthRequestID) {
 		url += `?oauth_auth_request=${opts.oauthAuthRequestID}`;
 	}
 	const response = await doGet(url, { signal: opts?.signal, dontLogErrors: true });
 
-	// If the server returns a redirect_uri, perform client-side redirect
-	if (response && typeof response === 'object' && 'redirect_uri' in response) {
-		window.location.href = (response as { redirect_uri: string }).redirect_uri;
-		return [];
-	}
-
 	return Array.isArray(response) ? response : [];
+}
+
+export async function checkCompositeOAuthComponent(
+	compositeMcpId: string,
+	componentMcpId: string,
+	opts?: { oauthAuthRequestID?: string; signal?: AbortSignal }
+): Promise<{ authURL?: string }> {
+	let url = `/oauth/vmcp/${encodeURIComponent(compositeMcpId)}/components/${encodeURIComponent(componentMcpId)}`;
+	if (opts?.oauthAuthRequestID) {
+		url += `?oauth_auth_request=${encodeURIComponent(opts.oauthAuthRequestID)}`;
+	}
+	return (await doGet(url, { signal: opts?.signal, dontLogErrors: true })) as { authURL?: string };
 }
 
 export type OAuthConsent = {
@@ -1075,6 +1282,8 @@ export type OAuthConsent = {
 	mcpConfigRequired: boolean;
 	mcpServer?: MCPCatalogServer;
 	mcpServerInstance?: MCPServerInstance;
+	vmcpInstanceID?: string;
+	vmcpComponents?: VMCPComponent[];
 	mcpAuthRequired: boolean;
 	userHasSecondLevelOAuthed: boolean;
 	mcpServerName?: string;
@@ -1154,7 +1363,7 @@ export async function listWorkspaceMCPCatalogServers(
 export async function getWorkspaceMCPCatalogServer(
 	workspaceID: string,
 	serverID: string,
-	opts?: { fetch?: Fetcher }
+	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<MCPCatalogServer> {
 	const response = (await doGet(
 		`/workspaces/${workspaceID}/servers/${serverID}`,
@@ -1180,7 +1389,7 @@ export async function deployWorkspaceMultiUserCatalogEntry(
 	workspaceID: string,
 	catalogEntryID: string,
 	server?: {
-		manifest?: { env?: MCPSubField[]; remoteConfig?: { url?: string; headers?: MCPSubField[] } };
+		manifest?: { config?: (MCPSubField & { usage: string })[]; remoteConfig?: { url?: string } };
 		alias?: string;
 	},
 	opts?: { fetch?: Fetcher }
@@ -1211,9 +1420,7 @@ export async function deleteWorkspaceMCPCatalogServer(
 	workspaceID: string,
 	serverID: string
 ): Promise<void> {
-	await doDelete(`/workspaces/${workspaceID}/servers/${serverID}`, {
-		responseHandler: mcpServerDeleteResponseHandler
-	});
+	await doDelete(`/workspaces/${workspaceID}/servers/${serverID}`, {});
 }
 
 export async function configureWorkspaceMCPCatalogServer(
@@ -1358,6 +1565,14 @@ export async function getLicense(opts?: { fetch?: Fetcher }): Promise<License> {
 }
 
 // Skills
+
+export async function listSkills(opts?: {
+	fetch?: Fetcher;
+	dontLogErrors?: boolean;
+}): Promise<Skill[]> {
+	const response = (await doGet('/skills', opts)) as ItemsResponse<Skill>;
+	return response.items ?? [];
+}
 
 export async function downloadSkill(
 	id: string,

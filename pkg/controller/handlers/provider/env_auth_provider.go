@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"strings"
@@ -36,22 +37,21 @@ const (
 	authProviderLoggingEnv              = "OBOT_AUTH_PROVIDER_ENABLE_LOGGING"
 )
 
-var legacyGenericOAuthStartupRequiredEnvVars = []string{
-	genericOAuthIssuerEnvVar,
-	genericOAuthClientIDEnvVar,
-	genericOAuthClientSecretEnvVar,
-}
-
-var legacyGenericOAuthStartupOptionalEnvVars = []string{
-	genericOAuthProviderNameEnvVar,
-	genericOAuthScopeEnvVar,
-	genericOAuthTrustEmailLinkingEnvVar,
-	authProviderCookieSecretEnv,
-	authProviderEmailDomainsEnv,
-	authProviderPostgresDSNEnv,
-	authProviderRefreshPeriodEnv,
-	authProviderLoggingEnv,
-}
+var (
+	legacyGenericOAuthStartupEnvVars = []string{
+		genericOAuthIssuerEnvVar,
+		genericOAuthClientIDEnvVar,
+		genericOAuthClientSecretEnvVar,
+		genericOAuthProviderNameEnvVar,
+		genericOAuthScopeEnvVar,
+		genericOAuthTrustEmailLinkingEnvVar,
+		authProviderCookieSecretEnv,
+		authProviderEmailDomainsEnv,
+		authProviderPostgresDSNEnv,
+		authProviderRefreshPeriodEnv,
+		authProviderLoggingEnv,
+	}
+)
 
 // EnsureAuthProviderEnvCredential configures one registry-backed auth provider
 // from process env at startup. OBOT_AUTH_PROVIDER_ID selects the provider, and
@@ -117,7 +117,7 @@ func (h *Handler) EnsureAuthProviderEnvCredential(ctx context.Context, c kclient
 		return fmt.Errorf("failed to update auth provider sync annotation %q: %w", authProvider.Name, err)
 	}
 
-	log.Infof("Configured auth provider from environment: provider=%s", authProvider.Name)
+	slog.Info("Configured auth provider from environment", "provider", authProvider.Name)
 	return nil
 }
 
@@ -126,7 +126,7 @@ func authProviderEnvID(lookup func(string) (string, bool)) (string, bool) {
 		return strings.TrimSpace(value), true
 	}
 
-	for _, key := range append(append([]string{}, legacyGenericOAuthStartupRequiredEnvVars...), legacyGenericOAuthStartupOptionalEnvVars...) {
+	for _, key := range legacyGenericOAuthStartupEnvVars {
 		if value, ok := lookup(key); ok && strings.TrimSpace(value) != "" {
 			return genericOAuthAuthProviderName, true
 		}

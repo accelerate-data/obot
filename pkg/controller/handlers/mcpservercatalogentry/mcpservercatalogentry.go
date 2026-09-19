@@ -1,25 +1,29 @@
 package mcpservercatalogentry
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"slices"
+	"log/slog"
+	"uuid"
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
-	"github.com/obot-platform/obot/pkg/controller/handlers/mcpserver"
 	gclient "github.com/obot-platform/obot/pkg/gateway/client"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/utils"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var log = logger.Package()
+type credentialClient interface {
+	RevealCredential(ctx context.Context, contexts []string, name string) (gatewaytypes.Credential, error)
+	DeleteCredential(ctx context.Context, credentialContext, name string) (bool, error)
+}
 
 // Handler handles operations for MCP server catalog entries
 type Handler struct {
@@ -55,31 +59,28 @@ func userCountForEntry(req router.Request, entry v1.MCPServerCatalogEntry) (int,
 		return 0, fmt.Errorf("failed to list MCP servers: %w", err)
 	}
 
-	isSingleUser := entry.Spec.Manifest.ServerUserType.IsSingleUser()
 	uniqueUsers := make(map[string]struct{}, len(mcpServers.Items))
 	userCount := 0
 	for _, server := range mcpServers.Items {
 		if !server.DeletionTimestamp.IsZero() || server.Spec.CompositeName != "" {
 			continue
 		}
-		if isSingleUser && server.Spec.UserID != "" {
+		if server.Spec.IsSingleUser() && server.Spec.UserID != "" {
 			uniqueUsers[server.Spec.UserID] = struct{}{}
-		} else if !isSingleUser {
+		} else if !server.Spec.IsSingleUser() {
 			if server.Status.MCPServerInstanceUserCount != nil {
 				userCount += *server.Status.MCPServerInstanceUserCount
 			}
 		}
 	}
-	if isSingleUser {
-		userCount = len(uniqueUsers)
-	}
+	userCount += len(uniqueUsers)
 
 	return userCount, nil
 }
 
 func updateEntryUserCount(req router.Request, entry *v1.MCPServerCatalogEntry, newUserCount int) error {
 	if entry.Status.UserCount != newUserCount {
-		log.Infof("Updated MCP catalog entry user count: entry=%s oldCount=%d newCount=%d", entry.Name, entry.Status.UserCount, newUserCount)
+		slog.Info("Updated MCP catalog entry user count", "entry", entry.Name, "oldCount", entry.Status.UserCount, "newCount", newUserCount)
 		entry.Status.UserCount = newUserCount
 		return req.Client.Status().Update(req.Ctx, entry)
 	}
@@ -87,21 +88,10 @@ func updateEntryUserCount(req router.Request, entry *v1.MCPServerCatalogEntry, n
 	return nil
 }
 
-// EnsureServerUserType backfills the serverUserType field to "singleUser" for
-// existing catalog entries that were created before the field was introduced.
-func (*Handler) EnsureServerUserType(req router.Request, _ router.Response) error {
-	entry := req.Object.(*v1.MCPServerCatalogEntry)
-	if entry.Spec.Manifest.ServerUserType != "" {
-		return nil
-	}
-	entry.Spec.Manifest.ServerUserType = types.ServerUserTypeSingleUser
-	return kclient.IgnoreNotFound(req.Client.Update(req.Ctx, entry))
-}
-
 func (h *Handler) DeleteEntriesWithoutRuntime(req router.Request, _ router.Response) error {
 	entry := req.Object.(*v1.MCPServerCatalogEntry)
 	if string(entry.Spec.Manifest.Runtime) == "" {
-		log.Infof("Deleting MCP catalog entry with empty runtime: entry=%s", entry.Name)
+		slog.Info("Deleting MCP catalog entry with empty runtime", "entry", entry.Name)
 		return req.Client.Delete(req.Ctx, entry)
 	}
 
@@ -116,7 +106,7 @@ func (*Handler) UpdateManifestHashAndLastUpdated(req router.Request, _ router.Re
 		now := metav1.Now()
 		entry.Status.ManifestHash = currentHash
 		entry.Status.LastUpdated = &now
-		log.Infof("Updated MCP catalog entry manifest hash: entry=%s hash=%s", entry.Name, currentHash)
+		slog.Info("Updated MCP catalog entry manifest hash", "entry", entry.Name, "hash", currentHash)
 		return req.Client.Status().Update(req.Ctx, entry)
 	}
 
@@ -130,273 +120,163 @@ func (*Handler) UpdateSystemManifestHashAndLastUpdated(req router.Request, _ rou
 		now := metav1.Now()
 		entry.Status.ManifestHash = currentHash
 		entry.Status.LastUpdated = &now
-		log.Infof("Updated system MCP catalog entry manifest hash: entry=%s hash=%s", entry.Name, currentHash)
+		slog.Info("Updated system MCP catalog entry manifest hash", "entry", entry.Name, "hash", currentHash)
 		return req.Client.Status().Update(req.Ctx, entry)
 	}
 
 	return nil
 }
 
-// DetectCompositeDrift detects when a composite catalog entry's component snapshots have drifted
-// from their source catalog entries or multi-user servers
-func (h *Handler) DetectCompositeDrift(req router.Request, _ router.Response) error {
-	entry := req.Object.(*v1.MCPServerCatalogEntry)
-
-	if entry.Spec.Manifest.Runtime != types.RuntimeComposite {
-		if entry.Status.NeedsUpdate {
-			entry.Status.NeedsUpdate = false
-			return req.Client.Status().Update(req.Ctx, entry)
-		}
-		return nil
-	}
-
-	// Check each component for drift
-	var drifted bool
-	for _, component := range entry.Spec.Manifest.CompositeConfig.ComponentServers {
-		// Handle multi-user component drift
-		if component.MCPServerID != "" {
-			var server v1.MCPServer
-			if err := req.Get(&server, entry.Namespace, component.MCPServerID); err != nil {
-				if apierrors.IsNotFound(err) {
-					drifted = true
-					break
-				}
-				return fmt.Errorf("failed to get multi-user server %s: %w", component.MCPServerID, err)
-			}
-
-			hasDrifted, err := mcpserver.ConfigurationHasDrifted(req.Ctx, h.gatewayClient, &server, component.Manifest, false)
-			if err != nil {
-				return fmt.Errorf("failed to detect drift for multi-user server %s: %w", component.MCPServerID, err)
-			}
-			if hasDrifted {
-				drifted = true
-				break
-			}
-		} else {
-			// Handle catalog entry component drift
-			var componentEntry v1.MCPServerCatalogEntry
-			if err := req.Get(&componentEntry, entry.Namespace, component.CatalogEntryID); err != nil {
-				if apierrors.IsNotFound(err) {
-					drifted = true
-					break
-				}
-				return fmt.Errorf("failed to get component catalog entry %s: %w", component.CatalogEntryID, err)
-			}
-
-			// We added the EntryKey field, but it really shouldn't affect drift detection here.
-			if component.Manifest.EntryKey == "" && componentEntry.Spec.Manifest.EntryKey != "" {
-				component.Manifest.EntryKey = componentEntry.Spec.Manifest.EntryKey
-			}
-
-			// Same for serverUserType
-			if component.Manifest.ServerUserType == "" && componentEntry.Spec.Manifest.ServerUserType != "" {
-				component.Manifest.ServerUserType = componentEntry.Spec.Manifest.ServerUserType
-			}
-
-			var (
-				snapshotHash = utils.Digest(component.Manifest)
-				currentHash  = utils.Digest(componentEntry.Spec.Manifest)
-			)
-			if snapshotHash != currentHash {
-				drifted = true
-				break
-			}
-		}
-	}
-
-	if entry.Status.NeedsUpdate != drifted {
-		log.Infof("MCP catalog entry composite drift status changed: entry=%s needsUpdate=%v", entry.Name, drifted)
-		entry.Status.NeedsUpdate = drifted
-		return req.Client.Status().Update(req.Ctx, entry)
-	}
-
-	return nil
-}
-
-// CleanupNestedCompositeServers removes component servers with composite runtimes from composite catalog entries.
-// This handler cleans up entries that were created before API validation to prevent nested composite servers.
-func (*Handler) CleanupNestedCompositeEntries(req router.Request, _ router.Response) error {
-	var (
-		entry    = req.Object.(*v1.MCPServerCatalogEntry)
-		manifest = entry.Spec.Manifest
-	)
-
-	if manifest.Runtime != types.RuntimeComposite ||
-		manifest.CompositeConfig == nil {
-		return nil
-	}
-
-	// Remove all composite components from the server's manifest
-	var (
-		components    = manifest.CompositeConfig.ComponentServers
-		numComponents = len(components)
-	)
-	components = slices.DeleteFunc(components, func(component types.CatalogComponentServer) bool {
-		return component.Manifest.Runtime == types.RuntimeComposite
-	})
-
-	if numComponents == len(components) {
-		// No components were removed, so no need to update the manifest.
-		return nil
-	}
-
-	entry.Spec.Manifest.CompositeConfig.ComponentServers = components
-	log.Infof("Pruned nested composite components from MCP catalog entry: entry=%s removedComponents=%d", entry.Name, numComponents-len(components))
-	return kclient.IgnoreNotFound(req.Client.Update(req.Ctx, entry))
-}
-
-// CleanupUnusedOAuthCredentials removes entry-owned static OAuth state unless
-// the current catalog entry still uses it.
-func (h *Handler) CleanupUnusedOAuthCredentials(req router.Request, _ router.Response) error {
-	entry := req.Object.(*v1.MCPServerCatalogEntry)
-
-	if entry.Spec.Manifest.Runtime == types.RuntimeRemote &&
+// requiresStaticOAuth reports whether entry is configured to use a static OAuth client. Only
+// entries in that shape ever have a static OAuth credential.
+func requiresStaticOAuth(entry *v1.MCPServerCatalogEntry) bool {
+	return entry.Spec.Manifest.Runtime == types.RuntimeRemote &&
 		entry.Spec.Manifest.RemoteConfig != nil &&
-		entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
-		return nil
-	}
-
-	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
-	if err != nil {
-		return fmt.Errorf("failed to coordinate static OAuth cleanup with catalog mutation: %w", err)
-	}
-	defer releaseCatalogMutationLock()
-
-	// Reconcile from authoritative state after acquiring the mutation lock so a
-	// stale cleanup request cannot delete an application restored while it waited.
-	var currentEntry v1.MCPServerCatalogEntry
-	if err := req.Client.Get(req.Ctx, router.Key(entry.Namespace, entry.Name), &currentEntry); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to confirm static OAuth cleanup is still required: %w", err)
-		}
-	} else if currentEntry.Spec.Manifest.Runtime == types.RuntimeRemote &&
-		currentEntry.Spec.Manifest.RemoteConfig != nil &&
-		currentEntry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
-		return nil
-	}
-
-	credentialName := system.MCPOAuthCredentialName(entry.Name)
-	releaseCredentialLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, credentialName)
-	if err != nil {
-		return fmt.Errorf("failed to coordinate static OAuth cleanup with credential mutation: %w", err)
-	}
-	defer releaseCredentialLock()
-	deploymentMCPIDs, err := staticOAuthDeploymentIDs(req, entry.Name)
-	if err != nil {
-		return err
-	}
-	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthCredential(req.Ctx, entry.Name, deploymentMCPIDs...)
-	if err != nil {
-		return fmt.Errorf("failed to clean up static OAuth state: %w", err)
-	}
-	if deleted {
-		log.Infof("Deleted unused static OAuth credential for MCP catalog entry: entry=%s", entry.Name)
-	}
-
-	return nil
+		entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired
 }
 
-// EnsureOAuthCredentialStatus updates the OAuthCredentialConfigured status field
-// for remote catalog entries that require static OAuth.
-func (h *Handler) EnsureOAuthCredentialStatus(req router.Request, _ router.Response) error {
+// ReconcileOAuthCredential keeps an entry's static OAuth credential and
+// Status.OAuthCredentialConfigured in agreement, querying the credential store only when that
+// status could be wrong.
+//
+// The delete and the status update must stay in one handler. nah runs every handler for a type
+// even after an earlier one errors, so as two handlers a failed delete did not stop the status
+// being cleared, and a cleared status meant the entry was never queried again.
+func (h *Handler) ReconcileOAuthCredential(req router.Request, _ router.Response) error {
+	return reconcileOAuthCredential(req, h.gatewayClient)
+}
+
+func reconcileOAuthCredential(req router.Request, creds credentialClient) error {
 	entry := req.Object.(*v1.MCPServerCatalogEntry)
 
-	// Clear sync annotation if present
-	if _, exists := entry.Annotations[v1.MCPServerCatalogEntrySyncAnnotation]; exists {
-		delete(entry.Annotations, v1.MCPServerCatalogEntrySyncAnnotation)
-		if err := req.Client.Update(req.Ctx, entry); err != nil {
-			return fmt.Errorf("failed to clear sync annotation: %w", err)
+	// Set by the API after it writes or deletes a credential.
+	_, recheck := entry.Annotations[v1.MCPServerCatalogEntrySyncAnnotation]
+
+	var configured, retained bool
+	if !requiresStaticOAuth(entry) && (entry.Status.OAuthCredentialConfigured || recheck) {
+		var err error
+		retained, err = oauthCredentialReferencedByVMCP(req, entry)
+		if err != nil {
+			return err
 		}
-		log.Infof("Cleared sync annotation for MCP catalog entry: entry=%s", entry.Name)
 	}
-
-	// Only process remote entries that require static OAuth
-	if entry.Spec.Manifest.Runtime != types.RuntimeRemote ||
-		entry.Spec.Manifest.RemoteConfig == nil ||
-		!entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
-		// Clear status if not applicable
-		if entry.Status.OAuthCredentialConfigured {
-			entry.Status.OAuthCredentialConfigured = false
-			log.Infof("Cleared static OAuth credential status for MCP catalog entry: entry=%s", entry.Name)
-			return req.Client.Status().Update(req.Ctx, entry)
+	if !retained {
+		var err error
+		configured, err = syncOAuthCredential(req.Ctx, creds, entry, recheck)
+		if err != nil {
+			return err
 		}
-
-		return nil
-	}
-
-	// Check if credentials exist
-	credName := system.MCPOAuthCredentialName(entry.Name)
-	credential, err := h.gatewayClient.RevealCredential(req.Ctx, []string{credName}, "oauth")
-
-	var configured bool
-	if err == nil {
-		configured = gclient.MCPStaticOAuthCredentialReady(credential.Secrets, entry.Spec.Manifest.RemoteConfig.FixedURL)
-	} else if !errors.As(err, &gclient.CredentialNotFoundError{}) {
-		return fmt.Errorf("failed to check credential status: %w", err)
 	}
 
 	if entry.Status.OAuthCredentialConfigured != configured {
 		entry.Status.OAuthCredentialConfigured = configured
-		log.Infof("Updated static OAuth credential status for MCP catalog entry: entry=%s configured=%v", entry.Name, configured)
-		return req.Client.Status().Update(req.Ctx, entry)
+		slog.Info("Updated static OAuth credential status for MCP catalog entry", "entry", entry.Name, "configured", configured)
+		if err := req.Client.Status().Update(req.Ctx, entry); err != nil {
+			return fmt.Errorf("failed to update OAuth credential status: %w", err)
+		}
 	}
 
+	if !recheck {
+		return nil
+	}
+
+	// Publish a durable revision for dependent vMCPs before clearing the recheck.
+	// Both changes are saved together, so a failure leaves the recheck pending.
+	entry.Annotations[v1.OAuthCredentialRevisionAnnotation] = uuid.New().String()
+	delete(entry.Annotations, v1.MCPServerCatalogEntrySyncAnnotation)
+	if err := req.Client.Update(req.Ctx, entry); err != nil {
+		return fmt.Errorf("failed to clear sync annotation: %w", err)
+	}
+	slog.Info("Cleared sync annotation for MCP catalog entry", "entry", entry.Name)
+
 	return nil
+}
+
+// syncOAuthCredential brings the credential store in line with entry and reports whether a
+// credential exists for it afterwards.
+func syncOAuthCredential(ctx context.Context, creds credentialClient, entry *v1.MCPServerCatalogEntry, recheck bool) (bool, error) {
+	credName := system.MCPOAuthCredentialName(entry.Name)
+
+	if requiresStaticOAuth(entry) {
+		if entry.Status.OAuthCredentialConfigured && !recheck {
+			return true, nil
+		}
+
+		_, err := creds.RevealCredential(ctx, []string{credName}, system.StaticOAuthCredentialName)
+		if err == nil {
+			return true, nil
+		}
+		if !errors.As(err, &gclient.CredentialNotFoundError{}) {
+			return false, fmt.Errorf("failed to check OAuth credential status: %w", err)
+		}
+
+		return false, nil
+	}
+
+	// Any credential here is left over from when the entry did use static OAuth. The runtime is
+	// not checked, because an entry changed away from remote keeps its credential under the same
+	// name and nothing else would remove it.
+	if !entry.Status.OAuthCredentialConfigured && !recheck {
+		return false, nil
+	}
+
+	deleted, err := creds.DeleteCredential(ctx, credName, system.StaticOAuthCredentialName)
+	if err != nil {
+		return false, fmt.Errorf("failed to delete OAuth credential: %w", err)
+	}
+	if deleted {
+		slog.Info("Deleted unused static OAuth credential for MCP catalog entry", "entry", entry.Name)
+	}
+
+	return false, nil
 }
 
 // RemoveOAuthCredentials removes OAuth credentials when a catalog entry is deleted.
 func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) error {
+	return removeOAuthCredentials(req, h.gatewayClient)
+}
+
+func removeOAuthCredentials(req router.Request, creds credentialClient) error {
 	entry := req.Object.(*v1.MCPServerCatalogEntry)
 
-	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
-	if err != nil {
-		return fmt.Errorf("failed to coordinate static OAuth removal with catalog mutation: %w", err)
+	// An entry on its way out is always swept, since being wrong there strands the credential. The
+	// rest of the guard only matters if this is ever called outside the deletion path.
+	_, recheck := entry.Annotations[v1.MCPServerCatalogEntrySyncAnnotation]
+	if entry.Spec.Manifest.Runtime != types.RuntimeRemote && !entry.Status.OAuthCredentialConfigured && !recheck && entry.DeletionTimestamp.IsZero() {
+		return nil
 	}
-	defer releaseCatalogMutationLock()
-	credentialName := system.MCPOAuthCredentialName(entry.Name)
-	releaseCredentialLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, credentialName)
-	if err != nil {
-		return fmt.Errorf("failed to coordinate static OAuth removal with credential mutation: %w", err)
-	}
-	defer releaseCredentialLock()
 
-	deploymentMCPIDs, err := staticOAuthDeploymentIDs(req, entry.Name)
-	if err != nil {
+	// Build the credential name for this entry
+	credName := system.MCPOAuthCredentialName(entry.Name)
+	if retained, err := oauthCredentialReferencedByVMCP(req, entry); err != nil {
 		return err
+	} else if retained {
+		return nil
 	}
-	deleted, err := h.gatewayClient.DeleteMCPStaticOAuthStateForDeletedCatalogEntry(req.Ctx, entry.Name, deploymentMCPIDs...)
+
+	deleted, err := creds.DeleteCredential(req.Ctx, credName, system.StaticOAuthCredentialName)
 	if err != nil {
-		return fmt.Errorf("failed to remove static OAuth state: %w", err)
+		return fmt.Errorf("failed to delete OAuth credential: %w", err)
 	}
 	if deleted {
-		log.Infof("Removed static OAuth credential for deleted MCP catalog entry: entry=%s", entry.Name)
+		slog.Info("Removed static OAuth credential for deleted MCP catalog entry", "entry", entry.Name)
 	}
 
 	return nil
 }
 
-func staticOAuthDeploymentIDs(req router.Request, entryName string) ([]string, error) {
-	var servers v1.MCPServerList
-	if err := req.List(&servers, &kclient.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entryName),
-		Namespace:     system.DefaultNamespace,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list MCP servers for static OAuth cleanup: %w", err)
+func oauthCredentialReferencedByVMCP(req router.Request, entry *v1.MCPServerCatalogEntry) (bool, error) {
+	var vmcps v1.VMCPList
+	if err := req.List(&vmcps, &kclient.ListOptions{Namespace: entry.Namespace}); err != nil {
+		return false, err
 	}
-	var instances v1.MCPServerInstanceList
-	if err := req.List(&instances, &kclient.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entryName),
-		Namespace:     system.DefaultNamespace,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list MCP server instances for static OAuth cleanup: %w", err)
+	ref := system.MCPOAuthCredentialName(entry.Name)
+	for _, vmcp := range vmcps.Items {
+		for _, component := range vmcp.Spec.Manifest.Components {
+			if vmcpconfig.ComponentOAuthCredentialReference(component) == ref {
+				return true, nil
+			}
+		}
 	}
-
-	ids := make([]string, 0, len(servers.Items)+len(instances.Items))
-	for _, server := range servers.Items {
-		ids = append(ids, server.Name)
-	}
-	for _, instance := range instances.Items {
-		ids = append(ids, instance.Name)
-	}
-	return ids, nil
+	return false, nil
 }

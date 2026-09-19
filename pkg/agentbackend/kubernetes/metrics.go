@@ -15,7 +15,9 @@ import (
 // metricsAPIPath is the standard metrics.k8s.io endpoint, served by
 // metrics-server. It is queried through a raw REST call rather than the typed
 // k8s.io/metrics client so that live usage costs no extra module dependency.
-const metricsAPIPath = "/apis/metrics.k8s.io/v1beta1/namespaces/%s/pods"
+const (
+	metricsAPIPath = "/apis/metrics.k8s.io/v1beta1/namespaces/%s/pods"
+)
 
 // podMetrics is the subset of PodMetrics this package reads.
 type podMetricsList struct {
@@ -47,6 +49,20 @@ type usageReader interface {
 
 type metricsServerReader struct {
 	client rest.Interface
+}
+
+// statsSummary is the subset of kubelet's /stats/summary this package reads.
+type statsSummary struct {
+	Pods []struct {
+		Volume []struct {
+			UsedBytes     int64 `json:"usedBytes"`
+			CapacityBytes int64 `json:"capacityBytes"`
+			PVCRef        struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"pvcRef"`
+		} `json:"volume"`
+	} `json:"pods"`
 }
 
 func newMetricsReader(config *rest.Config) (usageReader, error) {
@@ -101,20 +117,6 @@ func (m *metricsServerReader) PodUsage(ctx context.Context, namespace, labelSele
 		usage[item.Metadata.Name] = total
 	}
 	return usage, nil
-}
-
-// statsSummary is the subset of kubelet's /stats/summary this package reads.
-type statsSummary struct {
-	Pods []struct {
-		Volume []struct {
-			UsedBytes     int64 `json:"usedBytes"`
-			CapacityBytes int64 `json:"capacityBytes"`
-			PVCRef        struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
-			} `json:"pvcRef"`
-		} `json:"volume"`
-	} `json:"pods"`
 }
 
 // PoolVolumeUsage reports bytes used on a pool's shared volume.

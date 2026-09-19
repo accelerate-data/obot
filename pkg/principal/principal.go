@@ -11,20 +11,21 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/obot-platform/obot/pkg/system"
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 )
 
-// HostedAgentOwnerExtra carries the user a hosted agent was created by. It is
-// set on the principal at authentication time.
-const HostedAgentOwnerExtra = "hosted_agent_owner_id"
-
-// AuthorizedModelIDsExtra carries the Model resource names a hosted agent was
-// configured with, or "*" for every model. It is the agent's whole authority
-// over models: an agent is not re-evaluated against access policies, which
-// describe people.
-const AuthorizedModelIDsExtra = "authorized_model_ids"
-
 const (
+	// HostedAgentOwnerExtra carries the user a hosted agent was created by. It is
+	// set on the principal at authentication time.
+	HostedAgentOwnerExtra = "hosted_agent_owner_id"
+
+	// AuthorizedModelIDsExtra carries the Model resource names a hosted agent was
+	// configured with, or "*" for every model. It is the agent's whole authority
+	// over models: an agent is not re-evaluated against access policies, which
+	// describe people.
+	AuthorizedModelIDsExtra = "authorized_model_ids"
+
 	// APIKeyIDExtra and APIKeyNameExtra carry the non-secret credential
 	// attribution established by the API-key authenticator. Downstream code
 	// must use APIKeyAttributionFromUser instead of interpreting these values.
@@ -38,12 +39,17 @@ type APIKeyAttribution struct {
 	Name string
 }
 
+// MaskedAPIKeyName returns the non-secret identifier for an API key.
+func MaskedAPIKeyName(userID string, keyID uint) string {
+	return fmt.Sprintf("%s-%s-%d-*****", system.APIKeyPrefix, userID, keyID)
+}
+
 // NewAPIKeyAttribution creates event-time display attribution for an API key.
 // Unnamed keys use the reconstructable, non-secret masked key identifier so
 // audit consumers never need to join back to the API-key table to label them.
 func NewAPIKeyAttribution(id, ownerUserID uint, name string) APIKeyAttribution {
 	if name == "" {
-		name = fmt.Sprintf("ok1-%d-%d-*****", ownerUserID, id)
+		name = MaskedAPIKeyName(strconv.FormatUint(uint64(ownerUserID), 10), id)
 	}
 	return APIKeyAttribution{ID: id, Name: name}
 }

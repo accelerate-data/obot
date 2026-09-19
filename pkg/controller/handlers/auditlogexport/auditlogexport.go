@@ -19,7 +19,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const batchSize = 10_000
+const (
+	batchSize = 10_000
+)
 
 // Handler reconciles AuditLogExport resources and streams normalized JSONL events to the
 // configured object-storage provider.
@@ -108,6 +110,7 @@ func mcpAuditLogOptionsFromExport(export *v1.AuditLogExport, limit, offset int) 
 		Tool:                      filters.Tools,
 		Outcome:                   filters.Outcomes,
 		Client:                    filters.Clients,
+		APIKeyID:                  filters.APIKeyIDs,
 		UserID:                    filters.UserIDs,
 		MCPID:                     filters.MCPIDs,
 		MCPServerDisplayName:      filters.MCPServerDisplayNames,
@@ -139,6 +142,7 @@ func llmAuditLogOptionsFromExport(export *v1.AuditLogExport, limit, offset int) 
 	return client.LLMAuditLogOptions{
 		StartTime:              export.Spec.StartTime.Time,
 		EndTime:                export.Spec.EndTime.Time,
+		APIKeyID:               filters.APIKeyIDs,
 		UserID:                 filters.UserIDs,
 		ModelProvider:          filters.ModelProviders,
 		TargetModel:            filters.TargetModels,

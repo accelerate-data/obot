@@ -8,9 +8,8 @@
 	import BetaLogo from '$lib/components/navbar/BetaLogo.svelte';
 	import { HttpError } from '$lib/errors';
 	import { UserService, type OAuthConsent } from '$lib/services';
+	import { getManifestConfiguration } from '$lib/services/user/mcp';
 	import {
-		convertCompositeInfoToLaunchFormData,
-		convertCompositeLaunchFormDataToPayload,
 		convertEnvHeadersToRecord,
 		hasEditableConfiguration,
 		hasSecretBinding,
@@ -33,24 +32,25 @@
 	let configError = $state('');
 	let loadingConfig = $state(false);
 	let savingConfig = $state(false);
-	let hasConfiguredComposite = $state(false);
 
 	const consent = $derived(currentConsent);
-	const isCompositeMCPServer = $derived(consent.mcpServer?.manifest.runtime === 'composite');
-	const requiresMCPConfiguration = $derived(
-		consent.mcpConfigRequired || (isCompositeMCPServer && !hasConfiguredComposite)
-	);
+	const requiresMCPConfiguration = $derived(consent.mcpConfigRequired);
 	const scopes = $derived(consent.scope?.split(' ').filter(Boolean) ?? []);
 	const showMCPAuthNotice = $derived(consent.mcpAuthRequired || consent.userHasSecondLevelOAuthed);
 	const deprecated = $derived(isDeprecatedMCPServer(consent.mcpServer));
 	const hasConfigurableMCPConfiguration = $derived.by(() => {
+		if (consent.vmcpInstanceID) {
+			return consent.vmcpComponents?.some(hasEditableVMCPConfiguration);
+		}
 		if (consent.mcpServer) {
 			return hasEditableConfiguration(consent.mcpServer);
 		}
 		if (consent.mcpServerInstance) {
-			return (consent.mcpServerInstance.multiUserConfig?.userDefinedHeaders ?? []).some(
-				(header) => !hasSecretBinding(header)
-			);
+			return (
+				(consent.mcpServerInstance.config ?? []).filter(
+					(field) => field.usage === 'header' && field.userAllowed
+				) ?? []
+			).some((header) => !hasSecretBinding(header));
 		}
 		return false;
 	});
@@ -140,7 +140,7 @@
 	});
 
 	onMount(() => {
-		if (requiresMCPConfiguration) {
+		if (requiresMCPConfiguration || hasConfigurableMCPConfiguration) {
 			void loadMCPConfiguration(currentConsent);
 		}
 	});
@@ -150,43 +150,88 @@
 		configError = '';
 		try {
 			let values: Record<string, string> = {};
-			if (nextConsent.mcpServerInstance?.id) {
+			if (nextConsent.vmcpInstanceID && nextConsent.vmcpComponents) {
+				const configuration = await UserService.revealVMCPInstance(nextConsent.vmcpInstanceID, {
+					dontLogErrors: true
+				});
+				configureForm = {
+					componentConfigs: Object.fromEntries(
+						nextConsent.vmcpComponents.map((component) => {
+							const componentID = component.id ?? component.mcpServerCatalogEntryID;
+							const editableKeys = new Set(
+								component.configuration
+									?.filter((field) => field.policy === 'userAllowed')
+									.map((field) => field.key)
+							);
+							const manifestConfiguration = getManifestConfiguration(
+								component.catalogEntry.manifest
+							);
+							return [
+								componentID,
+								{
+									name: component.name,
+									envs: manifestConfiguration.env
+										.filter(
+											(field) =>
+												editableKeys.has(field.key) && !field.value && !hasSecretBinding(field)
+										)
+										.map((field) => ({
+											...field,
+											value: configuration.components[componentID]?.[field.key] ?? '',
+											isStatic: false
+										})),
+									headers: (component.catalogEntry.manifest.config ?? [])
+										.filter(
+											(field) =>
+												field.usage === 'header' &&
+												editableKeys.has(field.key) &&
+												!field.value &&
+												!hasSecretBinding(field)
+										)
+										.map(({ usage: _usage, ...field }) => ({
+											...field,
+											value: configuration.components[componentID]?.[field.key] ?? '',
+											isStatic: false
+										}))
+								}
+							];
+						})
+					)
+				};
+			} else if (nextConsent.mcpServerInstance?.id) {
 				values = await revealExistingConfiguration(() =>
 					UserService.revealMcpServerInstance(nextConsent.mcpServerInstance!.id, {
 						dontLogErrors: true
 					})
 				);
 				configureForm = {
-					headers: nextConsent.mcpServerInstance.multiUserConfig?.userDefinedHeaders?.map(
-						(header) => ({
+					headers: (nextConsent.mcpServerInstance.config ?? [])
+						.filter((field) => field.usage === 'header' && field.userAllowed)
+						?.map((header) => ({
 							...header,
 							value: values[header.key] ?? '',
 							isStatic: false
-						})
-					)
+						}))
 				};
 			} else if (nextConsent.mcpServer?.id) {
-				if (nextConsent.mcpServer.manifest.runtime === 'composite') {
-					configureForm = await convertCompositeInfoToLaunchFormData(nextConsent.mcpServer);
-					return;
-				}
-
 				values = await revealExistingConfiguration(() =>
 					UserService.revealSingleOrRemoteMcpServer(nextConsent.mcpServer!.id, {
 						dontLogErrors: true
 					})
 				);
 				configureForm = {
-					envs: nextConsent.mcpServer.manifest.env?.map((env) => ({
+					envs: getManifestConfiguration(nextConsent.mcpServer.manifest).env?.map((env) => ({
 						...env,
 						value: values[env.key] ?? '',
 						isStatic: Boolean(env.value)
 					})),
-					headers: nextConsent.mcpServer.manifest.remoteConfig?.headers?.map((header) => ({
-						...header,
-						value: values[header.key] ?? '',
-						isStatic: Boolean(header.value)
-					})),
+					headers: getManifestConfiguration(nextConsent.mcpServer.manifest).headers?.map(
+						(header) => ({
+							...header,
+							value: values[header.key] ?? '',
+							isStatic: Boolean(header.value)
+						})
+					),
 					url: nextConsent.mcpServer.manifest.remoteConfig?.url,
 					hostname: nextConsent.mcpServer.manifest.remoteConfig?.hostname
 				};
@@ -221,30 +266,45 @@
 		}
 	}
 
+	function hasEditableVMCPConfiguration(
+		component: NonNullable<OAuthConsent['vmcpComponents']>[number]
+	) {
+		const editableKeys = new Set(
+			component.configuration
+				?.filter((field) => field.policy === 'userAllowed')
+				.map((field) => field.key)
+		);
+		const manifest = component.catalogEntry.manifest;
+		return [
+			...getManifestConfiguration(manifest).env,
+			...(manifest.config ?? []).filter((field) => field.usage === 'header')
+		].some((field) => editableKeys.has(field.key) && !field.value && !hasSecretBinding(field));
+	}
+
 	async function saveMCPConfiguration() {
 		if (!configureForm) return;
 
 		configError = '';
 		savingConfig = true;
 		try {
-			if (consent.mcpServerInstance?.id) {
-				if (isCompositeForm(configureForm)) {
-					throw new Error('Unexpected composite configuration for MCP server instance');
-				}
+			if (consent.vmcpInstanceID && 'componentConfigs' in configureForm) {
+				await UserService.configureVMCPInstance(consent.vmcpInstanceID, {
+					components: Object.fromEntries(
+						Object.entries(configureForm.componentConfigs).map(([componentID, component]) => [
+							componentID,
+							convertEnvHeadersToRecord(component.envs, component.headers)
+						])
+					)
+				});
+			} else if (consent.mcpServerInstance?.id && !('componentConfigs' in configureForm)) {
 				const payload = convertEnvHeadersToRecord(undefined, configureForm.headers);
 				await UserService.configureMcpServerInstance(consent.mcpServerInstance.id, payload);
-			} else if (consent.mcpServer?.id) {
-				if (isCompositeForm(configureForm)) {
-					const payload = convertCompositeLaunchFormDataToPayload(configureForm);
-					await UserService.configureCompositeMcpServer(consent.mcpServer.id, payload);
-					hasConfiguredComposite = true;
-				} else {
-					const payload = convertEnvHeadersToRecord(configureForm.envs, configureForm.headers);
-					if (configureForm.hostname && configureForm.url) {
-						payload.__url = configureForm.url.trim();
-					}
-					await UserService.configureSingleOrRemoteMcpServer(consent.mcpServer.id, payload);
+			} else if (consent.mcpServer?.id && !('componentConfigs' in configureForm)) {
+				const payload = convertEnvHeadersToRecord(configureForm.envs, configureForm.headers);
+				if (configureForm.hostname && configureForm.url) {
+					payload.__url = configureForm.url.trim();
 				}
+				await UserService.configureSingleOrRemoteMcpServer(consent.mcpServer.id, payload);
 			} else {
 				throw new Error('Missing MCP server configuration target');
 			}
@@ -263,12 +323,6 @@
 		} finally {
 			savingConfig = false;
 		}
-	}
-
-	function isCompositeForm(
-		form: LaunchFormData | CompositeLaunchFormData
-	): form is CompositeLaunchFormData {
-		return 'componentConfigs' in form;
 	}
 
 	function clientCredentialSourceLabelFor(source: OAuthConsent['clientCredentialSource']) {
@@ -305,13 +359,8 @@
 				<div class="notification-info flex items-center gap-3 p-3">
 					<SettingsIcon class="size-5 shrink-0" />
 					<p class="min-w-0 text-sm">
-						{#if isCompositeMCPServer && !hasConfiguredComposite}
-							Configure <b class="font-semibold">{consent.mcpServerName || 'this MCP server'}</b> to choose
-							which composite servers to use before continuing.
-						{:else}
-							<b class="font-semibold">{consent.mcpServerName || 'This MCP server'}</b> needs required
-							configuration before Obot can finish authorizing this connection.
-						{/if}
+						<b class="font-semibold">{consent.mcpServerName || 'This MCP server'}</b> needs required configuration
+						before Obot can finish authorizing this connection.
 					</p>
 				</div>
 
@@ -434,7 +483,13 @@
 				</button>
 			{:else}
 				<form method="POST" action={resolve(consent.continueURL as `/${string}`)}>
-					<button class="btn btn-primary w-full" type="submit">Continue</button>
+					<button
+						class="btn btn-primary w-full"
+						type="submit"
+						disabled={loadingConfig || savingConfig}
+					>
+						Continue
+					</button>
 				</form>
 			{/if}
 		</footer>
@@ -450,6 +505,7 @@
 	loading={savingConfig}
 	error={configError}
 	{deprecated}
+	showComponentToggle={false}
 	cancelText="Close"
 	submitText="Save"
 	configurationTitle="MCP Server Configuration"

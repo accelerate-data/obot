@@ -3,10 +3,12 @@
 	import Navbar from '$lib/components/Navbar.svelte';
 	import SensitiveInput from '$lib/components/SensitiveInput.svelte';
 	import BetaLogo from '$lib/components/navbar/BetaLogo.svelte';
+	import { SEEN_SPLASH_DIALOG_KEY } from '$lib/constants';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { reloadPage } from '$lib/navigation';
 	import { AdminService, UserService, type BootstrapStatus, type TempUser } from '$lib/services';
-	import { appPath, goto } from '$lib/url';
+	import { clearProductAnalyticsConsentDeferral } from '$lib/stores/productTelemetryConsent.svelte';
+	import { goto } from '$lib/url';
 	import { CircleAlert, Handshake, ShieldAlert } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { slide } from 'svelte/transition';
@@ -48,7 +50,7 @@
 		class="bg-base-200 default-scrollbar-thin dark:bg-base-100 relative flex h-svh w-full grow flex-col overflow-y-auto"
 	>
 		<Navbar class="dark:bg-gray-990 sticky top-0 left-0 z-30 w-full" unauthorized />
-		<div class="flex min-h-1 w-full grow items-center justify-center">
+		<div class="flex min-h-1 w-full grow items-center justify-center p-4 md:p-0">
 			{#await fetchBootstrapStatus}
 				<div class="size-10">
 					<Loading class="size-8" />
@@ -80,14 +82,10 @@
 
 				{#if showSuccessOwnerConfirmation}
 					<div class="my-6 flex w-full flex-col items-center justify-center gap-6">
-						<div class="flex items-center justify-center gap-2">
-							<Handshake class="size-6" />
-							<h3 class="text-xl font-semibold">Confirm Handoff</h3>
-						</div>
 						<p class="text-md px-4 text-left font-light">
 							You've established your first owner user, the bootstrap user currently being used will
-							be disabled. Upon completing this action, you'll be logged out and asked to log in
-							using your auth provider.
+							be disabled. Upon completing this action, you'll be logged out and asked to log into
+							Obot again.
 						</p>
 					</div>
 					<button
@@ -95,11 +93,12 @@
 						onclick={async () => {
 							await AdminService.bootstrapLogout();
 							// make sure to clear seenSplashDialog so splash will show for logged in owner if needed
-							localStorage.removeItem('seenSplashDialog');
-							window.location.href = appPath('/oauth2/sign_out?rd=/admin');
+							localStorage.removeItem(SEEN_SPLASH_DIALOG_KEY);
+							clearProductAnalyticsConsentDeferral();
+							window.location.href = '/oauth2/sign_out?rd=/admin';
 						}}
 					>
-						Confirm & Log Out
+						Log out
 					</button>
 				{:else}
 					<div class="my-6 flex w-full flex-col items-center justify-center gap-6 px-8">
@@ -109,7 +108,7 @@
 								<h3 class="text-xl font-semibold">Explicit Admin Already Set</h3>
 							{:else}
 								<Handshake class="size-6" />
-								<h3 class="text-xl font-semibold">Confirm Owner Addition</h3>
+								<h3 class="text-xl font-semibold">Confirm New Owner</h3>
 							{/if}
 						</div>
 
@@ -126,7 +125,7 @@
 								set this account as an owner instead. (See <a
 									class="text-link"
 									target="_blank"
-									rel="external"
+									rel="external noopener noreferrer"
 									href="https://docs.obot.ai/configuration/auth-providers#preconfiguring-owner--admin-users"
 									>Preconfiguring Owner & Admin Users</a
 								> for more information.)
@@ -159,7 +158,7 @@
 							onclick={async () => {
 								loadingCancelTempUser = true;
 								await AdminService.cancelTempLogin();
-								goto('/admin/auth-providers', { replaceState: true });
+								goto('/identity-access?view=auth-providers', { replaceState: true });
 							}}
 							disabled={loadingCancelTempUser || loadingConfirmTempUser}
 						>
@@ -205,6 +204,7 @@
 
 			<a
 				href={resolve('/oauth2/sign_out?rd=/admin')}
+				onclick={clearProductAnalyticsConsentDeferral}
 				class="bg-base-200 hover:bg-base-300 dark:bg-base-200 dark:hover:bg-base-300 flex w-full items-center justify-center gap-1.5 rounded-full p-2 px-8 text-lg font-semibold"
 			>
 				<p class="text-center text-sm font-medium">Sign Out</p>
@@ -227,11 +227,9 @@
 						class="btn btn-secondary w-full"
 						onclick={() => {
 							localStorage.setItem('preAuthRedirect', window.location.href);
-							window.location.href = appPath(
-								`/oauth2/start?rd=${encodeURIComponent(
-									'/admin'
-								)}&obot-auth-provider=${authProvider.namespace}/${authProvider.id}`
-							);
+							window.location.href = `/oauth2/start?rd=${encodeURIComponent(
+								'/admin'
+							)}&obot-auth-provider=${authProvider.namespace}/${authProvider.id}`;
 						}}
 					>
 						{#if authProvider.icon}
@@ -240,8 +238,8 @@
 								src={authProvider.icon}
 								alt={authProvider.name}
 							/>
+							<span class="text-center text-sm font-light">Continue with {authProvider.name}</span>
 						{/if}
-						<span class="text-center text-sm font-light">Continue with {authProvider.name}</span>
 					</button>
 				{/each}
 
@@ -259,9 +257,7 @@
 		{#if showBootstrapLogin && bootstrapStatus?.enabled && !loggedIn}
 			<div class="flex flex-col gap-4" in:slide class:mt-4={authProviders.length === 0}>
 				<h4 class="text-center text-lg font-semibold">Authenticate with Bootstrap Token</h4>
-				<p class="text-md font-light">
-					Enter the bootstrap token to continue setup or restore owner access.
-				</p>
+				<p class="text-md font-light">Enter the bootstrap token to continue setup.</p>
 
 				<div class="text-md flex flex-col gap-1">
 					<label for="bootstrap-token" class="font-semibold">Bootstrap Token</label>
@@ -273,7 +269,9 @@
 					'Bootstrap Token', or configure it directly through environment variables at startup.
 				</i>
 
-				<button class="btn btn-primary mt-4 text-sm" onclick={handleBootstrapLogin}> Login </button>
+				<button class="btn btn-primary mt-4 text-sm" onclick={handleBootstrapLogin}>
+					Login as Bootstrap Admin
+				</button>
 			</div>
 		{/if}
 	</form>

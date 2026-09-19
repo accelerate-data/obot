@@ -11,6 +11,12 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
+type staticAuthenticator struct {
+	response *authenticator.Response
+	ok       bool
+	err      error
+}
+
 func TestRoleUpliftAddsRequestTimeAdminWithoutOwner(t *testing.T) {
 	wrapped := NewRoleUplift(staticAuthenticator{
 		response: &authenticator.Response{
@@ -128,12 +134,6 @@ func TestRoleUpliftDoesNotPromoteNonAdminJWT(t *testing.T) {
 	assert.NotContains(t, resp.User.GetGroups(), types.GroupAdmin)
 	assert.NotContains(t, resp.User.GetGroups(), types.GroupOwner)
 	assert.Contains(t, resp.User.GetGroups(), types.GroupBasic)
-}
-
-type staticAuthenticator struct {
-	response *authenticator.Response
-	ok       bool
-	err      error
 }
 
 func (s staticAuthenticator) AuthenticateRequest(*http.Request) (*authenticator.Response, bool, error) {

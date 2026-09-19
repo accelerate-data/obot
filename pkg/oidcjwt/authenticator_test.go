@@ -31,7 +31,7 @@ func TestAuthenticator_ReturnsGenericOAuthProviderIdentity(t *testing.T) {
 		"preferred_username": "alice@example.com",
 		"name":               "Alice Example",
 	})
-	req, _ := http.NewRequest("GET", "/api/system-mcp-catalogs", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/api/system-mcp-catalogs", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
 	resp, ok, err := auth.AuthenticateRequest(req)
@@ -84,7 +84,7 @@ func TestAuthenticator_NonAdminRoleReturnsProviderIdentityOnly(t *testing.T) {
 		"eligible": true,
 		"roles":    []string{"user"},
 	})
-	req, _ := http.NewRequest("GET", "/api/mcp-servers", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/api/mcp-servers", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
 	resp, ok, err := auth.AuthenticateRequest(req)
@@ -107,7 +107,7 @@ func TestAuthenticator_FailsWhenIneligible(t *testing.T) {
 	tok := testutil.MintTestJWT(t, priv, "kid-X", issuer.URL, "obot-default", "user-3", 60*time.Second, map[string]any{
 		"eligible": false,
 	})
-	req, _ := http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
 	_, _, err = auth.AuthenticateRequest(req)
@@ -125,7 +125,7 @@ func TestAuthenticator_FailsWhenEligibilityMissing(t *testing.T) {
 	auth := NewAuthenticator(cfg, v)
 
 	tok := testutil.MintTestJWT(t, priv, "kid-X", issuer.URL, "obot-default", "user-3", 60*time.Second, nil)
-	req, _ := http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
 	_, _, err = auth.AuthenticateRequest(req)
@@ -135,7 +135,7 @@ func TestAuthenticator_FailsWhenEligibilityMissing(t *testing.T) {
 func TestAuthenticator_NoBearerFallsThrough(t *testing.T) {
 	cfg := Config{IssuerURL: "https://example.com", Audience: "obot-default"}
 	auth := NewAuthenticator(cfg, nil)
-	req, _ := http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	_, ok, err := auth.AuthenticateRequest(req)
 	assert.NoError(t, err)
 	assert.False(t, ok)
@@ -144,7 +144,7 @@ func TestAuthenticator_NoBearerFallsThrough(t *testing.T) {
 func TestAuthenticator_NonJWTBearerFallsThrough(t *testing.T) {
 	cfg := Config{IssuerURL: "https://example.com", Audience: "obot-default"}
 	auth := NewAuthenticator(cfg, &Verifier{})
-	req, _ := http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer bootstrap-token")
 
 	_, ok, err := auth.AuthenticateRequest(req)
@@ -163,7 +163,7 @@ func TestAuthenticator_DifferentIssuerFallsThrough(t *testing.T) {
 	auth := NewAuthenticator(cfg, v)
 
 	tok := testutil.MintTestJWT(t, priv, "kid-X", "https://other-issuer.example.com", "obot-default", "user-4", 60*time.Second, nil)
-	req, _ := http.NewRequest("GET", "/", nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 
 	_, ok, err := auth.AuthenticateRequest(req)

@@ -1,22 +1,8 @@
-import { handleRouteError } from '$lib/errors';
-import { AdminService, UserService } from '$lib/services';
-import { profile } from '$lib/stores';
 import type { PageLoad } from './$types';
+import { redirect } from '@sveltejs/kit';
 
-export const load: PageLoad = async ({ fetch }) => {
-	const allGroupsPromise = await UserService.listGroups({ fetch });
-
-	try {
-		return {
-			groups: await allGroupsPromise,
-			groupRoleAssignments: await AdminService.listGroupRoleAssignments({ fetch })
-		};
-	} catch (err) {
-		handleRouteError(err, `/admin/groups`, profile.current);
-
-		return {
-			groups: await Promise.resolve([]),
-			groupRoleAssignments: await Promise.resolve([])
-		};
-	}
+export const load: PageLoad = ({ url }) => {
+	const searchParams = new URLSearchParams(url.searchParams);
+	searchParams.delete('view');
+	throw redirect(301, `/identity-access?view=groups&${searchParams}`);
 };

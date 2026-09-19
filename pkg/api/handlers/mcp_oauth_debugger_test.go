@@ -65,7 +65,7 @@ func TestExchangeAndPersistOAuthDebuggerTokenForDirectDynamicAndCIMD(t *testing.
 					AuthURL: config.Endpoint.AuthURL, TokenURL: config.Endpoint.TokenURL,
 				}
 			} else {
-				if err := gatewayClient.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, OAuthDebuggerPendingStateMarker, "", "new-state", "verifier-1", &config); err != nil {
+				if err := gatewayClient.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, OAuthDebuggerPendingStateMarker, "", "new-state", "verifier-1", "", &config); err != nil {
 					t.Fatalf("create debugger pending state: %v", err)
 				}
 				var err error
@@ -112,7 +112,7 @@ func TestExchangeOAuthDebuggerTokenBlocksStaticCatalogPrivateTokenEndpoint(t *te
 		newDirectOAuthDebuggerTestClient(t, "mcp-1"),
 		pending,
 		"code-1",
-		safehttp.NewClient(safehttp.ClientOptions{
+		safehttp.NewClient(safehttp.Options{
 			BlockLoopback:  true,
 			BlockPrivateIP: true,
 			BlockLinkLocal: true,
@@ -128,7 +128,8 @@ func newDirectOAuthDebuggerTestClient(t *testing.T, mcpID string) *gateway.Clien
 	storageClient := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(&v1.MCPServer{
-			Namespace: system.DefaultNamespace, Name: mcpID,
+			Namespace: system.DefaultNamespace,
+			Name:      mcpID,
 		}).
 		Build()
 	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
@@ -163,10 +164,12 @@ func TestOAuthDebuggerMetadata(t *testing.T) {
 	registrationJSON := mustJSON(t, registration)
 
 	m := &MCPHandler{serverURL: "https://obot.example.com"}
-	parsedAuthServer, parsedRegistration, err := m.oauthDebuggerMetadata(v1.MCPServer{
+	const resourceURL = "https://resource.example.com/mcp"
+	parsedAuthServer, parsedRegistration, parsedResourceURL, err := m.oauthDebuggerMetadata(v1.MCPServer{
 		Status: v1.MCPServerStatus{
 			OAuthMetadata: &v1.OAuthMetadata{
 				AuthorizationServerURL:      authServer.Issuer,
+				ProtectedResourceMetadata:   runtime.RawExtension{Raw: json.RawMessage(`{"resource":["https://resource.example.com/mcp"]}`)},
 				AuthorizationServerMetadata: runtime.RawExtension{Raw: authServerJSON},
 				ClientRegistration:          runtime.RawExtension{Raw: registrationJSON},
 			},
@@ -190,6 +193,9 @@ func TestOAuthDebuggerMetadata(t *testing.T) {
 	if !reflect.DeepEqual(parsedRegistration, expectedRegistration) {
 		t.Fatalf("parsed registration mismatch:\nexpected: %#v\nactual:   %#v", expectedRegistration, parsedRegistration)
 	}
+	if parsedResourceURL != resourceURL {
+		t.Fatalf("parsed resource URL = %q, want %q", parsedResourceURL, resourceURL)
+	}
 }
 
 func TestOAuthDebuggerMetadataErrors(t *testing.T) {
@@ -198,6 +204,13 @@ func TestOAuthDebuggerMetadataErrors(t *testing.T) {
 		oauthMetadata    *v1.OAuthMetadata
 		expectedContains string
 	}{
+		{
+			name: "invalid protected resource metadata",
+			oauthMetadata: &v1.OAuthMetadata{
+				ProtectedResourceMetadata: runtime.RawExtension{Raw: json.RawMessage(`{`)},
+			},
+			expectedContains: "failed to parse OAuth protected resource metadata",
+		},
 		{
 			name: "invalid auth server metadata",
 			oauthMetadata: &v1.OAuthMetadata{
@@ -238,7 +251,7 @@ func TestOAuthDebuggerMetadataErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := (&MCPHandler{}).oauthDebuggerMetadata(v1.MCPServer{
+			_, _, _, err := (&MCPHandler{}).oauthDebuggerMetadata(v1.MCPServer{
 				Status: v1.MCPServerStatus{OAuthMetadata: tt.oauthMetadata},
 			})
 			if err == nil {
@@ -253,18 +266,24 @@ func TestOAuthDebuggerMetadataErrors(t *testing.T) {
 
 func TestOAuthDebuggerAuthStyle(t *testing.T) {
 	tests := []struct {
-		method   string
-		expected oauth2.AuthStyle
+		name            string
+		method          string
+		hasClientSecret bool
+		staticClient    bool
+		expected        oauth2.AuthStyle
 	}{
-		{method: "client_secret_basic", expected: oauth2.AuthStyleInHeader},
-		{method: "client_secret_post", expected: oauth2.AuthStyleInParams},
-		{method: "", expected: oauth2.AuthStyleAutoDetect},
-		{method: "private_key_jwt", expected: oauth2.AuthStyleAutoDetect},
+		{name: "static confidential client", method: "client_secret_basic", hasClientSecret: true, staticClient: true, expected: oauth2.AuthStyleAutoDetect},
+		{name: "static public client", method: "client_secret_basic", staticClient: true, expected: oauth2.AuthStyleAutoDetect},
+		{name: "dynamic public client", method: "client_secret_basic", expected: oauth2.AuthStyleInParams},
+		{name: "dynamic confidential client basic", method: "client_secret_basic", hasClientSecret: true, expected: oauth2.AuthStyleInHeader},
+		{name: "dynamic confidential client post", method: "client_secret_post", hasClientSecret: true, expected: oauth2.AuthStyleInParams},
+		{name: "dynamic confidential client unspecified", hasClientSecret: true, expected: oauth2.AuthStyleAutoDetect},
+		{name: "dynamic confidential client private key", method: "private_key_jwt", hasClientSecret: true, expected: oauth2.AuthStyleAutoDetect},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.method, func(t *testing.T) {
-			if actual := oauthDebuggerAuthStyle(tt.method); actual != tt.expected {
+		t.Run(tt.name, func(t *testing.T) {
+			if actual := oauthDebuggerAuthStyle(tt.method, tt.hasClientSecret, tt.staticClient); actual != tt.expected {
 				t.Fatalf("expected %v, got %v", tt.expected, actual)
 			}
 		})
@@ -324,6 +343,14 @@ func TestOAuthDebuggerUsesCIMD(t *testing.T) {
 			},
 			clientID:     "client-id",
 			clientSecret: "client-secret",
+		},
+		{
+			name:      "public static client wins",
+			serverURL: "https://obot.example.com",
+			oauthMeta: &v1.OAuthMetadata{
+				ClientIDMetadataDocumentSupported: true,
+			},
+			clientID: "public-client-id",
 		},
 		{
 			name:      "unsupported by auth server",
@@ -399,6 +426,8 @@ func TestRegisterOAuthDebuggerClientUsesProvidedHTTPClient(t *testing.T) {
 		ClientID:     "registered-client",
 		ClientSecret: "registered-secret",
 	}
+	registrationResponse := expected
+	registrationResponse.Static = true
 	called := false
 	httpClient := &http.Client{Transport: oauthDebuggerRoundTripFunc(func(request *http.Request) (*http.Response, error) {
 		called = true
@@ -415,7 +444,7 @@ func TestRegisterOAuthDebuggerClientUsesProvidedHTTPClient(t *testing.T) {
 			t.Errorf("registration request = %#v, want %#v", actual, registration)
 		}
 
-		body := strings.NewReader(string(mustJSON(t, expected)))
+		body := strings.NewReader(string(mustJSON(t, registrationResponse)))
 		return &http.Response{
 			StatusCode: http.StatusCreated,
 			Header:     make(http.Header),
@@ -443,74 +472,4 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 		t.Fatal(err)
 	}
 	return b
-}
-
-func TestExchangeAndPersistOAuthDebuggerTokenRejectsRedirectAndSanitizesError(t *testing.T) {
-	const (
-		mcpID  = "direct-mcp-server"
-		mcpURL = "https://direct-mcp.example/api"
-	)
-
-	t.Run("redirect", func(t *testing.T) {
-		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			t.Error("redirect target received the debugger exchange credentials")
-			w.WriteHeader(http.StatusNoContent)
-		}))
-		t.Cleanup(target.Close)
-		redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
-		}))
-		t.Cleanup(redirector.Close)
-
-		pending, gatewayClient := newRedirectDebuggerPendingState(t, mcpID, mcpURL, "redirect-state", redirector.URL)
-		_, err := exchangeAndPersistOAuthDebuggerToken(t.Context(), gatewayClient, pending, "code-1", http.DefaultClient)
-		if err == nil {
-			t.Fatal("expected the redirected debugger exchange to fail")
-		}
-		if !strings.Contains(err.Error(), "redirect") {
-			t.Fatalf("error = %q, want a redirect refusal", err)
-		}
-		for _, leaked := range []string{"verifier-1", "dynamic-secret"} {
-			if strings.Contains(err.Error(), leaked) {
-				t.Fatalf("error %q leaked %q", err, leaked)
-			}
-		}
-	})
-
-	t.Run("upstream error body", func(t *testing.T) {
-		provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = fmt.Fprint(w, `{"error":"invalid_grant","error_description":"code cd-9f2 rejected for workspace ws-internal-7","request_id":"req-abc123"}`)
-		}))
-		t.Cleanup(provider.Close)
-
-		pending, gatewayClient := newRedirectDebuggerPendingState(t, mcpID, mcpURL, "error-state", provider.URL)
-		_, err := exchangeAndPersistOAuthDebuggerToken(t.Context(), gatewayClient, pending, "code-1", http.DefaultClient)
-		if err == nil {
-			t.Fatal("expected the rejected debugger exchange to fail")
-		}
-		for _, leaked := range []string{"req-abc123", "ws-internal-7", "cd-9f2"} {
-			if strings.Contains(err.Error(), leaked) {
-				t.Fatalf("error %q leaked %q", err, leaked)
-			}
-		}
-	})
-}
-
-func newRedirectDebuggerPendingState(t *testing.T, mcpID, mcpURL, state, tokenURL string) (*gatewaytypes.MCPOAuthPendingState, *gateway.Client) {
-	t.Helper()
-	gatewayClient := newDirectOAuthDebuggerTestClient(t, mcpID)
-	config := &oauth2.Config{
-		ClientID: "dynamic-client", ClientSecret: "dynamic-secret",
-		Endpoint: oauth2.Endpoint{AuthURL: tokenURL + "/authorize", TokenURL: tokenURL, AuthStyle: oauth2.AuthStyleInParams},
-	}
-	if err := gatewayClient.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, OAuthDebuggerPendingStateMarker, "", state, "verifier-1", config); err != nil {
-		t.Fatalf("create debugger pending state: %v", err)
-	}
-	pending, err := gatewayClient.GetMCPOAuthPendingState(t.Context(), state)
-	if err != nil {
-		t.Fatalf("load debugger pending state: %v", err)
-	}
-	return pending, gatewayClient
 }

@@ -2,12 +2,14 @@ package cleanup
 
 import (
 	"fmt"
+	"log/slog"
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/pkg/api/handlers"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/vmcp"
 )
 
 type Credentials struct {
@@ -31,22 +33,8 @@ func (c *Credentials) RemoveMCPCredentials(req router.Request, _ router.Response
 		return err
 	}
 
-	// Cleanup the audit log token.
-	if _, err := c.gatewayClient.DeleteCredential(req.Ctx, mcpServer.Name, mcpServer.Name+"-audit-log-token"); err != nil {
-		return err
-	}
-
-	var credCtx string
-	if mcpServer.Spec.IsCatalogServer() {
-		credCtx = fmt.Sprintf("%s-%s", mcpServer.Spec.MCPCatalogID, mcpServer.Name)
-	} else if mcpServer.Spec.IsPowerUserWorkspaceServer() {
-		credCtx = fmt.Sprintf("%s-%s", mcpServer.Spec.PowerUserWorkspaceID, mcpServer.Name)
-	} else {
-		credCtx = fmt.Sprintf("%s-%s", mcpServer.Spec.UserID, mcpServer.Name)
-	}
-
 	creds, err := c.gatewayClient.ListCredentials(req.Ctx, gateway.ListCredentialsOptions{
-		CredentialContexts: []string{credCtx},
+		CredentialContexts: []string{mcpServer.CredentialContext(mcpServer.Spec.UserID)},
 	})
 	if err != nil {
 		return err
@@ -86,4 +74,46 @@ func (c *Credentials) RemoveMCPInstanceCredentials(req router.Request, _ router.
 	}
 
 	return nil
+}
+
+func (c *Credentials) RemoveVMCPStaticConfigurationCredentials(req router.Request, _ router.Response) error {
+	_, err := c.gatewayClient.DeleteCredential(req.Ctx, vmcp.StaticConfigurationCredentialContext(req.Name), vmcp.ConfigurationCredentialName())
+	return err
+}
+
+func (c *Credentials) RemoveVMCPInstanceConfigurationCredentials(req router.Request, _ router.Response) error {
+	_, err := c.gatewayClient.DeleteCredential(req.Ctx, vmcp.InstanceConfigurationCredentialContext(req.Name), vmcp.ConfigurationCredentialName())
+	return err
+}
+
+// RemoveAuditLogCred removes the credential an older Obot stored per server for token exchange
+// and external audit log submitting. Nothing creates it any more, so a server is swept once and
+// the annotation records that it has been.
+func (c *Credentials) RemoveAuditLogCred(req router.Request, _ router.Response) error {
+	if _, swept := req.Object.GetAnnotations()[v1.AuditLogCredentialRemovedAnnotation]; swept {
+		return nil
+	}
+
+	credentialName := req.Name
+	if _, ok := req.Object.(*v1.SystemMCPServer); ok {
+		credentialName += "-secret-info"
+	}
+
+	deleted, err := c.gatewayClient.DeleteCredential(req.Ctx, req.Name, credentialName)
+	if err != nil {
+		return err
+	}
+	if deleted {
+		slog.Info("Removed legacy token exchange and audit log credential", "server", req.Name)
+	}
+
+	// Recorded only after the delete succeeds, so a failure retries.
+	annotations := req.Object.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string, 1)
+	}
+	annotations[v1.AuditLogCredentialRemovedAnnotation] = "true"
+	req.Object.SetAnnotations(annotations)
+
+	return req.Client.Update(req.Ctx, req.Object)
 }

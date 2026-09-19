@@ -3,6 +3,7 @@
 	import Loading from '$lib/icons/Loading.svelte';
 	import type { MCPAllowedSecretBindingTarget, MCPTunnel } from '$lib/services';
 	import type {
+		LegacyRemoteCatalogConfigAdmin,
 		RemoteCatalogConfigAdmin,
 		RemoteRuntimeConfigAdmin
 	} from '$lib/services/admin/types';
@@ -12,6 +13,8 @@
 	import Select from '../Select.svelte';
 	import Toggle from '../Toggle.svelte';
 	import IconButton from '../primitives/IconButton.svelte';
+	import Label from './CatalogFormLabel.svelte';
+	import CustomConfigurationOptions from './CustomConfigurationOptions.svelte';
 	import SecretBindingPicker from './SecretBindingPicker.svelte';
 	import { Plus, Trash2, Info, Settings } from '@lucide/svelte';
 	import { untrack, type Snippet } from 'svelte';
@@ -19,10 +22,11 @@
 	import { twMerge } from 'tailwind-merge';
 
 	interface Props {
-		config: RemoteCatalogConfigAdmin | RemoteRuntimeConfigAdmin;
+		config: LegacyRemoteCatalogConfigAdmin | RemoteRuntimeConfigAdmin;
 		variant?: 'catalog' | 'server';
 		readonly?: boolean;
 		showRequired?: Record<string, boolean>;
+		showInvalid?: Record<string, boolean>;
 		onFieldChange?: (field: string) => void;
 		isNewEntry?: boolean;
 		onConfigureOAuth?: () => void;
@@ -32,6 +36,7 @@
 		secretBindingTargets?: MCPAllowedSecretBindingTarget[];
 		tunnels?: MCPTunnel[];
 		tunnelsLoading?: boolean;
+		hideHeaders?: boolean;
 		children?: Snippet;
 		afterHeaders?: Snippet;
 	}
@@ -40,6 +45,7 @@
 		variant = 'catalog',
 		readonly,
 		showRequired,
+		showInvalid,
 		onFieldChange,
 		isNewEntry,
 		onConfigureOAuth,
@@ -49,6 +55,7 @@
 		secretBindingTargets,
 		tunnels,
 		tunnelsLoading = false,
+		hideHeaders = false,
 		children,
 		afterHeaders
 	}: Props = $props();
@@ -119,16 +126,19 @@
 			</p>
 			{#if config.headers}
 				{#each config.headers as header, i (i)}
+					{@const missingKey = showRequired?.headers && !header.key.trim()}
 					{#if secretBindingTargets !== undefined || !hasSecretBinding(header)}
 						<div
 							class="dark:border-base-400 bg-base-300 flex w-full items-center gap-4 rounded-lg border border-transparent p-4"
 						>
 							<div class="flex w-full flex-col gap-4">
 								<div class="flex w-full flex-col gap-1">
-									<label for={`header-key-${i}`} class="text-sm font-light">Key</label>
+									<Label title="Key" forInput={`header-key-${i}`} required showError={missingKey} />
 									<input
 										id={`header-key-${i}`}
 										class="text-input-filled bg-base-100 w-full shadow-none"
+										class:error={missingKey}
+										aria-invalid={missingKey}
 										bind:value={config.headers[i].key}
 										placeholder="e.g. CUSTOM_HEADER_KEY"
 										disabled={readonly}
@@ -144,9 +154,14 @@
 											}}
 											options={[
 												{ label: 'Static', id: 'static' },
-												{ label: 'User-Supplied', id: 'user_supplied' }
+												{ label: 'User-Supplied', id: 'user_supplied' },
+												{ label: 'Options', id: 'options' }
 											]}
-											selected={config.headers[i].required ? 'user_supplied' : 'static'}
+											selected={config.headers[i].options
+												? 'options'
+												: config.headers[i].required
+													? 'user_supplied'
+													: 'static'}
 											onSelect={(option) => {
 												if (!config.headers?.[i]) return;
 												if (option.id === 'user_supplied') {
@@ -158,11 +173,28 @@
 													config.headers[i].sensitive = false;
 												}
 												config.headers[i].value = '';
+
+												if (option.id === 'options') {
+													if (!config.headers[i].options) {
+														config.headers[i].options = [{ name: '', value: '', description: '' }];
+													}
+												} else {
+													config.headers[i].options = undefined;
+												}
 											}}
 											id={`header-value-type-${i}`}
 										/>
 									{/if}
 								</div>
+								{#if config.headers[i].options}
+									<CustomConfigurationOptions
+										bind:data={config.headers[i]}
+										id={`header-options-${i}`}
+										{readonly}
+										showRequired={showRequired?.headers}
+										showInvalid={showInvalid?.headers}
+									/>
+								{/if}
 								{#if config.headers[i].required}
 									<div class="flex w-full flex-col gap-1">
 										<label for={`header-name-${i}`} class="text-sm font-light">Name</label>
@@ -314,7 +346,9 @@
 
 		{@render children?.()}
 	</div>
-	{@render remoteHeaders(false)}
+	{#if !hideHeaders}
+		{@render remoteHeaders(false)}
+	{/if}
 	{@render afterHeaders?.()}
 {:else if !showAdvanced}
 	{@const remoteConfig = config as RemoteCatalogConfigAdmin}
@@ -527,7 +561,9 @@
 			{@render children?.()}
 		</div>
 	</div>
-	{@render remoteHeaders(selectedType === 'urlTemplate')}
+	{#if !hideHeaders}
+		{@render remoteHeaders(selectedType === 'urlTemplate')}
+	{/if}
 	{@render afterHeaders?.()}
 	<!-- Static OAuth Configuration -->
 	{#if config && !disableStaticOAuth}

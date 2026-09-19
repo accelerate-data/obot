@@ -1,7 +1,19 @@
+import {
+	COMMUNITY_ENTITLEMENT,
+	COMMUNITY_SIGNUP_BANNER_COPY,
+	ENTERPRISE_ENTITLEMENT
+} from '$lib/constants';
 import { Group } from '$lib/services';
+import type { License } from '$lib/services/admin/types';
 import type { Profile, Version } from '$lib/services/user/types';
-import { defaultModelAliases, profile, version } from '$lib/stores';
-import { getProfileResponse, getVersionResponse } from '../../tests/mocks/data';
+import {
+	defaultModelAliases,
+	license as licenseStore,
+	profile,
+	userDeviceSettings,
+	version
+} from '$lib/stores';
+import { getLicenseResponse, getProfileResponse, getVersionResponse } from '../../tests/mocks/data';
 import Layout from './Layout.svelte';
 import { createRawSnippet, tick } from 'svelte';
 import { describe, expect, it } from 'vitest';
@@ -10,48 +22,9 @@ import { page } from 'vitest/browser';
 
 const children = createRawSnippet(() => ({ render: () => '<div></div>' }));
 
-const adminSections = [
-	{ id: 'mcp-server-management', href: '/admin/mcp-catalog' },
-	{ id: 'skills-management', href: '/admin/skills' },
-	{ id: 'device-management', href: '/admin/devices' },
-	{ id: 'user-management', href: '/admin/users' },
-	{ id: 'llm-gateway', href: '/admin/token-usage' },
-	{ id: 'app-management', href: '/admin/license' }
-];
+const sharedLinks = ['/vmcps', '/skills', '/models', '/audit-logs', '/usage', '/identity-access'];
 
-const adminSectionLabels = [
-	'MCP Management',
-	'Skills Management',
-	'Device Management',
-	'Auth Management',
-	'LLM Gateway',
-	'App Management'
-];
-
-const adminSharedLinks = [
-	'/admin/mcp-catalog',
-	'/admin/mcp-access-policies',
-	'/admin/mcp-deployments',
-	'/admin/audit-logs',
-	'/admin/usage',
-	'/admin/filters',
-	'/admin/skills',
-	'/admin/skill-access-policies',
-	'/admin/devices',
-	'/admin/enforcement-decisions',
-	'/admin/users',
-	'/admin/groups',
-	'/admin/user-roles',
-	'/admin/auth-providers',
-	'/admin/agent-auth-scopes',
-	'/admin/token-usage',
-	'/admin/llm-audit-logs',
-	'/admin/model-providers',
-	'/admin/model-access-policies',
-	'/admin/license',
-	'/admin/branding',
-	'/admin/app-notification'
-];
+const adminOnlyLinks = ['/admin/enforcement-events', '/admin/platform'];
 
 function createProfile(groups: string[]): Profile {
 	return {
@@ -67,13 +40,26 @@ function createProfile(groups: string[]): Profile {
 	};
 }
 
-async function renderLayout(groups: string[] = [], versionOverrides: Partial<Version> = {}) {
-	profile.initialize(createProfile(groups));
+async function renderLayout(
+	groups: string[] = [],
+	versionOverrides: Partial<Version> = {},
+	licenseOverrides: Partial<License> = {},
+	profileOverrides: Partial<Profile> = {}
+) {
+	userDeviceSettings.setShowAllGuides(false);
+	profile.initialize({
+		...createProfile(groups),
+		...profileOverrides
+	});
 	version.initialize({
 		...getVersionResponse,
 		agentsEnabled: false,
 		engine: 'docker',
 		...versionOverrides
+	});
+	licenseStore.initialize({
+		...getLicenseResponse,
+		...licenseOverrides
 	});
 	await defaultModelAliases.initialize([]);
 
@@ -92,126 +78,230 @@ async function clickButton(id: string) {
 	await tick();
 }
 
-async function openAdvancedPane(label: 'Administration' | 'Advanced Settings') {
-	const button = page.getByRole('button', { name: label, exact: true });
-	await expect.element(button).toBeVisible();
-	await clickButton('advanced-pane-btn');
-}
-
 async function expandSection(id: string, expectedHref: string) {
-	const link = page.getByCSS(`a[href="${expectedHref}"]`);
+	const link = page.getByCSS(`a.sidebar-link[href="${expectedHref}"]`);
 	if ((await link.elements()).length === 0) {
 		await clickButton(`sidebar-collapse-${id}`);
 	}
 }
 
 async function expectLink(href: string) {
-	await expect.element(page.getByCSS(`a[href="${href}"]`)).toBeInTheDocument();
+	await expect.element(page.getByCSS(`a.sidebar-link[href="${href}"]`)).toBeInTheDocument();
 }
 
-async function expectAdminSections() {
-	for (const label of adminSectionLabels) {
-		await expect.element(page.getByText(label, { exact: true })).toBeVisible();
-	}
+async function expectNoLink(href: string) {
+	await expect.element(page.getByCSS(`a.sidebar-link[href="${href}"]`)).not.toBeInTheDocument();
+}
 
-	for (const { id, href } of adminSections) {
-		await expandSection(id, href);
-	}
+async function expectSharedNavigation() {
+	await expandSection('ai-resources', '/vmcps');
+	await expandSection('operations', '/audit-logs');
 
-	for (const href of adminSharedLinks) {
+	for (const href of sharedLinks) {
 		await expectLink(href);
 	}
 }
 
-describe('Layout.svelte', () => {
-	it('gives all users access to non-administrative sidebar navigation', async () => {
-		await renderLayout();
+async function expectAdminOnlyNavigation() {
+	await expandSection('operations', '/admin/enforcement-events');
 
-		for (const name of ['MCP Servers', 'Skills', 'Agent Auth Scopes']) {
-			await expect.element(page.getByRole('link', { name, exact: true })).toBeVisible();
-		}
+	for (const href of adminOnlyLinks) {
+		await expectLink(href);
+	}
+}
+
+async function expectNoAdminOnlyNavigation() {
+	for (const href of adminOnlyLinks) {
+		await expectNoLink(href);
+	}
+}
+
+describe('Layout.svelte', () => {
+	it('gives all users access to shared sidebar navigation', async () => {
+		await renderLayout();
+		await expectSharedNavigation();
+		await expectNoLink('/dashboard');
+		await expectNoAdminOnlyNavigation();
+	});
+
+	describe('when Hosted Agents are disabled', () => {
+		it('hides Hosted Agents navigation', async () => {
+			await renderLayout([Group.ADMIN], { hostedAgentsEnabled: false });
+
+			await expectNoLink('/hosted-agents');
+		});
+	});
+
+	describe('when Hosted Agents are enabled', () => {
+		it('shows Hosted Agents navigation', async () => {
+			await renderLayout([Group.ADMIN], { hostedAgentsEnabled: true });
+			await expectLink('/hosted-agents');
+		});
 	});
 
 	describe('based on user role', () => {
 		describe('when the user is an administrator', () => {
-			it('shows administration sections and their navigation items', async () => {
+			it('shows administrator-only navigation', async () => {
 				await renderLayout([Group.ADMIN]);
-				await openAdvancedPane('Administration');
-				await expectAdminSections();
-				await expectLink('/admin/mcp-tunnels');
-			});
-
-			describe('when agents are enabled', () => {
-				it('shows Obot Agent Management', async () => {
-					await renderLayout([Group.ADMIN], { agentsEnabled: true });
-					await openAdvancedPane('Administration');
-
-					await expect
-						.element(page.getByText('Obot Agent Management', { exact: true }))
-						.toBeVisible();
-				});
-			});
-
-			describe('when the Kubernetes engine is enabled', () => {
-				it('shows server scheduling and image pull secrets navigation', async () => {
-					await renderLayout([Group.ADMIN], { engine: 'kubernetes', hideK8sDetails: false });
-					await openAdvancedPane('Administration');
-					await expandSection('mcp-server-management', '/admin/mcp-catalog');
-
-					await expectLink('/admin/server-scheduling');
-					await expectLink('/admin/image-pull-secrets');
-				});
+				await expectSharedNavigation();
+				await expectLink('/dashboard');
+				await expectAdminOnlyNavigation();
+				await expectNoLink('/admin/product-analytics');
 			});
 		});
 
 		describe('when the user is a power user', () => {
-			it('shows only the power-user MCP Management navigation', async () => {
+			it('does not show administrator-only navigation', async () => {
 				await renderLayout([Group.POWERUSER]);
-				await openAdvancedPane('Advanced Settings');
-				await expect.element(page.getByText('MCP Management', { exact: true })).toBeVisible();
-				await expandSection('mcp-server-management', '/mcp-catalog');
-
-				for (const href of ['/mcp-catalog', '/audit-logs', '/usage']) {
-					await expectLink(href);
-				}
-				await expect
-					.element(page.getByCSS('a[href="/mcp-access-policies"]'))
-					.not.toBeInTheDocument();
+				await expectSharedNavigation();
+				await expectLink('/dashboard');
+				await expectLink('/mcp-servers');
+				await expectNoAdminOnlyNavigation();
 			});
 		});
 
 		describe('when the user is a power user plus', () => {
-			it('includes MCP access policies in MCP Management navigation', async () => {
+			it('does not show administrator-only navigation', async () => {
 				await renderLayout([Group.POWERUSER, Group.POWERUSER_PLUS]);
-				await openAdvancedPane('Advanced Settings');
-				await expect.element(page.getByText('MCP Management', { exact: true })).toBeVisible();
-				await expandSection('mcp-server-management', '/mcp-catalog');
-
-				for (const href of ['/mcp-catalog', '/mcp-access-policies', '/audit-logs', '/usage']) {
-					await expectLink(href);
-				}
+				await expectSharedNavigation();
+				await expectLink('/dashboard');
+				await expectLink('/mcp-servers');
+				await expectNoAdminOnlyNavigation();
 			});
 		});
 
 		describe('when the user is a basic user', () => {
-			it('does not show administration or advanced settings', async () => {
+			it('hides MCP Servers and does not show administrator-only navigation', async () => {
 				await renderLayout([Group.USER]);
-
-				await expect
-					.element(page.getByRole('button', { name: 'Administration', exact: true }))
-					.not.toBeInTheDocument();
-				await expect
-					.element(page.getByRole('button', { name: 'Advanced Settings', exact: true }))
-					.not.toBeInTheDocument();
+				await expectSharedNavigation();
+				await expectNoLink('/dashboard');
+				await expectNoLink('/mcp-servers');
+				await expectNoAdminOnlyNavigation();
 			});
 		});
 
 		describe('when the user is a basic user and auditor', () => {
 			it('shows the administrator navigation available to auditors', async () => {
 				await renderLayout([Group.USER, Group.AUDITOR]);
-				await openAdvancedPane('Administration');
-				await expectAdminSections();
+				await expectSharedNavigation();
+				await expectLink('/dashboard');
+				await expectAdminOnlyNavigation();
+				await expectNoLink('/admin/product-analytics');
 			});
+		});
+	});
+
+	describe('community signup banner', () => {
+		const copy = COMMUNITY_SIGNUP_BANNER_COPY;
+
+		it('shows for administrators without a community or enterprise license', async () => {
+			await renderLayout([Group.ADMIN]);
+
+			await expect.element(page.getByText(copy, { exact: true })).toBeVisible();
+			const register = page.getByRole('link', { name: 'Register', exact: true });
+			await expect.element(register).toBeVisible();
+			await expect.element(register).toHaveAttribute('href', '/admin/platform?view=license');
+		});
+
+		it('does not show for basic users', async () => {
+			await renderLayout([Group.USER]);
+
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('does not show for auditors', async () => {
+			await renderLayout([Group.USER, Group.AUDITOR]);
+
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('does not show license actions for auditors with violations', async () => {
+			await renderLayout([Group.USER, Group.AUDITOR], {
+				licenseEntitlementViolations: [
+					{
+						type: 'userLimit',
+						namespace: 'default',
+						name: 'users',
+						requiredEntitlements: [ENTERPRISE_ENTITLEMENT],
+						missingEntitlements: [ENTERPRISE_ENTITLEMENT]
+					}
+				]
+			});
+
+			await expect
+				.element(page.getByRole('button', { name: 'Resolve', exact: true }))
+				.not.toBeInTheDocument();
+			await expect.element(page.getByText(/Upgrade to Obot Enterprise/)).not.toBeInTheDocument();
+		});
+
+		it('does not show when a community license is present', async () => {
+			await renderLayout(
+				[Group.ADMIN],
+				{},
+				{
+					licenseKey: 'community-license-key',
+					enterprise: true,
+					entitlements: [COMMUNITY_ENTITLEMENT]
+				}
+			);
+
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('does not show when an enterprise license is present', async () => {
+			await renderLayout(
+				[Group.ADMIN],
+				{ enterprise: true },
+				{
+					licenseKey: 'enterprise-license-key',
+					enterprise: true,
+					entitlements: [ENTERPRISE_ENTITLEMENT]
+				}
+			);
+
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('can be dismissed for this device', async () => {
+			await renderLayout([Group.ADMIN]);
+
+			const dismiss = page.getByRole('button', {
+				name: 'Dismiss community signup banner',
+				exact: true
+			});
+			await expect.element(dismiss).toBeVisible();
+			// Native DOM click: Playwright actionability fails on driver.js overlays.
+			const el = await dismiss.element();
+			if (!(el instanceof HTMLElement)) {
+				throw new Error('Expected dismiss control to be an HTMLElement');
+			}
+			el.click();
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+
+			await renderLayout([Group.ADMIN]);
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('stays dismissed when dismissed after the profile was created', async () => {
+			localStorage.setItem(
+				'@obot/dismiss-community-signup-banner',
+				JSON.stringify({ dismissedAt: '2026-08-10T00:00:00.000Z' })
+			);
+
+			await renderLayout([Group.ADMIN], {}, {}, { created: '2026-08-04T16:58:40.000Z' });
+
+			await expect.element(page.getByText(copy, { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('shows again when the profile was created after the banner was dismissed', async () => {
+			localStorage.setItem(
+				'@obot/dismiss-community-signup-banner',
+				JSON.stringify({ dismissedAt: '2020-01-01T00:00:00.000Z' })
+			);
+
+			await renderLayout([Group.ADMIN], {}, {}, { created: '2026-08-04T16:58:40.000Z' });
+
+			await expect.element(page.getByText(copy, { exact: true })).toBeVisible();
 		});
 	});
 });

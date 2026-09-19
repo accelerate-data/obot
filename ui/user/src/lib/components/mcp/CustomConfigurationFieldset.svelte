@@ -1,14 +1,15 @@
 <script lang="ts">
-	import type { MCPAllowedSecretBindingTarget, MCPSubField } from '$lib/services';
+	import type { MCPAllowedSecretBindingTarget, MCPConfig, MCPSubField } from '$lib/services';
 	import { version } from '$lib/stores';
 	import Select from '../Select.svelte';
 	import Toggle from '../Toggle.svelte';
+	import Label from './CatalogFormLabel.svelte';
+	import CustomConfigurationOptions from './CustomConfigurationOptions.svelte';
 	import SecretBindingPicker from './SecretBindingPicker.svelte';
 	import { untrack } from 'svelte';
-	import { twMerge } from 'tailwind-merge';
 
 	interface Props {
-		data: MCPSubField & { secretBindingSource?: string };
+		data: (MCPSubField | MCPConfig) & { secretBindingSource?: string };
 		id: string;
 		serverUserType?: 'singleUser' | 'multiUser';
 		readonly?: boolean;
@@ -16,8 +17,10 @@
 		secretBindingTargets?: MCPAllowedSecretBindingTarget[];
 		classes?: {
 			input?: string;
+			optionInput?: string;
 		};
 		showRequired?: boolean;
+		showInvalid?: boolean;
 		urlTemplateVariable?: boolean;
 	}
 
@@ -30,6 +33,7 @@
 		secretBindingTargets,
 		classes,
 		showRequired,
+		showInvalid,
 		urlTemplateVariable = false
 	}: Props = $props();
 
@@ -40,10 +44,16 @@
 		return Boolean(field.secretBinding) || field.secretBindingSource === 'secret';
 	}
 
+	function isFileConfiguration(field: MCPSubField | MCPConfig) {
+		return 'usage' in field
+			? field.usage === 'file' || field.usage === 'dynamicFile'
+			: Boolean(field.file);
+	}
+
 	let selectedType = $state(
 		untrack(() =>
-			urlTemplateVariable
-				? 'user_supplied'
+			data.options && data.options.length > 0
+				? 'options'
 				: (data.value?.length ?? 0) > 0 || usesSecretBindingSource(data)
 					? 'static'
 					: 'user_supplied'
@@ -52,7 +62,15 @@
 
 	let missingKey = $derived(showRequired && !data.key.trim());
 	let missingName = $derived(showRequired && !data.name.trim());
-	let missingValue = $derived(showRequired && !data.value?.trim());
+	let missingValue = $derived(
+		showRequired && !data.value?.trim() && (data.options ?? []).length === 0
+	);
+	let displayedSecretBindingTargets = $derived.by(() => {
+		if (secretBindingTargets) return secretBindingTargets;
+		if (!readonly || !data.secretBinding) return undefined;
+
+		return [{ name: data.secretBinding.name, keys: [data.secretBinding.key] }];
+	});
 
 	$effect(() => {
 		if (urlTemplateVariable) {
@@ -60,7 +78,11 @@
 			data.secretBindingSource = 'value';
 			data.required = true;
 			data.sensitive = false;
-			data.file = false;
+			if ('usage' in data) {
+				data.usage = 'interpolated';
+			} else {
+				data.file = false;
+			}
 		} else if (data && usesSecretBindingSource(data)) {
 			data.sensitive = true;
 		}
@@ -75,7 +97,20 @@
 
 	{@render keyInput()}
 	{@render nameAndDescriptionInputs()}
+
+	<CustomConfigurationOptions
+		bind:data
+		{id}
+		{readonly}
+		{isPrebuiltEntry}
+		{showRequired}
+		{showInvalid}
+		{classes}
+		showTitle
+	/>
+
 	{#if !urlTemplateVariable}
+		<div class="divider my-0"></div>
 		<div class="flex gap-8">
 			<label class="flex items-center gap-2">
 				<input
@@ -108,15 +143,16 @@
 
 	{#if !urlTemplateVariable}
 		<div class="flex w-full flex-col gap-1" id={`${id}-value-type-container`}>
-			{@render label('Value', `env-value-type-${id}`)}
+			<Label title="Value" forInput={`env-value-type-${id}`} required />
 			<Select
 				class="bg-base-100 dark:border-base-400 border border-transparent shadow-none"
 				classes={{
 					root: 'flex grow'
 				}}
 				options={[
+					{ label: 'User-Supplied', id: 'user_supplied' },
 					{ label: 'Static', id: 'static' },
-					{ label: 'User-Supplied', id: 'user_supplied' }
+					{ label: 'Options', id: 'options' }
 				]}
 				selected={selectedType}
 				onSelect={(option) => {
@@ -130,9 +166,15 @@
 					data.description = '';
 					data.sensitive = false;
 
-					if (option.id === 'user_supplied') {
+					if (option.id === 'user_supplied' || option.id === 'options') {
 						data.secretBinding = undefined;
 						data.secretBindingSource = 'value';
+					}
+
+					if (option.id === 'options') {
+						data.options = [{ name: '', value: '', description: '' }];
+					} else {
+						data.options = undefined;
 					}
 				}}
 				readonly={readonly || isPrebuiltEntry}
@@ -145,10 +187,10 @@
 		{@render nameAndDescriptionInputs()}
 	{/if}
 	{#if selectedType === 'static'}
-		{#if secretBindingTargets && !version.current.hideK8sDetails}
+		{#if displayedSecretBindingTargets && !version.current.hideK8sDetails}
 			<SecretBindingPicker
 				bind:field={data}
-				targets={secretBindingTargets}
+				targets={displayedSecretBindingTargets}
 				{readonly}
 				{showRequired}
 			/>
@@ -156,7 +198,7 @@
 		{#if !usesSecretBindingSource(data)}
 			<div class="flex w-full flex-col gap-1">
 				<label for={`env-value-${id}`} class="sr-only">Static Value</label>
-				{#if data.file}
+				{#if isFileConfiguration(data)}
 					<textarea
 						id={`env-value-${id}`}
 						class="text-input-filled bg-base-100 min-h-24 w-full resize-y shadow-none"
@@ -174,7 +216,7 @@
 						class:error={missingValue}
 						bind:value={data.value}
 						placeholder="e.g. 123abcdef456"
-						disabled={readonly}
+						disabled={readonly || (data.options ?? []).length > 0}
 						type={data.sensitive ? 'password' : 'text'}
 						aria-required={!readonly ? 'true' : undefined}
 						aria-invalid={missingValue}
@@ -182,8 +224,19 @@
 				{/if}
 			</div>
 		{/if}
+	{:else if selectedType === 'options'}
+		<CustomConfigurationOptions
+			bind:data
+			{id}
+			{readonly}
+			{isPrebuiltEntry}
+			{showRequired}
+			{showInvalid}
+			{classes}
+		/>
 	{/if}
 	{#if !urlTemplateVariable}
+		<div class="divider my-0"></div>
 		<div class="flex w-full">
 			{#if !usesSecretBindingSource(data)}
 				<Toggle
@@ -220,19 +273,9 @@
 	{/if}
 {/if}
 
-{#snippet label(title: string, forInput: string, required?: boolean, showError?: boolean)}
-	<label for={forInput} class={twMerge('text-sm font-light', showError && 'text-error')}>
-		{title}
-		{#if !readonly && required}
-			<span class={showError ? 'text-error' : ''} aria-hidden="true">*</span>
-			<span class="sr-only">(required)</span>
-		{/if}
-	</label>
-{/snippet}
-
 {#snippet keyInput()}
 	<div class="flex w-full flex-col gap-1" id={`${id}-key-container`}>
-		{@render label('Key', `env-key-${id}`, true, missingKey)}
+		<Label title="Key" forInput={`env-key-${id}`} required showError={missingKey} />
 		<input
 			id={`env-key-${id}`}
 			class={classes?.input}
@@ -248,7 +291,7 @@
 
 {#snippet nameAndDescriptionInputs()}
 	<div class="flex w-full flex-col gap-1" id={`${id}-name-container`}>
-		{@render label('Name', `env-name-${id}`, true, missingName)}
+		<Label title="Name" forInput={`env-name-${id}`} required showError={missingName} />
 		<input
 			id={`env-name-${id}`}
 			class={classes?.input}
@@ -260,7 +303,7 @@
 		/>
 	</div>
 	<div class="flex w-full flex-col gap-1" id={`${id}-description-container`}>
-		{@render label('Description', `env-description-${id}`, false)}
+		<Label title="Description" forInput={`env-description-${id}`} />
 		<input
 			id={`env-description-${id}`}
 			class={classes?.input}

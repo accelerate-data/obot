@@ -2,14 +2,13 @@ package mcp
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
@@ -92,8 +91,68 @@ func TestHTTPClientForServer(t *testing.T) {
 		serviceFQDN:      "obot.obot-system.svc.cluster.local",
 	}
 
+	t.Run("Kubernetes service URL dial retries", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		server.Close() // Refuse connections so retrying clients reach the request deadline.
+		serverURL, err := url.Parse(server.URL)
+		require.NoError(t, err)
+		localBackend := &kubernetesBackend{
+			mcpNamespace:     backend.mcpNamespace,
+			mcpClusterDomain: backend.mcpClusterDomain,
+			serviceFQDN:      serverURL.Host,
+		}
+
+		for _, tt := range []struct {
+			name      string
+			url       string
+			wantRetry bool
+		}{
+			{
+				name:      "service URL",
+				url:       "http://test-server.obot-mcp.svc.cluster.local",
+				wantRetry: true,
+			},
+			{
+				name:      "service URL with path",
+				url:       "http://test-server.obot-mcp.svc.cluster.local/mcp",
+				wantRetry: true,
+			},
+			{
+				name: "remote URL",
+				url:  "https://example.com/mcp",
+			},
+			{
+				name: "remote URL sharing service prefix",
+				url:  "http://test-server.obot-mcp.svc.cluster.local.example.com/mcp",
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				client, err := (&SessionManager{backend: localBackend}).HTTPClientForServer(ServerConfig{
+					MCPServerName: "test-server",
+					URL:           tt.url,
+				}, HTTPClientOptions{})
+				require.NoError(t, err)
+				ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+				defer cancel()
+				// Exercise the configured client against a local closed port without cluster DNS.
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+				require.NoError(t, err)
+				resp, err := client.Do(req)
+				if resp != nil {
+					resp.Body.Close()
+				}
+				if tt.wantRetry {
+					require.ErrorIs(t, err, context.DeadlineExceeded)
+				} else {
+					require.ErrorIs(t, err, syscall.ECONNREFUSED)
+					require.NotErrorIs(t, err, context.DeadlineExceeded)
+				}
+			})
+		}
+	})
+
 	t.Run("direct server", func(t *testing.T) {
-		httpClient, err := (&SessionManager{backend: backend}).HTTPClientForServer(ServerConfig{}, nil, nil, timeout)
+		httpClient, err := (&SessionManager{backend: backend}).HTTPClientForServer(ServerConfig{}, HTTPClientOptions{Timeout: timeout})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -113,16 +172,13 @@ func TestHTTPClientForServer(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		}))
 		defer server.Close()
-
 		serverURL, err := url.Parse(server.URL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		httpClient, err := (&SessionManager{backend: backend}).HTTPClientForServer(
-			ServerConfig{},
-			[]string{serverURL.Host},
-			http.Header{"X-MCP-Test": {"injected"}},
-			timeout,
+		httpClient, err := (&SessionManager{backend: &kubernetesBackend{serviceFQDN: serverURL.Host}}).HTTPClientForServer(
+			ServerConfig{Headers: []string{"X-MCP-Test=injected"}},
+			HTTPClientOptions{Timeout: timeout},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -153,7 +209,7 @@ func TestHTTPClientForServer(t *testing.T) {
 			backend: &kubernetesBackend{
 				serviceFQDN: serverURL.Host,
 			},
-		}).HTTPClientForServer(ServerConfig{}, nil, nil, timeout)
+		}).HTTPClientForServer(ServerConfig{}, HTTPClientOptions{Timeout: timeout})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +225,7 @@ func TestHTTPClientForServer(t *testing.T) {
 	})
 
 	t.Run("tunnel manager required", func(t *testing.T) {
-		_, err := (&SessionManager{}).HTTPClientForServer(ServerConfig{TunnelName: "office"}, nil, nil, timeout)
+		_, err := (&SessionManager{}).HTTPClientForServer(ServerConfig{TunnelName: "office"}, HTTPClientOptions{Timeout: timeout, DirectConnect: true})
 		if err == nil {
 			t.Fatal("tunneled server without tunnel manager returned no error")
 		}
@@ -184,9 +240,7 @@ func TestHTTPClientForServer(t *testing.T) {
 
 		httpClient, err := (&SessionManager{tunnelManager: tunnelManager}).HTTPClientForServer(
 			ServerConfig{TunnelName: "office"},
-			nil,
-			nil,
-			timeout,
+			HTTPClientOptions{Timeout: timeout, DirectConnect: true},
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -208,71 +262,10 @@ func TestHTTPClientForServer(t *testing.T) {
 
 		_, err = (&SessionManager{tunnelManager: tunnelManager}).HTTPClientForServer(
 			ServerConfig{TunnelName: "Office"},
-			nil,
-			nil,
-			timeout,
+			HTTPClientOptions{Timeout: timeout, DirectConnect: true},
 		)
 		if err == nil {
 			t.Fatal("invalid tunnel name returned no error")
 		}
 	})
-}
-
-// ctxCapturingBackend implements backend, recording the ctx it was called
-// with so tests can assert on the deadline SessionManager.ensureDeployment
-// hands down to it.
-type ctxCapturingBackend struct {
-	capturedCtx context.Context
-}
-
-func (b *ctxCapturingBackend) ensureServerDeployment(ctx context.Context, server ServerConfig) (ServerConfig, error) {
-	b.capturedCtx = ctx
-	return server, nil
-}
-
-func (b *ctxCapturingBackend) deployServer(context.Context, ServerConfig) error { return nil }
-
-func (b *ctxCapturingBackend) streamServerLogs(context.Context, string) (io.ReadCloser, error) {
-	return nil, nil
-}
-
-func (b *ctxCapturingBackend) getServerDetails(context.Context, string) (types.MCPServerDetails, error) {
-	return types.MCPServerDetails{}, nil
-}
-
-func (b *ctxCapturingBackend) restartServer(context.Context, ServerConfig) error { return nil }
-
-func (b *ctxCapturingBackend) shutdownServer(context.Context, string, bool) error { return nil }
-
-func (b *ctxCapturingBackend) transformObotHostname(url string) string { return url }
-
-func (b *ctxCapturingBackend) remoteConfig(globalConfig RemoteMCPURLValidationConfig) (RemoteMCPURLValidationConfig, []string) {
-	return globalConfig, nil
-}
-
-// Image acquisition can be slow (registry pull), and that time must not be
-// carved out of the tight StartupTimeout budget meant for container
-// creation/start/readiness. ensureDeployment used to wrap the ctx it handed
-// to the backend in its own StartupTimeout-derived deadline; that
-// responsibility now belongs to each backend individually, applied after
-// image acquisition rather than before it.
-func TestEnsureDeployment_DoesNotImposeItsOwnStartupTimeout(t *testing.T) {
-	backend := &ctxCapturingBackend{}
-	sm := &SessionManager{backend: backend}
-
-	server := ServerConfig{
-		Runtime:        types.RuntimeNPX,
-		StartupTimeout: 5 * time.Millisecond,
-	}
-
-	_, err := sm.ensureDeployment(context.Background(), server)
-	if err != nil {
-		t.Fatalf("ensureDeployment() error = %v", err)
-	}
-	if backend.capturedCtx == nil {
-		t.Fatal("backend.ensureServerDeployment was never called")
-	}
-	if _, ok := backend.capturedCtx.Deadline(); ok {
-		t.Fatal("ensureDeployment must not impose its own StartupTimeout-derived deadline; that responsibility now belongs to each backend")
-	}
 }

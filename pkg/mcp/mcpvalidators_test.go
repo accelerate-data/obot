@@ -22,41 +22,18 @@ func TestValidateServerManifestForCatalog_MultiUserConfig(t *testing.T) {
 
 	require.NoError(t, ValidateServerManifest(t.Context(), manifest, true, ValidationOptions{}))
 
-	manifest.MultiUserConfig = &types.MultiUserConfig{}
+	manifest.Config = []types.MCPConfig{{Usage: types.Header, UserAllowed: true, Key: "X-Tenant"}}
 	require.Equal(t, types.RuntimeValidationError{
 		Runtime: types.RuntimeNPX,
-		Field:   "multiUserConfig",
-		Message: "multiUserConfig may only be set for multi-user servers",
+		Field:   "config",
+		Message: "userAllowed may only be set for multi-user headers",
 	}, ValidateServerManifest(t.Context(), manifest, false, ValidationOptions{}))
 	require.NoError(t, ValidateServerManifest(t.Context(), manifest, true, ValidationOptions{}))
 }
 
-func TestValidateCatalogEntryManifest_MultiUserConfig(t *testing.T) {
-	manifest := types.MCPServerCatalogEntryManifest{
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeNPX,
-		NPXConfig: &types.NPXRuntimeConfig{
-			Package: "test-server",
-		},
-	}
-
-	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), manifest, false, ValidationOptions{}))
-
-	manifest.MultiUserConfig = &types.MultiUserConfig{}
-	require.Equal(t, types.RuntimeValidationError{
-		Runtime: types.RuntimeNPX,
-		Field:   "multiUserConfig",
-		Message: "multiUserConfig may only be set for multi-user catalog entries",
-	}, ValidateCatalogEntryManifest(t.Context(), manifest, false, ValidationOptions{}))
-
-	manifest.ServerUserType = types.ServerUserTypeMultiUser
-	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), manifest, false, ValidationOptions{}))
-}
-
 func TestValidateCatalogEntryManifest_ContainerOAuth(t *testing.T) {
 	manifest := types.MCPServerCatalogEntryManifest{
-		ServerUserType: types.ServerUserTypeMultiUser,
-		Runtime:        types.RuntimeContainerized,
+		Runtime: types.RuntimeContainerized,
 		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 			Image: "example.test/mcp:1", Port: 8080, Path: "/mcp",
 			OAuth: &types.ContainerOAuthConfig{
@@ -68,20 +45,16 @@ func TestValidateCatalogEntryManifest_ContainerOAuth(t *testing.T) {
 				Scopes:          []string{"api://${ENTRA_CLIENT_ID}/Mcp.Tools.ReadWrite"},
 			},
 		},
-		Env: []types.MCPEnv{
-			{Key: "ENTRA_INSTANCE"},
-			{Key: "ENTRA_TENANT_ID"},
-			{Key: "ENTRA_CLIENT_ID"},
-			{Key: "ENTRA_CLIENT_SECRET"},
+		Config: []types.MCPConfig{
+			{Key: "ENTRA_INSTANCE", Usage: types.Env},
+			{Key: "ENTRA_TENANT_ID", Usage: types.Env},
+			{Key: "ENTRA_CLIENT_ID", Usage: types.Env},
+			{Key: "ENTRA_CLIENT_SECRET", Usage: types.Env},
 		},
 	}
 
 	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}))
 
-	manifest.ServerUserType = types.ServerUserTypeSingleUser
-	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "container OAuth requires a multi-user catalog entry")
-
-	manifest.ServerUserType = types.ServerUserTypeMultiUser
 	manifest.ContainerizedConfig.OAuth.Provider = "arbitrary"
 	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "provider must be microsoftEntra")
 
@@ -90,12 +63,14 @@ func TestValidateCatalogEntryManifest_ContainerOAuth(t *testing.T) {
 	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "scope templates may only reference clientIDEnv")
 
 	manifest.ContainerizedConfig.OAuth.Scopes = []string{"api://${ENTRA_CLIENT_ID}/Mcp.Tools.ReadWrite"}
-	manifest.Env = manifest.Env[:3]
+	manifest.Config = manifest.Config[:3]
 	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "is not declared in env")
 
-	manifest.Env = append(manifest.Env, types.MCPEnv{Key: "ENTRA_CLIENT_SECRET"})
-	manifest.MultiUserConfig = &types.MultiUserConfig{UserDefinedHeaders: []types.MCPHeader{{Key: "authorization"}}}
-	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "Authorization cannot be user-defined")
+	server, err := types.MapCatalogEntryToServer(manifest, "", false)
+	require.NoError(t, err)
+	require.ErrorContains(t, ValidateServerManifest(t.Context(), server, false, ValidationOptions{}), "container OAuth requires a multi-user server")
+	server.Config = append(server.Config, types.MCPConfig{Key: "Authorization", Usage: types.Header, UserAllowed: true})
+	require.ErrorContains(t, ValidateServerManifest(t.Context(), server, true, ValidationOptions{}), "Authorization cannot be user-defined")
 }
 
 func TestRemoteValidator_validateRemoteCatalogConfig(t *testing.T) {
@@ -223,29 +198,6 @@ func TestRemoteValidator_validateRemoteCatalogConfig(t *testing.T) {
 			expectError: false,
 		},
 
-		// Valid cases - with Headers
-		{
-			name: "valid fixedURL with headers",
-			config: types.RemoteCatalogConfig{
-				FixedURL: "https://8.8.8.8/mcp",
-				Headers: []types.MCPHeader{
-					{Name: "Authorization", Key: "Bearer token"},
-					{Name: "Content-Type", Key: "application/json"},
-				},
-			},
-			expectError: false,
-		},
-		{
-			name: "valid hostname with headers",
-			config: types.RemoteCatalogConfig{
-				Hostname: "*.example.com",
-				Headers: []types.MCPHeader{
-					{Name: "X-API-Key", Key: "secret"},
-				},
-			},
-			expectError: false,
-		},
-
 		// Valid cases - URLTemplate only
 		{
 			name: "valid urlTemplate with single variable",
@@ -320,19 +272,6 @@ func TestRemoteValidator_validateRemoteCatalogConfig(t *testing.T) {
 			name: "valid urlTemplate with numbers in variables",
 			config: types.RemoteCatalogConfig{
 				URLTemplate: "https://${API_HOST}/api/v${VERSION}/endpoint",
-			},
-			expectError: false,
-		},
-
-		// Valid cases - URLTemplate with Headers
-		{
-			name: "valid urlTemplate with headers",
-			config: types.RemoteCatalogConfig{
-				URLTemplate: "https://${API_HOST}/mcp",
-				Headers: []types.MCPHeader{
-					{Name: "Authorization", Key: "Bearer token"},
-					{Name: "X-API-Key", Key: "secret"},
-				},
 			},
 			expectError: false,
 		},
@@ -692,33 +631,133 @@ func TestRemoteValidator_validateRemoteCatalogConfig_HostnameRegexEdgeCases(t *t
 		expectError bool
 	}{
 		// Valid cases that might be edge cases for regex
-		{"valid single letter domain", "a.b", false},
-		{"valid numbers only", "123.456", false},
-		{"valid mixed alphanumeric", "a1b2.c3d4", false},
-		{"valid long hostname", "very-long-subdomain-name.very-long-domain-name.com", false},
-		{"valid wildcard with single char", "*.a", false},
-		{"valid deep subdomain", "a.b.c.d.e.f.g.h", false},
+		{
+			name:        "valid single letter domain",
+			hostname:    "a.b",
+			expectError: false,
+		},
+		{
+			name:        "valid numbers only",
+			hostname:    "123.456",
+			expectError: false,
+		},
+		{
+			name:        "valid mixed alphanumeric",
+			hostname:    "a1b2.c3d4",
+			expectError: false,
+		},
+		{
+			name:        "valid long hostname",
+			hostname:    "very-long-subdomain-name.very-long-domain-name.com",
+			expectError: false,
+		},
+		{
+			name:        "valid wildcard with single char",
+			hostname:    "*.a",
+			expectError: false,
+		},
+		{
+			name:        "valid deep subdomain",
+			hostname:    "a.b.c.d.e.f.g.h",
+			expectError: false,
+		},
 
 		// Invalid cases for regex
-		{"empty string", "", true},
-		{"just wildcard", "*", true},
-		{"just dot", ".", true},
-		{"starts with dot", ".example.com", true},
-		{"ends with dot", "example.com.", true},
-		{"consecutive dots", "example..com", true},
-		{"wildcard not at start", "sub.*.example.com", true},
-		{"multiple wildcards", "*.*.example.com", true},
-		{"wildcard without dot", "*example.com", true},
-		{"contains slash", "example.com/path", true},
-		{"contains colon", "example.com:8080", true},
-		{"contains question mark", "example.com?query", true},
-		{"contains hash", "example.com#fragment", true},
-		{"contains at sign", "user@example.com", true},
-		{"contains space", "example .com", true},
-		{"contains tab", "example\t.com", true},
-		{"contains newline", "example\n.com", true},
-		{"unicode characters", "exämple.com", true},
-		{"chinese characters", "例え.com", true},
+		{
+			name:        "empty string",
+			hostname:    "",
+			expectError: true,
+		},
+		{
+			name:        "just wildcard",
+			hostname:    "*",
+			expectError: true,
+		},
+		{
+			name:        "just dot",
+			hostname:    ".",
+			expectError: true,
+		},
+		{
+			name:        "starts with dot",
+			hostname:    ".example.com",
+			expectError: true,
+		},
+		{
+			name:        "ends with dot",
+			hostname:    "example.com.",
+			expectError: true,
+		},
+		{
+			name:        "consecutive dots",
+			hostname:    "example..com",
+			expectError: true,
+		},
+		{
+			name:        "wildcard not at start",
+			hostname:    "sub.*.example.com",
+			expectError: true,
+		},
+		{
+			name:        "multiple wildcards",
+			hostname:    "*.*.example.com",
+			expectError: true,
+		},
+		{
+			name:        "wildcard without dot",
+			hostname:    "*example.com",
+			expectError: true,
+		},
+		{
+			name:        "contains slash",
+			hostname:    "example.com/path",
+			expectError: true,
+		},
+		{
+			name:        "contains colon",
+			hostname:    "example.com:8080",
+			expectError: true,
+		},
+		{
+			name:        "contains question mark",
+			hostname:    "example.com?query",
+			expectError: true,
+		},
+		{
+			name:        "contains hash",
+			hostname:    "example.com#fragment",
+			expectError: true,
+		},
+		{
+			name:        "contains at sign",
+			hostname:    "user@example.com",
+			expectError: true,
+		},
+		{
+			name:        "contains space",
+			hostname:    "example .com",
+			expectError: true,
+		},
+		{
+			name:        "contains tab",
+			hostname:    "example\t.com",
+			expectError: true,
+		},
+		{
+			name:        "contains newline",
+			hostname:    "example\n.com",
+			expectError: true,
+		},
+		{
+			name:        "unicode characters",
+			hostname:    "exämple.com",
+			expectError: true,
+		},
+		{
+			name:        "chinese characters",
+			hostname:    "例え.com",
+			expectError: true,
+		},
 	}
 
 	for _, tt := range regexTests {
@@ -758,10 +797,10 @@ func TestRemoteValidator_ValidateConfig_HeaderValidation(t *testing.T) {
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "Authorization", Value: "Bearer token"},
-						{Key: "Content-Type", Value: "application/json"},
-					},
+				},
+				Config: []types.MCPConfig{
+					{Usage: types.Header, Key: "Authorization", Value: "Bearer token"},
+					{Usage: types.Header, Key: "Content-Type", Value: "application/json"},
 				},
 			},
 			expectError: false,
@@ -799,13 +838,13 @@ func TestRemoteValidator_ValidateConfig_HeaderValidation(t *testing.T) {
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "", Value: "some-value"},
-					},
+				},
+				Config: []types.MCPConfig{
+					{Usage: types.Header, Key: "", Value: "some-value"},
 				},
 			},
 			expectError: true,
-			errorField:  "header[0].key",
+			errorField:  "config[0].key",
 			errorMsg:    "header key cannot be empty",
 		},
 		{
@@ -814,29 +853,26 @@ func TestRemoteValidator_ValidateConfig_HeaderValidation(t *testing.T) {
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "   ", Value: "some-value"},
-					},
+				},
+				Config: []types.MCPConfig{
+					{Usage: types.Header, Key: "   ", Value: "some-value"},
 				},
 			},
 			expectError: true,
-			errorField:  "header[0].key",
+			errorField:  "config[0].key",
 			errorMsg:    "header key cannot be empty",
 		},
 		{
-			name: "static header marked as sensitive should fail",
+			name: "static header can be sensitive",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "Authorization", Value: "Bearer token", Sensitive: true},
-					},
+				},
+				Config: []types.MCPConfig{
+					{Usage: types.Header, Key: "Authorization", Value: "Bearer token", Sensitive: true},
 				},
 			},
-			expectError: true,
-			errorField:  "header[0]",
-			errorMsg:    "static header value cannot be marked as sensitive",
 		},
 		{
 			name: "user-configurable header can be sensitive",
@@ -844,9 +880,9 @@ func TestRemoteValidator_ValidateConfig_HeaderValidation(t *testing.T) {
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "API-Key", Value: "", Sensitive: true, Required: true},
-					},
+				},
+				Config: []types.MCPConfig{
+					{Usage: types.Header, Key: "API-Key", Value: "", Sensitive: true, Required: true},
 				},
 			},
 			expectError: false,
@@ -1047,8 +1083,7 @@ func TestValidateRemoteManifestURLWithOptions(t *testing.T) {
 
 	validateCatalogEntryManifest := func(ctx context.Context, rawURL, tunnelName string, options ValidationOptions) error {
 		return ValidateCatalogEntryManifest(ctx, types.MCPServerCatalogEntryManifest{
-			Runtime:        types.RuntimeRemote,
-			ServerUserType: types.ServerUserTypeSingleUser,
+			Runtime: types.RuntimeRemote,
 			RemoteConfig: &types.RemoteCatalogConfig{
 				FixedURL:   rawURL,
 				TunnelName: tunnelName,
@@ -1072,9 +1107,18 @@ func TestValidateRemoteManifestURLWithOptions(t *testing.T) {
 				name string
 				fn   func(context.Context, string, string, ValidationOptions) error
 			}{
-				{name: "server", fn: validateServerManifest},
-				{name: "catalog entry", fn: validateCatalogEntryManifest},
-				{name: "system server", fn: validateSystemManifest},
+				{
+					name: "server",
+					fn:   validateServerManifest,
+				},
+				{
+					name: "catalog entry",
+					fn:   validateCatalogEntryManifest,
+				},
+				{
+					name: "system server",
+					fn:   validateSystemManifest,
+				},
 			} {
 				t.Run(validator.name, func(t *testing.T) {
 					err := validator.fn(t.Context(), tt.rawURL, tt.tunnelName, tt.options)
@@ -1097,6 +1141,7 @@ func TestValidateRemoteManifestAllowMissingURL(t *testing.T) {
 	tests := []struct {
 		name    string
 		config  types.RemoteRuntimeConfig
+		fields  []types.MCPConfig
 		options ValidationOptions
 		wantErr string
 	}{
@@ -1130,10 +1175,8 @@ func TestValidateRemoteManifestAllowMissingURL(t *testing.T) {
 			wantErr: "localhost URL",
 		},
 		{
-			name: "missing URL still validates headers",
-			config: types.RemoteRuntimeConfig{
-				Headers: []types.MCPHeader{{Value: "value"}},
-			},
+			name:    "missing URL still validates headers",
+			fields:  []types.MCPConfig{{Usage: types.Header, Value: "value"}},
 			options: ValidationOptions{AllowMissingURL: true},
 			wantErr: "header key cannot be empty",
 		},
@@ -1141,8 +1184,8 @@ func TestValidateRemoteManifestAllowMissingURL(t *testing.T) {
 			name: "template without URL still validates headers",
 			config: types.RemoteRuntimeConfig{
 				IsTemplate: true,
-				Headers:    []types.MCPHeader{{Value: "value"}},
 			},
+			fields:  []types.MCPConfig{{Usage: types.Header, Value: "value"}},
 			wantErr: "header key cannot be empty",
 		},
 	}
@@ -1152,6 +1195,7 @@ func TestValidateRemoteManifestAllowMissingURL(t *testing.T) {
 			err := ValidateServerManifest(t.Context(), types.MCPServerManifest{
 				Runtime:      types.RuntimeRemote,
 				RemoteConfig: &tt.config,
+				Config:       tt.fields,
 			}, false, tt.options)
 			if tt.wantErr == "" {
 				require.NoError(t, err)
@@ -1164,8 +1208,7 @@ func TestValidateRemoteManifestAllowMissingURL(t *testing.T) {
 
 func TestValidateSystemCatalogEntryRejectsTunnel(t *testing.T) {
 	err := ValidateSystemMCPServerCatalogEntryManifest(t.Context(), types.SystemMCPServerCatalogEntryManifest{
-		Runtime:        types.RuntimeRemote,
-		ServerUserType: types.ServerUserTypeSingleUser,
+		Runtime: types.RuntimeRemote,
 		RemoteConfig: &types.RemoteCatalogConfig{
 			FixedURL:   "https://example.com/mcp",
 			TunnelName: "mt1office",
@@ -1174,103 +1217,18 @@ func TestValidateSystemCatalogEntryRejectsTunnel(t *testing.T) {
 	require.ErrorContains(t, err, "tunnels are not supported for system MCP servers")
 }
 
-func TestRemoteValidator_ValidateCatalogConfig_HeaderValidation(t *testing.T) {
-	validator := RemoteValidator{}
-
-	tests := []struct {
-		name        string
-		manifest    types.MCPServerCatalogEntryManifest
-		expectError bool
-		errorField  string
-		errorMsg    string
-	}{
-		{
-			name: "valid headers",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					FixedURL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "Authorization", Value: "Bearer token"},
-						{Key: "Content-Type", Value: "application/json"},
-					},
-				},
-			},
-			expectError: false,
+func TestValidateSystemCatalogEntryRejectsInvalidConfigUsage(t *testing.T) {
+	err := ValidateSystemMCPServerCatalogEntryManifest(t.Context(), types.SystemMCPServerCatalogEntryManifest{
+		Runtime: types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{
+			Package: "test-server",
 		},
-		{
-			name: "empty header key should fail",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					FixedURL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "", Value: "some-value"},
-					},
-				},
-			},
-			expectError: true,
-			errorField:  "header[0].key",
-			errorMsg:    "header key cannot be empty",
-		},
-		{
-			name: "multiple headers with one empty key should fail",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					FixedURL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "Valid-Header", Value: "valid-value"},
-						{Key: "", Value: "invalid-value"},
-					},
-				},
-			},
-			expectError: true,
-			errorField:  "header[1].key",
-			errorMsg:    "header key cannot be empty",
-		},
-		{
-			name: "static header marked as sensitive should fail",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					FixedURL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "Authorization", Value: "Bearer token", Sensitive: true},
-					},
-				},
-			},
-			expectError: true,
-			errorField:  "header[0]",
-			errorMsg:    "static header value cannot be marked as sensitive",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validator.ValidateCatalogConfig(t.Context(), tt.manifest)
-
-			if tt.expectError {
-				if err == nil {
-					t.Errorf("expected error but got none")
-					return
-				}
-
-				if runtimeErr, ok := errors.AsType[types.RuntimeValidationError](err); ok {
-					if runtimeErr.Field != tt.errorField {
-						t.Errorf("expected error field %q, got %q", tt.errorField, runtimeErr.Field)
-					}
-					if !strings.Contains(runtimeErr.Message, tt.errorMsg) {
-						t.Errorf("expected error message to contain %q, got %q", tt.errorMsg, runtimeErr.Message)
-					}
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
+		Config: []types.MCPConfig{{
+			Key:   "TOKEN",
+			Usage: "invalid",
+		}},
+	}, ValidationOptions{})
+	require.ErrorContains(t, err, `invalid usage "invalid" for config key "TOKEN"`)
 }
 
 func TestValidateEgressDomains(t *testing.T) {
@@ -1393,704 +1351,6 @@ func TestValidateEgressDomains(t *testing.T) {
 	}
 }
 
-func TestCompositeValidator_ValidateCatalogConfig(t *testing.T) {
-	validator := CompositeValidator{}
-
-	tests := []struct {
-		name          string
-		manifest      types.MCPServerCatalogEntryManifest
-		expectedError error
-	}{
-		{
-			name: "non-composite runtime",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeRemote,
-				Field:   "runtime",
-				Message: "expected composite runtime",
-			},
-		},
-		{
-			name: "missing composite config",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime:         types.RuntimeComposite,
-				CompositeConfig: nil,
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig",
-				Message: "composite configuration is required",
-			},
-		},
-		{
-			name: "no component servers",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers",
-				Message: "must contain at least one component server",
-			},
-		},
-		{
-			name: "component missing both IDs",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "",
-							MCPServerID:    "",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0]",
-				Message: "must have one of catalogEntryID or mcpServerID set",
-			},
-		},
-		{
-			name: "component with both IDs set",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							MCPServerID:    "server-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0]",
-				Message: "must have one of catalogEntryID or mcpServerID set",
-			},
-		},
-		{
-			name: "nested composite runtime not allowed in catalog",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeComposite,
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].manifest.runtime",
-				Message: "runtime cannot be composite",
-			},
-		},
-		{
-			name: "multi-user catalog entry component not allowed in catalog",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime:        types.RuntimeRemote,
-								ServerUserType: types.ServerUserTypeMultiUser,
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0]",
-				Message: "multi-user catalog entries cannot be included in a composite server; use the multi-user MCP server instead",
-			},
-		},
-		{
-			name: "multi-user MCP server component is allowed in catalog",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							MCPServerID: "server-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime:        types.RuntimeRemote,
-								ServerUserType: types.ServerUserTypeMultiUser,
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "duplicate component servers detected in catalog",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[1]",
-				Message: "duplicate component server: entry-1",
-			},
-		},
-		{
-			name: "valid catalog composite configuration passes",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{
-									Name:         "tool-1",
-									OverrideName: "tool-1",
-									Enabled:      true,
-								},
-							},
-						},
-						{
-							MCPServerID: "server-2",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "remote component with static OAuth is allowed in catalog",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteCatalogConfig{
-									FixedURL:            "https://example.com/mcp",
-									StaticOAuthRequired: true,
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "remote component without static OAuth is allowed in catalog",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteCatalogConfig{
-									FixedURL:            "https://example.com/mcp",
-									StaticOAuthRequired: false,
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "tool prefix with invalid character",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list", Enabled: true},
-							},
-							ToolPrefix: "gh space",
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].toolPrefix",
-				Message: "toolPrefix must match ^[A-Za-z0-9._/-]*$",
-			},
-		},
-		{
-			name: "tool prefix is allowed without tool overrides",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolPrefix: "gh_",
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "duplicate non-empty tool prefix",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list", Enabled: true},
-							},
-							ToolPrefix: "gh_",
-						},
-						{
-							CatalogEntryID: "entry-2",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list", Enabled: true},
-							},
-							ToolPrefix: "gh_",
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[1].toolPrefix",
-				Message: "duplicate toolPrefix: gh_",
-			},
-		},
-		{
-			name: "valid tool prefix with tool overrides",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list", Enabled: true},
-							},
-							ToolPrefix: "gh_",
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "tool prefix at max length is allowed",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolPrefix: strings.Repeat("a", maxToolPrefixLength),
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "tool prefix exceeds max length",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolPrefix: strings.Repeat("a", maxToolPrefixLength+1),
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].toolPrefix",
-				Message: "toolPrefix must be at most 64 characters",
-			},
-		},
-		{
-			name: "empty tool prefixes may repeat across components",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-						{
-							CatalogEntryID: "entry-2",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "empty original tool name",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "", Enabled: true},
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].toolOverrides[0].name",
-				Message: "original tool name is required",
-			},
-		},
-		{
-			name: "effective tool name exceeds max length",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolPrefix: strings.Repeat("a", maxToolPrefixLength),
-							ToolOverrides: []types.ToolOverride{
-								{Name: strings.Repeat("b", maxToolNameLength-maxToolPrefixLength+1), Enabled: true},
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].toolOverrides[0]",
-				Message: fmt.Sprintf(
-					"effective tool name must be at most 128 characters: %q",
-					strings.Repeat("a", maxToolPrefixLength)+strings.Repeat("b", maxToolNameLength-maxToolPrefixLength+1),
-				),
-			},
-		},
-		{
-			name: "effective tool name has invalid character",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list things", Enabled: true},
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].toolOverrides[0]",
-				Message: "effective tool name must match ^[A-Za-z0-9._/-]*$",
-			},
-		},
-		{
-			name: "duplicate effective tool name across components",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list", Enabled: true},
-							},
-						},
-						{
-							CatalogEntryID: "entry-2",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolOverrides: []types.ToolOverride{
-								{Name: "list", Enabled: true},
-							},
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[1].toolOverrides[0]",
-				Message: "duplicate tool name: list",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validator.ValidateCatalogConfig(t.Context(), tt.manifest)
-			require.Equal(t, tt.expectedError, err)
-		})
-	}
-}
-
-func TestCompositeValidator_ValidateConfig_StaticOAuth(t *testing.T) {
-	validator := CompositeValidator{}
-
-	tests := []struct {
-		name          string
-		manifest      types.MCPServerManifest
-		expectedError error
-	}{
-		{
-			name: "remote component with static OAuth is allowed",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteRuntimeConfig{
-									URL:                 "https://example.com/mcp",
-									StaticOAuthRequired: true,
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "remote component without static OAuth is allowed",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteRuntimeConfig{
-									URL:                 "https://example.com/mcp",
-									StaticOAuthRequired: false,
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "non-remote component in composite is allowed",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeUVX,
-								UVXConfig: &types.UVXRuntimeConfig{
-									Package: "mcp-server-test",
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-		{
-			name: "mixed components with one having static OAuth is allowed",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteRuntimeConfig{
-									URL:                 "https://example.com/mcp",
-									StaticOAuthRequired: false,
-								},
-							},
-						},
-						{
-							CatalogEntryID: "entry-2",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteRuntimeConfig{
-									URL:                 "https://oauth.example.com/mcp",
-									StaticOAuthRequired: true,
-								},
-							},
-						},
-					},
-				},
-			},
-			expectedError: nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validator.ValidateConfig(t.Context(), tt.manifest)
-			require.Equal(t, tt.expectedError, err)
-		})
-	}
-}
-
-func TestCompositeValidator_ValidateConfig_ToolPrefixLength(t *testing.T) {
-	validator := CompositeValidator{}
-
-	tests := []struct {
-		name          string
-		manifest      types.MCPServerManifest
-		expectedError error
-	}{
-		{
-			name: "tool prefix at max length is allowed",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolPrefix: strings.Repeat("a", maxToolPrefixLength),
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "tool prefix exceeds max length",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{
-							CatalogEntryID: "entry-1",
-							Manifest: types.MCPServerManifest{
-								Runtime: types.RuntimeRemote,
-							},
-							ToolPrefix: strings.Repeat("a", maxToolPrefixLength+1),
-						},
-					},
-				},
-			},
-			expectedError: types.RuntimeValidationError{
-				Runtime: types.RuntimeComposite,
-				Field:   "compositeConfig.componentServers[0].toolPrefix",
-				Message: "toolPrefix must be at most 64 characters",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validator.ValidateConfig(t.Context(), tt.manifest)
-			require.Equal(t, tt.expectedError, err)
-		})
-	}
-}
-
 func TestValidateManifestStartupTimeoutNonNegative(t *testing.T) {
 	t.Run("server manifest rejects negative startup timeout", func(t *testing.T) {
 		err := ValidateServerManifest(t.Context(), types.MCPServerManifest{
@@ -2110,8 +1370,7 @@ func TestValidateManifestStartupTimeoutNonNegative(t *testing.T) {
 
 	t.Run("catalog manifest rejects negative startup timeout", func(t *testing.T) {
 		err := ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{
-			ServerUserType: types.ServerUserTypeSingleUser,
-			Runtime:        types.RuntimeUVX,
+			Runtime: types.RuntimeUVX,
 			UVXConfig: &types.UVXRuntimeConfig{
 				Package:               "test-package",
 				StartupTimeoutSeconds: -1,
@@ -2147,8 +1406,7 @@ func TestValidateManifestStartupTimeoutNonNegative(t *testing.T) {
 	t.Run("catalog manifest rejects startup timeout above maximum", func(t *testing.T) {
 		maxStartupTimeoutSeconds := int(MaxMCPServerStartupTimeout.Seconds())
 		err := ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{
-			ServerUserType: types.ServerUserTypeSingleUser,
-			Runtime:        types.RuntimeNPX,
+			Runtime: types.RuntimeNPX,
 			NPXConfig: &types.NPXRuntimeConfig{
 				Package:               "test-package",
 				StartupTimeoutSeconds: maxStartupTimeoutSeconds + 1,
@@ -2186,10 +1444,9 @@ func TestValidateMCPResourceRequirements(t *testing.T) {
 
 	t.Run("catalog manifest accepts valid resources", func(t *testing.T) {
 		err := ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{
-			ServerUserType: types.ServerUserTypeSingleUser,
-			Runtime:        types.RuntimeUVX,
-			UVXConfig:      &types.UVXRuntimeConfig{Package: "test-package"},
-			Resources:      validResources,
+			Runtime:   types.RuntimeUVX,
+			UVXConfig: &types.UVXRuntimeConfig{Package: "test-package"},
+			Resources: validResources,
 		}, false, ValidationOptions{})
 		require.NoError(t, err)
 	})
@@ -2285,10 +1542,9 @@ func TestValidateMCPResourceRequirements(t *testing.T) {
 
 		t.Run("catalog manifest rejects "+tt.name, func(t *testing.T) {
 			err := ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{
-				ServerUserType: types.ServerUserTypeSingleUser,
-				Runtime:        types.RuntimeUVX,
-				UVXConfig:      &types.UVXRuntimeConfig{Package: "test-package"},
-				Resources:      tt.resources,
+				Runtime:   types.RuntimeUVX,
+				UVXConfig: &types.UVXRuntimeConfig{Package: "test-package"},
+				Resources: tt.resources,
 			}, false, ValidationOptions{})
 
 			var validationErr types.RuntimeValidationError
@@ -2349,9 +1605,8 @@ func TestValidateMCPResourceMaximums(t *testing.T) {
 
 	t.Run("catalog manifest rejects resources above maximum", func(t *testing.T) {
 		err := ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{
-			ServerUserType: types.ServerUserTypeSingleUser,
-			Runtime:        types.RuntimeUVX,
-			UVXConfig:      &types.UVXRuntimeConfig{Package: "test-package"},
+			Runtime:   types.RuntimeUVX,
+			UVXConfig: &types.UVXRuntimeConfig{Package: "test-package"},
 			Resources: &types.MCPResourceRequirements{
 				Requests: types.MCPResourceRequests{
 					CPU: "250m",
@@ -2360,54 +1615,13 @@ func TestValidateMCPResourceMaximums(t *testing.T) {
 		}, false, options)
 		require.ErrorContains(t, err, "resources.requests.cpu 250m exceeds configured maximum 100m")
 	})
+}
 
-	t.Run("composite server manifest rejects component resources above maximum", func(t *testing.T) {
-		err := ValidateServerManifest(t.Context(), types.MCPServerManifest{
-			Runtime: types.RuntimeComposite,
-			CompositeConfig: &types.CompositeRuntimeConfig{
-				ComponentServers: []types.ComponentServer{
-					{
-						CatalogEntryID: "component",
-						Manifest: types.MCPServerManifest{
-							Runtime:   types.RuntimeNPX,
-							NPXConfig: &types.NPXRuntimeConfig{Package: "test-package"},
-							Resources: &types.MCPResourceRequirements{
-								Requests: types.MCPResourceRequests{
-									CPU: "250m",
-								},
-							},
-						},
-					},
-				},
-			},
-		}, false, options)
-		require.ErrorContains(t, err, "resources.requests.cpu 250m exceeds configured maximum 100m")
-	})
-
-	t.Run("composite catalog manifest rejects component resources above maximum", func(t *testing.T) {
-		err := ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{
-			ServerUserType: types.ServerUserTypeSingleUser,
-			Runtime:        types.RuntimeComposite,
-			CompositeConfig: &types.CompositeCatalogConfig{
-				ComponentServers: []types.CatalogComponentServer{
-					{
-						CatalogEntryID: "component",
-						Manifest: types.MCPServerCatalogEntryManifest{
-							ServerUserType: types.ServerUserTypeSingleUser,
-							Runtime:        types.RuntimeNPX,
-							NPXConfig:      &types.NPXRuntimeConfig{Package: "test-package"},
-							Resources: &types.MCPResourceRequirements{
-								Requests: types.MCPResourceRequests{
-									CPU: "250m",
-								},
-							},
-						},
-					},
-				},
-			},
-		}, false, options)
-		require.ErrorContains(t, err, "resources.requests.cpu 250m exceeds configured maximum 100m")
-	})
+func TestRejectCompositeRuntime(t *testing.T) {
+	manifest := types.MCPServerManifest{Runtime: types.RuntimeComposite}
+	require.ErrorContains(t, ValidateServerManifest(t.Context(), manifest, false, ValidationOptions{}), "unsupported runtime")
+	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), types.MCPServerCatalogEntryManifest{Runtime: types.RuntimeComposite}, false, ValidationOptions{}), "unsupported runtime")
+	require.ErrorContains(t, ValidateSystemMCPServerManifest(t.Context(), types.SystemMCPServerManifest{Runtime: types.RuntimeComposite}, ValidationOptions{}), "unsupported runtime")
 }
 
 func TestValidateSecretBindings(t *testing.T) {
@@ -2424,10 +1638,9 @@ func TestValidateSecretBindings(t *testing.T) {
 		{
 			name: "no bindings is allowed regardless",
 			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					Headers: []types.MCPHeader{{Key: "X-Foo", Value: "bar"}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{},
+				Config:       []types.MCPConfig{{Usage: types.Header, Key: "X-Foo", Value: "bar"}},
 			},
 			gitManaged: false,
 			backend:    "docker",
@@ -2435,10 +1648,9 @@ func TestValidateSecretBindings(t *testing.T) {
 		{
 			name: "bound header requires git-managed",
 			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					Headers: []types.MCPHeader{{Key: "DD-API-KEY", SecretBinding: binding}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{},
+				Config:       []types.MCPConfig{{Usage: types.Header, Key: "DD-API-KEY", SecretBinding: binding}},
 			},
 			gitManaged: false,
 			backend:    "kubernetes",
@@ -2447,10 +1659,9 @@ func TestValidateSecretBindings(t *testing.T) {
 		{
 			name: "bound header accepted for git-managed remote",
 			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					Headers: []types.MCPHeader{{Key: "DD-API-KEY", SecretBinding: binding}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{},
+				Config:       []types.MCPConfig{{Usage: types.Header, Key: "DD-API-KEY", SecretBinding: binding}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
@@ -2459,7 +1670,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound env accepted for admin-managed multi-user server",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				Env:     []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding}},
+				Config:  []types.MCPConfig{{Usage: types.Env, Key: "DD_API_KEY", SecretBinding: binding}},
 			},
 			adminManaged: true,
 			backend:      "kubernetes",
@@ -2468,9 +1679,9 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound multi-user header is rejected",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				MultiUserConfig: &types.MultiUserConfig{UserDefinedHeaders: []types.MCPHeader{{
-					Key: "X-API-Key", SecretBinding: binding,
-				}}},
+				Config: []types.MCPConfig{{
+					Key: "X-API-Key", Usage: types.Header, UserAllowed: true, SecretBinding: binding,
+				}},
 			},
 			adminManaged: true,
 			backend:      "kubernetes",
@@ -2479,10 +1690,9 @@ func TestValidateSecretBindings(t *testing.T) {
 		{
 			name: "bound header rejected on non-kubernetes backend",
 			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					Headers: []types.MCPHeader{{Key: "DD-API-KEY", SecretBinding: binding}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{},
+				Config:       []types.MCPConfig{{Usage: types.Header, Key: "DD-API-KEY", SecretBinding: binding}},
 			},
 			gitManaged: true,
 			backend:    "docker",
@@ -2491,10 +1701,9 @@ func TestValidateSecretBindings(t *testing.T) {
 		{
 			name: "binding and static value are mutually exclusive",
 			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					Headers: []types.MCPHeader{{Key: "DD-API-KEY", Value: "literal", SecretBinding: binding}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{},
+				Config:       []types.MCPConfig{{Usage: types.Header, Key: "DD-API-KEY", Value: "literal", SecretBinding: binding}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
@@ -2503,10 +1712,9 @@ func TestValidateSecretBindings(t *testing.T) {
 		{
 			name: "binding requires non-empty name/key",
 			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					Headers: []types.MCPHeader{{Key: "DD-API-KEY", SecretBinding: &types.MCPSecretBinding{Name: "datadog-prod"}}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{},
+				Config:       []types.MCPConfig{{Usage: types.Header, Key: "DD-API-KEY", SecretBinding: &types.MCPSecretBinding{Name: "datadog-prod"}}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
@@ -2516,7 +1724,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound env under remote runtime is rejected",
 			manifest: types.MCPServerManifest{
 				Runtime:      types.RuntimeRemote,
-				Env:          []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding}},
+				Config:       []types.MCPConfig{{Usage: types.Env, Key: "DD_API_KEY", SecretBinding: binding}},
 				RemoteConfig: &types.RemoteRuntimeConfig{},
 			},
 			gitManaged: true,
@@ -2527,7 +1735,7 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "file-backed env with secret binding is accepted",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				Env:     []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding, File: true}},
+				Config:  []types.MCPConfig{{Key: "DD_API_KEY", SecretBinding: binding, Usage: types.File}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
@@ -2536,31 +1744,29 @@ func TestValidateSecretBindings(t *testing.T) {
 			name: "bound env accepted for git-managed containerized",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
-				Env:     []types.MCPEnv{{Key: "DD_API_KEY", SecretBinding: binding}},
+				Config:  []types.MCPConfig{{Usage: types.Env, Key: "DD_API_KEY", SecretBinding: binding}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
 		},
 		{
-			name: "dynamicFile without file is accepted and ignored",
+			name: "env binding is accepted",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{Usage: types.Env,
 					Key: "DD_API_KEY", SecretBinding: binding,
-					DynamicFile: true,
 				}},
 			},
 			gitManaged: true,
 			backend:    "kubernetes",
 		},
 		{
-			name: "file and dynamicFile together are accepted",
+			name: "dynamicFile is accepted",
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
-					Key:         "DD_API_KEY",
-					File:        true,
-					DynamicFile: true,
+				Config: []types.MCPConfig{{
+					Key:   "DD_API_KEY",
+					Usage: types.DynamicFile,
 				}},
 			},
 			gitManaged: true,
@@ -2593,8 +1799,7 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 			name: "urlTemplate referencing non-bound env is allowed",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeRemote,
-				Env: []types.MCPEnv{{
-					Key: "HOST", Required: true}},
+				Config:  []types.MCPConfig{{Key: "HOST", Usage: types.Env, Required: true}},
 				RemoteConfig: &types.RemoteCatalogConfig{
 					URLTemplate: "https://${HOST}/mcp",
 				},
@@ -2604,8 +1809,7 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 			name: "urlTemplate referencing secret-bound env is rejected",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeRemote,
-				Env: []types.MCPEnv{{
-					Key: "TOKEN", Required: true, SecretBinding: binding}},
+				Config:  []types.MCPConfig{{Key: "TOKEN", Usage: types.Env, Required: true, SecretBinding: binding}},
 				RemoteConfig: &types.RemoteCatalogConfig{
 					URLTemplate: "https://example.com/${TOKEN}/mcp",
 				},
@@ -2616,8 +1820,7 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 			name: "no urlTemplate with bound env passes to core check",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
-					Key: "TOKEN", Required: true, SecretBinding: binding}},
+				Config:  []types.MCPConfig{{Key: "TOKEN", Usage: types.Env, Required: true, SecretBinding: binding}},
 			},
 		},
 	}
@@ -2635,7 +1838,7 @@ func TestValidateSecretBindingsCatalogEntry_URLTemplate(t *testing.T) {
 	}
 }
 
-func TestValidateSecretBindingsCatalogEntryMultiUser(t *testing.T) {
+func TestValidateSecretBindingsCatalogEntryAdminManaged(t *testing.T) {
 	binding := &types.MCPSecretBinding{Name: "my-secret", Key: "token"}
 
 	tests := []struct {
@@ -2645,44 +1848,34 @@ func TestValidateSecretBindingsCatalogEntryMultiUser(t *testing.T) {
 		wantErr      string
 	}{
 		{
-			name: "admin-managed non-git multi-user catalog entry allows env binding",
+			name: "admin-managed non-git catalog entry allows env binding",
 			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime:        types.RuntimeNPX,
-				ServerUserType: types.ServerUserTypeMultiUser,
-				Env: []types.MCPEnv{{
-					Key: "TOKEN", SecretBinding: binding}},
+				Runtime: types.RuntimeNPX,
+				Config:  []types.MCPConfig{{Key: "TOKEN", Usage: types.Env, SecretBinding: binding}},
 			},
 			adminManaged: true,
 		},
 		{
-			name: "non-admin non-git multi-user catalog entry rejects env binding",
+			name: "non-admin non-git catalog entry rejects env binding",
 			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime:        types.RuntimeNPX,
-				ServerUserType: types.ServerUserTypeMultiUser,
-				Env: []types.MCPEnv{{
-					Key: "TOKEN", SecretBinding: binding}},
+				Runtime: types.RuntimeNPX,
+				Config:  []types.MCPConfig{{Key: "TOKEN", Usage: types.Env, SecretBinding: binding}},
 			},
-			wantErr: "multi-user catalog entries",
+			wantErr: "administrator-managed vMCPs",
 		},
 		{
-			name: "admin-managed non-git single-user catalog entry rejects env binding",
+			name: "admin-managed non-git catalog entry allows env binding",
 			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime:        types.RuntimeNPX,
-				ServerUserType: types.ServerUserTypeSingleUser,
-				Env: []types.MCPEnv{{
-					Key: "TOKEN", SecretBinding: binding}},
+				Runtime: types.RuntimeNPX,
+				Config:  []types.MCPConfig{{Key: "TOKEN", Usage: types.Env, SecretBinding: binding}},
 			},
 			adminManaged: true,
-			wantErr:      "multi-user catalog entries",
 		},
 		{
-			name: "admin-managed non-git multi-user remote catalog entry allows header binding",
+			name: "admin-managed non-git remote catalog entry allows header binding",
 			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime:        types.RuntimeRemote,
-				ServerUserType: types.ServerUserTypeMultiUser,
-				RemoteConfig: &types.RemoteCatalogConfig{Headers: []types.MCPHeader{{
-					Key: "Authorization", SecretBinding: binding,
-				}}},
+				Runtime: types.RuntimeRemote,
+				Config:  []types.MCPConfig{{Key: "Authorization", Usage: types.Header, SecretBinding: binding}},
 			},
 			adminManaged: true,
 		},
@@ -2710,35 +1903,18 @@ func TestValidateSecretBindingsCatalogEntryRejectsAdminAdded(t *testing.T) {
 		wantErr  string
 	}{
 		{
-			name: "env adminAdded rejected",
+			name: "env config adminAdded rejected",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
-					Key: "TOKEN", SecretBinding: binding}},
+				Config:  []types.MCPConfig{{Key: "TOKEN", Usage: types.Env, SecretBinding: binding}},
 			},
 			wantErr: "secretBinding.adminAdded is not valid for catalog entry",
 		},
 		{
-			name: "header adminAdded rejected",
+			name: "header config adminAdded rejected",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{Headers: []types.MCPHeader{{
-					Key: "Authorization", SecretBinding: binding,
-				}}},
-			},
-			wantErr: "secretBinding.adminAdded is not valid for catalog entry",
-		},
-		{
-			name: "composite component adminAdded rejected",
-			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{ComponentServers: []types.CatalogComponentServer{{
-					Manifest: types.MCPServerCatalogEntryManifest{
-						Runtime: types.RuntimeNPX,
-						Env: []types.MCPEnv{{
-							Key: "TOKEN", SecretBinding: binding}},
-					},
-				}}},
+				Config:  []types.MCPConfig{{Key: "Authorization", Usage: types.Header, SecretBinding: binding}},
 			},
 			wantErr: "secretBinding.adminAdded is not valid for catalog entry",
 		},
@@ -2753,25 +1929,9 @@ func TestValidateSecretBindingsCatalogEntryRejectsAdminAdded(t *testing.T) {
 	}
 }
 
-func TestValidateSecretBindingsCatalogEntryRejectsMultiUserHeaderBinding(t *testing.T) {
-	binding := &types.MCPSecretBinding{Name: "my-secret", Key: "token"}
-	manifest := types.MCPServerCatalogEntryManifest{
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
-		MultiUserConfig: &types.MultiUserConfig{UserDefinedHeaders: []types.MCPHeader{{
-			Key:           "X-API-Key",
-			SecretBinding: binding,
-		}}},
-	}
-
-	err := ValidateSecretBindingsCatalogEntry(manifest, true, false, "kubernetes")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "secretBinding is not supported for user-defined headers")
-}
-
 func TestValidateTemplateReferences_Server(t *testing.T) {
-	required := types.MCPEnv{Key: "TAG", Required: true}
-	optional := types.MCPEnv{Key: "TAG", Required: false}
+	required := types.MCPConfig{Usage: types.Env, Key: "TAG", Required: true}
+	optional := types.MCPConfig{Usage: types.Env, Key: "TAG", Required: false}
 
 	tests := []struct {
 		name     string
@@ -2790,7 +1950,7 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 			manifest: types.MCPServerManifest{
 				Runtime:   types.RuntimeNPX,
 				NPXConfig: &types.NPXRuntimeConfig{Package: "pkg", Args: []string{"--tag=${TAG}"}},
-				Env:       []types.MCPEnv{required},
+				Config:    []types.MCPConfig{required},
 			},
 		},
 		{
@@ -2798,7 +1958,7 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 			manifest: types.MCPServerManifest{
 				Runtime:   types.RuntimeNPX,
 				NPXConfig: &types.NPXRuntimeConfig{Package: "pkg", Args: []string{"--tag=${TAG}"}},
-				Env:       []types.MCPEnv{optional},
+				Config:    []types.MCPConfig{optional},
 			},
 			wantErr: "must be required=true",
 		},
@@ -2807,7 +1967,7 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 			manifest: types.MCPServerManifest{
 				Runtime:   types.RuntimeUVX,
 				UVXConfig: &types.UVXRuntimeConfig{Package: "pkg", Command: "${TAG}"},
-				Env:       []types.MCPEnv{required},
+				Config:    []types.MCPConfig{required},
 			},
 		},
 		{
@@ -2818,7 +1978,7 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 					Image: "img",
 					Args:  []string{"--tag=${TAG}"},
 				},
-				Env: []types.MCPEnv{optional},
+				Config: []types.MCPConfig{optional},
 			},
 			wantErr: "must be required=true",
 		},
@@ -2829,7 +1989,7 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://${TAG}.example.com/mcp",
 				},
-				Env: []types.MCPEnv{optional},
+				Config: []types.MCPConfig{optional},
 			},
 			wantErr: "must be required=true",
 		},
@@ -2838,10 +1998,9 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 			manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
-					URL:     "https://example.com/mcp",
-					Headers: []types.MCPHeader{{Key: "Authorization", Value: "Bearer ${TAG}"}},
+					URL: "https://example.com/mcp",
 				},
-				Env: []types.MCPEnv{optional},
+				Config: []types.MCPConfig{optional, {Usage: types.Header, Key: "Authorization", Value: "Bearer ${TAG}"}},
 			},
 			wantErr: "must be required=true",
 		},
@@ -2869,8 +2028,8 @@ func TestValidateTemplateReferences_Server(t *testing.T) {
 }
 
 func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
-	required := types.MCPEnv{Key: "TAG", Required: true}
-	optional := types.MCPEnv{Key: "TAG", Required: false}
+	required := types.MCPConfig{Key: "TAG", Usage: types.Interpolated, Required: true}
+	optional := types.MCPConfig{Key: "TAG", Usage: types.Interpolated, Required: false}
 
 	tests := []struct {
 		name     string
@@ -2882,7 +2041,7 @@ func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:   types.RuntimeNPX,
 				NPXConfig: &types.NPXRuntimeConfig{Package: "pkg", Args: []string{"--tag=${TAG}"}},
-				Env:       []types.MCPEnv{required},
+				Config:    []types.MCPConfig{required},
 			},
 		},
 		{
@@ -2901,7 +2060,7 @@ func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
 				RemoteConfig: &types.RemoteCatalogConfig{
 					FixedURL: "https://${TAG}.example.com/mcp",
 				},
-				Env: []types.MCPEnv{required},
+				Config: []types.MCPConfig{required},
 			},
 		},
 		{
@@ -2909,7 +2068,7 @@ func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:   types.RuntimeNPX,
 				NPXConfig: &types.NPXRuntimeConfig{Package: "pkg", Args: []string{"--tag=${TAG}"}},
-				Env:       []types.MCPEnv{optional},
+				Config:    []types.MCPConfig{optional},
 			},
 			wantErr: "must be required=true",
 		},
@@ -2920,18 +2079,16 @@ func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
 				RemoteConfig: &types.RemoteCatalogConfig{
 					URLTemplate: "https://${TAG}.example.com/mcp",
 				},
-				Env: []types.MCPEnv{optional},
+				Config: []types.MCPConfig{optional},
 			},
 			wantErr: "must be required=true",
 		},
 		{
 			name: "remote header value templated by undeclared env is rejected",
 			manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					FixedURL: "https://example.com/mcp",
-					Headers:  []types.MCPHeader{{Key: "Authorization", Value: "Bearer ${TAG}"}},
-				},
+				Runtime:      types.RuntimeRemote,
+				RemoteConfig: &types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp"},
+				Config:       []types.MCPConfig{{Key: "Authorization", Usage: types.Header, Value: "Bearer ${TAG}"}},
 			},
 			wantErr: "undeclared",
 		},
@@ -2950,193 +2107,14 @@ func TestValidateTemplateReferences_CatalogEntry(t *testing.T) {
 	}
 }
 
-func TestValidateCatalogEntryForRoute(t *testing.T) {
-	singleUserManifest := types.MCPServerCatalogEntryManifest{ServerUserType: types.ServerUserTypeSingleUser}
-	multiUserManifest := types.MCPServerCatalogEntryManifest{ServerUserType: types.ServerUserTypeMultiUser}
-	invalidManifest := types.MCPServerCatalogEntryManifest{}
-
-	tests := []struct {
-		name        string
-		manifest    types.MCPServerCatalogEntryManifest
-		catalogID   string
-		workspaceID string
-		expectError bool
-	}{
-		{
-			name:        "single-user entry on single-user route: ok",
-			manifest:    singleUserManifest,
-			catalogID:   "",
-			workspaceID: "",
-			expectError: false,
-		},
-		{
-			name:        "empty serverUserType on single-user route: rejected",
-			manifest:    invalidManifest,
-			catalogID:   "",
-			workspaceID: "",
-			expectError: true,
-		},
-		{
-			name:        "multiUser entry on single-user route: rejected",
-			manifest:    multiUserManifest,
-			catalogID:   "",
-			workspaceID: "",
-			expectError: true,
-		},
-		{
-			name:        "single-user entry on catalog route: rejected",
-			manifest:    singleUserManifest,
-			catalogID:   "default",
-			workspaceID: "",
-			expectError: true,
-		},
-		{
-			name:        "single-user entry on workspace route: rejected",
-			manifest:    singleUserManifest,
-			catalogID:   "",
-			workspaceID: "ws-1",
-			expectError: true,
-		},
-		{
-			name:        "multiUser entry on catalog route: ok",
-			manifest:    multiUserManifest,
-			catalogID:   "default",
-			workspaceID: "",
-			expectError: false,
-		},
-		{
-			name:        "multiUser entry on workspace route: ok",
-			manifest:    multiUserManifest,
-			catalogID:   "",
-			workspaceID: "ws-1",
-			expectError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateCatalogEntryForRoute(tt.manifest, tt.catalogID, tt.workspaceID)
-			if tt.expectError && err == nil {
-				t.Error("expected error, got nil")
-			} else if !tt.expectError && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-		})
-	}
-}
-
-func TestValidateCatalogEntryManifest_ServerUserType(t *testing.T) {
-	npxManifest := types.MCPServerCatalogEntryManifest{
+func TestValidateCatalogEntryManifest_ShortDescriptionMaxLength(t *testing.T) {
+	base := types.MCPServerCatalogEntryManifest{
 		Runtime: types.RuntimeNPX,
 		NPXConfig: &types.NPXRuntimeConfig{
 			Package: "test-server",
 		},
+		ShortDescription: strings.Repeat("a", maxShortDescriptionLength),
 	}
-	uvxManifest := types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeUVX,
-		UVXConfig: &types.UVXRuntimeConfig{
-			Package: "test-server",
-		},
-	}
-	containerizedManifest := types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeContainerized,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "myimage:latest",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-	}
-	remoteManifest := types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeRemote,
-		RemoteConfig: &types.RemoteCatalogConfig{
-			FixedURL: "https://example.com/mcp",
-		},
-	}
-	compositeManifest := types.MCPServerCatalogEntryManifest{
-		Runtime:         types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{},
-	}
-
-	tests := []struct {
-		name           string
-		manifest       types.MCPServerCatalogEntryManifest
-		serverUserType types.ServerUserType
-		expectError    bool
-	}{
-		{
-			name:           "empty serverUserType with npx is rejected",
-			manifest:       npxManifest,
-			serverUserType: "",
-			expectError:    true,
-		},
-		{
-			name:           "explicit singleUser with npx is valid",
-			manifest:       npxManifest,
-			serverUserType: types.ServerUserTypeSingleUser,
-			expectError:    false,
-		},
-		{
-			name:           "multiUser with npx runtime is valid",
-			manifest:       npxManifest,
-			serverUserType: types.ServerUserTypeMultiUser,
-			expectError:    false,
-		},
-		{
-			name:           "multiUser with uvx runtime is valid",
-			manifest:       uvxManifest,
-			serverUserType: types.ServerUserTypeMultiUser,
-			expectError:    false,
-		},
-		{
-			name:           "multiUser with containerized runtime is valid",
-			manifest:       containerizedManifest,
-			serverUserType: types.ServerUserTypeMultiUser,
-			expectError:    false,
-		},
-		{
-			name:           "multiUser with remote runtime is valid",
-			manifest:       remoteManifest,
-			serverUserType: types.ServerUserTypeMultiUser,
-			expectError:    false,
-		},
-		{
-			name:           "multiUser with composite runtime is rejected",
-			manifest:       compositeManifest,
-			serverUserType: types.ServerUserTypeMultiUser,
-			expectError:    true,
-		},
-		{
-			name:           "invalid serverUserType is rejected",
-			manifest:       npxManifest,
-			serverUserType: "foo",
-			expectError:    true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manifest := tt.manifest
-			manifest.ServerUserType = tt.serverUserType
-			err := ValidateCatalogEntryManifest(t.Context(), manifest, false, ValidationOptions{})
-			if tt.expectError && err == nil {
-				t.Errorf("expected error for serverUserType=%q, got nil", tt.serverUserType)
-			} else if !tt.expectError && err != nil {
-				t.Errorf("unexpected error for serverUserType=%q: %v", tt.serverUserType, err)
-			}
-		})
-	}
-}
-
-func TestValidateCatalogEntryManifest_ShortDescriptionMaxLength(t *testing.T) {
-	base := types.MCPServerCatalogEntryManifest{
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeNPX,
-		NPXConfig: &types.NPXRuntimeConfig{
-			Package: "test-server",
-		},
-	}
-
-	base.ShortDescription = strings.Repeat("a", maxShortDescriptionLength)
 	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), base, false, ValidationOptions{}))
 
 	base.ShortDescription = strings.Repeat("a", maxShortDescriptionLength+1)
@@ -3144,33 +2122,10 @@ func TestValidateCatalogEntryManifest_ShortDescriptionMaxLength(t *testing.T) {
 	require.ErrorContains(t, err, fmt.Sprintf("short description must be less than or equal to %d characters", maxShortDescriptionLength))
 }
 
-func TestValidateCatalogEntryManifestGitManagedRequiresOverrideDescription(t *testing.T) {
-	manifest := types.MCPServerCatalogEntryManifest{
-		Name:           "Composite",
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{ComponentServers: []types.CatalogComponentServer{
-			{CatalogEntryID: "target", ToolOverrides: []types.ToolOverride{
-				{Name: "tool", Description: "old description", Enabled: true},
-			}},
-		}},
-	}
-
-	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), manifest, false, ValidationOptions{}))
-
-	err := ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{})
-	require.ErrorContains(t, err, "compositeConfig.componentServers[0].toolOverrides[0].description: cannot be set in Git-managed catalogs; use overrideDescription instead")
-
-	manifest.CompositeConfig.ComponentServers[0].ToolOverrides[0].Description = ""
-	manifest.CompositeConfig.ComponentServers[0].ToolOverrides[0].OverrideDescription = "new description"
-	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}))
-}
-
 func TestValidateCatalogEntryManifestCatalogSyncedRejectsTunnelName(t *testing.T) {
 	manifest := types.MCPServerCatalogEntryManifest{
-		Name:           "Remote",
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeRemote,
+		Name:    "Remote",
+		Runtime: types.RuntimeRemote,
 		RemoteConfig: &types.RemoteCatalogConfig{
 			FixedURL:   "https://example.com/mcp",
 			TunnelName: "mt1office",
@@ -3183,23 +2138,4 @@ func TestValidateCatalogEntryManifestCatalogSyncedRejectsTunnelName(t *testing.T
 		Field:   "remoteConfig.tunnelName",
 		Message: "cannot be set on catalog-synced entries",
 	}, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}))
-
-	composite := types.MCPServerCatalogEntryManifest{
-		Name:           "Composite",
-		ServerUserType: types.ServerUserTypeSingleUser,
-		Runtime:        types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{{
-				CatalogEntryID: "remote",
-				Manifest:       manifest,
-			}},
-		},
-	}
-
-	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), composite, false, ValidationOptions{}))
-	require.Equal(t, types.RuntimeValidationError{
-		Runtime: types.RuntimeRemote,
-		Field:   "compositeConfig.componentServers[0].manifest.remoteConfig.tunnelName",
-		Message: "cannot be set on catalog-synced entries",
-	}, ValidateCatalogEntryManifest(t.Context(), composite, true, ValidationOptions{}))
 }

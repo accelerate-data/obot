@@ -12,6 +12,7 @@
 		noteIcon?: Component;
 		note?: Snippet;
 		beta?: boolean;
+		nodes?: NavLink[];
 	};
 
 	const NAV_COLLAPSED_KEY = '@obot/layout/nav-collapsed';
@@ -53,30 +54,28 @@
 	import { page } from '$app/state';
 	import { columnResize } from '$lib/actions/resize';
 	import Navbar from '$lib/components/Navbar.svelte';
-	import { COMMUNITY_ENTITLEMENT } from '$lib/constants';
-	import { ADMIN_AGENT_DISABLED_MESSAGE, USER_AGENT_DISABLED_MESSAGE } from '$lib/constants';
+	import { COMMUNITY_ENTITLEMENT, ENTERPRISE_ENTITLEMENT } from '$lib/constants';
 	import {
 		initLayout as defaultInitLayout,
 		getLayout as defaultGetLayout,
 		type Layout as LayoutState
 	} from '$lib/context/layout.svelte';
-	import Bots from '$lib/icons/Bots.svelte';
 	import { localState } from '$lib/runes/localState.svelte';
 	import { Group } from '$lib/services';
 	import {
-		accessibleModels,
-		defaultModelAliases,
+		license as licenseStore,
 		profile,
 		responsive,
 		version,
 		appNotification as appNotificationStore
 	} from '$lib/stores';
 	import { adminConfigStore } from '$lib/stores/adminConfig.svelte';
-	import { isAgentEnabled, validateVersionUserLimit } from '$lib/utils';
+	import { validateVersionUserLimit } from '$lib/utils';
 	import AppNotificationBanner from './AppNotificationBanner.svelte';
+	import DotDotDot from './DotDotDot.svelte';
 	import InfoTooltip from './InfoTooltip.svelte';
-	import ConfigureBanner from './admin/ConfigureBanner.svelte';
 	import SetupSplashDialog from './admin/SetupSplashDialog.svelte';
+	import CommunitySignupBanner from './admin/license/CommunitySignupBanner.svelte';
 	import LicenseViolationBanner from './admin/license/LicenseViolationBanner.svelte';
 	import GuidePanel from './guides/GuidePanel.svelte';
 	import Guide from './guides/Guides.svelte';
@@ -85,46 +84,27 @@
 	import IconButton from './primitives/IconButton.svelte';
 	import { Render } from './ui/render';
 	import {
-		BrainCog,
 		ChevronDown,
 		ChevronLeft,
 		ChevronUp,
-		RadioTower,
-		Server,
 		Users,
-		BotMessageSquare,
-		PencilRuler,
-		LockOpen,
 		Bot,
 		LayoutDashboard,
-		Notebook,
-		Laptop,
 		PanelLeftOpen,
-		Settings,
 		PanelLeftClose,
-		Brain,
-		Container,
-		LayoutGrid,
-		KeyRound,
 		Menu,
-		X
+		X,
+		Logs,
+		Settings2,
+		MessageSquareText,
+		ChevronRight
 	} from '@lucide/svelte';
 	import { tick, untrack } from 'svelte';
 	import { fade, slide, type TransitionConfig } from 'svelte/transition';
 	import { twMerge } from 'tailwind-merge';
 
 	let navCollapsed = $state({ ...navCollapsedCache });
-	let showAdvancedPane = $state(untrack(() => isAdvancedPaneRoute(page.url.pathname)));
 	let animatingNavSectionId = $state<string | null>(null);
-
-	function isAdvancedPaneRoute(route: string): boolean {
-		return (
-			route.includes('/admin') ||
-			['/mcp-catalog', '/mcp-access-policies', '/audit-logs', '/usage'].some((p) =>
-				route.startsWith(p)
-			)
-		);
-	}
 
 	function isNavCollapsed(id: string): boolean {
 		return navCollapsed[id] ?? false;
@@ -178,6 +158,7 @@
 		rightMenu?: Snippet;
 		leftMenu?: Snippet;
 		title?: string;
+		titleContent?: Snippet;
 		subtitle?: string;
 		showBackButton?: boolean;
 		onBackButtonClick?: () => void;
@@ -212,7 +193,8 @@
 		layoutContext,
 		disableResize,
 		hideProfileButton,
-		alwaysShowHeaderTitle
+		alwaysShowHeaderTitle,
+		titleContent
 	}: Props = $props();
 	let nav = $state<HTMLDivElement>();
 	let sidebarScroll = $state<HTMLDivElement>();
@@ -220,455 +202,132 @@
 
 	function saveSidebarScroll() {
 		if (!sidebarScroll) return;
-		const pane: SidebarPane = showAdvancedPane ? 'advanced' : 'default';
-		sidebarScrollTopCache[pane] = sidebarScroll.scrollTop;
+		sidebarScrollTopCache.default = sidebarScroll.scrollTop;
 	}
 
 	async function restoreSidebarScroll() {
 		await tick();
 		if (!sidebarScroll) return;
-		const pane: SidebarPane = showAdvancedPane ? 'advanced' : 'default';
-		const scrollTop = sidebarScrollTopCache[pane];
+		const scrollTop = sidebarScrollTopCache.default;
 		if (scrollTop !== null) {
 			sidebarScroll.scrollTop = scrollTop;
 		}
 	}
 
-	// Whether the Obot Agent feature is enabled server-side. When false, agent entry
-	// points are removed entirely (not just disabled). When the feature is enabled but
-	// models aren't configured, agentLinkEnabled is false so links show as disabled.
-	let agentsFeatureEnabled = $derived(version.current.agentsEnabled !== false);
-	let agentLinkEnabled = $derived(
-		isAgentEnabled(defaultModelAliases.current) && agentsFeatureEnabled
-	);
-
+	let hostedAgentsFeatureEnabled = $derived(version.current.hostedAgentsEnabled === true);
 	let isBootStrapUser = $derived(profile.current.isBootstrapUser?.() ?? false);
-	let isAtLeastPowerUser = $derived(profile.current.groups.includes(Group.POWERUSER));
-	let isAtLeastPowerUserPlus = $derived(profile.current.groups.includes(Group.POWERUSER_PLUS));
+	let isAtLeastPoweruser = $derived(profile.current.groups.includes(Group.POWERUSER));
 
-	let hasAccessibleModels = $derived(accessibleModels.current.length > 0);
 	let hasLicenseEntitlementViolations = $derived(
 		(version.current.licenseEntitlementViolations?.length ?? 0) > 0
 	);
 	const isNearUserLimit = $derived(validateVersionUserLimit(version.current));
 
-	let defaultLinks = $derived<NavLink[]>([
-		{
-			id: 'mcp-servers',
-			icon: Server,
-			label: 'MCP Servers',
-			href: '/mcp-servers'
-		},
-		{
-			id: 'mcp-skills',
-			icon: PencilRuler,
-			label: 'Skills',
-			href: '/skills'
-		},
-		{
-			id: 'hosted-agents',
-			icon: Container,
-			label: 'Hosted Agents',
-			href: '/hosted-agents'
-		},
-		...(hasAccessibleModels
-			? [
-					{
-						id: 'llm-gateway-models',
-						href: '/llm-gateway/models',
-						icon: Brain,
-						label: 'Models',
-						collapsible: false
-					}
-				]
-			: []),
-		{
-			id: 'agent-auth-scope',
-			icon: KeyRound,
-			label: 'Agent Auth Scopes',
-			href: '/agent-auth-scopes',
-			collapsible: false
-		},
-		...(agentsFeatureEnabled
-			? [
-					{
-						id: 'launch-agent-chat',
-						href: '/agent',
-						icon: BotMessageSquare,
-						disabled: isBootStrapUser || !agentLinkEnabled,
-						label: 'Launch Agent',
-						collapsible: false,
-						noteIcon: !agentLinkEnabled ? LockOpen : undefined,
-						note: !agentLinkEnabled ? renderAgentDisabledNote : undefined
-					}
-				]
-			: [])
-	]);
-
-	let agentManagementLinks = $derived<NavLink[]>(
-		agentsFeatureEnabled
-			? [
-					{
-						id: 'agent-management',
-						icon: Bot,
-						label: 'Obot Agent Management',
-						collapsible: true,
-						items: [
-							{
-								id: 'admin-agents',
-								href: '/admin/agents',
-								icon: Bots,
-								label: 'Agents',
-								collapsible: false,
-								disabled: isBootStrapUser || !agentLinkEnabled
-							}
-						]
-					}
-				]
-			: []
-	);
-
-	let managementLinks = $derived<NavLink[]>(
-		profile.current.hasAdminAccess?.()
+	let routes = $derived([
+		...(isAtLeastPoweruser || profile.current.hasAdminAccess?.()
 			? [
 					{
 						id: 'mcp-dashboard',
 						icon: LayoutDashboard,
 						label: 'Dashboard',
-						href: '/admin/dashboard',
+						href: '/dashboard',
 						collapsible: false
-					},
-					{
-						id: 'mcp-server-management',
-						icon: RadioTower,
-						label: 'MCP Management',
-						collapsible: true,
-						items: [
-							{
-								id: 'mcp-catalog',
-								href: '/admin/mcp-catalog',
-								label: 'MCP Catalog',
-								disabled: isBootStrapUser,
-								collapsible: false
-							},
-							{
-								id: 'mcp-access-policies',
-								href: '/admin/mcp-access-policies',
-								label: 'MCP Access Policies',
-								disabled: isBootStrapUser,
-								collapsible: false
-							},
-							{
-								id: 'mcp-deployments',
-								href: '/admin/mcp-deployments',
-								label: 'MCP Deployments',
-								collapsible: false
-							},
-							{
-								id: 'audit-logs',
-								href: '/admin/audit-logs',
-								label: 'Audit Logs',
-								disabled: isBootStrapUser,
-								collapsible: false
-							},
-							{
-								id: 'usage',
-								href: '/admin/usage',
-								label: 'Usage',
-								disabled: isBootStrapUser,
-								collapsible: false
-							},
-							{
-								id: 'filters',
-								href: '/admin/filters',
-								label: 'Filters',
-								disabled: isBootStrapUser
-							},
-							version.current.engine === 'kubernetes' && !version.current.hideK8sDetails
-								? {
-										id: 'server-scheduling',
-										href: '/admin/server-scheduling',
-										label: 'Server Scheduling',
-										collapsible: false
-									}
-								: undefined,
-							version.current.engine === 'kubernetes'
-								? {
-										id: 'image-pull-secrets',
-										href: '/admin/image-pull-secrets',
-										label: 'Image Pull Secrets',
-										disabled: isBootStrapUser,
-										collapsible: false
-									}
-								: undefined,
-							...(profile.current.isAdmin?.()
-								? [
-										{
-											id: 'mcp-tunnels',
-											href: '/admin/mcp-tunnels',
-											label: 'MCP Tunnels',
-											disabled: isBootStrapUser,
-											collapsible: false
-										}
-									]
-								: [])
-						].filter(Boolean) as NavLink[]
-					},
-					{
-						id: 'skills-management',
-						icon: Notebook,
-						label: 'Skills Management',
-						collapsible: true,
-						items: [
-							{
-								id: 'skills',
-								href: '/admin/skills',
-								label: 'Skill Sources',
-								collapsible: false
-							},
-							{
-								id: 'skill-access-policies',
-								href: '/admin/skill-access-policies',
-								label: 'Skill Access Policies',
-								collapsible: false
-							}
-						]
-					},
-					{
-						id: 'hosted-agent-management',
-						icon: Container,
-						// "Management" is dropped deliberately: the section's items already
-						// say what they are, and the longer label wrapped to two lines in a
-						// narrow sidebar.
-						label: 'Hosted Agents',
-						collapsible: true,
-						items: [
-							{
-								id: 'hosted-agents',
-								href: '/admin/hosted-agents',
-								label: 'Templates',
-								collapsible: false
-							},
-							{
-								id: 'hosted-agent-access-policies',
-								href: '/admin/hosted-agent-access-policies',
-								label: 'Access Policies',
-								collapsible: false
-							}
-						]
-					},
-					{
-						id: 'device-management',
-						icon: Laptop,
-						label: 'Device Management',
-						collapsible: true,
-						items: [
-							{
-								id: 'devices',
-								href: '/admin/devices',
-								label: 'Devices',
-								disabled: isBootStrapUser,
-								collapsible: false,
-								beta: true
-							},
-							{
-								id: 'enforcement-decisions',
-								href: '/admin/enforcement-decisions',
-								label: 'Enforcement Decisions',
-								disabled: isBootStrapUser,
-								collapsible: false,
-								beta: true
-							}
-						]
-					},
-					{
-						id: 'user-management',
-						icon: Users,
-						label: 'Auth Management',
-						disabled: !version.current.authEnabled,
-						collapsible: true,
-						noteIcon: !version.current.authEnabled ? LockOpen : undefined,
-						note: !version.current.authEnabled ? renderAuthDisabledNote : undefined,
-						items: [
-							{
-								id: 'users',
-								href: '/admin/users',
-								label: 'Users',
-								collapsible: false,
-								disabled: !version.current.authEnabled
-							},
-							{
-								id: 'groups',
-								href: '/admin/groups',
-								label: 'Groups',
-								collapsible: false,
-								disabled: !version.current.authEnabled
-							},
-							{
-								id: 'user-roles',
-								href: '/admin/user-roles',
-								label: 'User Roles',
-								collapsible: false,
-								disabled: !version.current.authEnabled
-							},
-							{
-								id: 'auth-providers',
-								href: '/admin/auth-providers',
-								label: 'Auth Providers',
-								disabled: !version.current.authEnabled,
-								collapsible: false
-							},
-							{
-								id: 'agent-auth-scopes',
-								href: '/admin/agent-auth-scopes',
-								label: 'Agent Auth Scopes',
-								disabled: !version.current.authEnabled,
-								collapsible: false
-							}
-						]
-					},
-					{
-						id: 'llm-gateway',
-						icon: BrainCog,
-						label: 'LLM Gateway',
-						collapsible: true,
-						items: [
-							{
-								id: 'tokens',
-								href: '/admin/token-usage',
-								label: 'Token Usage',
-								disabled: isBootStrapUser,
-								collapsible: false
-							},
-							{
-								id: 'llm-audit-logs',
-								href: '/admin/llm-audit-logs',
-								label: 'Audit Logs',
-								disabled: isBootStrapUser,
-								collapsible: false
-							},
-							{
-								id: 'model-providers',
-								href: '/admin/model-providers',
-								label: 'Model Providers',
-								collapsible: false
-							},
-							{
-								id: 'model-access-policies',
-								href: '/admin/model-access-policies',
-								label: 'Model Access Policies',
-								collapsible: false
-							},
-							...(version.current.messagePoliciesEnabled
-								? [
-										{
-											id: 'message-policies',
-											href: '/admin/message-policies',
-											label: 'Message Policies',
-											collapsible: false
-										},
-										{
-											id: 'policy-violations',
-											href: '/admin/policy-violations',
-											label: 'Message Policy Violations',
-											collapsible: false
-										}
-									]
-								: [])
-						]
-					},
-					...agentManagementLinks,
-					{
-						id: 'app-management',
-						icon: LayoutGrid,
-						label: 'App Management',
-						collapsible: true,
-						items: [
-							{
-								id: 'license',
-								href: '/admin/license',
-								label: 'License',
-								disabled: false,
-								collapsible: false
-							},
-							{
-								id: 'branding',
-								href: '/admin/branding',
-								label: 'Branding',
-								disabled: false,
-								collapsible: false
-							},
-							{
-								id: 'app-notification',
-								href: '/admin/app-notification',
-								label: 'App Notification',
-								disabled: false,
-								collapsible: false
-							},
-							...(version.current.engine === 'kubernetes' && !version.current.hideK8sDetails
-								? [
-										{
-											id: 'app-scheduling',
-											href: '/admin/app-scheduling',
-											label: 'App Scheduling',
-											disabled: false,
-											collapsible: false
-										}
-									]
-								: [])
-						]
 					}
 				]
-			: isAtLeastPowerUser
-				? [
-						{
-							id: 'mcp-server-management',
-							icon: RadioTower,
-							label: 'MCP Management',
-							collapsible: true,
-							disabled: false,
-							items: [
-								...(isAtLeastPowerUser
-									? [
-											{
-												id: 'mcp-catalog',
-												href: '/mcp-catalog',
-												label: 'MCP Catalog',
-												disabled: false,
-												collapsible: false
-											},
-											...(isAtLeastPowerUserPlus
-												? [
-														{
-															id: 'mcp-access-policies',
-															href: '/mcp-access-policies',
-															label: 'MCP Access Policies',
-															disabled: false,
-															collapsible: false
-														}
-													]
-												: [])
-										]
-									: []),
-								{
-									id: 'audit-logs',
-									href: '/audit-logs',
-									label: 'Audit Logs',
-									disabled: false,
-									collapsible: false
-								},
-								{
-									id: 'usage',
-									href: '/usage',
-									label: 'Usage',
-									disabled: false,
-									collapsible: false
-								}
-							]
-						}
-					]
-				: []
-	);
+			: []),
+		{
+			id: 'ai-resources',
+			icon: Bot,
+			label: 'AI Resources',
+			collapsible: true,
+			items: [
+				{
+					id: 'vmcp',
+					label: 'vMCPs',
+					href: '/vmcps'
+				},
+				...(isAtLeastPoweruser || profile.current.hasAdminAccess?.()
+					? [
+							{
+								id: 'mcp-servers',
+								label: 'MCP Servers',
+								href: '/mcp-servers'
+							}
+						]
+					: []),
+				{
+					id: 'skills',
+					label: 'Skills',
+					href: '/skills'
+				},
+				{
+					id: 'models',
+					label: 'Models',
+					href: '/models'
+				}
+			]
+		},
+		{
+			id: 'operations',
+			icon: Logs,
+			label: 'Operations',
+			collapsible: true,
+			items: [
+				{
+					id: 'audit-logs',
+					label: 'Audit Logs',
+					href: '/audit-logs'
+				},
+				{
+					id: 'usage',
+					label: 'Usage',
+					href: '/usage'
+				},
+				...(profile.current.hasAdminAccess?.()
+					? [
+							{
+								id: 'inventory',
+								label: 'Inventory',
+								href: '/inventory',
+								beta: true
+							},
+							{
+								id: 'enforcement-events',
+								label: 'Enforcement Events',
+								href: '/admin/enforcement-events',
+								beta: true
+							}
+						]
+					: [])
+			]
+		},
+		...(hostedAgentsFeatureEnabled
+			? [
+					{
+						id: 'hosted-agents',
+						label: 'Hosted Agents',
+						icon: MessageSquareText,
+						href: '/hosted-agents'
+					}
+				]
+			: []),
+		{
+			id: 'identity-and-access',
+			label: 'Identity & Access',
+			icon: Users,
+			href: '/identity-access'
+		},
+		...(profile.current.hasAdminAccess?.()
+			? [
+					{
+						id: 'platform',
+						label: 'Platform',
+						icon: Settings2,
+						href: '/admin/platform'
+					}
+				]
+			: [])
+	]);
 
 	function collectBetaHrefs(links: NavLink[]): string[] {
 		return links.flatMap((link) => [
@@ -677,15 +336,13 @@
 		]);
 	}
 
-	let betaRoutes = $derived(collectBetaHrefs([...defaultLinks, ...managementLinks]));
+	let betaRoutes = $derived(collectBetaHrefs(routes));
 	let isBetaRoute = $derived(
 		betaRoutes.some((href) => pathname === href || pathname.startsWith(`${href}/`))
 	);
 	let logoVariant = $derived.by(() => {
-		if (version.current.licenseEntitlements?.includes(COMMUNITY_ENTITLEMENT))
-			return 'community' as const;
 		if (version.current.enterprise) return 'enterprise' as const;
-		return 'default' as const;
+		return 'community' as const;
 	});
 	$effect(() => {
 		if (responsive.isMobile) {
@@ -694,39 +351,28 @@
 	});
 
 	afterNavigate(async ({ to }) => {
-		if (to && managementLinks.length > 0) {
-			if (!isAdvancedPaneRoute(to.url.pathname)) {
-				showAdvancedPane = false;
-			} else {
-				showAdvancedPane = true;
-				const currentPath = to.url.pathname;
-				const parentNavLink = managementLinks.find((link) =>
-					link.items?.find(
-						(item) =>
-							item.href && (currentPath === item.href || currentPath.startsWith(`${item.href}/`))
-					)
-				);
-				if (parentNavLink && isNavCollapsed(parentNavLink.id)) {
-					toggleNavCollapsed(parentNavLink.id);
-				}
+		if (to && routes.length > 0) {
+			const currentPath = to.url.pathname;
+			const parentNavLink = routes.find((link) =>
+				link.items?.find(
+					(item) =>
+						item.href && (currentPath === item.href || currentPath.startsWith(`${item.href}/`))
+				)
+			);
+			if (parentNavLink && isNavCollapsed(parentNavLink.id)) {
+				toggleNavCollapsed(parentNavLink.id);
 			}
 		}
 
 		await restoreSidebarScroll();
 	});
 
-	const isAdminRoute = $derived(pathname.includes('/admin'));
 	const isAgentRoute = $derived(pathname === '/agent' || pathname.startsWith('/agent/'));
-	const excludeConfigureBanner = [
-		...(version.current.agentsEnabled !== false ? ['/admin/model-providers'] : []),
-		'/admin/auth-providers',
-		'/admin/branding'
-	];
 	$effect(() => {
 		const isAdminOrBootstrapUser =
 			profile.current.loaded &&
 			(profile.current.hasAdminAccess?.() || profile.current.isBootstrapUser?.());
-		if (isAdminOrBootstrapUser && isAdminRoute) {
+		if (isAdminOrBootstrapUser) {
 			adminConfigStore.initialize();
 		}
 	});
@@ -761,6 +407,74 @@
 			dismissedAt: new Date().toISOString()
 		} satisfies BannerDismissState;
 	}
+
+	const COMMUNITY_SIGNUP_BANNER_KEY = '@obot/dismiss-community-signup-banner';
+	let communitySignupBannerDismissed = localState<BannerDismissState | undefined>(
+		COMMUNITY_SIGNUP_BANNER_KEY,
+		undefined,
+		{
+			parse: (value) => {
+				if (!value) return undefined;
+				try {
+					const parsed = JSON.parse(value) as unknown;
+					if (parsed && typeof parsed === 'object') {
+						const dismissedAt = (parsed as BannerDismissState).dismissedAt;
+						return {
+							dismissedAt: typeof dismissedAt === 'string' ? dismissedAt : undefined
+						} satisfies BannerDismissState;
+					}
+					return undefined;
+				} catch {
+					return undefined;
+				}
+			}
+		}
+	);
+
+	function handleDismissCommunitySignupBanner() {
+		communitySignupBannerDismissed.current = {
+			dismissedAt: new Date().toISOString()
+		} satisfies BannerDismissState;
+	}
+
+	function isCommunitySignupDismissedForCurrentProfile() {
+		const dismissedAt = communitySignupBannerDismissed.current?.dismissedAt;
+		const dismissedDate = dismissedAt ? new Date(dismissedAt) : undefined;
+		const hasValidDismissedAt =
+			dismissedDate !== undefined && !Number.isNaN(dismissedDate.getTime());
+		if (!hasValidDismissedAt) return false;
+
+		const profileCreatedMs = profile.current.created
+			? new Date(profile.current.created).getTime()
+			: undefined;
+		if (
+			profileCreatedMs === undefined ||
+			Number.isNaN(profileCreatedMs) ||
+			profileCreatedMs < dismissedDate.getTime()
+		) {
+			return true;
+		}
+
+		return false;
+	}
+
+	const hasCommunityOrEnterpriseLicense = $derived.by(() => {
+		if (version.current.enterprise || licenseStore.current.enterprise) return true;
+		const entitlements = [
+			...(licenseStore.current.entitlements ?? []),
+			...(version.current.licenseEntitlements ?? [])
+		];
+		return (
+			entitlements.includes(COMMUNITY_ENTITLEMENT) || entitlements.includes(ENTERPRISE_ENTITLEMENT)
+		);
+	});
+
+	const canShowCommunitySignup = $derived.by(() => {
+		if (!(profile.current.isAdmin?.() || profile.current.isBootstrapUser?.())) return false;
+		if (hasCommunityOrEnterpriseLicense) return false;
+		if (!communitySignupBannerDismissed.isReady) return false;
+		return !isCommunitySignupDismissedForCurrentProfile();
+	});
 
 	let showAppNotificationBanner = $derived.by(() => {
 		if (isAgentRoute) return false;
@@ -817,44 +531,14 @@
 						classes?.sidebar
 					)}
 				>
-					{#if showAdvancedPane}
-						<div class="flex flex-col gap-0.5 h-full" in:slide={{ axis: 'x', duration: 100 }}>
-							<button
-								id="back-to-app-btn"
-								class="sidebar-link"
-								onclick={() => (showAdvancedPane = false)}
-							>
-								<ChevronLeft class="size-5 text-muted-content" />
-								<span class="uppercase text-xs font-semibold tracking-wide text-muted-content">
-									Back to App
-								</span>
-							</button>
-							{#each managementLinks as link (link.id)}
-								{@render navLink(link)}
-							{/each}
-						</div>
-					{:else}
-						<div class="flex flex-col gap-0.5 h-full">
-							{#each defaultLinks as link (link.id)}
-								{@render navLink(link)}
-							{/each}
-
-							<div class="flex grow"></div>
-
-							{#if managementLinks.length > 0}
-								<button
-									id="advanced-pane-btn"
-									class="sidebar-link mb-2 md:mb-0"
-									onclick={() => (showAdvancedPane = true)}
-								>
-									<Settings class="size-5 text-muted-content" />
-									<span class="uppercase text-xs font-semibold tracking-wide text-muted-content">
-										{profile.current.hasAdminAccess?.() ? 'Administration' : 'Advanced Settings'}
-									</span>
-								</button>
-							{/if}
-						</div>
-					{/if}
+					<div class="flex flex-col gap-0.5 h-full grow">
+						<!-- {#each allRoutesA as link (link.id)}
+							{@render navLink(link)}
+						{/each} -->
+						{#each routes as link (link.id)}
+							{@render navLink(link)}
+						{/each}
+					</div>
 				</div>
 
 				{#if !responsive.isMobile}
@@ -889,7 +573,7 @@
 			<div class="sticky top-0 left-0 z-50 w-full">
 				{#if banner}
 					{@render banner()}
-				{:else if hasLicenseEntitlementViolations || isNearUserLimit}
+				{:else if (hasLicenseEntitlementViolations || isNearUserLimit) && !profile.current.isAdminReadonly?.()}
 					<LicenseViolationBanner warnUserLimit={isNearUserLimit}>
 						{#snippet fallback()}
 							{#if showAppNotificationBanner}
@@ -905,8 +589,13 @@
 						data={appNotificationStore.current?.banner}
 						onDismiss={handleDismissBanner}
 					/>
+				{:else if canShowCommunitySignup}
+					<CommunitySignupBanner onDismiss={handleDismissCommunitySignupBanner} />
 				{/if}
-				<Navbar class={twMerge('dark:bg-base-100', classes?.navbar)} {hideProfileButton}>
+				<Navbar
+					class={twMerge('dark:bg-base-200 border-b border-base-300', classes?.navbar)}
+					{hideProfileButton}
+				>
 					{#snippet leftContent()}
 						{#if overrideLeftMenu}
 							{@render overrideLeftMenu()}
@@ -966,9 +655,6 @@
 						classes?.childrenContainer ?? ''
 					)}
 				>
-					{#if isAdminRoute && !excludeConfigureBanner.includes(pathname)}
-						<ConfigureBanner />
-					{/if}
 					{#if (!layout.sidebarOpen || hideSidebar) && !alwaysShowHeaderTitle}
 						<div
 							class={twMerge(
@@ -1012,14 +698,13 @@
 	{/if}
 </div>
 
-{#if isAdminRoute}
-	<SetupSplashDialog />
-{/if}
+<SetupSplashDialog />
 
 {#snippet layoutHeaderContent()}
 	{#if showBackButton}
 		<IconButton
 			class="btn btn-square btn-ghost shrink-0"
+			tooltip={{ text: 'Back' }}
 			onclick={() => {
 				if (onBackButtonClick) {
 					onBackButtonClick();
@@ -1031,7 +716,7 @@
 			<ChevronLeft class="size-6" />
 		</IconButton>
 	{/if}
-	{#if title}
+	{#if title || titleContent}
 		<div class="flex flex-col md:w-full">
 			{#if subtitle}
 				<span class="text-xs font-light text-muted-content">{subtitle}</span>
@@ -1042,109 +727,160 @@
 					!layout.sidebarOpen && classes?.noSidebarTitle
 				)}
 			>
-				{title}
-				{#if isBetaRoute}
-					<span class="badge badge-primary badge-sm font-medium uppercase">Beta</span>
+				{#if titleContent}
+					{@render titleContent()}
+				{:else}
+					{title}
+					{#if isBetaRoute}
+						<span class="badge badge-primary badge-sm font-medium uppercase">Beta</span>
+					{/if}
 				{/if}
 			</h1>
 		</div>
 	{/if}
 {/snippet}
 
-{#snippet renderAuthDisabledNote()}
-	{#if !version.current.authEnabled}
-		<p class="mt-1 text-sm">
-			Obot is running with authentication disabled. Click <a
-				href="https://docs.obot.ai/installation/enabling-authentication/"
-				rel="external noopener noreferrer"
-				target="_blank"
-				class="text-link">here</a
-			> for details.
-		</p>
-	{/if}
-{/snippet}
-
-{#snippet renderAgentDisabledNote()}
-	{#if !agentLinkEnabled}
-		<p class="mt-1 text-sm">
-			{profile.current.isAdmin?.() ? ADMIN_AGENT_DISABLED_MESSAGE : USER_AGENT_DISABLED_MESSAGE}
-		</p>
+{#snippet dotdotdot(link: NavLink, alt?: boolean)}
+	{#if link.nodes}
+		{@const isChildActive = link.nodes.some(
+			(node) => node.href && (node.href === pathname || pathname.startsWith(`${node.href}/`))
+		)}
+		<DotDotDot
+			class="flex w-full items-center justify-start"
+			placement="right-start"
+			classes={{ popover: 'z-60', menu: 'min-w-64' }}
+		>
+			{#snippet icon()}
+				{#if alt}
+					<div class="relative flex items-center gap-2 w-full" id={link.id}>
+						<div
+							class={twMerge(
+								'bg-base-400 absolute top-1/2 left-0 h-full w-0.5 -translate-x-3.25 -translate-y-1/2',
+								isChildActive && 'bg-primary'
+							)}
+						></div>
+						<span
+							class={twMerge(
+								'flex items-center gap-1 sidebar-link text-md font-medium justify-between w-full',
+								isChildActive && 'bg-base-300'
+							)}
+						>
+							<span class="flex items-center gap-1">
+								{#if link.icon}
+									<link.icon class="size-5" />
+								{/if}
+								{link.label}
+							</span>
+							<ChevronRight class="size-5" />
+						</span>
+					</div>
+				{:else}
+					<span
+						class={twMerge(
+							'flex items-center gap-1 sidebar-link text-md font-medium justify-between w-full',
+							isChildActive && 'bg-base-300'
+						)}
+					>
+						<span class="flex items-center gap-1">
+							{#if link.icon}
+								<link.icon class="size-5" />
+							{/if}
+							{link.label}
+						</span>
+						<ChevronRight class="size-5" />
+					</span>
+				{/if}
+			{/snippet}
+			{#each link.nodes as node (node.id)}
+				{@render navLink(node)}
+			{/each}
+		</DotDotDot>
+	{:else if link.href}
+		{@render rootLinkContent(link)}
 	{/if}
 {/snippet}
 
 {#snippet navLink(link: NavLink)}
-	<div class="flex">
-		{#if link.collapsible && !link.href}
-			<button
-				class="flex w-full items-center"
-				onclick={() => toggleNavCollapsed(link.id)}
-				id={`sidebar-collapse-${link.id}`}
-			>
-				{@render rootLinkContent(link)}
-				<div class="px-2">
-					{#if isNavCollapsed(link.id)}
-						<ChevronDown class="size-5" />
-					{:else}
-						<ChevronUp class="size-5" />
-					{/if}
-				</div>
-			</button>
-		{:else}
-			<div class="flex w-full items-center" id={link.id}>
-				{@render rootLinkContent(link)}
-			</div>
-		{/if}
-	</div>
-	{#if !isNavCollapsed(link.id)}
-		<div
-			in:navSectionSlide={{ id: link.id, axis: 'y' }}
-			out:navSectionSlide={{ id: link.id, axis: 'y' }}
-			onintroend={() => clearNavSectionAnimation(link.id)}
-			onoutroend={() => clearNavSectionAnimation(link.id)}
-		>
-			{#if onRenderSubContent}
-				{@render onRenderSubContent(link.label)}
-			{/if}
-			{#if link.items}
-				<div class="flex flex-col px-7 text-sm font-light mb-2">
-					{#each link.items as item (item.href)}
-						{@const isActive =
-							item.href && (item.href === pathname || pathname.startsWith(`${item.href}/`))}
-						<div class="relative flex items-center gap-2" id={item.id}>
-							<div
-								class={twMerge(
-									'bg-base-400 absolute top-1/2 left-0 h-full w-0.5 -translate-x-3 -translate-y-1/2',
-									isActive && 'bg-primary'
-								)}
-							></div>
-							{#if item.disabled}
-								<div class="sidebar-link disabled">
-									{@render linkContent(item)}
-								</div>
-							{:else if item.href}
-								<a
-									id={`sidebar-link-${item.id}`}
-									href={resolve(item.href as `/${string}`)}
-									class={twMerge('sidebar-link', isActive && 'bg-base-300')}
-									onclick={saveSidebarScroll}
-								>
-									{@render linkContent(item)}
-								</a>
-							{:else}
-								<div class="sidebar-link disabled">
-									{@render linkContent(item)}
-								</div>
-							{/if}
-							{#if item.noteIcon && item.note}
-								<InfoTooltip icon={item.noteIcon} interactive>
-									{@render item.note()}
-								</InfoTooltip>
-							{/if}
-						</div>
-					{/each}
+	{#if link.nodes}
+		{@render dotdotdot(link)}
+	{:else}
+		<div class="flex">
+			{#if link.collapsible && !link.href}
+				<button
+					class="flex w-full items-center"
+					onclick={() => toggleNavCollapsed(link.id)}
+					id={`sidebar-collapse-${link.id}`}
+				>
+					{@render rootLinkContent(link)}
+					<div class="px-2">
+						{#if isNavCollapsed(link.id)}
+							<ChevronDown class="size-5" />
+						{:else}
+							<ChevronUp class="size-5" />
+						{/if}
+					</div>
+				</button>
+			{:else}
+				<div class="flex w-full items-center" id={link.id}>
+					{@render rootLinkContent(link)}
 				</div>
 			{/if}
 		</div>
+		{#if !isNavCollapsed(link.id)}
+			<div
+				in:navSectionSlide={{ id: link.id, axis: 'y' }}
+				out:navSectionSlide={{ id: link.id, axis: 'y' }}
+				onintroend={() => clearNavSectionAnimation(link.id)}
+				onoutroend={() => clearNavSectionAnimation(link.id)}
+			>
+				{#if onRenderSubContent}
+					{@render onRenderSubContent(link.label)}
+				{/if}
+				{#if link.items}
+					<div class="flex flex-col pl-7 text-sm font-light mb-2">
+						{#each link.items as item (item.label)}
+							{#if item.nodes}
+								{@render dotdotdot(item, true)}
+							{:else}
+								{@const isActive =
+									item.href && (item.href === pathname || pathname.startsWith(`${item.href}/`))}
+								<div class="relative flex items-center gap-2" id={item.id}>
+									<div
+										class={twMerge(
+											'bg-base-400 absolute top-1/2 left-0 h-full w-0.5 -translate-x-3 -translate-y-1/2',
+											isActive && 'bg-primary'
+										)}
+									></div>
+									{#if item.disabled}
+										<div class="sidebar-link disabled">
+											{@render linkContent(item)}
+										</div>
+									{:else if item.href}
+										<a
+											id={`sidebar-link-${item.id}`}
+											href={resolve(item.href as `/${string}`)}
+											class={twMerge('sidebar-link', isActive && 'bg-base-300')}
+											onclick={saveSidebarScroll}
+										>
+											{@render linkContent(item)}
+										</a>
+									{:else}
+										<div class="sidebar-link disabled">
+											{@render linkContent(item)}
+										</div>
+									{/if}
+									{#if item.noteIcon && item.note}
+										<InfoTooltip icon={item.noteIcon} interactive>
+											{@render item.note()}
+										</InfoTooltip>
+									{/if}
+								</div>
+							{/if}
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
 	{/if}
 {/snippet}
 

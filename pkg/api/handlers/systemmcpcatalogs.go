@@ -16,7 +16,12 @@ import (
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	catalogCredentialMask          = "****"
+	catalogCredentialVisibleSuffix = 4
 )
 
 type SystemMCPCatalogHandler struct {
@@ -167,7 +172,7 @@ func (*SystemMCPCatalogHandler) ListEntries(req api.Context) error {
 	}
 
 	var list v1.SystemMCPServerCatalogEntryList
-	if err := req.List(&list, client.MatchingFields{"spec.systemMCPCatalogName": catalogName}); err != nil {
+	if err := req.List(&list, kclient.MatchingFields{"spec.systemMCPCatalogName": catalogName}); err != nil {
 		return fmt.Errorf("failed to list system catalog entries: %w", err)
 	}
 
@@ -307,11 +312,6 @@ func normalizeAndValidateCatalogSourceURLs(sourceURLs []string, localPath string
 	}
 	return nil
 }
-
-const (
-	catalogCredentialMask          = "****"
-	catalogCredentialVisibleSuffix = 4
-)
 
 func maskCatalogCredential(token string) string {
 	if len(token) <= catalogCredentialVisibleSuffix {

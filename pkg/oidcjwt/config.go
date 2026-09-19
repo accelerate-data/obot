@@ -1,6 +1,18 @@
 package oidcjwt
 
-import "strings"
+import (
+	"strings"
+)
+
+const (
+	defaultEligibilityClaimName = "eligible"
+	defaultRolesClaimName       = "roles"
+)
+
+var (
+	defaultAdminRoles = []string{"admin"}
+	defaultOwnerRoles = []string{"owner"}
+)
 
 type Config struct {
 	IssuerURL            string
@@ -11,14 +23,6 @@ type Config struct {
 	OwnerRoles           []string
 }
 
-const (
-	defaultEligibilityClaimName = "eligible"
-	defaultRolesClaimName       = "roles"
-)
-
-var defaultAdminRoles = []string{"admin"}
-var defaultOwnerRoles = []string{"owner"}
-
 func NormalizeIssuer(s string) string {
 	return strings.TrimRight(strings.TrimSpace(s), "/")
 }
@@ -27,7 +31,7 @@ func (c Config) Enabled() bool {
 	return c.IssuerURL != "" && c.Audience != ""
 }
 
-func LoadConfigFromEnv(getenv func(string) string) (Config, error) {
+func LoadConfigFromEnv(getenv func(string) string) Config {
 	issuer := getenv("OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER")
 	cfg := Config{
 		IssuerURL:            NormalizeIssuer(issuer),
@@ -44,7 +48,7 @@ func LoadConfigFromEnv(getenv func(string) string) (Config, error) {
 
 	cfg.AdminRoles = configuredRoles(getenv("OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ADMIN_ROLES"), defaultAdminRoles)
 	cfg.OwnerRoles = configuredRoles(getenv("OBOT_GENERIC_OAUTH_AUTH_PROVIDER_OWNER_ROLES"), defaultOwnerRoles)
-	return cfg, nil
+	return cfg
 }
 
 func configuredRoles(value string, defaults []string) []string {

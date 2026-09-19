@@ -21,6 +21,12 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	licenseKeyMask          = "****"
+	licenseKeyVisibleSuffix = 8
+	manualCheckCoolDown     = 5 * time.Minute
+)
+
 type LicenseProvider interface {
 	LicenseKey(context.Context) (string, error)
 	LicenseKeyViaConfiguration() bool
@@ -52,12 +58,6 @@ type LicenseStatus struct {
 type LicenseUpdate struct {
 	LicenseKey string `json:"licenseKey"`
 }
-
-const (
-	licenseKeyMask          = "****"
-	licenseKeyVisibleSuffix = 8
-	manualCheckCoolDown     = 5 * time.Minute
-)
 
 func NewLicenseHandler(licenseProvider LicenseProvider, communityIssuer upgrade.CommunityLicenseIssuer) *LicenseHandler {
 	return &LicenseHandler{

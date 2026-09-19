@@ -3,9 +3,9 @@
 	import { page } from '$app/state';
 	import { columnResize } from '$lib/actions/resize';
 	import { buildPillSearchParamFilters, buildSearchParamFiltersArray } from '$lib/auditlogs';
+	import FilterPills from '$lib/components/FilterPills.svelte';
 	import Search from '$lib/components/Search.svelte';
 	import AuditLogCalendar from '$lib/components/admin/audit-logs/AuditLogCalendar.svelte';
-	import AuditLogFilterPills from '$lib/components/admin/audit-logs/AuditLogFilterPills.svelte';
 	import AuditLogTableSkeleton from '$lib/components/admin/audit-logs/AuditLogTableSkeleton.svelte';
 	import FiltersDrawer from '$lib/components/admin/filters-drawer/FiltersDrawer.svelte';
 	import { setVirtualPageData } from '$lib/components/ui/virtual-page/context';
@@ -191,8 +191,8 @@
 			})
 			.catch((err) => {
 				if (isAbortError(err) || controller.signal.aborted) return;
-				console.error('Failed to fetch enforcement decisions:', err);
-				fetchError = err instanceof Error ? err.message : 'Failed to load enforcement decisions';
+				console.error('Failed to fetch enforcement events:', err);
+				fetchError = err instanceof Error ? err.message : 'Failed to load enforcement events';
 			})
 			.finally(() => {
 				if (controller.signal.aborted) return;
@@ -393,7 +393,7 @@
 			<TriangleAlert class="size-4 shrink-0" />
 			<span class="text-xs">
 				Enforcement is currently disabled, so no new decisions are being recorded.
-				<a class="text-link" href={resolve('/admin/devices?view=configuration')}
+				<a class="text-link" href={resolve('/inventory?view=configuration')}
 					>Enable it on the Devices page.</a
 				>
 			</span>
@@ -401,7 +401,7 @@
 	{/if}
 
 	{#if hasFilterPills}
-		<AuditLogFilterPills
+		<FilterPills
 			{pillsSearchParamFilters}
 			{getFilterDisplayLabel}
 			getFilterValue={(key, value) => getFilterOptionLabel(key.toString(), value.toString())}
@@ -415,7 +415,7 @@
 	<div class="notification-error flex w-full items-center gap-3 p-4">
 		<CircleAlert class="size-5 shrink-0" />
 		<div class="flex flex-col gap-1">
-			<p class="text-sm font-semibold">Unable to load enforcement decisions</p>
+			<p class="text-sm font-semibold">Unable to load enforcement events</p>
 			<p class="text-sm font-light">{fetchError}</p>
 		</div>
 	</div>
@@ -431,7 +431,7 @@
 {:else}
 	<div class="flex w-full flex-col items-center justify-center gap-4 px-6 py-16 text-center">
 		<ShieldCheck class="text-muted-content size-20 opacity-50" />
-		<h4 class="text-muted-content text-lg font-semibold">No enforcement decisions</h4>
+		<h4 class="text-muted-content text-lg font-semibold">No enforcement events</h4>
 		<p class="text-muted-content max-w-md text-sm font-light">
 			Nothing has been recorded for this range. Decisions are only logged while enforcement is
 			enabled for the fleet.

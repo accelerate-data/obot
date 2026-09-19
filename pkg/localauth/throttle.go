@@ -15,15 +15,9 @@ const (
 // dummyHash is verified when a login is attempted for an email that has no local user, so that
 // the response time doesn't reveal whether the account exists. It is the hash of a password that
 // cannot be entered, since it is longer than any form field allows.
-var dummyHash = mustHash(strings.Repeat("x", 128))
-
-func mustHash(password string) string {
-	h, err := HashPassword(password)
-	if err != nil {
-		panic(err)
-	}
-	return h
-}
+var (
+	dummyHash = mustHash(strings.Repeat("x", 128))
+)
 
 // throttle slows down password guessing by locking an email out after too many failures.
 // It is per-process and in-memory: it is a speed bump, not a distributed rate limiter.
@@ -35,6 +29,14 @@ type throttle struct {
 type failureCount struct {
 	count int
 	first time.Time
+}
+
+func mustHash(password string) string {
+	h, err := HashPassword(password)
+	if err != nil {
+		panic(err)
+	}
+	return h
 }
 
 func newThrottle() *throttle {

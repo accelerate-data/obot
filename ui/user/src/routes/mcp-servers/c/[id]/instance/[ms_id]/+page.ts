@@ -1,38 +1,24 @@
 import { handleRouteError } from '$lib/errors';
-import { UserService } from '$lib/services';
-import { profile } from '$lib/stores';
+import { getMCPCatalogEntry, getSingleOrRemoteMcpServer } from '../../../../utils';
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ params, fetch }) => {
+export const load: PageLoad = async ({ params, url, fetch, parent }) => {
 	const catalogEntryId = params.id;
 	const mcpServerId = params.ms_id;
-	let workspaceId;
+	const { profile } = await parent();
+
 	let catalogEntry;
 	let mcpServer;
 	try {
-		workspaceId = await UserService.fetchWorkspaceIDForProfile(profile.current?.id, { fetch });
-	} catch (_err) {
-		// can happen if basic user atm
-		workspaceId = undefined;
-	}
-
-	try {
-		catalogEntry = await UserService.getMCP(catalogEntryId, {
-			fetch
-		});
-		mcpServer = await UserService.getSingleOrRemoteMcpServer(mcpServerId, { fetch });
+		catalogEntry = await getMCPCatalogEntry(catalogEntryId, url, profile, fetch);
+		mcpServer = await getSingleOrRemoteMcpServer(mcpServerId, catalogEntryId, url, profile, fetch);
 	} catch (err) {
-		handleRouteError(
-			err,
-			`/mcp-servers/c/${catalogEntryId}/instance/${mcpServerId}`,
-			profile.current
-		);
+		handleRouteError(err, `/mcp-servers/c/${catalogEntryId}/instance/${mcpServerId}`, profile);
 	}
 
 	return {
-		workspaceId,
 		catalogEntry,
-		mcpServer,
-		mcpServerId
+		mcpServerId,
+		mcpServer
 	};
 };

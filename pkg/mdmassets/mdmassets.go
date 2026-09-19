@@ -36,15 +36,28 @@ import (
 // SchemaVersion is the manifest format this loader understands. An
 // assets tree declaring anything else is rejected so a newer format
 // can't be misread by an older server.
-const SchemaVersion = "v1"
+const (
+	SchemaVersion = "v1"
+)
 
-var artifactSlugNonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
+var (
+	artifactSlugNonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
+)
 
 // Loader validates and renders files from one immutable MDM asset bundle.
 type Loader struct {
 	files    fs.FS
 	manifest types.MDMAssetManifest
 	fields   *jsonschema.Resolved
+}
+
+// RenderedArtifact contains one fully rendered platform/OS download. Callers
+// persist Content privately and expose only the platform, OS, and instructions.
+type RenderedArtifact struct {
+	Platform     string
+	OS           string
+	Instructions string
+	Content      []byte
 }
 
 // NewFS loads and validates an assets snapshot rooted at files. Callers must
@@ -261,15 +274,6 @@ func (l *Loader) ValidateTemplates(c types.MDMAssetConfiguration, values map[str
 		}
 	}
 	return nil
-}
-
-// RenderedArtifact contains one fully rendered platform/OS download. Callers
-// persist Content privately and expose only the platform, OS, and instructions.
-type RenderedArtifact struct {
-	Platform     string
-	OS           string
-	Instructions string
-	Content      []byte
 }
 
 // RenderAll completes and validates values once, then renders every target in

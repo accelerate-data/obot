@@ -43,6 +43,11 @@ func TestGetCurrentUserContinuesWhenAuthProviderURLUnavailable(t *testing.T) {
 	kclient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(&v1.AuthProvider{
 		Name:      "generic-oauth-auth-provider",
 		Namespace: system.DefaultNamespace,
+		Spec: v1.AuthProviderSpec{AuthProviderManifest: apitypes.AuthProviderManifest{
+			CommonProviderMetadata: apitypes.CommonProviderMetadata{
+				RequiredConfigurationParameters: []apitypes.ProviderConfigurationParameter{{Name: "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID"}},
+			},
+		}},
 		Status: v1.AuthProviderStatus{
 			MissingConfigurationParameters: []string{"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID"},
 		},
@@ -119,6 +124,12 @@ func TestGetCurrentUserIncludesRequestTimeAdminUplift(t *testing.T) {
 	}
 	if body.EffectiveRole.HasRole(apitypes.RoleOwner) {
 		t.Fatalf("expected response effective role not to include owner, got %v", body.EffectiveRole)
+	}
+}
+
+func TestApplyRequestTimeRoleUpliftPreservesOwnerRolePrecedence(t *testing.T) {
+	if got := applyRequestTimeRoleUplift(apitypes.RoleBasic, apitypes.RoleOwner.Groups()); got != apitypes.RoleOwner {
+		t.Fatalf("expected owner uplift, got %v", got)
 	}
 }
 

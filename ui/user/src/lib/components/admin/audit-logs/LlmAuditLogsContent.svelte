@@ -2,8 +2,13 @@
 	import { afterNavigate } from '$app/navigation';
 	import { page } from '$app/state';
 	import { columnResize } from '$lib/actions/resize';
-	import { buildPillSearchParamFilters, buildSearchParamFiltersArray } from '$lib/auditlogs';
-	import DotDotDot from '$lib/components/DotDotDot.svelte';
+	import {
+		buildPillSearchParamFilters,
+		buildSearchParamFiltersArray,
+		getAuditLogAPIKeyFilterOptionLabel,
+		isAuditLogAPIKeyFilterOption
+	} from '$lib/auditlogs';
+	import FilterPills from '$lib/components/FilterPills.svelte';
 	import Search from '$lib/components/Search.svelte';
 	import AuditLogCalendar from '$lib/components/admin/audit-logs/AuditLogCalendar.svelte';
 	import LlmAuditLogsTable from '$lib/components/admin/audit-logs/LlmAuditLogsTable.svelte';
@@ -13,32 +18,34 @@
 		AdminService,
 		UserService,
 		type LLMAuditLog,
+		type AuditLogAPIKeyFilterOption,
 		type LLMAuditLogURLFilters,
 		type OrgUser
 	} from '$lib/services';
 	import type { PaginatedResponse } from '$lib/services/http';
-	import { profile, responsive } from '$lib/stores';
+	import { responsive } from '$lib/stores';
 	import { goto, replaceState } from '$lib/url';
 	import { getUserDisplayName } from '$lib/utils';
 	import FiltersDrawer from '../filters-drawer/FiltersDrawer.svelte';
-	import AuditLogFilterPills from './AuditLogFilterPills.svelte';
 	import AuditLogTableSkeleton from './AuditLogTableSkeleton.svelte';
 	import LlmAuditLogDetails, { type LlmAuditLogDetail } from './LlmAuditLogDetails.svelte';
-	import {
-		Captions,
-		ChevronLeft,
-		ChevronRight,
-		CircleAlert,
-		Funnel,
-		Plus,
-		Settings
-	} from '@lucide/svelte';
+	import { Captions, ChevronLeft, ChevronRight, CircleAlert, Funnel } from '@lucide/svelte';
 	import { endOfDay, set, subDays } from 'date-fns';
 	import { debounce } from 'es-toolkit';
 	import { twMerge } from 'tailwind-merge';
 
+	interface Props {
+		apiKeyId?: string | null;
+		startTime?: Date | null;
+		endTime?: Date | null;
+	}
+
+	let { apiKeyId, startTime: startTimeOverride, endTime: endTimeOverride }: Props = $props();
+	const hasDateRangeOverride = $derived(Boolean(startTimeOverride && endTimeOverride));
+
 	type SupportedFilter = keyof LLMAuditLogURLFilters;
 	const supportedFilters: SupportedFilter[] = [
+		'api_key_id',
 		'user_id',
 		'client_session_id',
 		'hide_models_requests',
@@ -57,10 +64,11 @@
 	let response = $state<PaginatedResponse<LLMAuditLog>>();
 	let pageIndex = $state(0);
 	let users = $state<OrgUser[]>([]);
+	let apiKeyFilterOptions = $state<Record<string, AuditLogAPIKeyFilterOption>>({});
 	let showFilters = $state(false);
 	let rightSidebar = $state<HTMLDivElement>();
 	let selectedAuditLog = $state<LlmAuditLogDetail>();
-	let isAdminReadonly = $derived(profile.current.isAdminReadonly?.());
+	const isApiKeyScoped = $derived(Boolean(apiKeyId));
 
 	const total = $derived(response?.total ?? 0);
 	const numberOfPages = $derived(Math.ceil(total / pageLimit));
@@ -118,12 +126,26 @@
 		);
 	});
 
+	const propsFilters = $derived.by(() => {
+		if (!apiKeyId) return {} as Partial<LLMAuditLogURLFilters>;
+		return { api_key_id: apiKeyId } as Partial<LLMAuditLogURLFilters>;
+	});
+	const propsFiltersKeys = $derived(new Set(Object.keys(propsFilters)));
+
 	const pillsSearchParamFilters = $derived(
-		buildPillSearchParamFilters<LLMAuditLogURLFilters>(searchParamFiltersAsArray)
+		buildPillSearchParamFilters<LLMAuditLogURLFilters>(
+			searchParamFiltersAsArray,
+			propsFilters,
+			propsFiltersKeys
+		)
 	);
 	const hasFilterPills = $derived(Object.keys(pillsSearchParamFilters).length > 0);
 
 	const timeRangeFilters = $derived.by(() => {
+		if (startTimeOverride && endTimeOverride) {
+			return { startTime: startTimeOverride, endTime: endTimeOverride };
+		}
+
 		const startParam = page.url.searchParams.get('start_time');
 		const endParam = page.url.searchParams.get('end_time');
 		const endTime = set(new Date(endParam || new Date()), { milliseconds: 0, seconds: 59 });
@@ -136,6 +158,7 @@
 
 	const filters = $derived<LLMAuditLogURLFilters>({
 		...pillsSearchParamFilters,
+		...propsFilters,
 		start_time: timeRangeFilters.startTime.toISOString(),
 		end_time: timeRangeFilters.endTime.toISOString(),
 		limit: pageLimit,
@@ -151,6 +174,37 @@
 			end_time: timeRangeFilters.endTime.toISOString()
 		})
 	);
+
+	function rememberAPIKeyFilterOptions(options: unknown[]) {
+		for (const option of options) {
+			if (typeof option !== 'string' && isAuditLogAPIKeyFilterOption(option)) {
+				apiKeyFilterOptions[option.value] = option;
+			}
+		}
+	}
+
+	$effect(() => {
+		const controller = new AbortController();
+		if (!filters.api_key_id) {
+			apiKeyFilterOptions = {};
+			return;
+		}
+		AdminService.listLLMAuditLogFilterOptions('api_key_id', {
+			...filters,
+			offset: null,
+			signal: controller.signal
+		})
+			.then((result) => {
+				apiKeyFilterOptions = {};
+				rememberAPIKeyFilterOptions(result.options ?? []);
+			})
+			.catch((error) => {
+				if (!isAbortError(error) && !controller.signal.aborted) {
+					console.error('Failed to fetch API key filter options:', error);
+				}
+			});
+		return () => controller.abort();
+	});
 
 	$effect(() => {
 		void filterPaginationKey;
@@ -220,6 +274,7 @@
 	function getFilterDisplayLabel(key: string) {
 		const _key = key as keyof LLMAuditLogURLFilters;
 		if (_key === 'outcome') return 'Outcome';
+		if (_key === 'api_key_id') return 'API Key';
 		if (_key === 'request_path') return 'Path';
 		if (_key === 'response_status') return 'Status';
 		if (_key === 'user_id') return 'User';
@@ -232,6 +287,12 @@
 	}
 
 	function getFilterValue(label: keyof LLMAuditLogURLFilters, value: string | number) {
+		if (label === 'api_key_id') {
+			const option = apiKeyFilterOptions[value.toString()];
+			return option
+				? getAuditLogAPIKeyFilterOptionLabel(option, (id) => getUserDisplayName(usersMap, id))
+				: value.toString();
+		}
 		if (label === 'user_id') {
 			return getUserDisplayName(usersMap, value + '');
 		}
@@ -253,7 +314,7 @@
 		formType: 'export' | 'scheduled' | 'storage',
 		next?: 'export' | 'scheduled'
 	) {
-		const url = new URL('/admin/llm-audit-logs/exports', page.url.origin);
+		const url = new URL('/audit-logs/llm/exports', page.url.origin);
 		page.url.searchParams.forEach((value, key) => {
 			url.searchParams.set(key, value);
 		});
@@ -267,7 +328,7 @@
 		return url;
 	}
 
-	async function openExportForm(formType: 'export' | 'scheduled') {
+	export async function openExportForm(formType: 'export' | 'scheduled') {
 		try {
 			const response = await AdminService.getStorageCredentials();
 			if (response.provider) {
@@ -282,7 +343,7 @@
 	}
 </script>
 
-<div class="flex flex-col gap-4 @container">
+<div class="flex flex-col gap-2 @container">
 	<div class="flex flex-col gap-4 @min-[768px]:flex-row">
 		<Search
 			class="dark:bg-base-200 dark:border-base-400 bg-base-100 border border-transparent shadow-sm"
@@ -291,11 +352,13 @@
 			value={query}
 		/>
 		<div class="self-start @min-[768px]:self-end flex gap-4">
-			<AuditLogCalendar
-				start={timeRangeFilters.startTime}
-				end={timeRangeFilters.endTime}
-				onChange={handleDateChange}
-			/>
+			{#if !hasDateRangeOverride}
+				<AuditLogCalendar
+					start={timeRangeFilters.startTime}
+					end={timeRangeFilters.endTime}
+					onChange={handleDateChange}
+				/>
+			{/if}
 			<button
 				class="btn btn-neutral h-12.5"
 				onclick={() => {
@@ -310,46 +373,13 @@
 		</div>
 	</div>
 
-	{#if hasFilterPills || !isAdminReadonly}
-		<div class="flex flex-col flex-nowrap gap-4 @min-[768px]:flex-row">
-			<div class="min-w-0 grow hidden @min-[768px]:block">
-				{#if hasFilterPills}
-					<AuditLogFilterPills {pillsSearchParamFilters} {getFilterDisplayLabel} {getFilterValue} />
-				{/if}
-			</div>
-			{#if !isAdminReadonly}
-				<div class="@min-[768px]:ml-auto flex shrink-0 gap-4">
-					<DotDotDot class="btn btn-block btn-primary w-fit text-sm" placement="bottom">
-						{#snippet icon()}
-							<span class="flex items-center justify-center gap-1">
-								<Plus class="size-4" /> Create Export
-							</span>
-						{/snippet}
-						<button class="menu-button" onclick={() => openExportForm('export')}>
-							Create One-time Export
-						</button>
-						<button class="menu-button" onclick={() => openExportForm('scheduled')}>
-							Create Export Schedule
-						</button>
-					</DotDotDot>
-
-					<button
-						class="btn btn-neutral rounded-4xl"
-						onclick={() => {
-							goto('/admin/llm-audit-logs/exports');
-						}}
-					>
-						<Settings class="size-4" />
-						Manage Exports
-					</button>
-				</div>
-			{/if}
-			<div class="min-w-0 grow block @min-[768px]:hidden">
-				{#if hasFilterPills}
-					<AuditLogFilterPills {pillsSearchParamFilters} {getFilterDisplayLabel} {getFilterValue} />
-				{/if}
-			</div>
-		</div>
+	{#if hasFilterPills}
+		<FilterPills
+			{pillsSearchParamFilters}
+			{getFilterDisplayLabel}
+			{getFilterValue}
+			isFilterClearable={(filterKey) => !propsFiltersKeys.has(String(filterKey))}
+		/>
 	{/if}
 </div>
 
@@ -442,8 +472,11 @@
 	{:else if showFilters}
 		<FiltersDrawer
 			onClose={handleRightSidebarClose}
-			filters={{ ...searchParamFilters }}
-			isFilterDisabled={() => false}
+			filters={{ ...searchParamFilters, ...propsFilters }}
+			getVisibleFilterKeys={() =>
+				supportedFilters.filter((key) => !(isApiKeyScoped && key === 'api_key_id'))}
+			isFilterDisabled={(filterId) => propsFiltersKeys.has(filterId)}
+			isFilterClearable={(filterId) => !propsFiltersKeys.has(filterId)}
 			isFilterMultiSelect={(filterId) => filterId !== 'hide_models_requests'}
 			getDefaultValue={(filterId) => (filterId === 'hide_models_requests' ? 'true' : undefined)}
 			getUserDisplayName={(...args) => getUserDisplayName(usersMap, ...args)}
@@ -461,9 +494,11 @@
 			endpoint={async (filterId, opts) => {
 				const response = await AdminService.listLLMAuditLogFilterOptions(filterId, {
 					...opts,
+					query,
 					start_time: timeRangeFilters.startTime.toISOString(),
 					end_time: timeRangeFilters.endTime.toISOString()
 				});
+				if (filterId === 'api_key_id') rememberAPIKeyFilterOptions(response.options ?? []);
 				return { options: response?.options ?? [] };
 			}}
 		/>

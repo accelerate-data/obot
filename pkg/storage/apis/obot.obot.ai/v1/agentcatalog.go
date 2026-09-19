@@ -8,7 +8,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-var _ fields.Fields = (*AgentCatalog)(nil)
+var (
+	_ fields.Fields = (*AgentCatalog)(nil)
+)
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
@@ -18,6 +20,28 @@ type AgentCatalog struct {
 
 	Spec   AgentCatalogSpec   `json:"spec"`
 	Status AgentCatalogStatus `json:"status"`
+}
+
+type AgentCatalogSpec struct {
+	types.AgentCatalogManifest `json:",inline"`
+}
+
+type AgentCatalogStatus struct {
+	LastSyncTime           metav1.Time `json:"lastSyncTime,omitzero"`
+	IsSyncing              bool        `json:"isSyncing,omitempty"`
+	SyncError              string      `json:"syncError,omitempty"`
+	ResolvedCommitSHA      string      `json:"resolvedCommitSHA,omitempty"`
+	DiscoveredAgentCount   int         `json:"discoveredAgentCount"`
+	DiscoveredHarnessCount int         `json:"discoveredHarnessCount"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+type AgentCatalogList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []AgentCatalog `json:"items"`
 }
 
 func (in *AgentCatalog) Has(field string) (exists bool) {
@@ -49,26 +73,4 @@ func (in *AgentCatalog) GetColumns() [][]string {
 		{"Discovered Harnesses", "Status.DiscoveredHarnessCount"},
 		{"Last Synced", "{{ago .Status.LastSyncTime}}"},
 	}
-}
-
-type AgentCatalogSpec struct {
-	types.AgentCatalogManifest `json:",inline"`
-}
-
-type AgentCatalogStatus struct {
-	LastSyncTime           metav1.Time `json:"lastSyncTime,omitzero"`
-	IsSyncing              bool        `json:"isSyncing,omitempty"`
-	SyncError              string      `json:"syncError,omitempty"`
-	ResolvedCommitSHA      string      `json:"resolvedCommitSHA,omitempty"`
-	DiscoveredAgentCount   int         `json:"discoveredAgentCount"`
-	DiscoveredHarnessCount int         `json:"discoveredHarnessCount"`
-}
-
-// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-
-type AgentCatalogList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata"`
-
-	Items []AgentCatalog `json:"items"`
 }

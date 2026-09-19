@@ -3,37 +3,45 @@
 	import Layout from '$lib/components/Layout.svelte';
 	import McpServerEntryForm from '$lib/components/admin/McpServerEntryForm.svelte';
 	import McpDeprecatedNotice from '$lib/components/mcp/McpDeprecatedNotice.svelte';
+	import McpDetachedNotice from '$lib/components/mcp/McpDetachedNotice.svelte';
 	import McpServerActions from '$lib/components/mcp/McpServerActions.svelte';
 	import { VirtualPageViewport } from '$lib/components/ui/virtual-page';
-	import { PAGE_TRANSITION_DURATION } from '$lib/constants';
-	import { UserService } from '$lib/services';
-	import { isDeprecatedMCPServer } from '$lib/services/user/mcp';
-	import { mcpServersAndEntries } from '$lib/stores';
-	import { type Component } from 'svelte';
+	import { DEFAULT_MCP_CATALOG_ID, PAGE_TRANSITION_DURATION } from '$lib/constants';
+	import { AdminService } from '$lib/services';
+	import { isDeprecatedMCPServer, isMultiUserCatalogEntry } from '$lib/services/user/mcp';
+	import { profile } from '$lib/stores';
+	import { success } from '$lib/stores/success';
+	import { isConnectorsNavigation } from '../../utils';
+	import { untrack, type Component } from 'svelte';
 	import { fly } from 'svelte/transition';
 
 	const duration = PAGE_TRANSITION_DURATION;
 
 	let { data } = $props();
-	let { workspaceId, catalogEntry } = $derived(data);
-	let title = $derived(catalogEntry?.manifest?.name ?? 'MCP Server');
-	const hasExistingConfigured = $derived(
-		Boolean(
-			catalogEntry &&
-			mcpServersAndEntries.current.userConfiguredServers.some(
-				(server) => server.catalogEntryID === catalogEntry?.id
-			)
-		)
+	let catalogEntry = $state(untrack(() => data.catalogEntry));
+
+	let isAdminReadonly = $derived(profile.current.isAdminReadonly?.());
+	let isSourcedEntry = $derived(
+		catalogEntry && 'sourceURL' in catalogEntry && !!catalogEntry.sourceURL
 	);
-	const configuredServers = $derived(
-		catalogEntry
-			? mcpServersAndEntries.current.userConfiguredServers.filter(
-					(server) => server.catalogEntryID === catalogEntry?.id
-				)
-			: []
-	);
-	let promptOAuthConfig = $derived(page.url.searchParams.get('configure-oauth') === 'true');
 	let deprecated = $derived(isDeprecatedMCPServer(catalogEntry));
+
+	let workspaceId = $derived(catalogEntry?.powerUserWorkspaceID);
+	let serverScopeEntity = $derived(workspaceId ? ('workspace' as const) : ('catalog' as const));
+	let serverScopeID = $derived(workspaceId || DEFAULT_MCP_CATALOG_ID);
+	let preview = $derived(isConnectorsNavigation(page.url));
+
+	async function acceptOwnership() {
+		if (!catalogEntry) return;
+		catalogEntry = await AdminService.acceptMCPCatalogEntryOwnership(
+			DEFAULT_MCP_CATALOG_ID,
+			catalogEntry.id
+		);
+	}
+
+	let title = $derived(catalogEntry?.manifest?.name ?? 'MCP Server');
+	let promptInitialLaunch = $derived(page.url.searchParams.get('launch') === 'true');
+	let promptOAuthConfig = $derived(page.url.searchParams.get('configure-oauth') === 'true');
 </script>
 
 <Layout
@@ -47,39 +55,46 @@
 	{#snippet rightNavActions()}
 		<McpServerActions
 			entry={catalogEntry}
+			catalogID={workspaceId ? undefined : serverScopeID}
 			workspaceID={workspaceId}
+			{promptInitialLaunch}
 			{promptOAuthConfig}
 			onOAuthConfigured={() => {
 				if (!catalogEntry) return;
-				UserService.getMCP(catalogEntry.id).then((entry) => {
+				AdminService.getMCPCatalogEntry(DEFAULT_MCP_CATALOG_ID, catalogEntry.id).then((entry) => {
 					catalogEntry = entry;
 				});
 			}}
+			onConnect={({ entry, server }) => {
+				if (isMultiUserCatalogEntry(entry) && server) {
+					success.add(`${server.alias || server.manifest.name} has been created.`);
+				}
+			}}
+			hideActions
 		/>
 	{/snippet}
 	<div class="flex h-full flex-col gap-6" in:fly={{ x: 100, delay: duration, duration }}>
 		<McpDeprecatedNotice {deprecated} variant="notification" />
-
-		{#if catalogEntry}
-			<McpServerEntryForm
-				entry={catalogEntry}
-				type={catalogEntry?.manifest.runtime === 'composite'
-					? 'composite'
-					: catalogEntry?.manifest.runtime === 'remote'
-						? 'remote'
-						: 'hosted'}
-				readonly={catalogEntry && 'sourceURL' in catalogEntry && !!catalogEntry.sourceURL}
-				id={workspaceId}
-				entity="workspace"
-				{hasExistingConfigured}
-				{configuredServers}
-				limitViews={['overview', 'tools']}
-				connectOnly
+		{#if profile.current.hasAdminAccess?.()}
+			<McpDetachedNotice
+				detached={catalogEntry?.detached}
+				sourceURL={catalogEntry?.sourceURL}
+				variant="notification"
+				onAcceptOwnership={isAdminReadonly ? undefined : acceptOwnership}
 			/>
 		{/if}
+
+		<McpServerEntryForm
+			entry={catalogEntry}
+			type={catalogEntry?.manifest.runtime === 'remote' ? 'remote' : 'hosted'}
+			readonly={isAdminReadonly || isSourcedEntry}
+			id={serverScopeID}
+			entity={serverScopeEntity}
+			limitViews={preview ? ['overview', 'tools'] : undefined}
+		/>
 	</div>
 </Layout>
 
 <svelte:head>
-	<title>Obot | {title}</title>
+	<title>Obot | {catalogEntry?.manifest?.name ?? 'MCP Server'}</title>
 </svelte:head>

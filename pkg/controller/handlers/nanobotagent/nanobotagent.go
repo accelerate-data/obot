@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"slices"
 	"strconv"
@@ -14,13 +15,12 @@ import (
 	"github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/nah/pkg/name"
 	"github.com/obot-platform/nah/pkg/router"
-	nanobottypes "github.com/obot-platform/nanobot/pkg/types"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/alias"
 	"github.com/obot-platform/obot/pkg/controller/handlers/provider"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	llmtypes "github.com/obot-platform/obot/pkg/llm"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
@@ -35,14 +35,38 @@ const (
 	nanobotRefreshBefore = 2 * time.Hour
 )
 
-var log = logger.Package()
-
 type Handler struct {
 	gatewayClient      *client.Client
 	localK8SBackend    backend.Backend
 	nanobotImage       string
 	serverURL          string
 	mcpServerNamespace string
+}
+
+// resolvedLLMModel pairs the resolved model resource name with its configured provider reference
+// and the dialect declared by that provider (if any).
+type resolvedLLMModel struct {
+	Name            string           // Kubernetes Model resource name
+	ModelProvider   string           // e.g. "openai-model-provider", "anthropic-model-provider"
+	ProviderDialect llmtypes.Dialect // from the resolved model manifest; empty if not declared
+}
+
+// nanobotLLMProvider describes how a single LLM provider should be configured in nanobot's YAML.
+type nanobotLLMProvider struct {
+	Name    string // key in llmProviders map (e.g. "openai", "anthropic")
+	Dialect llmtypes.Dialect
+	APIKey  string // env var reference derived from Name, e.g. "${OPENAI_MODEL_PROVIDER_API_KEY}"
+	BaseURL string // actual Obot proxy URL
+}
+
+type agentConfig struct {
+	LLMProviders map[string]agentLLMProviderConfig `json:"llmProviders,omitempty"`
+}
+
+type agentLLMProviderConfig struct {
+	Dialect llmtypes.Dialect `json:"dialect,omitempty"`
+	APIKey  string           `json:"apiKey,omitempty"`
+	BaseURL string           `json:"baseURL,omitempty"`
 }
 
 func New(gatewayClient *client.Client, localK8sRouter *router.Router, nanobotImage, serverURL, mcpServerNamespace string, mcpSessionManager *mcp.SessionManager) *Handler {
@@ -99,15 +123,14 @@ func (h *Handler) EnsureMCPServer(req router.Request, resp router.Response) erro
 			needsUpdate = true
 		}
 
-		expectedEnv := []types.MCPEnv{
+		expectedEnv := []types.MCPConfig{
 			{
 				Name:        "NANOBOT_ENV_FILE",
 				Description: "Environment variables file for Nanobot",
 				Key:         "NANOBOT_ENV_FILE",
 				Sensitive:   true,
 				Required:    true,
-				File:        true,
-				DynamicFile: true,
+				Usage:       types.DynamicFile,
 			},
 			{
 				Name:        "NANOBOT_CONFIG_FILE",
@@ -115,8 +138,7 @@ func (h *Handler) EnsureMCPServer(req router.Request, resp router.Response) erro
 				Key:         "NANOBOT_CONFIG_FILE",
 				Sensitive:   true,
 				Required:    true,
-				File:        true,
-				DynamicFile: true,
+				Usage:       types.DynamicFile,
 			},
 		}
 
@@ -132,23 +154,21 @@ func (h *Handler) EnsureMCPServer(req router.Request, resp router.Response) erro
 			}
 		}
 
-		// reflect.DeepEqual, not slices.Equal: MCPEnv carries a slice of configuration
-		// options, so it is no longer comparable.
-		if !reflect.DeepEqual(existing.Spec.Manifest.Env, expectedEnv) {
+		if !reflect.DeepEqual(existing.Spec.Manifest.Config, expectedEnv) {
 			needsUpdate = true
 		}
 
 		if needsUpdate {
-			log.Debugf("Updating nanobot MCP server config: agent=%s mcpServer=%s", agent.Name, mcpServerName)
+			slog.Debug("Updating nanobot MCP server config", "agent", agent.Name, "mcpServer", mcpServerName)
 			existing.Spec.Manifest.ContainerizedConfig.Args = expectedArgs
-			existing.Spec.Manifest.Env = expectedEnv
+			existing.Spec.Manifest.Config = expectedEnv
 			if err := req.Client.Update(req.Ctx, &existing); err != nil {
 				return fmt.Errorf("failed to update MCPServer: %w", err)
 			}
 		}
 
 		// Ensure credentials are up to date
-		if err := h.ensureCredentials(req.Ctx, req, resp, agent, mcpServerName); err != nil {
+		if err := h.ensureCredentials(req.Ctx, req, resp, agent, &existing); err != nil {
 			return fmt.Errorf("failed to ensure credentials: %w", err)
 		}
 
@@ -177,26 +197,22 @@ func (h *Handler) EnsureMCPServer(req router.Request, resp router.Response) erro
 					Path:        "/mcp",
 					HealthzPath: "/healthz",
 				},
-				Env: []types.MCPEnv{
-					{
-						Name:        "NANOBOT_ENV_FILE",
-						Description: "Environment variables file for Nanobot",
-						Key:         "NANOBOT_ENV_FILE",
-						Sensitive:   true,
-						Required:    true,
-						File:        true,
-						DynamicFile: true,
-					},
+				Config: []types.MCPConfig{{
+					Name:        "NANOBOT_ENV_FILE",
+					Description: "Environment variables file for Nanobot",
+					Key:         "NANOBOT_ENV_FILE",
+					Sensitive:   true,
+					Required:    true,
+					Usage:       types.DynamicFile,
+				},
 					{
 						Name:        "NANOBOT_CONFIG_FILE",
 						Description: "Provider config YAML for Nanobot",
 						Key:         "NANOBOT_CONFIG_FILE",
 						Sensitive:   true,
 						Required:    true,
-						File:        true,
-						DynamicFile: true,
-					},
-				},
+						Usage:       types.DynamicFile,
+					}},
 			},
 		},
 	}
@@ -204,10 +220,10 @@ func (h *Handler) EnsureMCPServer(req router.Request, resp router.Response) erro
 	if err := req.Client.Create(req.Ctx, mcpServer); err != nil {
 		return fmt.Errorf("failed to create MCPServer: %w", err)
 	}
-	log.Infof("Created nanobot agent MCP server: agent=%s mcpServer=%s", agent.Name, mcpServerName)
+	slog.Info("Created nanobot agent MCP server", "agent", agent.Name, "mcpServer", mcpServerName)
 
 	// Create credentials for the new server
-	if err := h.ensureCredentials(req.Ctx, req, resp, agent, mcpServerName); err != nil {
+	if err := h.ensureCredentials(req.Ctx, req, resp, agent, mcpServer); err != nil {
 		return fmt.Errorf("failed to create credentials: %w", err)
 	}
 
@@ -216,8 +232,9 @@ func (h *Handler) EnsureMCPServer(req router.Request, resp router.Response) erro
 
 // ensureCredentials ensures that the MCP server has credentials with API keys that are valid
 // and refreshes them when they are close to expiration.
-func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, resp router.Response, agent *v1.NanobotAgent, mcpServerName string) error {
-	credCtx := fmt.Sprintf("%s-%s", agent.Spec.UserID, mcpServerName)
+func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, resp router.Response, agent *v1.NanobotAgent, mcpServer *v1.MCPServer) error {
+	mcpServerName := mcpServer.Name
+	credCtx := mcpServer.CredentialContext(agent.Spec.UserID)
 
 	llmModel, err := resolveModel(ctx, req.Client, req.Namespace, types.DefaultModelAliasTypeLLM)
 	if err != nil {
@@ -253,7 +270,7 @@ func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, res
 		}
 		// Credential doesn't exist, needs to be created
 		needsRefresh = true
-		log.Debugf("Nanobot credential missing, creating: agent=%s mcpServer=%s", agent.Name, mcpServerName)
+		slog.Debug("Nanobot credential missing, creating", "agent", agent.Name, "mcpServer", mcpServerName)
 	} else {
 		// Credential exists, check if token needs refreshing.
 		// Use the configured provider's API key env var to find the token.
@@ -264,25 +281,25 @@ func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, res
 			if err != nil {
 				// Token is invalid, needs refresh
 				needsRefresh = true
-				log.Debugf("Nanobot credential token invalid, refreshing: agent=%s mcpServer=%s", agent.Name, mcpServerName)
+				slog.Debug("Nanobot credential token invalid, refreshing", "agent", agent.Name, "mcpServer", mcpServerName)
 			} else if apiKey.ExpiresAt != nil {
 				if untilRefresh := time.Until(*apiKey.ExpiresAt) - nanobotRefreshBefore; untilRefresh <= 0 {
 					// If the token expires soon, then refresh it
 					needsRefresh = true
 					resp.RetryAfter(time.Second)
-					log.Debugf("Nanobot credential due for refresh: agent=%s mcpServer=%s expiresAt=%s", agent.Name, mcpServerName, apiKey.ExpiresAt.UTC().Format(time.RFC3339))
+					slog.Debug("Nanobot credential due for refresh", "agent", agent.Name, "mcpServer", mcpServerName, "expiresAt", apiKey.ExpiresAt.UTC().Format(time.RFC3339))
 				} else {
 					// Otherwise, look at the agent again around the time the refresh would be needed.
 					resp.RetryAfter(untilRefresh)
 				}
 			} else {
 				needsRefresh = true
-				log.Debugf("API key set for no expiration, refreshing: agent=%s mcpServer=%s", agent.Name, mcpServerName)
+				slog.Debug("API key set for no expiration, refreshing", "agent", agent.Name, "mcpServer", mcpServerName)
 			}
 		} else {
 			// No token in credential, needs refresh
 			needsRefresh = true
-			log.Debugf("Nanobot credential missing token, refreshing: agent=%s mcpServer=%s", agent.Name, mcpServerName)
+			slog.Debug("Nanobot credential missing token, refreshing", "agent", agent.Name, "mcpServer", mcpServerName)
 		}
 	}
 
@@ -294,7 +311,7 @@ func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, res
 		return nil
 	}
 
-	log.Debugf("Refreshing nanobot credentials: agent=%s mcpServer=%s model=%s miniModel=%s", agent.Name, mcpServerName, llmDefault, miniDefault)
+	slog.Debug("Refreshing nanobot credentials", "agent", agent.Name, "mcpServer", mcpServerName, "model", llmDefault, "miniModel", miniDefault)
 
 	// Look up the gateway user to get the uint ID needed for API key creation
 	gatewayUser, err := h.gatewayClient.UserByID(ctx, agent.Spec.UserID)
@@ -371,7 +388,7 @@ func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, res
 	if h.localK8SBackend != nil {
 		// If local Kubernetes backend is available, trigger a sync to update the secret with the new credentials
 		triggerKey := fmt.Sprintf("%s/%s", h.mcpServerNamespace, name.SafeConcatName(mcpServerName, "mcp", "files"))
-		log.Debugf("Triggering local k8s secret sync: agent=%s mcpServer=%s key=%s", agent.Name, mcpServerName, triggerKey)
+		slog.Debug("Triggering local k8s secret sync", "agent", agent.Name, "mcpServer", mcpServerName, "key", triggerKey)
 		if err := h.localK8SBackend.Trigger(
 			ctx,
 			corev1.SchemeGroupVersion.WithKind("Secret"),
@@ -381,31 +398,15 @@ func (h *Handler) ensureCredentials(ctx context.Context, req router.Request, res
 			return fmt.Errorf("failed to trigger local Kubernetes sync: %w", err)
 		}
 	}
-	log.Infof("Nanobot credentials refreshed: agent=%s mcpServer=%s apiKeyID=%d", agent.Name, mcpServerName, apiKeyResp.ID)
+	slog.Info("Nanobot credentials refreshed", "agent", agent.Name, "mcpServer", mcpServerName, "apiKeyID", apiKeyResp.ID)
 	return nil
-}
-
-// resolvedLLMModel pairs the resolved model resource name with its configured provider reference
-// and the dialect declared by that provider (if any).
-type resolvedLLMModel struct {
-	Name            string               // Kubernetes Model resource name
-	ModelProvider   string               // e.g. "openai-model-provider", "anthropic-model-provider"
-	ProviderDialect nanobottypes.Dialect // from resolved model manifest dialect or ProviderMeta.Dialect; empty if not declared
-}
-
-// nanobotLLMProvider describes how a single LLM provider should be configured in nanobot's YAML.
-type nanobotLLMProvider struct {
-	Name    string // key in llmProviders map (e.g. "openai", "anthropic")
-	Dialect nanobottypes.Dialect
-	APIKey  string // env var reference derived from Name, e.g. "${OPENAI_MODEL_PROVIDER_API_KEY}"
-	BaseURL string // actual Obot proxy URL
 }
 
 // parseModelProvider returns the nanobot provider config and the fully-qualified
 // model name (provider/model) for a resolved model.
 //
-// If the provider has declared a dialect via ProviderMeta.Dialect, that dialect
-// is used. Otherwise the known built-in providers supply a default dialect.
+// If the provider has declared a dialect in its manifest, that dialect is used.
+// Otherwise the known built-in providers supply a default dialect.
 func (h *Handler) parseModelProvider(model resolvedLLMModel) (nanobotLLMProvider, string, error) {
 	name := model.ModelProvider
 	envVarName := strings.ToUpper(strings.ReplaceAll(name, "-", "_")) + "_API_KEY"
@@ -414,11 +415,11 @@ func (h *Handler) parseModelProvider(model resolvedLLMModel) (nanobotLLMProvider
 	if dialect == "" {
 		switch model.ModelProvider {
 		case system.AnthropicModelProvider:
-			dialect = nanobottypes.DialectAnthropicMessages
+			dialect = llmtypes.DialectAnthropicMessages
 		case system.OpenAIModelProvider:
-			dialect = nanobottypes.DialectOpenAIResponses
+			dialect = llmtypes.DialectOpenAIResponses
 		default:
-			dialect = nanobottypes.DialectOpenResponses
+			dialect = llmtypes.DialectOpenResponses
 		}
 	}
 
@@ -454,18 +455,18 @@ func (h *Handler) parseModelProvider(model resolvedLLMModel) (nanobotLLMProvider
 // buildNanobotProviderConfigYAML generates a nanobot Config YAML containing only the
 // providers required by the given LLM and mini-LLM models.
 func buildNanobotProviderConfigYAML(providers ...nanobotLLMProvider) (string, error) {
-	llmProviders := make(map[string]nanobottypes.LLMProvider, len(providers))
+	llmProviders := make(map[string]agentLLMProviderConfig, len(providers))
 	for _, p := range providers {
 		if _, exists := llmProviders[p.Name]; exists {
 			continue
 		}
-		llmProviders[p.Name] = nanobottypes.LLMProvider{
+		llmProviders[p.Name] = agentLLMProviderConfig{
 			Dialect: p.Dialect,
 			APIKey:  p.APIKey,
 			BaseURL: p.BaseURL,
 		}
 	}
-	data, err := sigsyaml.Marshal(nanobottypes.Config{LLMProviders: llmProviders})
+	data, err := sigsyaml.Marshal(agentConfig{LLMProviders: llmProviders})
 	if err != nil {
 		return "", err
 	}
@@ -491,7 +492,7 @@ func getModelForAlias(ctx context.Context, client kclient.Client, namespace stri
 	return resolvedLLMModel{
 		Name:            model.Name,
 		ModelProvider:   model.Spec.Manifest.ModelProvider,
-		ProviderDialect: nanobottypes.Dialect(model.Spec.Manifest.Dialect),
+		ProviderDialect: llmtypes.Dialect(model.Spec.Manifest.Dialect),
 	}, nil
 }
 
@@ -551,7 +552,7 @@ func chooseModel(ctx context.Context, client kclient.Client, namespace string, m
 				return resolvedLLMModel{
 					Name:            model.Name,
 					ModelProvider:   model.Spec.Manifest.ModelProvider,
-					ProviderDialect: nanobottypes.Dialect(model.Spec.Manifest.Dialect),
+					ProviderDialect: llmtypes.Dialect(model.Spec.Manifest.Dialect),
 				}, nil
 			}
 		}
@@ -565,7 +566,7 @@ func chooseModel(ctx context.Context, client kclient.Client, namespace string, m
 		return resolvedLLMModel{
 			Name:            models[0].Name,
 			ModelProvider:   models[0].Spec.Manifest.ModelProvider,
-			ProviderDialect: nanobottypes.Dialect(models[0].Spec.Manifest.Dialect),
+			ProviderDialect: llmtypes.Dialect(models[0].Spec.Manifest.Dialect),
 		}, nil
 	}
 
@@ -587,7 +588,9 @@ func preferredModelsForAlias(aliasName types.DefaultModelAliasType) []string {
 
 // deleteTokens revokes the API key and deletes the MCP token associated with the MCP server.
 func (h *Handler) deleteTokens(ctx context.Context, agent *v1.NanobotAgent, mcpServerName string) error {
-	credCtx := fmt.Sprintf("%s-%s", agent.Spec.UserID, mcpServerName)
+	// Agent servers are user-scoped and may already be deleted during cleanup.
+	mcpServer := v1.MCPServer{Name: mcpServerName}
+	credCtx := mcpServer.CredentialContext(agent.Spec.UserID)
 
 	// Retrieve the credential to get the API key ID
 	cred, err := h.gatewayClient.RevealCredential(ctx, []string{credCtx}, mcpServerName)

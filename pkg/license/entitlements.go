@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -21,23 +22,26 @@ const (
 	deviceLimitEntitlementDevicesSuffix = "_DEVICES"
 )
 
-var entitlementPathsToGate = []string{
-	"/mcp-connect/{mcp_id}",
-	"/mcp-connect/{mcp_id}/",
-	"GET /oauth/authorize",
-	"GET /oauth/authorize/",
-	"GET /oauth/consent/",
-	"POST /oauth/consent/",
-	"GET /oauth/complete/",
-	"GET /oauth/mcp/callback/",
-	"POST /oauth/",
-	"PUT /oauth/",
-	"GET /api/oauth/composite/{mcp_id}",
-	"/api/llm-proxy/",
-	"/api/skills",
-	"/api/skills/",
-	"POST /api/devices/scans",
-}
+var (
+	entitlementPathsToGate = []string{
+		"/mcp-connect/{mcp_id}",
+		"/mcp-connect/{mcp_id}/",
+		"GET /oauth/authorize",
+		"GET /oauth/authorize/",
+		"GET /oauth/consent/",
+		"POST /oauth/consent/",
+		"GET /oauth/complete/",
+		"GET /oauth/mcp/callback/",
+		"POST /oauth/",
+		"PUT /oauth/",
+		"GET /api/oauth/vmcp/{mcp_id}",
+		"GET /api/oauth/vmcp/{mcp_id}/",
+		"/api/llm-proxy/",
+		"/api/skills",
+		"/api/skills/",
+		"POST /api/devices/scans",
+	}
+)
 
 // Violation describes a configured provider that requires license entitlements
 // that are not currently available.
@@ -50,15 +54,27 @@ type Violation struct {
 	Message              string   `json:"message"`
 }
 
-type ProviderMeta struct {
-	RequiredEntitlements []string                               `json:"requiredEntitlements"`
-	EnvVars              []types.ProviderConfigurationParameter `json:"envVars"`
-}
-
 type ProviderEntitlementGate struct {
 	licenseProvider *Provider
 	client          kclient.Client
 	mux             *http.ServeMux
+}
+
+// fake is a fake handler that does fake things
+type fake struct{}
+
+// GetDistributionFromEntitlements returns the product distribution represented by the entitlements.
+func GetDistributionFromEntitlements(entitlements []string) types.ProductTelemetryDistribution {
+	switch {
+	case slices.Contains(entitlements, CloudEntitlement):
+		return types.ProductTelemetryDistributionCloud
+	case slices.Contains(entitlements, EnterpriseEntitlement):
+		return types.ProductTelemetryDistributionEnterprise
+	case slices.Contains(entitlements, CommunityEntitlement):
+		return types.ProductTelemetryDistributionRegistered
+	default:
+		return types.ProductTelemetryDistributionUnregistered
+	}
 }
 
 func NewProviderEntitlementGate(licenseProvider *Provider, client kclient.Client) *ProviderEntitlementGate {
@@ -324,8 +340,5 @@ func (p *Provider) configuredAuthProviderViolations(ctx context.Context, c kclie
 
 	return violations, nil
 }
-
-// fake is a fake handler that does fake things
-type fake struct{}
 
 func (f *fake) ServeHTTP(http.ResponseWriter, *http.Request) {}

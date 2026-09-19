@@ -1,6 +1,13 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+)
+
+const (
+	HostedAgentResourceTypeHostedAgent HostedAgentResourceType = "hostedAgent"
+	HostedAgentResourceTypeSelector    HostedAgentResourceType = "selector"
+)
 
 type HostedAgentAccessRule struct {
 	Metadata                      `json:",inline"`
@@ -12,6 +19,15 @@ type HostedAgentAccessRuleManifest struct {
 	Subjects    []Subject             `json:"subjects,omitempty"`
 	Resources   []HostedAgentResource `json:"resources,omitempty"`
 }
+
+type HostedAgentResource struct {
+	Type HostedAgentResourceType `json:"type"`
+	ID   string                  `json:"id"`
+}
+
+type HostedAgentResourceType string
+
+type HostedAgentAccessRuleList List[HostedAgentAccessRule]
 
 func (h HostedAgentAccessRuleManifest) Validate() error {
 	if len(h.Subjects) == 0 {
@@ -57,11 +73,6 @@ func (h HostedAgentAccessRuleManifest) Validate() error {
 	return nil
 }
 
-type HostedAgentResource struct {
-	Type HostedAgentResourceType `json:"type"`
-	ID   string                  `json:"id"`
-}
-
 func (h HostedAgentResource) Validate() error {
 	switch h.Type {
 	case HostedAgentResourceTypeHostedAgent:
@@ -82,12 +93,3 @@ func (h HostedAgentResource) Validate() error {
 func (h HostedAgentResource) IsWildcard() bool {
 	return h.Type == HostedAgentResourceTypeSelector && h.ID == "*"
 }
-
-type HostedAgentResourceType string
-
-const (
-	HostedAgentResourceTypeHostedAgent HostedAgentResourceType = "hostedAgent"
-	HostedAgentResourceTypeSelector    HostedAgentResourceType = "selector"
-)
-
-type HostedAgentAccessRuleList List[HostedAgentAccessRule]

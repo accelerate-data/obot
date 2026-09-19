@@ -1,6 +1,14 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+)
+
+const (
+	PolicyDirectionUserMessage PolicyDirection = "user-message"
+	PolicyDirectionToolCalls   PolicyDirection = "tool-calls"
+	PolicyDirectionBoth        PolicyDirection = "both"
+)
 
 type MessagePolicy struct {
 	Metadata              `json:",inline"`
@@ -16,11 +24,7 @@ type MessagePolicyManifest struct {
 
 type PolicyDirection string
 
-const (
-	PolicyDirectionUserMessage PolicyDirection = "user-message"
-	PolicyDirectionToolCalls   PolicyDirection = "tool-calls"
-	PolicyDirectionBoth        PolicyDirection = "both"
-)
+type MessagePolicyList List[MessagePolicy]
 
 func (m MessagePolicyManifest) Validate() error {
 	if m.DisplayName == "" {
@@ -60,5 +64,3 @@ func (m MessagePolicyManifest) Validate() error {
 
 	return nil
 }
-
-type MessagePolicyList List[MessagePolicy]

@@ -31,8 +31,10 @@ serve-docs:
 
 GIT_TAG := $(shell git describe --tags --exact-match 2>/dev/null | xargs -I {} echo -X 'github.com/obot-platform/obot/pkg/version.Tag={}')
 GO_LD_FLAGS := "-s -w $(GIT_TAG)"
+# Obot does not load Kustomize Go plugins; omit their dynamic symbol overhead.
+GO_BUILD_TAGS := kustomize_disable_go_plugin_support
 build:
-	go build -ldflags=$(GO_LD_FLAGS) -o bin/obot .
+	go build -trimpath -tags=$(GO_BUILD_TAGS) -ldflags=$(GO_LD_FLAGS) -o bin/obot .
 
 dev:
 	./tools/dev.sh $(ARGS)
@@ -83,6 +85,11 @@ test:
 	cd apiclient && go test -v -cover ./... && cd ..
 	cd logger && go test -v -cover ./... && cd ..
 
+# Integration tests start an isolated obot server and require Docker plus npm
+# and GHCR registry access.
+test-integration:
+	go test -count=1 -v -tags=integration -timeout=10m ./tests/integration/...
+
 # Runs Go linters and validates that all generated code is committed.
 validate-go-code: tidy generate lint-go no-changes
 
@@ -113,4 +120,4 @@ remove-docs-version:
 	rm -rf "./docs/versioned_docs/version-${version}"
 	jq 'del(.[] | select(. == "${version}"))' ./docs/versions.json > tmp.json && mv tmp.json ./docs/versions.json
 
-.PHONY: ui ui-user build all clean dev dev-open otel-jaeger-up otel-jaeger-down otel-jaeger-logs telepresence-setup lint lint-admin lint-api no-changes fmt tidy gen-docs-release deprecate-docs-release remove-docs-version
+.PHONY: ui ui-user build all clean dev dev-open otel-jaeger-up otel-jaeger-down otel-jaeger-logs telepresence-setup lint lint-admin lint-api test-integration no-changes fmt tidy gen-docs-release deprecate-docs-release remove-docs-version

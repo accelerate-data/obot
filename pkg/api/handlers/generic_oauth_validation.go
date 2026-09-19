@@ -3,11 +3,15 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/obot-platform/obot/apiclient/types"
+	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 )
 
 const (
@@ -23,6 +27,27 @@ type oidcDiscoveryDocument struct {
 	TokenEndpoint         string `json:"token_endpoint"`
 	JWKSURI               string `json:"jwks_uri"`
 	UserInfoEndpoint      string `json:"userinfo_endpoint"`
+}
+
+func validateGenericOAuthConfigChange(ctx context.Context, gatewayClient *gateway.Client, providerName string, existingCredentialContexts []string, envVars map[string]string) error {
+	if err := validateGenericOAuthConfig(ctx, providerName, envVars); err != nil {
+		return types.NewErrBadRequest("%v", err)
+	}
+	if providerName != GenericOAuthAuthProviderName {
+		return nil
+	}
+
+	existing, err := gatewayClient.RevealCredential(ctx, existingCredentialContexts, providerName)
+	if err != nil {
+		if errors.As(err, &gateway.CredentialNotFoundError{}) {
+			return nil
+		}
+		return fmt.Errorf("failed to reveal existing generic OAuth credential: %w", err)
+	}
+	if err := requireGenericOAuthTrustReconfirmation(providerName, existing.Secrets[GenericOAuthIssuerEnvVar], envVars); err != nil {
+		return types.NewErrBadRequest("%v", err)
+	}
+	return nil
 }
 
 func validateGenericOAuthConfig(ctx context.Context, providerName string, envVars map[string]string) error {

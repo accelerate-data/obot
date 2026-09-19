@@ -2,17 +2,144 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/oasdiff/yaml"
-	ntypes "github.com/obot-platform/nanobot/pkg/types"
+	mmmcpconfig "github.com/obot-platform/mmmcp/config"
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/version"
 )
+
+func TestConstructMCPServerMMMCPYAML(t *testing.T) {
+	data, err := constructMCPServerMMMCPYAML(ServerConfig{
+		MCPServerName:        "test-server",
+		MCPServerDisplayName: "Test/Server",
+		Command:              "npx",
+		Args:                 []string{"example", "${LITERAL_ARG}"},
+	}, map[string][]byte{
+		"TOKEN": []byte("${LITERAL_TOKEN}"),
+	})
+	if err != nil {
+		t.Fatalf("constructMCPServerMMMCPYAML() error = %v", err)
+	}
+
+	cfg, err := mmmcpconfig.Load(data, mmmcpconfig.LoadOptions{LookupEnv: func(string) (string, bool) { return "", false }})
+	if err != nil {
+		t.Fatalf("generated mmmcp config is invalid: %v\n%s", err, data)
+	}
+	if len(cfg.Servers) != 1 {
+		t.Fatalf("server count = %d, want 1", len(cfg.Servers))
+	}
+	if cfg.Name != "Test/Server" || cfg.Version != version.Get().String() {
+		t.Fatalf("server identity = %q/%q, want %q/%q", cfg.Name, cfg.Version, "Test/Server", version.Get().String())
+	}
+	server := cfg.Servers[0]
+	if server.Name != "Test-Server" || server.Command != "npx" {
+		t.Fatalf("unexpected mmmcp server identity: %#v", server)
+	}
+	if len(server.Args) != 2 || server.Args[1] != "${LITERAL_ARG}" {
+		t.Fatalf("args = %#v, want literal interpolation syntax preserved", server.Args)
+	}
+	if server.Env["TOKEN"] != "${LITERAL_TOKEN}" {
+		t.Fatalf("TOKEN = %q, want literal interpolation syntax preserved", server.Env["TOKEN"])
+	}
+}
+
+func TestMMMCPConfigTreatsVMCPAsAggregate(t *testing.T) {
+	config := MMMCPConfig(ServerConfig{
+		Runtime:              types.RuntimeVMCP,
+		MCPServerName:        "vmcp-server",
+		MCPServerDisplayName: "VMCP Server",
+		Components: []ComponentServer{
+			{
+				DisplayName: "search",
+				URL:         "http://127.0.0.1:8080/mcp-connect/search",
+				ToolPrefix:  "search_",
+				Tools: []types.ToolOverride{
+					{
+						Name:                "find",
+						OverrideName:        "find_documents",
+						Description:         "find a document",
+						OverrideDescription: "find documents",
+						Enabled:             true,
+					},
+				},
+			},
+		},
+	}, nil)
+
+	if config.Name != "VMCP Server" || len(config.Servers) != 1 {
+		t.Fatalf("vMCP config = %#v, want one aggregate component", config)
+	}
+	server := config.Servers[0]
+	if server.Name != "search" || server.URL != "http://127.0.0.1:8080/mcp-connect/search" || server.Prefix != "search_" {
+		t.Fatalf("vMCP component = %#v, want preserved name, URL, and prefix", server)
+	}
+	if len(server.Tools) != 1 {
+		t.Fatalf("vMCP tool overrides = %#v, want one", server.Tools)
+	}
+	tool := server.Tools[0]
+	if tool.Name != "find" || tool.OverrideName != "find_documents" || tool.Description != "find a document" || tool.OverrideDescription != "find documents" || !tool.Enabled {
+		t.Fatalf("vMCP tool override = %#v, want preserved override", tool)
+	}
+}
+
+func TestMMMCPConfigServerNameFallsBackToName(t *testing.T) {
+	config := MMMCPConfig(ServerConfig{
+		MCPServerName: "fallback-server",
+		URL:           "http://127.0.0.1:8080/mcp",
+	}, nil)
+
+	if config.Name != "fallback-server" || config.Version != version.Get().String() {
+		t.Fatalf("server identity = %q/%q, want %q/%q", config.Name, config.Version, "fallback-server", version.Get().String())
+	}
+}
+
+func TestServerHookConfigBuildsScopedHooks(t *testing.T) {
+	hooks, servers := ServerHookConfig(ServerConfig{UserID: "user-1", Audiences: []string{"https://obot.example"}, Webhooks: []Webhook{
+		{
+			Name: "policy/resource", DisplayName: "Shared Display Name", URL: "https://policy.example/mcp", ToolName: "validate",
+			Audience: "https://obot.example/mcp-connect/sms1policy-resource",
+			Definitions: types.MCPSelectors{
+				{Method: "tools/list"},
+				{Method: "tools/call", Identifiers: []string{"echo"}},
+				{Method: "resources/read", Identifiers: []string{"*"}},
+			},
+			MutateAllowed: true,
+		},
+	}})
+
+	server, ok := servers["policy-resource"]
+	if !ok {
+		t.Fatalf("hook server did not use stable resource name: %#v", servers)
+	}
+	if server.MCPServerName != system.SystemMCPServerPrefix+"policy/resource" || server.URL != "https://policy.example/mcp" || server.UserID != "user-1" || !server.SystemMCPServer {
+		t.Fatalf("unexpected native hook server config: %#v", server)
+	}
+	if len(server.Audiences) != 1 || server.Audiences[0] != "https://obot.example/mcp-connect/sms1policy-resource" {
+		t.Fatalf("hook server did not use the webhook audience: %#v", server.Audiences)
+	}
+	if len(hooks) != 3 {
+		t.Fatalf("got %d hook mappings, want 3: %#v", len(hooks), hooks)
+	}
+	if !hooks[0].Matches("tools/list", map[string]string{"name": "", "direction": "request"}) {
+		t.Fatal("tools/list method selector did not match")
+	}
+	if !hooks[1].Matches("tools/call", map[string]string{"name": "echo"}) || hooks[1].Matches("tools/call", map[string]string{"name": "search"}) {
+		t.Fatal("tools/call identifier selector did not scope by tool name")
+	}
+	if !hooks[2].Matches("resources/read", map[string]string{"name": "file:///readme"}) {
+		t.Fatal("wildcard identifier did not match resource URI")
+	}
+	for _, hook := range hooks {
+		if hook.Targets[0].Target != "policy-resource/validate" || hook.Targets[0].MutateDisallowed {
+			t.Fatalf("unexpected hook target: %#v", hook.Targets[0])
+		}
+	}
+}
 
 func TestEnsureServerReadyUsesHealthzPath(t *testing.T) {
 	var healthzCalls, mcpCalls int
@@ -79,283 +206,40 @@ func TestEnsureServerReadyHealthzPathWaitsForOK(t *testing.T) {
 	}
 }
 
-func TestConstructMCPServerNanobotYAMLForCompositeIncludesOnlyEnabledTools(t *testing.T) {
-	data, err := constructMCPServerNanobotYAMLForComposite(ServerConfig{
-		Components: []ComponentServer{
-			{
-				Name:       "configured-ping-echo",
-				URL:        "https://example.com/mcp",
-				ToolPrefix: "configured_",
-				Tools: []types.ToolOverride{
-					{Name: "ping", Enabled: false},
-					{Name: "echo", Enabled: true},
-				},
-			},
+func TestMMMCPConfigDisablesNPXAudit(t *testing.T) {
+	tests := []struct {
+		name    string
+		runtime types.Runtime
+		// want is the expected NPM_CONFIG_AUDIT value, empty when it should not be set at all.
+		want string
+	}{
+		{
+			name:    "npx",
+			runtime: types.RuntimeNPX,
+			want:    "false",
 		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	config := mustUnmarshalNanobotConfig(t, data)
-	server := config.MCPServers["configured-ping-echo"]
-	if server.ToolPrefix != "configured_" {
-		t.Fatalf("expected toolPrefix configured_, got %q", server.ToolPrefix)
-	}
-	if server.NoTools {
-		t.Fatal("expected noTools to be false")
-	}
-	if len(server.ToolOverrides) != 1 {
-		t.Fatalf("expected one tool override, got %#v", server.ToolOverrides)
-	}
-	if _, ok := server.ToolOverrides["echo"]; !ok {
-		t.Fatalf("expected echo to be included, got %#v", server.ToolOverrides)
-	}
-	if _, ok := server.ToolOverrides["ping"]; ok {
-		t.Fatalf("expected ping to be omitted, got %#v", server.ToolOverrides)
-	}
-}
-
-func TestConstructMCPServerNanobotYAMLForCompositeOmitsToolConfigWhenOverridesOmitted(t *testing.T) {
-	data, err := constructMCPServerNanobotYAMLForComposite(ServerConfig{
-		Components: []ComponentServer{
-			{
-				Name: "default-tools",
-				URL:  "https://example.com/mcp",
-			},
+		{
+			name:    "uvx",
+			runtime: types.RuntimeUVX,
+			want:    "",
 		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	config := mustUnmarshalNanobotConfig(t, data)
-	server := config.MCPServers["default-tools"]
-	if server.NoTools {
-		t.Fatal("expected omitted overrides not to set noTools")
-	}
-	if strings.Contains(string(data), "toolOverrides") {
-		t.Fatalf("expected omitted overrides not to set toolOverrides, got YAML:\n%s", string(data))
-	}
-	if len(server.ToolOverrides) != 0 {
-		t.Fatalf("expected omitted overrides not to set toolOverrides, got %#v", server.ToolOverrides)
-	}
-}
-
-func TestConstructMCPServerNanobotYAMLForCompositePreservesComponentsWithNoEnabledTools(t *testing.T) {
-	data, err := constructMCPServerNanobotYAMLForComposite(ServerConfig{
-		Components: []ComponentServer{
-			{
-				Name:    "ping-echo",
-				URL:     "https://example.com/mcp",
-				Tools:   []types.ToolOverride{},
-				noTools: true,
-			},
-			{
-				Name:       "configured-ping-echo",
-				URL:        "https://example.com/configured-mcp",
-				ToolPrefix: "configured_",
-				Tools: []types.ToolOverride{
-					{Name: "ping", Enabled: false},
-					{Name: "echo", Enabled: true},
-				},
-			},
+		{
+			name:    "containerized",
+			runtime: types.RuntimeContainerized,
+			want:    "",
 		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
 	}
 
-	config := mustUnmarshalNanobotConfig(t, data)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := MMMCPConfig(ServerConfig{
+				MCPServerName: "test-server",
+				Runtime:       tt.runtime,
+			}, nil)
 
-	disabledOnlyServer := config.MCPServers["ping-echo"]
-	if !disabledOnlyServer.NoTools {
-		t.Fatal("expected component with no enabled tools to set noTools")
-	}
-	if len(disabledOnlyServer.ToolOverrides) != 0 {
-		t.Fatalf("expected no enabled tool overrides, got %#v", disabledOnlyServer.ToolOverrides)
-	}
-
-	configuredServer := config.MCPServers["configured-ping-echo"]
-	if configuredServer.ToolPrefix != "configured_" {
-		t.Fatalf("expected toolPrefix configured_, got %q", configuredServer.ToolPrefix)
-	}
-	if configuredServer.NoTools {
-		t.Fatal("expected configured component to expose enabled tools")
-	}
-	if len(configuredServer.ToolOverrides) != 1 {
-		t.Fatalf("expected one configured tool override, got %#v", configuredServer.ToolOverrides)
-	}
-	if _, ok := configuredServer.ToolOverrides["echo"]; !ok {
-		t.Fatalf("expected echo to be included, got %#v", configuredServer.ToolOverrides)
-	}
-	if _, ok := configuredServer.ToolOverrides["ping"]; ok {
-		t.Fatalf("expected ping to be omitted, got %#v", configuredServer.ToolOverrides)
-	}
-}
-
-func TestConstructMCPServerNanobotYAMLForCompositeOmitsWebhooks(t *testing.T) {
-	data, err := constructMCPServerNanobotYAMLForComposite(ServerConfig{
-		Components: []ComponentServer{
-			{
-				Name: "component",
-				URL:  "https://example.com/mcp",
-			},
-		},
-		Webhooks: []Webhook{
-			{
-				Name:        "fallback-webhook",
-				DisplayName: "review/webhook",
-				URL:         "https://example.com/webhook",
-				ToolName:    "validate",
-				Definitions: types.MCPSelectors{
-					{Method: "tools/call", Identifiers: []string{"echo"}},
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	config := mustUnmarshalNanobotConfig(t, data)
-
-	if _, ok := config.MCPServers["review-webhook"]; ok {
-		t.Fatalf("expected webhook server to be omitted, got %#v", config.MCPServers)
-	}
-	if len(config.Hooks) != 0 {
-		t.Fatalf("expected hook mappings to be omitted, got %#v", config.Hooks)
-	}
-}
-
-func mustUnmarshalNanobotConfig(t *testing.T, data []byte) ntypes.Config {
-	t.Helper()
-	var config ntypes.Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		t.Fatalf("failed to unmarshal nanobot config: %v\n%s", err, string(data))
-	}
-	return config
-}
-
-// A command runtime (npx/uvx) downloads its package on first start. When that download
-// outruns nanobot's own two-minute first health check, nanobot records
-// "initialize failed: context deadline exceeded" and serves it as a 500 until its health
-// ticker retries a minute later — by which point the package is cached and the check
-// passes. The readiness poller must survive that window instead of aborting the whole
-// startup budget on the first 500 (VD-5283).
-func TestEnsureServerReadyToleratesTransientInternalServerError(t *testing.T) {
-	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" {
-			t.Errorf("unexpected path %s", r.URL.Path)
-		}
-		calls++
-		if calls < 3 {
-			http.Error(w, "initialize failed: context deadline exceeded", http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-
-	if err := ensureServerReady(ctx, server.URL+"/", ServerConfig{HealthzPath: "healthz"}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if calls != 3 {
-		t.Fatalf("expected three healthz calls, got %d", calls)
-	}
-}
-
-func TestEnsureServerReadyFailsOnPersistentInternalServerError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "tool listing failed", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
-
-	err := ensureServerReady(ctx, server.URL+"/", ServerConfig{HealthzPath: "healthz"})
-	if !errors.Is(err, ErrHealthCheckFailed) {
-		t.Fatalf("expected ErrHealthCheckFailed, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "tool listing failed") {
-		t.Fatalf("expected the nanobot body to be relayed, got %v", err)
-	}
-}
-
-// analyzePodStatus probes for a permanent verdict inside a watch loop rather than polling
-// for readiness, so it passes a zero grace period and must still fail on the first 500.
-func TestEnsureHTTPGetOKFailsFastWhenInternalServerErrorGraceIsZero(t *testing.T) {
-	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		http.Error(w, "tool listing failed", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-
-	if err := ensureHTTPGetOK(ctx, server.Client(), server.URL+"/healthz", 0); !errors.Is(err, ErrHealthCheckFailed) {
-		t.Fatalf("expected ErrHealthCheckFailed, got %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected exactly one healthz call, got %d", calls)
-	}
-}
-
-func TestEnsureHTTPGetOKGivesUpAfterInternalServerErrorGrace(t *testing.T) {
-	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		http.Error(w, "tool listing failed", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	if err := ensureHTTPGetOK(ctx, server.Client(), server.URL+"/healthz", 200*time.Millisecond); !errors.Is(err, ErrHealthCheckFailed) {
-		t.Fatalf("expected ErrHealthCheckFailed, got %v", err)
-	}
-	if ctx.Err() != nil {
-		t.Fatal("expected the grace period to end the poll, not the context")
-	}
-	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
-		t.Fatalf("gave up after %v, before the grace period elapsed", elapsed)
-	}
-	if calls < 2 {
-		t.Fatalf("expected the poll to retry within the grace period, got %d calls", calls)
-	}
-}
-
-// A server alternating 500 with any other status must not postpone the permanence verdict
-// for ever: the 500 window measures how long the server has been failing to come up, so
-// only a 200 clears it.
-func TestEnsureHTTPGetOKInternalServerErrorGraceSurvivesInterleavedStatuses(t *testing.T) {
-	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		if calls%2 == 0 {
-			http.Error(w, "waiting for startup", http.StatusTooEarly)
-			return
-		}
-		http.Error(w, "tool listing failed", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
-
-	if err := ensureHTTPGetOK(ctx, server.Client(), server.URL+"/healthz", 200*time.Millisecond); !errors.Is(err, ErrHealthCheckFailed) {
-		t.Fatalf("expected ErrHealthCheckFailed, got %v", err)
-	}
-	if ctx.Err() != nil {
-		t.Fatal("expected the grace period to end the poll, not the context")
+			if got := config.Servers[0].Env["NPM_CONFIG_AUDIT"]; got != tt.want {
+				t.Fatalf("NPM_CONFIG_AUDIT = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

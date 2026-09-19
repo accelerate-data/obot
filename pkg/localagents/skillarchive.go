@@ -13,20 +13,6 @@ import (
 	"github.com/obot-platform/obot/pkg/skillformat"
 )
 
-// SkillArchive is a validated skill payload ready for agent-specific
-// installation. ZIP parsing and download-specific checks live outside
-// DirectInstaller implementations.
-type SkillArchive struct {
-	Name  string
-	Files []SkillArchiveFile
-}
-
-type SkillArchiveFile struct {
-	RelPath string
-	Content []byte
-	Mode    fs.FileMode
-}
-
 const (
 	maxSkillArchiveFiles             = 200
 	maxSkillArchiveEntryBytes        = 100 * 1024 * 1024
@@ -38,6 +24,20 @@ var (
 	multipleDashes    = regexp.MustCompile(`-+`)
 	windowsDrivePath  = regexp.MustCompile(`^[A-Za-z]:`)
 )
+
+// SkillArchive is a validated skill payload ready for agent-specific
+// installation. ZIP parsing and download-specific checks live outside
+// local agent installers.
+type SkillArchive struct {
+	Name  string
+	Files []SkillArchiveFile
+}
+
+type SkillArchiveFile struct {
+	RelPath string
+	Content []byte
+	Mode    fs.FileMode
+}
 
 // ParseSkillArchive validates downloaded skill ZIP bytes and returns a
 // normalized archive rooted at the skill directory.

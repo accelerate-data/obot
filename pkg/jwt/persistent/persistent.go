@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -16,8 +17,6 @@ import (
 
 	"github.com/MicahParks/jwkset"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -26,7 +25,9 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
-var log = logger.Package()
+const (
+	keyEnvVar = "JWK_KEY"
+)
 
 type TokenService struct {
 	lock          sync.RWMutex
@@ -34,6 +35,33 @@ type TokenService struct {
 	jwks          json.RawMessage
 	gatewayClient *client.Client
 	serverURL     string
+}
+
+type TokenContext struct {
+	Issuer                string `json:"iss"`
+	Audience              string `json:"aud"`
+	IssuedAt              Time   `json:"iat"`
+	ExpiresAt             Time   `json:"exp"`
+	UserID                string `json:"sub"`
+	UserName              string `json:"name"`
+	UserEmail             string `json:"email"`
+	OAuthScope            string `json:"scope"`
+	Picture               string `json:"picture"`
+	UserGroups            StringSlice
+	AuthProviderName      string
+	AuthProviderNamespace string
+	AuthProviderUserID    string
+
+	MCPID            string
+	AuthorizedMCPIDs StringSlice
+
+	// This is used for requesting community license
+	InstallationID string `json:"installation_id,omitempty"`
+
+	// The following fields are for runs
+	Namespace     string
+	ModelProvider string
+	Model         string
 }
 
 func NewTokenService(serverURL string, gatewayClient *client.Client) (*TokenService, error) {
@@ -128,32 +156,6 @@ func (t *TokenService) ReplaceJWK(req api.Context) error {
 	return nil
 }
 
-type TokenContext struct {
-	Issuer                string `json:"iss"`
-	Audience              string `json:"aud"`
-	IssuedAt              Time   `json:"iat"`
-	ExpiresAt             Time   `json:"exp"`
-	UserID                string `json:"sub"`
-	UserName              string `json:"name"`
-	UserEmail             string `json:"email"`
-	OAuthScope            string `json:"scope"`
-	Picture               string `json:"picture"`
-	UserGroups            StringSlice
-	AuthProviderName      string
-	AuthProviderNamespace string
-	AuthProviderUserID    string
-
-	MCPID string
-
-	// This is used for requesting community license
-	InstallationID string `json:"installation_id,omitempty"`
-
-	// The following fields are for runs
-	Namespace     string
-	ModelProvider string
-	Model         string
-}
-
 func (t TokenContext) GetAudience() (jwt.ClaimStrings, error) {
 	if t.Audience == "" {
 		return nil, nil
@@ -207,42 +209,29 @@ func (t *TokenService) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		"mcp_id":                  {tokenContext.MCPID},
 		"resource":                {tokenContext.Audience},
 		"oauthScope":              {tokenContext.OAuthScope},
+		"authorized_mcp_ids":      tokenContext.AuthorizedMCPIDs,
 	}
 	if tokenContext.MCPID != "" {
-		extra["authorized_mcp_ids"] = []string{tokenContext.MCPID}
-	}
-	if mcpID, ok := strings.CutPrefix(tokenContext.Audience, t.serverURL+"/mcp-connect/"); ok {
-		// Ensure we only get the MCP ID
-		mcpID, _, _ := strings.Cut(mcpID, "/")
-		if mcpID != tokenContext.MCPID {
-			extra["authorized_mcp_ids"] = append(extra["authorized_mcp_ids"], mcpID)
-		}
-	} else if mcpID, ok := strings.CutPrefix(tokenContext.Audience, t.serverURL+"/mcp-connect-composite/"); ok {
-		mcpID, _, _ := strings.Cut(mcpID, "/")
-		if mcpID != tokenContext.MCPID {
-			extra["authorized_mcp_ids"] = append(extra["authorized_mcp_ids"], mcpID)
-		}
+		extra["authorized_mcp_ids"] = append(extra["authorized_mcp_ids"], tokenContext.MCPID)
 	}
 
 	groups := tokenContext.UserGroups
+	extra["obot_groups"] = slices.Clone(groups)
 
 	// Look up auth provider group memberships from the gateway DB
 	if userID, err := strconv.ParseUint(tokenContext.UserID, 10, 64); err == nil {
 		if authGroupIDs, err := t.gatewayClient.ListGroupIDsForUser(req.Context(), uint(userID)); err != nil {
-			log.Warnf("failed to list auth provider groups for user %s: %s", tokenContext.UserID, err.Error())
+			slog.Warn("failed to list auth provider groups for user", "userID", tokenContext.UserID, "error", err)
 		} else {
 			extra["auth_provider_groups"] = authGroupIDs
 
-			// If this token is scoped to the user's groups, then resolve the effective role.
-			if slices.Contains(groups, types.GroupBasic) {
-				// Resolve effective role by merging individual + group roles
-				if gatewayUser, err := t.gatewayClient.UserByID(req.Context(), tokenContext.UserID); err != nil {
-					log.Warnf("failed to look up user %s for role resolution: %s", tokenContext.UserID, err.Error())
-				} else if effectiveRole, err := t.gatewayClient.ResolveUserEffectiveRole(req.Context(), gatewayUser, authGroupIDs); err != nil {
-					log.Warnf("failed to resolve effective role for user %s: %s", tokenContext.UserID, err.Error())
-				} else {
-					groups = effectiveRole.Groups()
-				}
+			// Resolve effective role by merging individual + group roles
+			if gatewayUser, err := t.gatewayClient.UserByID(req.Context(), tokenContext.UserID); err != nil {
+				slog.Warn("failed to look up user for role resolution", "userID", tokenContext.UserID, "error", err)
+			} else if effectiveRole, err := t.gatewayClient.ResolveUserEffectiveRole(req.Context(), gatewayUser, authGroupIDs); err != nil {
+				slog.Warn("failed to resolve effective role for user", "userID", tokenContext.UserID, "error", err)
+			} else {
+				extra["obot_groups"] = effectiveRole.RoleGroups()
 			}
 		}
 	}
@@ -296,9 +285,13 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 	}
 
 	var groups []string
-	if userGroups, ok := claims["UserGroups"].(string); ok {
+	if userGroups, ok := claims["UserGroups"].(string); ok && userGroups != "" {
 		groups = strings.Split(userGroups, ",")
 		groups = slices.DeleteFunc(groups, func(s string) bool { return s == "" })
+	}
+	var authorizedMCPIDs StringSlice
+	if mcpIDs, ok := claims["AuthorizedMCPIDs"].(string); ok && mcpIDs != "" {
+		authorizedMCPIDs = StringSlice(strings.Split(mcpIDs, ","))
 	}
 
 	var issuedAt, expiresAt time.Time
@@ -330,6 +323,7 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 		AuthProviderNamespace: getStringClaim("AuthProviderNamespace"),
 		AuthProviderUserID:    getStringClaim("AuthProviderUserID"),
 		MCPID:                 getStringClaim("MCPID"),
+		AuthorizedMCPIDs:      authorizedMCPIDs,
 		Namespace:             getStringClaim("Namespace"),
 		ModelProvider:         getStringClaim("ModelProvider"),
 		Model:                 getStringClaim("Model"),
@@ -390,8 +384,6 @@ func (t *TokenService) ServeJWKS(api api.Context) error {
 
 	return api.Write(jwks)
 }
-
-const keyEnvVar = "JWK_KEY"
 
 func (t *TokenService) replaceKey(ctx context.Context, key ed25519.PrivateKey) error {
 	jwk, err := jwkset.NewJWKFromKey(key, jwkset.JWKOptions{

@@ -1,22 +1,9 @@
-import { DEFAULT_SYSTEM_MCP_CATALOG_ID } from '$lib/constants';
-import { handleRouteError } from '$lib/errors';
-import { AdminService } from '$lib/services';
 import type { PageLoad } from './$types';
+import { redirect } from '@sveltejs/kit';
 
-export const load: PageLoad = async ({ params, fetch, parent }) => {
-	const { profile } = await parent();
-	const { filterEntryId } = params;
-
-	try {
-		const entry = await AdminService.getSystemMCPCatalogEntry(
-			DEFAULT_SYSTEM_MCP_CATALOG_ID,
-			filterEntryId,
-			{
-				fetch
-			}
-		);
-		return { entry };
-	} catch (err) {
-		handleRouteError(err, `/admin/filters/c/${filterEntryId}`, profile);
-	}
+export const load: PageLoad = ({ params, url }) => {
+	throw redirect(
+		301,
+		`/mcp-servers/filters/c/${encodeURIComponent(params.filterEntryId)}${url.search}`
+	);
 };

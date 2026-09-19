@@ -12,7 +12,12 @@ import (
 // which httptest.ResponseRecorder alone cannot hijack.
 type hijackableRecorder struct {
 	*httptest.ResponseRecorder
+	flushed  bool
 	hijacked bool
+}
+
+func (r *hijackableRecorder) Flush() {
+	r.flushed = true
 }
 
 func (r *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -37,11 +42,21 @@ func TestResponseWritersStayHijackable(t *testing.T) {
 		{"audit over headers", func(rw http.ResponseWriter) http.ResponseWriter {
 			return &responseWriter{ResponseWriter: &headersResponseWriter{ResponseWriter: rw}}
 		}},
+		{"audit over headers over status", func(rw http.ResponseWriter) http.ResponseWriter {
+			return &responseWriter{ResponseWriter: &headersResponseWriter{ResponseWriter: &statusWriter{ResponseWriter: rw}}}
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := &hijackableRecorder{ResponseRecorder: httptest.NewRecorder()}
+			controller := http.NewResponseController(tt.wrap(recorder))
 
-			if _, _, err := http.NewResponseController(tt.wrap(recorder)).Hijack(); err != nil {
+			if err := controller.Flush(); err != nil {
+				t.Fatalf("Flush through the wrapper: %v", err)
+			}
+			if !recorder.flushed {
+				t.Error("the flush did not reach the underlying writer")
+			}
+			if _, _, err := controller.Hijack(); err != nil {
 				t.Fatalf("Hijack through the wrapper: %v", err)
 			}
 			if !recorder.hijacked {

@@ -2,42 +2,37 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
+	"log/slog"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/license"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/mcptester"
 	"github.com/obot-platform/obot/pkg/storage"
 	"github.com/obot-platform/obot/pkg/upgrade"
 	"github.com/obot-platform/obot/pkg/version"
 )
 
-type SessionStore string
-
 const (
 	SessionStoreDB     SessionStore = "db"
 	SessionStoreCookie SessionStore = "cookie"
-
-	updateCheckInterval = 24 * time.Hour
 )
 
-func sessionStoreFromPostgresDSN(postgresDSN string) SessionStore {
-	if postgresDSN != "" {
-		return SessionStoreDB
-	}
-	return SessionStoreCookie
+type SessionStore string
+
+type UpgradeStatusReader interface {
+	Status() upgrade.Status
 }
 
 type VersionHandlerOptions struct {
+	ProviderConfiguration   mcptester.ProviderConfigurationResolver
+	ModelProxyURL           *url.URL
+	ModelProxySettings      mcptester.ModelProxySettingsReader
 	GatewayClient           *client.Client
 	StorageClient           storage.Client
 	LicenseProvider         *license.Provider
@@ -46,45 +41,31 @@ type VersionHandlerOptions struct {
 	MCPNetworkPolicyEnabled bool
 	MCPDefaultDenyAllEgress bool
 	AuthEnabled             bool
-	DisableUpdateCheck      bool
 	MessagePoliciesEnabled  bool
 	AgentsEnabled           bool
+	HostedAgentsEnabled     bool
 	HideK8sDetails          bool
+	UpgradeStatusReader     UpgradeStatusReader
 }
 
 type VersionHandler struct {
 	VersionHandlerOptions
 
 	sessionStore SessionStore
-
-	upgradeServerURL string
-	upgradeAvailable bool
-	latestVersion    string
-
-	upgradeLock sync.RWMutex
 }
 
-func NewVersionHandler(ctx context.Context, opts VersionHandlerOptions) (*VersionHandler, error) {
-	v := &VersionHandler{
+func sessionStoreFromPostgresDSN(postgresDSN string) SessionStore {
+	if postgresDSN != "" {
+		return SessionStoreDB
+	}
+	return SessionStoreCookie
+}
+
+func NewVersionHandler(opts VersionHandlerOptions) *VersionHandler {
+	return &VersionHandler{
 		VersionHandlerOptions: opts,
 		sessionStore:          sessionStoreFromPostgresDSN(opts.PostgresDSN),
-		upgradeServerURL:      upgrade.EndpointURL(upgrade.ServerBaseURL(), "check-upgrade"),
 	}
-
-	currentVersion, _, _ := strings.Cut(version.Get().String(), "+")
-	currentVersion, _, _ = strings.Cut(currentVersion, "-")
-
-	// Don't start the upgrade check if explicitly disabled or if this is a development version.
-	if !opts.DisableUpdateCheck && (!strings.HasPrefix(currentVersion, "v0.0.0") || os.Getenv("OBOT_FORCE_UPGRADE_CHECK") == "true") {
-		installationID, err := upgrade.GetInstallationID(ctx, opts.GatewayClient)
-		if err != nil {
-			return nil, err
-		}
-
-		go v.startUpgradeCheck(ctx, installationID, currentVersion, opts.Engine)
-	}
-
-	return v, nil
 }
 
 func (v *VersionHandler) GetVersion(req api.Context) error {
@@ -106,10 +87,7 @@ func (v *VersionHandler) getVersionResponse(ctx context.Context) (map[string]any
 		return nil, err
 	}
 
-	v.upgradeLock.RLock()
-	upgradeAvailable := v.upgradeAvailable
-	latestVersion := v.latestVersion
-	v.upgradeLock.RUnlock()
+	upgradeStatus := v.upgradeStatus()
 
 	entitlements, err := v.LicenseProvider.Entitlements(ctx)
 	if err != nil {
@@ -127,8 +105,8 @@ func (v *VersionHandler) getVersionResponse(ctx context.Context) (map[string]any
 	}
 
 	values := map[string]any{
-		"upgradeAvailable":             upgradeAvailable,
-		"latestVersion":                latestVersion,
+		"upgradeAvailable":             upgradeStatus.UpgradeAvailable,
+		"latestVersion":                upgradeStatus.LatestVersion,
 		"obot":                         version.Get().String(),
 		"authEnabled":                  v.AuthEnabled,
 		"sessionStore":                 v.sessionStore,
@@ -140,11 +118,11 @@ func (v *VersionHandler) getVersionResponse(ctx context.Context) (map[string]any
 		"engine":                       engine,
 		"mcpNetworkPolicyEnabled":      v.MCPNetworkPolicyEnabled,
 		"mcpDefaultDenyAllEgress":      v.MCPDefaultDenyAllEgress,
-		"messagePoliciesEnabled":       v.MessagePoliciesEnabled,
-		"agentsEnabled":                v.AgentsEnabled,
-		"hideK8sDetails":               v.HideK8sDetails,
 		"licenseEntitlementViolations": violations,
 		"missingLicenseEntitlements":   missingEntitlements(violations),
+	}
+	for key, value := range v.featureValues() {
+		values[key] = value
 	}
 
 	userLimit, err := v.LicenseProvider.UserLimit(ctx)
@@ -173,7 +151,42 @@ func (v *VersionHandler) getVersionResponse(ctx context.Context) (map[string]any
 		}
 	}
 
+	// Model configuration can be changing independently of the rest of the app.
+	// Keep the version response available, but never interpret lookup failure as
+	// permission to use the external model service.
+	availability, availabilityErr := mcptester.ResolveModelProxyAvailability(ctx, v.ModelProxyURL, v.ProviderConfiguration, v.ModelProxySettings)
+	if availabilityErr != nil {
+		slog.Warn("model provider availability unresolved", "error", availabilityErr)
+	}
+
+	hasValidLicense, err := v.LicenseProvider.HasValidLicense(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set after OBOT_SERVER_VERSIONS so capability values cannot be overridden.
+	values["hasModelProvider"] = availability.HasModelProvider
+
+	values["hasValidLicense"] = hasValidLicense
+	values["mcpTesterModelProxyAvailable"] = availabilityErr == nil && availability.Enabled && hasValidLicense
+
 	return values, nil
+}
+
+func (v *VersionHandler) upgradeStatus() upgrade.Status {
+	if v.UpgradeStatusReader == nil {
+		return upgrade.Status{}
+	}
+	return v.UpgradeStatusReader.Status()
+}
+
+func (v *VersionHandler) featureValues() map[string]bool {
+	return map[string]bool{
+		"messagePoliciesEnabled": v.MessagePoliciesEnabled,
+		"agentsEnabled":          v.AgentsEnabled,
+		"hostedAgentsEnabled":    v.HostedAgentsEnabled,
+		"hideK8sDetails":         v.HideK8sDetails,
+	}
 }
 
 func missingEntitlements(violations []license.Violation) []string {
@@ -189,84 +202,4 @@ func missingEntitlements(violations []license.Violation) []string {
 	}
 	slices.Sort(missing)
 	return missing
-}
-
-func (v *VersionHandler) startUpgradeCheck(ctx context.Context, installationID, currentVersion, engine string) {
-	timer := time.NewTimer(updateCheckInterval)
-	defer timer.Stop()
-
-	var err error
-	for {
-		distribution := "oss"
-		hasValidLicense, licenseErr := v.LicenseProvider.HasValidLicense(ctx)
-		if licenseErr != nil {
-			log.Debugf("failed to refresh license state for upgrade check: %v", licenseErr)
-		} else if hasValidLicense {
-			distribution = "enterprise"
-		}
-		if err = v.checkForUpgrade(ctx, installationID, currentVersion, engine, distribution); err != nil {
-			log.Debugf("failed to check for server upgrade: %v", err)
-		}
-
-		select {
-		case <-ctx.Done():
-			log.Debugf("upgrade check context cancelled, exiting")
-			return
-		case <-timer.C:
-			timer.Reset(updateCheckInterval)
-		}
-	}
-}
-
-func (v *VersionHandler) checkForUpgrade(ctx context.Context, installationID, currentVersion, engine, distribution string) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.upgradeServerURL, nil)
-	if err != nil {
-		return err
-	}
-
-	query := req.URL.Query()
-	query.Set("uid", installationID)
-	query.Set("engine", engine)
-	query.Set("distribution", distribution)
-	query.Set("current-version", currentVersion)
-	req.URL.RawQuery = query.Encode()
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	var upgradeInfo upgradeCheckResponse
-	if err := json.NewDecoder(resp.Body).Decode(&upgradeInfo); err != nil {
-		return err
-	}
-
-	v.upgradeLock.RLock()
-	currentUpgradeAvailable := v.upgradeAvailable
-	latestVersion := v.latestVersion
-	v.upgradeLock.RUnlock()
-
-	if currentUpgradeAvailable != upgradeInfo.UpgradeAvailable || latestVersion != upgradeInfo.LatestVersion {
-		v.upgradeLock.Lock()
-		v.upgradeAvailable = upgradeInfo.UpgradeAvailable
-		v.latestVersion = upgradeInfo.LatestVersion
-		v.upgradeLock.Unlock()
-	}
-
-	return nil
-}
-
-type upgradeCheckResponse struct {
-	UpgradeAvailable bool   `json:"upgradeAvailable"`
-	LatestVersion    string `json:"latestVersion"`
-	CurrentVersion   string `json:"currentVersion"`
 }

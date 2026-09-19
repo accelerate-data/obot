@@ -8,11 +8,16 @@ export const UNAUTHORIZED_PATHS = new Set([
 	'/admin',
 	// The local auth provider's login form: anonymous by definition, so a 401 from the layout's
 	// profile fetch must not bounce the user back to the provider list.
-	'/login/local'
+	'/login/local',
+	// Activation carries its setup token in the URL fragment, so redirecting an anonymous visitor
+	// away would discard the only browser-side copy of it.
+	'/activate'
 ]);
 
 export const PAGE_TRANSITION_DURATION = 200;
 export const PAGE_SIZE = 50;
+
+export const SEEN_SPLASH_DIALOG_KEY = 'seenSplashDialog';
 
 export const CommonModelProviderIds = {
 	OLLAMA: 'ollama-model-provider',
@@ -44,6 +49,8 @@ export const RecommendedModelProviders = [
 
 export const PROJECT_MCP_SERVER_NAME = 'MCP Servers';
 export const DEFAULT_MCP_CATALOG_ID = 'default';
+export const MCP_NAV_SOURCE_PARAM = 'from';
+export const MCP_CONNECTORS_NAV_SOURCE = 'connectors';
 export const DEFAULT_SYSTEM_MCP_CATALOG_ID = 'default';
 
 export const CommonAuthProviderIds = {
@@ -346,8 +353,6 @@ export const PII_FILTER_OPTION_VALUES = [
 ];
 
 export const OBOT_GUIDE_KEYS = {
-	COMPLETED: '@obot/completed-guide',
-	GUIDE: '@obot/seen-guide',
 	SHOW_ALL_GUIDES: '@obot/show-all-guides'
 } as const;
 
@@ -387,7 +392,6 @@ export const CATALOG_SERVER_FIELD_IDS = {
 	cancelBtn: 'catalog-server-form-cancel',
 	removeConfigurationBtn: 'catalog-server-remove-configuration-btn',
 	compositeEntryChoice: 'catalog-server-composite-entry-choice',
-	compositeConfigureEntryToolsDialog: 'catalog-server-composite-entry-configure-tools',
 	compositeEntrySearchMcpServersDialog: 'search-mcp-servers-dialog',
 	compositeEntrySearchMcpServersConfirmBtn: 'search-mcp-servers-confirm-btn',
 	compositeEntrySearchMcpServersCancelBtn: 'search-mcp-servers-cancel-btn',
@@ -417,9 +421,10 @@ export const MCP_ACCESS_POLICY_FIELD_IDS = {
 } as const;
 
 export const MDM_DEVICES_CONFIGURATION_FIELD_IDS = {
-	devicesLink: 'sidebar-link-devices',
-	enforcementDecisionsLink: 'sidebar-link-enforcement-decisions',
-	configurationTab: 'devices-tab-configuration',
+	devicesLink: 'sidebar-link-inventory',
+	enforcementEventsLink: 'sidebar-link-enforcement-events',
+	configurationTab: 'tab-configuration',
+	inventoryTabDeviceMcpServers: 'tab-device-mcp-servers',
 	configurationDetails: 'devices-configuration-details',
 	getStartedButton: 'devices-configuration-get-started',
 	newEnrollmentKeyButton: 'enrollment-new-key-btn',
@@ -433,8 +438,8 @@ export const MDM_DEVICES_CONFIGURATION_FIELD_IDS = {
 	installInstructionsStep: 'devices-install-instructions',
 	agentSettingsButton: 'devices-agent-settings',
 	checkForUpdatesButton: 'devices-check-for-updates-button',
-	devicesTabOverview: 'devices-tab-overview',
-	devicesTabDevices: 'devices-tab-devices',
+	devicesTabOverview: 'tab-overview',
+	devicesTabDevices: 'tab-devices',
 	toolCallEnforcementSection: 'tool-call-enforcement-section'
 };
 
@@ -450,6 +455,13 @@ export const MCP_FILTERS_FIELD_IDS = {
 	saveBtn: 'filter-save-btn'
 };
 
+export const CLOUD_ENTITLEMENT = 'OBOT_CLOUD';
 export const COMMUNITY_ENTITLEMENT = 'OBOT_COMMUNITY';
 export const ENTERPRISE_ENTITLEMENT = 'OBOT_ENTERPRISE';
 export const MODEL_PROVIDERS_ENTITLEMENT = 'OBOT_ENTERPRISE_MODEL_PROVIDERS';
+
+export const COMMUNITY_SIGNUP_BANNER_COPY =
+	'Register your email to unlock all remaining IDPs and to receive the Obot Community Newsletter!';
+
+export const SETUP_COMMUNITY_SIGNUP_BANNER_COPY =
+	'Register once to get the free Obot Community Newsletter plus unlimited free access to Enterprise IdP providers and the Obot-powered chat for MCP Inspector.';

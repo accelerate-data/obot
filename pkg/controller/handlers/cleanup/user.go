@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strconv"
@@ -38,7 +39,7 @@ func NewUserCleanup(gatewayClient *gclient.Client, acrHelper *accesscontrolrule.
 func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 	userDelete := req.Object.(*v1.UserDelete)
 	userID := strconv.FormatUint(uint64(userDelete.Spec.UserID), 10)
-	log.Infof("Starting user cleanup: userID=%s", userID)
+	slog.Info("Starting user cleanup", "userID", userID)
 
 	complete, err := cleanupHostedAgents(req, userDelete, userID)
 	if err != nil {
@@ -65,7 +66,7 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 			return err
 		}
 	}
-	log.Infof("Removed user identities during cleanup: userID=%s identities=%d", userID, len(identities))
+	slog.Info("Removed user identities during cleanup", "userID", userID, "identities", len(identities))
 
 	var projects v1.ProjectList
 	if err := req.List(&projects, &kclient.ListOptions{
@@ -82,7 +83,7 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 			return err
 		}
 	}
-	log.Infof("Deleted projects during user cleanup: userID=%s projects=%d", userID, len(projects.Items))
+	slog.Info("Deleted projects during user cleanup", "userID", userID, "projects", len(projects.Items))
 
 	// Revoke any API keys the user created. Nanobot-agent keys are handled by the
 	// NanobotAgent delete flow above; this sweeps user-created keys plus anything
@@ -96,7 +97,49 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 			return fmt.Errorf("failed to revoke API key %d for user %d: %w", key.ID, userDelete.Spec.UserID, err)
 		}
 	}
-	log.Infof("Revoked API keys during user cleanup: userID=%s keys=%d", userID, len(apiKeys))
+	slog.Info("Revoked API keys during user cleanup", "userID", userID, "keys", len(apiKeys))
+
+	// Delete vMCPs
+	var vmcps v1.VMCPList
+	if err := req.List(&vmcps, &kclient.ListOptions{
+		Namespace: req.Namespace,
+		FieldSelector: fields.SelectorFromSet(map[string]string{
+			"spec.userID": userID,
+		}),
+	}); err != nil {
+		return err
+	}
+
+	var deletedvMCPs int
+	for _, vmcp := range vmcps.Items {
+		if err := kclient.IgnoreNotFound(req.Delete(&vmcp)); err != nil {
+			return err
+		}
+
+		deletedvMCPs++
+	}
+	slog.Info("Deleted vMCPs during user cleanup", "userID", userID, "vMCPs", deletedvMCPs)
+
+	// Delete vMCPInstances
+	var vmcpInstances v1.VMCPInstanceList
+	if err := req.List(&vmcpInstances, &kclient.ListOptions{
+		Namespace: req.Namespace,
+		FieldSelector: fields.SelectorFromSet(map[string]string{
+			"spec.userID": userID,
+		}),
+	}); err != nil {
+		return err
+	}
+
+	var deletedvMCPInstances int
+	for _, instance := range vmcpInstances.Items {
+		if err := kclient.IgnoreNotFound(req.Delete(&instance)); err != nil {
+			return err
+		}
+
+		deletedvMCPInstances++
+	}
+	slog.Info("Deleted vMCP instances during user cleanup", "userID", userID, "vMCPInstances", deletedvMCPInstances)
 
 	var servers v1.MCPServerList
 	if err := req.List(&servers, &kclient.ListOptions{
@@ -113,7 +156,9 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 		// Skip multi-user servers in the default MCPCatalog — they should persist after user deletion.
 		// Also skip servers that are associated with an agent because we need the credential to stick
 		// around so we can revoke the API key.
-		if server.Spec.MCPCatalogID == system.DefaultCatalog || server.Spec.NanobotAgentID != "" {
+		// Finally, skip servers associated to vMCP components because those will be deleted when the above
+		// objects are deleted.
+		if server.Spec.MCPCatalogID == system.DefaultCatalog || server.Spec.NanobotAgentID != "" || server.Spec.VMCPComponentID != "" {
 			continue
 		}
 		if err := req.Delete(&server); err != nil {
@@ -121,7 +166,7 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 		}
 		deletedServers++
 	}
-	log.Infof("Deleted MCP servers during user cleanup: userID=%s servers=%d (skipped=%d)", userID, deletedServers, len(servers.Items)-deletedServers)
+	slog.Info("Deleted MCP servers during user cleanup", "userID", userID, "servers", deletedServers, "skipped", len(servers.Items)-deletedServers)
 
 	// DeleteRefs should handle cleaning up most of the user's MCPServerInstances.
 	// But there still might be MCPServerInstances pointing to multi-user servers that we need to delete.
@@ -135,12 +180,20 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 		return err
 	}
 
+	var instancesDeleted int
 	for _, instance := range instances.Items {
+		// Don't delete instances associated to vMCP components because they will be
+		// deleted when the vMCP instance is deleted.
+		if instance.Spec.VMCPComponentID != "" {
+			continue
+		}
+
 		if err := req.Delete(&instance); err != nil {
 			return err
 		}
+		instancesDeleted++
 	}
-	log.Infof("Deleted MCP server instances during user cleanup: userID=%s instances=%d", userID, len(instances.Items))
+	slog.Info("Deleted MCP server instances during user cleanup", "userID", userID, "instances", instancesDeleted)
 
 	// Find the AccessControlRules that the user is on, and update them to remove the user.
 	acrs, err := u.acrHelper.GetAccessControlRulesForUser(req.Namespace, userID)
@@ -165,7 +218,7 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 		}
 		updatedACRs++
 	}
-	log.Infof("Updated access control rules during user cleanup: userID=%s rules=%d", userID, updatedACRs)
+	slog.Info("Updated access control rules during user cleanup", "userID", userID, "rules", updatedACRs)
 
 	// Delete the user's PowerUserWorkspace if it exists
 	var workspaces v1.PowerUserWorkspaceList
@@ -183,10 +236,10 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 			return err
 		}
 	}
-	log.Infof("Deleted power user workspaces during user cleanup: userID=%s workspaces=%d", userID, len(workspaces.Items))
+	slog.Info("Deleted power user workspaces during user cleanup", "userID", userID, "workspaces", len(workspaces.Items))
 
 	// If everything is cleaned up successfully, then delete this object because we don't need it.
-	log.Infof("Completed user cleanup: userID=%s", userID)
+	slog.Info("Completed user cleanup", "userID", userID)
 	return req.Delete(userDelete)
 }
 
@@ -211,7 +264,7 @@ func cleanupHostedAgents(req router.Request, userDelete *v1.UserDelete, userID s
 				return false, err
 			}
 		}
-		log.Infof("Waiting for hosted agent instance cleanup: userID=%s instances=%d", userID, len(instances.Items))
+		slog.Info("Waiting for hosted agent instance cleanup", "userID", userID, "instances", len(instances.Items))
 		return false, nil
 	}
 
@@ -258,7 +311,7 @@ func cleanupHostedAgents(req router.Request, userDelete *v1.UserDelete, userID s
 				return false, err
 			}
 		}
-		log.Infof("Waiting for hosted agent pool assignment cleanup: userID=%s assignments=%d", userID, len(assignments.Items))
+		slog.Info("Waiting for hosted agent pool assignment cleanup", "userID", userID, "assignments", len(assignments.Items))
 		return false, nil
 	}
 
@@ -292,7 +345,7 @@ func cleanupHostedAgents(req router.Request, userDelete *v1.UserDelete, userID s
 		}
 	}
 	if waiting {
-		log.Infof("Waiting for hosted agent pool cleanup: userID=%s pools=%d", userID, len(poolIDs))
+		slog.Info("Waiting for hosted agent pool cleanup", "userID", userID, "pools", len(poolIDs))
 		return false, nil
 	}
 	return true, nil

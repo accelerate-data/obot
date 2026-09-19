@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,8 +18,6 @@ import (
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
-	"github.com/obot-platform/obot/pkg/mcp"
-	"github.com/obot-platform/obot/pkg/safehttp"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
@@ -28,7 +25,6 @@ import (
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/oauth2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -48,65 +44,18 @@ func (s *consumeOAuthTokenAfterGetStorage) Get(ctx context.Context, key kclient.
 	return nil
 }
 
-func TestRefreshOAuthTokenUsesRestrictedHTTPClient(t *testing.T) {
-	var requests atomic.Int32
-	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		requests.Add(1)
-	}))
-	t.Cleanup(tokenEndpoint.Close)
+func newOAuthTokenTestServices(t *testing.T, objects ...kclient.Object) (storage.Client, *gatewayclient.Client, *persistent.TokenService) {
+	t.Helper()
 
-	config := &oauth2.Config{
-		ClientID:     "client-id",
-		ClientSecret: "client-secret",
-		Endpoint:     oauth2.Endpoint{TokenURL: tokenEndpoint.URL},
-	}
-	token := &oauth2.Token{RefreshToken: "refresh-token", Expiry: time.Now().Add(-time.Hour)}
-
-	_, err := refreshOAuthToken(
-		context.Background(),
-		safehttp.NewClient(safehttp.ClientOptions{
-			BlockLoopback:  true,
-			BlockPrivateIP: true,
-			BlockLinkLocal: true,
-		}),
-		config,
-		token,
-	)
-	require.Error(t, err)
-	require.Zero(t, requests.Load())
-}
-
-func TestTokenExchangeUsesUserSpecificOAuthForMCPServerInstance(t *testing.T) {
-	const (
-		baseURL         = "https://obot.example.test"
-		userID          = "42"
-		serverID        = "ms1server"
-		instanceID      = "msi1user-server"
-		otherInstanceID = "msi1user-other"
-		resource        = "https://linear.example.test/mcp"
-		accessToken     = "linear-user-token"
-	)
-
+	objects = append(objects, &v1.SystemMCPServer{
+		Namespace: system.DefaultNamespace,
+		Name:      system.SystemMCPServerPrefix + "test",
+	})
 	storage := clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
-		WithObjects(
-			&v1.MCPServerInstance{
-				Namespace: system.DefaultNamespace,
-				Name:      instanceID,
-				Spec: v1.MCPServerInstanceSpec{
-					UserID:        userID,
-					MCPServerName: serverID,
-				},
-			},
-			&v1.MCPServerInstance{
-				Namespace: system.DefaultNamespace,
-				Name:      otherInstanceID,
-				Spec: v1.MCPServerInstanceSpec{
-					UserID:        userID,
-					MCPServerName: "ms1other",
-				},
-			},
-		).
+		WithIndex(&v1.VMCPInstance{}, "spec.legacySlug", func(obj kclient.Object) []string { return []string{obj.(*v1.VMCPInstance).Spec.LegacySlug} }).
+		WithIndex(&v1.OAuthAuthRequest{}, "spec.hashedAuthCode", func(obj kclient.Object) []string { return []string{obj.(*v1.OAuthAuthRequest).Spec.HashedAuthCode} }).
+		WithObjects(objects...).
 		Build()
 
 	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
@@ -117,125 +66,6 @@ func TestTokenExchangeUsesUserSpecificOAuthForMCPServerInstance(t *testing.T) {
 
 	gatewayClient := gatewayclient.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
-
-	_, privateKey, err := ed25519.GenerateKey(nil)
-	require.NoError(t, err)
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.JWKCredentialContext,
-		Name:    system.JWKCredentialContext,
-		Secrets: map[string]string{
-			"JWK_KEY": base64.StdEncoding.EncodeToString(privateKey),
-		},
-	}))
-
-	tokenService, err := persistent.NewTokenService(baseURL, gatewayClient)
-	require.NoError(t, err)
-	now := time.Now()
-	_, subjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
-		Audience:  baseURL + "/mcp-connect/" + serverID,
-		IssuedAt:  persistent.NewTime(now),
-		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
-		UserID:    userID,
-		MCPID:     instanceID,
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(
-		t.Context(),
-		userID,
-		instanceID,
-		resource,
-		"",
-		&oauth2.Config{},
-		&oauth2.Token{
-			AccessToken: accessToken,
-			TokenType:   "Bearer",
-			Expiry:      now.Add(time.Hour),
-		},
-	))
-
-	recorder := httptest.NewRecorder()
-	req := api.Context{
-		ResponseWriter: recorder,
-		Request:        httptest.NewRequest("POST", "/oauth/token", nil),
-		Storage:        storage,
-		GatewayClient:  gatewayClient,
-	}
-	h := &handler{
-		tokenService: tokenService,
-		tokenStore:   mcp.NewGlobalTokenStore(gatewayClient),
-	}
-
-	err = h.doTokenExchange(req, v1.OAuthClient{}, resource, subjectToken, tokenTypeJWT, "")
-	require.NoError(t, err)
-
-	var response TokenExchangeResponse
-	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&response))
-	require.Equal(t, accessToken, response.AccessToken)
-
-	_, otherSubjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
-		Audience:  baseURL + "/mcp-connect/ms1other",
-		IssuedAt:  persistent.NewTime(now),
-		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
-		UserID:    userID,
-		MCPID:     otherInstanceID,
-	})
-	require.NoError(t, err)
-
-	otherRecorder := httptest.NewRecorder()
-	req.ResponseWriter = otherRecorder
-	err = h.doTokenExchange(req, v1.OAuthClient{}, resource, otherSubjectToken, tokenTypeJWT, "")
-	require.Error(t, err)
-	require.Empty(t, otherRecorder.Body.String())
-
-	_, otherUserSubjectToken, err := tokenService.NewToken(t.Context(), persistent.TokenContext{
-		Audience:  baseURL + "/mcp-connect/" + serverID,
-		IssuedAt:  persistent.NewTime(now),
-		ExpiresAt: persistent.NewTime(now.Add(time.Hour)),
-		UserID:    "43",
-		MCPID:     instanceID,
-	})
-	require.NoError(t, err)
-
-	otherUserRecorder := httptest.NewRecorder()
-	req.ResponseWriter = otherUserRecorder
-	err = h.doTokenExchange(
-		req,
-		v1.OAuthClient{},
-		resource,
-		otherUserSubjectToken,
-		tokenTypeJWT,
-		"",
-	)
-	require.ErrorContains(t, err, "access_denied")
-	require.Empty(t, otherUserRecorder.Body.String())
-}
-
-func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
-	const (
-		baseURL      = "https://obot.example.com"
-		clientName   = "oauth-client"
-		mcpID        = system.SystemMCPServerPrefix + "test"
-		refreshToken = "old-refresh-token"
-	)
-
-	storage := clientfake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(&v1.SystemMCPServer{
-			Namespace: system.DefaultNamespace,
-			Name:      mcpID,
-		}).
-		Build()
-
-	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
-	require.NoError(t, err)
-	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
-	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate())
-
-	gatewayClient := gatewayclient.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
-	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
-
 	require.NoError(t, db.WithContext(t.Context()).Create(&gatewaytypes.User{
 		ID:       42,
 		Username: "alice",
@@ -252,6 +82,86 @@ func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
 			"JWK_KEY": base64.StdEncoding.EncodeToString(privateKey),
 		},
 	}))
+	tokenService, err := persistent.NewTokenService("https://obot.example.com", gatewayClient)
+	require.NoError(t, err)
+
+	return storage, gatewayClient, tokenService
+}
+
+func TestDoAuthorizationCodeScopesTokenToAudience(t *testing.T) {
+	const (
+		baseURL    = "https://obot.example.com"
+		clientName = "oauth-client"
+		mcpID      = system.SystemMCPServerPrefix + "test"
+		code       = "authorization-code"
+	)
+
+	tests := []struct {
+		name           string
+		audience       string
+		wantAuthorized persistent.StringSlice
+	}{
+		{
+			name:           "distinct audience",
+			audience:       "multi-user-server",
+			wantAuthorized: persistent.StringSlice{"multi-user-server"},
+		},
+		{
+			name: "empty audience",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authRequest := &v1.OAuthAuthRequest{
+				Namespace: system.DefaultNamespace,
+				Name:      "oauth-request",
+				Spec: v1.OAuthAuthRequestSpec{
+					ClientID:       clientName,
+					Resource:       baseURL + "/mcp-connect/" + tt.audience,
+					Scope:          "profile email",
+					HashedAuthCode: fmt.Sprintf("%x", sha256.Sum256([]byte(code))),
+					UserID:         42,
+					MCPID:          mcpID,
+					Audience:       tt.audience,
+				},
+			}
+			storage, gatewayClient, tokenService := newOAuthTokenTestServices(t, authRequest)
+			recorder := httptest.NewRecorder()
+			h := &handler{tokenService: tokenService}
+			err := h.doAuthorizationCode(api.Context{
+				ResponseWriter: recorder,
+				Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
+				Storage:        storage,
+				GatewayClient:  gatewayClient,
+			}, v1.OAuthClient{Namespace: system.DefaultNamespace, Name: clientName}, code, "")
+			require.NoError(t, err)
+
+			var response types.OAuthToken
+			require.NoError(t, json.NewDecoder(recorder.Body).Decode(&response))
+			claims, err := tokenService.DecodeToken(t.Context(), response.AccessToken)
+			require.NoError(t, err)
+			assert.Equal(t, mcpID, claims.MCPID)
+			assert.Equal(t, tt.wantAuthorized, claims.AuthorizedMCPIDs)
+
+			var refreshToken v1.OAuthToken
+			require.NoError(t, storage.Get(t.Context(), kclient.ObjectKey{
+				Namespace: system.DefaultNamespace,
+				Name:      fmt.Sprintf("%x", sha256.Sum256([]byte(response.RefreshToken))),
+			}, &refreshToken))
+			assert.Equal(t, tt.audience, refreshToken.Spec.Audience)
+		})
+	}
+}
+
+func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
+	const (
+		baseURL      = "https://obot.example.com"
+		clientName   = "oauth-client"
+		mcpID        = system.SystemMCPServerPrefix + "test"
+		audience     = "multi-user-server"
+		refreshToken = "old-refresh-token"
+	)
 
 	tokenName := fmt.Sprintf("%x", sha256.Sum256([]byte(refreshToken)))
 	storageToken := &v1.OAuthToken{
@@ -259,20 +169,18 @@ func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
 		Name:      tokenName,
 		Spec: v1.OAuthTokenSpec{
 			ClientID: clientName,
-			Resource: baseURL,
+			Resource: baseURL + "/mcp-connect/" + audience,
 			Scope:    "profile email",
 			UserID:   42,
 			MCPID:    mcpID,
+			Audience: audience,
 		},
 	}
-	require.NoError(t, storage.Create(t.Context(), storageToken))
-
-	tokenService, err := persistent.NewTokenService(baseURL, gatewayClient)
-	require.NoError(t, err)
+	storage, gatewayClient, tokenService := newOAuthTokenTestServices(t, storageToken)
 	recorder := httptest.NewRecorder()
 	req := api.Context{
 		ResponseWriter: recorder,
-		Request:        httptest.NewRequest("POST", "/oauth/token", nil),
+		Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
 		Storage:        storage,
 		GatewayClient:  gatewayClient,
 	}
@@ -280,22 +188,56 @@ func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
 		Namespace: system.DefaultNamespace,
 		Name:      clientName,
 	}
-	h := &handler{tokenService: tokenService}
-	err = h.doRefreshToken(req, oauthClient, refreshToken)
+	h := &handler{baseURL: baseURL, tokenService: tokenService}
+	err := h.doRefreshToken(req, oauthClient, refreshToken)
 	require.NoError(t, err)
 
 	var response types.OAuthToken
 	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&response))
 	require.NotEmpty(t, response.RefreshToken)
+	claims, err := tokenService.DecodeToken(t.Context(), response.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, mcpID, claims.MCPID)
+	assert.Equal(t, persistent.StringSlice{audience}, claims.AuthorizedMCPIDs)
 
 	var refreshed v1.OAuthToken
 	refreshedName := fmt.Sprintf("%x", sha256.Sum256([]byte(response.RefreshToken)))
 	require.NoError(t, storage.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: refreshedName}, &refreshed))
 	assert.Equal(t, "profile email", refreshed.Spec.Scope)
+	assert.Equal(t, audience, refreshed.Spec.Audience)
+
+	emptyAudienceRefreshToken := "empty-audience-refresh-token"
+	require.NoError(t, storage.Create(t.Context(), &v1.OAuthToken{
+		Namespace: system.DefaultNamespace,
+		Name:      fmt.Sprintf("%x", sha256.Sum256([]byte(emptyAudienceRefreshToken))),
+		Spec: v1.OAuthTokenSpec{
+			ClientID: clientName,
+			Resource: baseURL + "/mcp-connect/" + audience,
+			UserID:   42,
+			MCPID:    mcpID,
+		},
+	}))
+	emptyAudienceRecorder := httptest.NewRecorder()
+	err = h.doRefreshToken(api.Context{
+		ResponseWriter: emptyAudienceRecorder,
+		Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
+		Storage:        storage,
+		GatewayClient:  gatewayClient,
+	}, oauthClient, emptyAudienceRefreshToken)
+	require.NoError(t, err)
+	require.NoError(t, json.NewDecoder(emptyAudienceRecorder.Body).Decode(&response))
+	claims, err = tokenService.DecodeToken(t.Context(), response.AccessToken)
+	require.NoError(t, err)
+	assert.Equal(t, persistent.StringSlice{audience}, claims.AuthorizedMCPIDs)
+
+	var legacyRefreshed v1.OAuthToken
+	legacyRefreshedName := fmt.Sprintf("%x", sha256.Sum256([]byte(response.RefreshToken)))
+	require.NoError(t, storage.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: legacyRefreshedName}, &legacyRefreshed))
+	assert.Equal(t, audience, legacyRefreshed.Spec.Audience)
 
 	err = h.doRefreshToken(api.Context{
 		ResponseWriter: httptest.NewRecorder(),
-		Request:        httptest.NewRequest("POST", "/oauth/token", nil),
+		Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
 		Storage:        storage,
 	}, oauthClient, refreshToken)
 	require.Error(t, err)
@@ -323,7 +265,7 @@ func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
 
 	err = h.doRefreshToken(api.Context{
 		ResponseWriter: httptest.NewRecorder(),
-		Request:        httptest.NewRequest("POST", "/oauth/token", nil),
+		Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
 		Storage:        storage,
 		GatewayClient:  gatewayClient,
 	}, oauthClient, staleRefreshToken)
@@ -352,7 +294,7 @@ func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
 
 	err = h.doRefreshToken(api.Context{
 		ResponseWriter: httptest.NewRecorder(),
-		Request:        httptest.NewRequest("POST", "/oauth/token", nil),
+		Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
 		Storage:        &consumeOAuthTokenAfterGetStorage{Client: storage},
 		GatewayClient:  gatewayClient,
 	}, oauthClient, racedRefreshToken)

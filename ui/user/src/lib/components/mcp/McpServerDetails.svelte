@@ -1,16 +1,12 @@
 <script lang="ts">
-	import { resolve } from '$app/paths';
-	import { page } from '$app/state';
-	import McpServerCompositeInfo from '$lib/components/admin/McpServerCompositeInfo.svelte';
 	import McpServerK8sInfo from '$lib/components/admin/McpServerK8sInfo.svelte';
 	import McpTunnelDisconnectedStatus from '$lib/components/mcp/McpTunnelDisconnectedStatus.svelte';
 	import OAuthMetadataDebug from '$lib/components/mcp/OAuthMetadataDebug.svelte';
 	import { DEFAULT_MCP_CATALOG_ID } from '$lib/constants';
-	import { Group, type MCPCatalogEntry, type MCPCatalogServer, type OrgUser } from '$lib/services';
+	import type { MCPCatalogEntry, MCPCatalogServer, OrgUser } from '$lib/services';
 	import { getMCPDisplayName, supportsMCPBackendDetails } from '$lib/services/user/mcp';
 	import { isMcpTunnelDisconnected } from '$lib/services/user/mcpTunnel';
 	import { mcpTunnelConnections, profile } from '$lib/stores';
-	import { isOwnSingleUserServer } from '$lib/utils';
 	import Table from '../table/Table.svelte';
 	import { Info } from '@lucide/svelte';
 
@@ -21,7 +17,6 @@
 		server?: MCPCatalogServer;
 		serverId?: string;
 		connectedUsers?: (OrgUser & { mcpInstanceId?: string; mcpInstanceConfigured?: boolean })[];
-		compositeParentName?: string;
 		k8sOverrides?: {
 			title?: string;
 			classes?: {
@@ -38,7 +33,6 @@
 		server,
 		serverId,
 		connectedUsers,
-		compositeParentName,
 		k8sOverrides,
 		readonly
 	}: Props = $props();
@@ -47,13 +41,14 @@
 	);
 	let supportsDetails = $derived(supportsMCPBackendDetails(server));
 	let hasAdminAccess = $derived(profile.current.hasAdminAccess?.());
-	let isAdminUrl = $derived(page.url.pathname.includes('/admin'));
 	let entity = $derived(
-		overrideEntity ?? (server && server?.powerUserWorkspaceID ? 'workspace' : 'catalog')
+		overrideEntity ??
+			(server?.powerUserWorkspaceID || catalogEntry?.powerUserWorkspaceID ? 'workspace' : 'catalog')
 	);
 	let entityId = $derived(
 		overrideEntityId ??
 			server?.powerUserWorkspaceID ??
+			catalogEntry?.powerUserWorkspaceID ??
 			server?.mcpCatalogID ??
 			catalogEntry?.id ??
 			DEFAULT_MCP_CATALOG_ID
@@ -62,36 +57,6 @@
 	let tunnelDisconnected = $derived(
 		isMcpTunnelDisconnected(server ?? catalogEntry, mcpTunnelConnections.current.connections)
 	);
-
-	function getAuditLogUrl(d: OrgUser) {
-		const id = serverId ?? server?.id;
-
-		if (!id) return null;
-
-		if (compositeParentName || entity === 'agent') return null;
-
-		if (isAdminUrl) {
-			const adminPrefix = page.url.pathname.startsWith('/admin/mcp-deployments')
-				? '/admin/mcp-deployments'
-				: '/admin/mcp-catalog';
-
-			if (!hasAdminAccess) return null;
-			return entity === 'workspace'
-				? catalogEntry?.id
-					? `${adminPrefix}/w/${entityId}/c/${catalogEntry.id}?view=audit-logs&user_id=${d.id}`
-					: `${adminPrefix}/w/${entityId}/s/${encodeURIComponent(id ?? '')}?view=audit-logs&user_id=${d.id}`
-				: catalogEntry?.id
-					? `${adminPrefix}/c/${catalogEntry.id}?view=audit-logs&user_id=${d.id}`
-					: `${adminPrefix}/s/${encodeURIComponent(id ?? '')}?view=audit-logs&user_id=${d.id}`;
-		}
-
-		// Basic users can access audit logs for their own single-user servers
-		let isOwnServer = server && isOwnSingleUserServer(server, profile.current?.id);
-		if (!isOwnServer && !profile.current?.groups.includes(Group.POWERUSER)) return null;
-		return catalogEntry?.id
-			? `/mcp-catalog/c/${catalogEntry.id}?view=audit-logs&user_id=${d.id}`
-			: `/mcp-catalog/s/${encodeURIComponent(id ?? '')}?view=audit-logs&user_id=${d.id}`;
-	}
 </script>
 
 {#if server || mcpServerId}
@@ -99,23 +64,13 @@
 		{#if tunnelDisconnected}
 			<McpTunnelDisconnectedStatus detailed />
 		{/if}
-		{#if catalogEntry?.manifest.runtime === 'composite'}
-			<McpServerCompositeInfo
-				{mcpServerId}
-				name={title}
-				entity="catalog"
-				entityId={DEFAULT_MCP_CATALOG_ID}
-				{catalogEntry}
-				connectedUsers={[]}
-			/>
-		{:else if supportsDetails && mcpServerId}
+		{#if supportsDetails && mcpServerId}
 			<McpServerK8sInfo
 				{mcpServerId}
 				name={title}
 				{readonly}
 				{catalogEntry}
 				mcpServer={server}
-				compositeParentName={server?.compositeName}
 				hideTitle
 				{entity}
 				id={entityId}
@@ -139,15 +94,6 @@
 							{d.mcpInstanceConfigured === false ? 'Not Configured' : 'Up to date'}
 						{:else}
 							{d[property as keyof typeof d]}
-						{/if}
-					{/snippet}
-
-					{#snippet actions(d)}
-						{@const auditLogsUrl = getAuditLogUrl(d)}
-						{#if auditLogsUrl}
-							<a href={resolve(auditLogsUrl as `/${string}`)} class="btn btn-link">
-								View Audit Logs
-							</a>
 						{/if}
 					{/snippet}
 				</Table>

@@ -1,15 +1,18 @@
 package server
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	types2 "github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/gateway/types"
@@ -20,7 +23,9 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
-var pkgLog = logger.Package()
+const (
+	maxGroupIDsPerRequest = 100
+)
 
 func (s *Server) getCurrentUser(apiContext api.Context) error {
 	user, err := apiContext.GatewayClient.User(apiContext.Context(), apiContext.User.GetName())
@@ -36,9 +41,9 @@ func (s *Server) getCurrentUser(apiContext api.Context) error {
 	if name != "" && namespace != "" {
 		providerURL, err := s.dispatcher.URLForAuthProvider(apiContext.Context(), namespace, name)
 		if err != nil {
-			pkgLog.Warnf("failed to get auth provider URL for %s/%s: %v", namespace, name, err)
+			slog.Warn("failed to get auth provider URL", "namespace", namespace, "name", name, "error", err)
 		} else if err = apiContext.GatewayClient.UpdateProfileIfNeeded(apiContext.Context(), user, name, namespace, providerURL.String()); err != nil {
-			pkgLog.Warnf("failed to update profile icon for user %s: %v", user.Username, err)
+			slog.Warn("failed to update profile icon for user", "username", user.Username, "error", err)
 		}
 	}
 
@@ -46,15 +51,20 @@ func (s *Server) getCurrentUser(apiContext api.Context) error {
 	authGroupStrs := apiContext.User.GetExtra()["auth_provider_groups"]
 	effectiveRole, err := apiContext.GatewayClient.ResolveUserEffectiveRole(apiContext.Context(), user, authGroupStrs)
 	if err != nil {
-		pkgLog.Warnf("failed to resolve effective role for user %s: %v", user.Username, err)
+		slog.Warn("failed to resolve effective role for user", "username", user.Username, "error", err)
 		effectiveRole = user.Role
 	}
 	effectiveRole = applyRequestTimeRoleUplift(effectiveRole, apiContext.User.GetGroups())
 
-	return apiContext.Write(types.ConvertUserWithEffectiveRole(user, apiContext.GatewayClient.HasExplicitRole(user.Email) != types2.RoleUnknown, name, effectiveRole))
+	result := types.ConvertUserWithEffectiveRole(user, apiContext.GatewayClient.HasExplicitRole(user.Email) != types2.RoleUnknown, name, effectiveRole)
+	result.RequirePasswordChange = cmp.Or(apiContext.User.GetExtra()["password_change_required"]...) == "true"
+	return apiContext.Write(result)
 }
 
 func applyRequestTimeRoleUplift(effectiveRole types2.Role, requestGroups []string) types2.Role {
+	if slices.Contains(requestGroups, types2.GroupOwner) && !effectiveRole.HasRole(types2.RoleOwner) {
+		return effectiveRole.SwitchBaseRole(types2.RoleOwner)
+	}
 	if slices.Contains(requestGroups, types2.GroupAdmin) && !effectiveRole.HasRole(types2.RoleAdmin) {
 		return effectiveRole.SwitchBaseRole(types2.RoleAdmin)
 	}
@@ -155,13 +165,13 @@ func (s *Server) getUser(apiContext api.Context) error {
 	// Get user's groups and compute effective role
 	groupIDs, err := apiContext.GatewayClient.ListGroupIDsForUser(apiContext.Context(), user.ID)
 	if err != nil {
-		pkgLog.Warnf("failed to get groups for user %s: %v", user.Username, err)
+		slog.Warn("failed to get groups for user", "username", user.Username, "error", err)
 		groupIDs = nil
 	}
 
 	effectiveRole, err := apiContext.GatewayClient.ResolveUserEffectiveRole(apiContext.Context(), user, groupIDs)
 	if err != nil {
-		pkgLog.Warnf("failed to resolve effective role for user %s: %v", user.Username, err)
+		slog.Warn("failed to resolve effective role for user", "username", user.Username, "error", err)
 		effectiveRole = user.Role
 	}
 
@@ -196,15 +206,15 @@ func (s *Server) updateUser(apiContext api.Context) error {
 
 	if !apiContext.UserIsOwner() {
 		if originalUser.Role.HasRole(types2.RoleOwner) != user.Role.HasRole(types2.RoleOwner) {
-			pkgLog.Infof("Denied user role update: targetUserID=%s reason=owner_role_change_requires_owner", userID)
+			slog.Info("Denied user role update", "targetUserID", userID, "reason", "owner_role_change_requires_owner")
 			return types2.NewErrHTTP(http.StatusForbidden, "only owner can add or remove owner role")
 		}
 		if originalUser.Role.HasRole(types2.RoleAuditor) != user.Role.HasRole(types2.RoleAuditor) {
-			pkgLog.Infof("Denied user role update: targetUserID=%s reason=auditor_role_change_requires_owner", userID)
+			slog.Info("Denied user role update", "targetUserID", userID, "reason", "auditor_role_change_requires_owner")
 			return types2.NewErrHTTP(http.StatusForbidden, "only owner can add or remove auditor role")
 		}
 		if originalUser.Role.HasRole(types2.RoleUserImpersonation) != user.Role.HasRole(types2.RoleUserImpersonation) {
-			pkgLog.Infof("Denied user role update: targetUserID=%s reason=user_impersonation_role_change_requires_owner", userID)
+			slog.Info("Denied user role update", "targetUserID", userID, "reason", "user_impersonation_role_change_requires_owner")
 			return types2.NewErrHTTP(http.StatusForbidden, "only owner can add or remove user impersonation role")
 		}
 	}
@@ -232,7 +242,7 @@ func (s *Server) updateUser(apiContext api.Context) error {
 
 	// Create UserRoleChange event to trigger reconciliation if personal role changed
 	if originalUser.Role != existingUser.Role {
-		pkgLog.Infof("User role changed via API: userID=%d oldRole=%d newRole=%d", existingUser.ID, originalUser.Role, existingUser.Role)
+		slog.Info("User role changed via API", "userID", existingUser.ID, "oldRole", originalUser.Role, "newRole", existingUser.Role)
 		if err = apiContext.Create(&v1.UserRoleChange{
 			GenerateName: system.UserRoleChangePrefix,
 			Namespace:    apiContext.Namespace(),
@@ -243,7 +253,7 @@ func (s *Server) updateUser(apiContext api.Context) error {
 			return fmt.Errorf("failed to create user role change event: %v", err)
 		}
 	}
-	pkgLog.Infof("Updated user profile via API: userID=%d", existingUser.ID)
+	slog.Info("Updated user profile via API", "userID", existingUser.ID)
 
 	return apiContext.Write(types.ConvertUser(existingUser, apiContext.GatewayClient.HasExplicitRole(existingUser.Email) != types2.RoleUnknown, ""))
 }
@@ -290,15 +300,15 @@ func (s *Server) deleteUser(apiContext api.Context) (err error) {
 
 	if !apiContext.UserIsOwner() {
 		if existingUser.Role.HasRole(types2.RoleOwner) {
-			pkgLog.Infof("Denied user deletion: targetUserID=%s reason=owner_delete_requires_owner", userID)
+			slog.Info("Denied user deletion", "targetUserID", userID, "reason", "owner_delete_requires_owner")
 			return types2.NewErrHTTP(http.StatusForbidden, "only owner can delete an owner")
 		}
 		if existingUser.Role.HasRole(types2.RoleAuditor) {
-			pkgLog.Infof("Denied user deletion: targetUserID=%s reason=auditor_delete_requires_owner", userID)
+			slog.Info("Denied user deletion", "targetUserID", userID, "reason", "auditor_delete_requires_owner")
 			return types2.NewErrHTTP(http.StatusForbidden, "only owner can delete an auditor")
 		}
 		if existingUser.Role.HasRole(types2.RoleUserImpersonation) {
-			pkgLog.Infof("Denied user deletion: targetUserID=%s reason=user_impersonation_delete_requires_owner", userID)
+			slog.Info("Denied user deletion", "targetUserID", userID, "reason", "user_impersonation_delete_requires_owner")
 			return types2.NewErrHTTP(http.StatusForbidden, "only owner can delete a user with user impersonation role")
 		}
 	}
@@ -325,7 +335,7 @@ func (s *Server) deleteUser(apiContext api.Context) (err error) {
 	}); err != nil {
 		return fmt.Errorf("failed to start deletion of user owned objects: %v", err)
 	}
-	pkgLog.Infof("Scheduled user cleanup after deletion: targetUserID=%d deleteMe=%v", existingUser.ID, isDeleteMe)
+	slog.Info("Scheduled user cleanup after deletion", "targetUserID", existingUser.ID, "deleteMe", isDeleteMe)
 
 	// Only clear the cookie if this is a "delete me" operation
 	if isDeleteMe {
@@ -343,41 +353,125 @@ func (s *Server) deleteUser(apiContext api.Context) (err error) {
 	return apiContext.Write(types.ConvertUser(existingUser, apiContext.GatewayClient.HasExplicitRole(existingUser.Email) != types2.RoleUnknown, ""))
 }
 
+// GET /api/groups?name=&limit=&cursor=&ids=
+// Returns one page of the auth provider's groups, optionally filtered by name. Paging is by opaque
+// cursor: the response carries the position of the next page, or nothing when there are no more.
+// Passing ids instead resolves those specific group IDs to their display names.
 func (s *Server) listAuthGroups(apiContext api.Context) error {
 	name, namespace := apiContext.AuthProviderNameAndNamespace()
 	if name == "" || namespace == "" {
-		return apiContext.Write([]types.Group{})
+		return apiContext.Write(types.GroupListResponse{
+			Items:  []types.Group{},
+			Source: types.GroupSourceCache,
+		})
 	}
+
+	query := apiContext.URL.Query()
 
 	providerURL, err := s.dispatcher.URLForAuthProvider(apiContext.Context(), namespace, name)
 	if err != nil {
-		return fmt.Errorf("failed to get auth provider URL: %v", err)
+		return fmt.Errorf("failed to get auth provider URL: %w", err)
 	}
-	groups, err := apiContext.GatewayClient.ListAuthGroups(
+
+	if rawIDs := query.Get("ids"); rawIDs != "" {
+		ids, err := splitGroupIDs(rawIDs)
+		if err != nil {
+			return types2.NewErrHTTP(http.StatusBadRequest, err.Error())
+		}
+
+		groups, err := apiContext.GatewayClient.ResolveAuthGroups(apiContext.Context(), providerURL.String(), namespace, name, ids)
+		if err != nil {
+			return fmt.Errorf("failed to resolve auth groups: %w", err)
+		}
+
+		return apiContext.Write(types.GroupListResponse{
+			Items:  trimGroupsForUser(apiContext.User, groups),
+			Source: types.GroupSourceCache,
+		})
+	}
+
+	limit, cursor := parseGroupListParams(query)
+	result, err := apiContext.GatewayClient.ListAuthGroups(
 		apiContext.Context(),
 		providerURL.String(),
 		namespace,
 		name,
-		apiContext.URL.Query().Get("name"),
+		client.ListAuthGroupsOptions{
+			NameFilter: query.Get("name"),
+			Limit:      limit,
+			Cursor:     cursor,
+		},
 	)
 	if err != nil {
-		return fmt.Errorf("failed to list auth groups: %v", err)
+		return fmt.Errorf("failed to list auth groups: %w", err)
 	}
 
-	pkgLog.Infof("Listed auth provider groups: provider=%s/%s groups=%d", namespace, name, len(groups))
+	slog.Debug("Listed auth provider groups",
+		"providerNamespace", namespace, "providerName", name,
+		"groups", len(result.Groups), "hasMore", result.NextCursor != "",
+		"source", result.Source, "degraded", result.Degraded, "reset", result.Reset)
 
-	if userIsBasicOrPower(apiContext.User) {
-		trimmedGroups := make([]types.Group, 0, len(groups))
-		for _, group := range groups {
-			trimmedGroups = append(trimmedGroups, types.Group{
-				ID:   group.ID,
-				Name: group.Name,
-			})
+	return apiContext.Write(types.GroupListResponse{
+		Items:      trimGroupsForUser(apiContext.User, result.Groups),
+		NextCursor: result.NextCursor,
+		Source:     result.Source,
+		Degraded:   result.Degraded,
+		Reset:      result.Reset,
+	})
+}
+
+func parseGroupListParams(query url.Values) (limit int, cursor string) {
+	limit, err := strconv.Atoi(query.Get("limit"))
+	if err != nil || limit <= 0 {
+		limit = client.DefaultGroupPageSize
+	}
+
+	return min(limit, client.MaxGroupPageSize), query.Get("cursor")
+}
+
+// splitGroupIDs parses the comma-separated ids parameter, dropping blanks and duplicates.
+// IDs are returned in the order they first appear in raw.
+func splitGroupIDs(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	if len(parts) > maxGroupIDsPerRequest {
+		return nil, fmt.Errorf("too many group ids: %d, limit is %d", len(parts), maxGroupIDsPerRequest)
+	}
+
+	seen := make(map[string]struct{}, len(parts))
+	ids := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
 		}
-		return apiContext.Write(trimmedGroups)
+		if _, ok := seen[id]; ok {
+			continue
+		}
+
+		seen[id] = struct{}{}
+		ids = append(ids, id)
 	}
 
-	return apiContext.Write(groups)
+	return ids, nil
+}
+
+// trimGroupsForUser strips everything but the ID and name for users who should not see which auth
+// provider a group belongs to.
+func trimGroupsForUser(u user.Info, groups []types.Group) []types.Group {
+	if !userIsBasicOrPower(u) {
+		return groups
+	}
+
+	trimmed := make([]types.Group, 0, len(groups))
+	for _, group := range groups {
+		trimmed = append(trimmed, types.Group{
+			ID:   group.ID,
+			Name: group.Name,
+		})
+	}
+
+	return trimmed
 }
 
 func userIsBasicOrPower(u user.Info) bool {

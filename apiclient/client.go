@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -13,10 +14,19 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 )
 
-var log = logger.Package()
+// maxErrorBodyBytes bounds how much of a non-2xx response body reaches an
+// ErrHTTP message.
+//
+// The body is not necessarily an API error document. A wrong base path, a
+// reverse proxy, or a load balancer answers with a whole HTML page, and callers
+// put these messages in front of people and models: obot-sentry's enforcement
+// hook renders one into the text it hands the agent, where an unbounded body
+// buried the instructions after it. 4 KiB holds every error this API produces.
+const (
+	maxErrorBodyBytes = 4 << 10
+)
 
 type tokenFetcher func(context.Context, string, TokenFetchOptions) (string, error)
 
@@ -33,6 +43,18 @@ type Client struct {
 	Token        string
 	Cookie       *http.Cookie
 	tokenFetcher tokenFetcher
+}
+
+type tokenScopeValidationResponse struct {
+	Allowed bool `json:"allowed"`
+	Scopes  struct {
+		CanAccessAPI                bool     `json:"canAccessAPI"`
+		CanAccessSkills             bool     `json:"canAccessSkills"`
+		CanAccessLLMProxy           bool     `json:"canAccessLLMProxy"`
+		CanAccessPublishedArtifacts bool     `json:"canAccessPublishedArtifacts"`
+		CanAccessDeviceScans        bool     `json:"canAccessDeviceScans"`
+		MCPServerIDs                []string `json:"mcpServerIds,omitempty"`
+	} `json:"scopes"`
 }
 
 func (c *Client) WithTokenFetcher(f tokenFetcher) *Client {
@@ -55,18 +77,6 @@ func (c *Client) GetToken(ctx context.Context, opts TokenFetchOptions) (string, 
 		return c.tokenFetcher(ctx, c.BaseURL, opts)
 	}
 	return "", fmt.Errorf("no token or token fetcher")
-}
-
-type tokenScopeValidationResponse struct {
-	Allowed bool `json:"allowed"`
-	Scopes  struct {
-		CanAccessAPI                bool     `json:"canAccessAPI"`
-		CanAccessSkills             bool     `json:"canAccessSkills"`
-		CanAccessLLMProxy           bool     `json:"canAccessLLMProxy"`
-		CanAccessPublishedArtifacts bool     `json:"canAccessPublishedArtifacts"`
-		CanAccessDeviceScans        bool     `json:"canAccessDeviceScans"`
-		MCPServerIDs                []string `json:"mcpServerIds,omitempty"`
-	} `json:"scopes"`
 }
 
 // TokenHasScopes reports whether token is valid for baseURL and includes all requested scopes.
@@ -172,7 +182,8 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body io.Rea
 }
 
 func (c *Client) doRequestWithBaseURL(ctx context.Context, method, baseURL, path string, body io.Reader, headerKV ...string) (*http.Request, *http.Response, error) {
-	if log.IsDebug() {
+	debug := slog.Default().Enabled(ctx, slog.LevelDebug)
+	if debug {
 		var (
 			data    = "[NONE]"
 			headers string
@@ -194,7 +205,7 @@ func (c *Client) doRequestWithBaseURL(ctx context.Context, method, baseURL, path
 		for i := 0; i < len(headerKV); i += 2 {
 			headers += fmt.Sprintf("%s=%s, ", headerKV[i], headerKV[i+1])
 		}
-		log.Fields("method", method, "path", path, "body", data, "headers", headers).Debugf("HTTP Request")
+		slog.Debug("HTTP Request", "method", method, "path", path, "body", data, "headers", headers)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(baseURL, "/")+path, body)
@@ -231,9 +242,9 @@ func (c *Client) doRequestWithBaseURL(ctx context.Context, method, baseURL, path
 		return nil, nil, err
 	}
 	if resp.StatusCode > 399 {
-		return nil, nil, errFromResponse(resp)
+		return nil, nil, ErrorFromResponse(resp)
 	}
-	if log.IsDebug() && !slices.Contains(headerKV, "text/event-stream") {
+	if debug && !slices.Contains(headerKV, "text/event-stream") {
 		var data string
 		dataBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -244,25 +255,15 @@ func (c *Client) doRequestWithBaseURL(ctx context.Context, method, baseURL, path
 		} else {
 			data = fmt.Sprintf("[BINARY DATA len(%d)]", len(dataBytes))
 		}
-		log.Fields("method", method, "path", path, "body", data, "code", resp.StatusCode).Debugf("HTTP Response")
+		slog.Debug("HTTP Response", "method", method, "path", path, "body", data, "code", resp.StatusCode)
 		resp.Body = io.NopCloser(bytes.NewReader(dataBytes))
 	}
 	return req, resp, err
 }
 
-// maxErrorBodyBytes bounds how much of a non-2xx response body reaches an
-// ErrHTTP message.
-//
-// The body is not necessarily an API error document. A wrong base path, a
-// reverse proxy, or a load balancer answers with a whole HTML page, and callers
-// put these messages in front of people and models: obot-sentry's enforcement
-// hook renders one into the text it hands the agent, where an unbounded body
-// buried the instructions after it. 4 KiB holds every error this API produces.
-const maxErrorBodyBytes = 4 << 10
-
-// errFromResponse builds the error for a non-2xx response and closes its body.
-// Callers get no response on this path, so nothing else can close it.
-func errFromResponse(resp *http.Response) error {
+// ErrorFromResponse builds a bounded HTTP error from a response, consuming and closing its body.
+// Callers should use it only after deciding that the response status represents an error.
+func ErrorFromResponse(resp *http.Response) error {
 	defer resp.Body.Close()
 
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes+1))
@@ -289,8 +290,6 @@ func errFromResponse(resp *http.Response) error {
 	}
 	return &types.ErrHTTP{Code: resp.StatusCode, Message: msg}
 }
-
-func ErrorFromResponse(resp *http.Response) error { return errFromResponse(resp) }
 
 // trimPartialRune removes an incomplete UTF-8 sequence from the end of data.
 func trimPartialRune(data []byte) []byte {

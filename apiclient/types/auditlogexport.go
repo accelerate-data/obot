@@ -1,5 +1,19 @@
 package types
 
+const (
+	AuditLogTypeMCP AuditLogType = "mcp"
+	AuditLogTypeLLM AuditLogType = "llm"
+
+	AuditLogExportStateRunning   AuditLogExportState = "running"
+	AuditLogExportStateCompleted AuditLogExportState = "completed"
+	AuditLogExportStateFailed    AuditLogExportState = "failed"
+
+	StorageProviderS3        StorageProviderType = "s3"
+	StorageProviderGCS       StorageProviderType = "gcs"
+	StorageProviderAzureBlob StorageProviderType = "azure"
+	StorageProviderCustomS3  StorageProviderType = "custom"
+)
+
 // AuditLogExportCreateRequest represents a request to create an audit log export
 type AuditLogExportCreateRequest struct {
 	Name       string                    `json:"name"`
@@ -118,6 +132,8 @@ type AuditLogExportFilters struct {
 	Outcomes []string `json:"outcomes,omitempty"`
 	// Clients is the MCP client name or local-agent provider.
 	Clients []string `json:"clients,omitempty"`
+	// APIKeyIDs matches API keys used to make requests.
+	APIKeyIDs []uint `json:"apiKeyIDs,omitempty"`
 
 	// Single-source filters.
 	UserIDs                    []string `json:"userIDs,omitempty"`
@@ -144,6 +160,7 @@ type AuditLogExportFilters struct {
 
 // LLMAuditLogExportFilters represents filters for LLM audit log export
 type LLMAuditLogExportFilters struct {
+	APIKeyIDs              []uint   `json:"apiKeyIDs,omitempty"`
 	UserIDs                []string `json:"userIDs,omitempty"`
 	ModelProviders         []string `json:"modelProviders,omitempty"`
 	TargetModels           []string `json:"targetModels,omitempty"`
@@ -158,11 +175,6 @@ type LLMAuditLogExportFilters struct {
 
 // AuditLogType identifies the source of logs exported by a unified audit log export resource.
 type AuditLogType string
-
-const (
-	AuditLogTypeMCP AuditLogType = "mcp"
-	AuditLogTypeLLM AuditLogType = "llm"
-)
 
 // StorageCredentialsTestRequest represents a request to test storage credentials
 type StorageCredentialsTestRequest struct {
@@ -184,20 +196,7 @@ type StorageCredentialsResponse struct {
 
 type AuditLogExportState string
 
-const (
-	AuditLogExportStateRunning   AuditLogExportState = "running"
-	AuditLogExportStateCompleted AuditLogExportState = "completed"
-	AuditLogExportStateFailed    AuditLogExportState = "failed"
-)
-
 type StorageProviderType string
-
-const (
-	StorageProviderS3        StorageProviderType = "s3"
-	StorageProviderGCS       StorageProviderType = "gcs"
-	StorageProviderAzureBlob StorageProviderType = "azure"
-	StorageProviderCustomS3  StorageProviderType = "custom"
-)
 
 type StorageProviderConfigInput struct {
 	Provider            StorageProviderType `json:"provider"`

@@ -4,7 +4,7 @@ title: MCP Hosting
 
 # MCP Hosting
 
-The MCP Hosting layer runs and manages MCP servers directly within Obot. It handles deployment, lifecycle management, and runtime isolation for MCP servers.
+Obot deploys and manages hosted MCP server workloads on the underlying Kubernetes or Docker runtime.
 
 ## Runtime Types
 
@@ -42,7 +42,7 @@ For production deployments, Obot can deploy MCP servers to Kubernetes:
 
 Obot handles OAuth 2.1 flows for MCP servers that require authentication:
 
-- OAuth credentials stored securely with encryption at rest
+- OAuth credentials encrypted at rest when an [encryption provider](../configuration/encryption-providers/overview.md) is configured; encryption is disabled by default
 - Automatic token refresh
 - Per-user credential isolation
 - Supports custom OAuth configurations

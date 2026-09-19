@@ -21,6 +21,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+type conflictOnceClient struct {
+	kclient.Client
+	updateCalls int
+}
+
 func TestAuthProviderEnvIDNoopWhenEnvAbsent(t *testing.T) {
 	providerID, configured := authProviderEnvID(func(string) (string, bool) {
 		return "", false
@@ -331,11 +336,6 @@ func newProviderTestGatewayClient(t *testing.T, storageClient kclient.Client) *g
 	})
 
 	return gateway.New(context.Background(), db, storageClient, nil, nil, nil, nil, time.Hour, 1000, 90, 90, 90, true)
-}
-
-type conflictOnceClient struct {
-	kclient.Client
-	updateCalls int
 }
 
 func (c *conflictOnceClient) Update(ctx context.Context, obj kclient.Object, opts ...kclient.UpdateOption) error {

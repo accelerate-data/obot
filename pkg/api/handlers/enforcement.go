@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,8 +16,26 @@ import (
 	"github.com/obot-platform/obot/pkg/enforcement"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gtypes "github.com/obot-platform/obot/pkg/gateway/types"
-	"github.com/obot-platform/obot/pkg/utils"
 	"gorm.io/gorm"
+)
+
+const (
+	maxUnresolvedReasonRunes = 512
+	maxIdentifierRunes       = 256
+	maxServerURLRunes        = 2048
+)
+
+// enforcementDecisionFilters are the filter keys the decision-log UI may request
+// options for. "decision" is a fixed enum served independently of the data.
+var (
+	enforcementDecisionFilters = map[string]struct{}{
+		"agent":    {},
+		"tool":     {},
+		"kind":     {},
+		"server":   {},
+		"decision": {},
+		"actor":    {},
+	}
 )
 
 type EnforcementHandler struct {
@@ -45,12 +64,12 @@ func (h *EnforcementHandler) Decide(req api.Context) error {
 	}
 
 	extra := req.User.GetExtra()
-	deviceID := utils.FirstSet(extra["device_id"]...)
+	deviceID := cmp.Or(extra["device_id"]...)
 
 	// Resolve the fleet configuration strictly from the authenticated identity.
 	// A caller that is not an enrolled device has no fleet to enforce against:
 	// deny without recording, so only devices can write decision rows.
-	configID, ok := parseConfigurationID(utils.FirstSet(extra["mdm_configuration_id"]...))
+	configID, ok := parseConfigurationID(cmp.Or(extra["mdm_configuration_id"]...))
 	if deviceID == "" || !ok {
 		return respondDecision(req, enforcement.Decision{
 			Allow:  false,
@@ -232,17 +251,6 @@ func (h *EnforcementHandler) CheckDecisionAllowlist(req api.Context) error {
 		AllowlistReason:    decision.Reason,
 		EnforcementEnabled: policy.Enabled,
 	})
-}
-
-// enforcementDecisionFilters are the filter keys the decision-log UI may request
-// options for. "decision" is a fixed enum served independently of the data.
-var enforcementDecisionFilters = map[string]struct{}{
-	"agent":    {},
-	"tool":     {},
-	"kind":     {},
-	"server":   {},
-	"decision": {},
-	"actor":    {},
 }
 
 // ListFilterOptions handles GET /api/enforcement-decisions/filter-options/{filter} (admin-only).
@@ -467,12 +475,6 @@ func sanitizeServerCommand(raw string) string {
 	}
 	return fields[0]
 }
-
-const (
-	maxUnresolvedReasonRunes = 512
-	maxIdentifierRunes       = 256
-	maxServerURLRunes        = 2048
-)
 
 func sanitizeUnresolvedReason(raw string) string {
 	return truncateRunes(strings.TrimSpace(raw), maxUnresolvedReasonRunes)

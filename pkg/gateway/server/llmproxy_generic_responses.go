@@ -6,7 +6,7 @@ import (
 	"net/url"
 	"strings"
 
-	nanobottypes "github.com/obot-platform/nanobot/pkg/types"
+	llmtypes "github.com/obot-platform/obot/pkg/llm"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 )
@@ -15,6 +15,13 @@ const (
 	genericResponsesBaseURLEnv = "OBOT_GENERIC_RESPONSES_MODEL_PROVIDER_BASE_URL"
 	genericResponsesAPIKeyEnv  = "OBOT_GENERIC_RESPONSES_MODEL_PROVIDER_API_KEY"
 )
+
+type genericResponsesProviderBackend struct{}
+
+type genericResponsesTransport struct {
+	key  string
+	next http.RoundTripper
+}
 
 func (s *Server) newGenericResponsesLLMProviderProxy() *llmProviderProxy {
 	return &llmProviderProxy{
@@ -26,13 +33,11 @@ func (s *Server) newGenericResponsesLLMProviderProxy() *llmProviderProxy {
 	}
 }
 
-type genericResponsesProviderBackend struct{}
-
 func (genericResponsesProviderBackend) modelProviderName() string {
 	return system.GenericResponsesModelProvider
 }
 
-func (genericResponsesProviderBackend) upstreamURL(_ *http.Request, credEnv map[string]string) (url.URL, nanobottypes.Dialect, error) {
+func (genericResponsesProviderBackend) upstreamURL(_ *http.Request, credEnv map[string]string) (url.URL, llmtypes.Dialect, error) {
 	rawURL := strings.TrimSpace(credEnv[genericResponsesBaseURLEnv])
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -42,7 +47,7 @@ func (genericResponsesProviderBackend) upstreamURL(_ *http.Request, credEnv map[
 		return url.URL{}, "", fmt.Errorf("generic Responses base URL must be an absolute HTTP or HTTPS URL")
 	}
 	u.Path = strings.TrimRight(u.Path, "/")
-	return *u, nanobottypes.DialectOpenResponses, nil
+	return *u, llmtypes.DialectOpenResponses, nil
 }
 
 func (genericResponsesProviderBackend) transport(_ v1.ModelProvider, credEnv map[string]string) (http.RoundTripper, error) {
@@ -50,11 +55,6 @@ func (genericResponsesProviderBackend) transport(_ v1.ModelProvider, credEnv map
 		key:  credEnv[genericResponsesAPIKeyEnv],
 		next: http.DefaultTransport,
 	}, nil
-}
-
-type genericResponsesTransport struct {
-	key  string
-	next http.RoundTripper
 }
 
 func (g genericResponsesTransport) RoundTrip(req *http.Request) (*http.Response, error) {

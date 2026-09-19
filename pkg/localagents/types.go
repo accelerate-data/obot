@@ -1,13 +1,15 @@
 package localagents
 
-import "context"
-
-type DetectionState string
+import (
+	"context"
+)
 
 const (
 	DetectionMissing DetectionState = "missing"
 	DetectionPresent DetectionState = "present"
 )
+
+type DetectionState string
 
 type DetectionResult struct {
 	AgentID     string
@@ -27,12 +29,6 @@ type Agent interface {
 	ID() string
 	DisplayName() string
 	Detect(ctx context.Context) DetectionResult
-}
-
-type DirectInstaller interface {
-	Agent
-	InstallBootstrap(ctx context.Context, home string) (InstallResult, error)
-	InstallSkill(ctx context.Context, home string, skill SkillArchive) (InstallResult, error)
 }
 
 type SetupTarget interface {

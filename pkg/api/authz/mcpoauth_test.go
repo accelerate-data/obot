@@ -18,9 +18,10 @@ func TestMCPGroupAllowsMCPAndAnyGroupRoutes(t *testing.T) {
 		Name:      "msi1test",
 		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
-			UserID: "mcpoauth-user-uid",
+			UserID:        "mcpoauth-user-uid",
+			MCPServerName: "ms1test",
 		},
-	}).Build()
+	}, &v1.MCPServer{Name: "ms1test", Namespace: system.DefaultNamespace}).Build()
 	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
 	mcpUser := &user.DefaultInfo{
 		Name:   "mcp-user",
@@ -187,7 +188,7 @@ func TestMCPGroupDeniesNonMCPAPIRoutes(t *testing.T) {
 	}
 }
 
-func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoutes(t *testing.T) {
+func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoute(t *testing.T) {
 	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&v1.MCPServerInstance{
 		Name:      "instance-1",
 		Namespace: system.DefaultNamespace,
@@ -201,27 +202,9 @@ func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoutes(t *testing.T) {
 		UID:    "owner-uid",
 		Groups: []string{types.GroupAPI, types.GroupAuthenticated},
 	}
+	req := httptest.NewRequest(http.MethodDelete, "/api/mcp-server-instances/instance-1/oauth", nil)
 
-	tests := []struct {
-		name string
-		path string
-	}{
-		{
-			name: "oauth url",
-			path: "/api/mcp-server-instances/instance-1/oauth-url",
-		},
-		{
-			name: "oauth redirect",
-			path: "/api/mcp-server-instances/instance-1/oauth-redirect",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
-			if allowed := authorizer.Authorize(req, apiUser); !allowed {
-				t.Fatalf("Authorize() = false, want true")
-			}
-		})
+	if allowed := authorizer.Authorize(req, apiUser); !allowed {
+		t.Fatal("Authorize() = false, want true")
 	}
 }

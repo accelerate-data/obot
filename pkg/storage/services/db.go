@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"log/slog"
 	"net"
 	"time"
 
@@ -33,13 +34,11 @@ func connectDB(
 			return nil, err
 		}
 		lastErr = err
-		log.Warnf(
-			"Database connection attempt %d/%d failed, retrying in %s: %v",
-			attempt+1,
-			maxAttempts,
-			delay,
-			err,
-		)
+		slog.Warn("Database connection failed, retrying",
+			"attempt", attempt+1,
+			"maxAttempts", maxAttempts,
+			"delay", delay,
+			"error", err)
 		time.Sleep(delay)
 	}
 	return nil, lastErr
@@ -55,6 +54,6 @@ func isTransientConnectError(err error) bool {
 	if _, ok := errors.AsType[*net.OpError](err); ok {
 		return true
 	}
-	var connectErr *pgconn.ConnectError
-	return errors.As(err, &connectErr)
+	_, ok := errors.AsType[*pgconn.ConnectError](err)
+	return ok
 }

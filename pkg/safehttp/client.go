@@ -2,68 +2,84 @@ package safehttp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/oauth2"
 )
 
-type ClientOptions struct {
-	BlockLoopback  bool
-	BlockPrivateIP bool
-	BlockLinkLocal bool
-	// BlockRedirects rejects any HTTP redirect instead of following it. Set it on
-	// clients that carry credentials, such as OAuth token exchange and refresh, so
-	// an authorization code, PKCE verifier, or client secret is never replayed to
-	// another origin.
-	BlockRedirects bool
-	AllowList      []string
-	Timeout        time.Duration
-	Headers        http.Header
-}
+type (
+	Options struct {
+		BlockLoopback  bool
+		BlockPrivateIP bool
+		BlockLinkLocal bool
+		AllowList      []string
+		Timeout        time.Duration
+		Headers        http.Header
+		TokenSource    oauth2.TokenSource
+		// DialRetryTimeout bounds retries of transient TCP failures before any HTTP bytes are sent.
+		DialRetryTimeout time.Duration
+	}
+
+	checkingTransport struct {
+		base        http.RoundTripper
+		dialer      *safeDialer
+		headers     http.Header
+		tokenSource oauth2.TokenSource
+	}
+
+	safeDialer struct {
+		dialer           *net.Dialer
+		resolver         *net.Resolver
+		dialRetryTimeout time.Duration
+
+		blockLoopback  bool
+		blockPrivateIP bool
+		blockLinkLocal bool
+		allowList      []allowListEntry
+	}
+
+	allowListEntry struct {
+		host   string
+		port   string
+		suffix bool
+	}
+)
 
 // NewClient returns an HTTP client that can block selected local address ranges.
-func NewClient(options ClientOptions) *http.Client {
+func NewClient(options Options) *http.Client {
+	return &http.Client{
+		Timeout:   options.Timeout,
+		Transport: NewSafeTransport(options),
+	}
+}
+
+func NewSafeTransport(options Options) http.RoundTripper {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	dialer := &safeDialer{
-		dialer:         &net.Dialer{},
-		resolver:       net.DefaultResolver,
-		blockLoopback:  options.BlockLoopback,
-		blockPrivateIP: options.BlockPrivateIP,
-		blockLinkLocal: options.BlockLinkLocal,
-		allowList:      parseAllowList(options.AllowList),
+		dialer:           &net.Dialer{},
+		resolver:         net.DefaultResolver,
+		blockLoopback:    options.BlockLoopback,
+		blockPrivateIP:   options.BlockPrivateIP,
+		blockLinkLocal:   options.BlockLinkLocal,
+		allowList:        parseAllowList(options.AllowList),
+		dialRetryTimeout: options.DialRetryTimeout,
 	}
 	transport.DialContext = dialer.DialContext
 
-	client := &http.Client{
-		Timeout: options.Timeout,
-		Transport: checkingTransport{
-			base:    transport,
-			dialer:  dialer,
-			headers: options.Headers.Clone(),
-		},
+	return checkingTransport{
+		base:        transport,
+		dialer:      dialer,
+		headers:     options.Headers.Clone(),
+		tokenSource: options.TokenSource,
 	}
-	if options.BlockRedirects {
-		client.CheckRedirect = RejectRedirects
-	}
-
-	return client
-}
-
-// RejectRedirects is an http.Client CheckRedirect policy that refuses every
-// redirect. The error names only the target host, so a redirected request's
-// credentials never reach a log or an API response.
-func RejectRedirects(req *http.Request, _ []*http.Request) error {
-	return fmt.Errorf("refusing to follow redirect to %s", req.URL.Host)
-}
-
-type checkingTransport struct {
-	base    http.RoundTripper
-	dialer  *safeDialer
-	headers http.Header
 }
 
 func (t checkingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -73,28 +89,69 @@ func (t checkingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 	}
 
-	if len(t.headers) > 0 {
+	if len(t.headers) > 0 || t.tokenSource != nil {
+		preserveAuthorization := sameOriginAsInitialRequest(req, req.URL)
 		req = req.Clone(req.Context())
 		if req.Header == nil {
-			req.Header = make(http.Header, len(t.headers))
+			req.Header = make(http.Header, len(t.headers)+1)
 		}
 		maps.Copy(req.Header, t.headers)
+		if !preserveAuthorization {
+			req.Header.Del("Authorization")
+		}
+
+		if t.tokenSource != nil && preserveAuthorization {
+			token, err := t.tokenSource.Token()
+			if err != nil {
+				return nil, fmt.Errorf("failed to get token from source: %w", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+		}
 	}
 
 	return t.base.RoundTrip(req)
 }
 
-type safeDialer struct {
-	dialer   *net.Dialer
-	resolver *net.Resolver
-
-	blockLoopback  bool
-	blockPrivateIP bool
-	blockLinkLocal bool
-	allowList      []allowListEntry
+func sameOriginAsInitialRequest(req *http.Request, target *url.URL) bool {
+	if req == nil || target == nil {
+		return false
+	}
+	initial := req
+	for initial.Response != nil && initial.Response.Request != nil {
+		initial = initial.Response.Request
+	}
+	return initial.URL != nil &&
+		strings.EqualFold(initial.URL.Scheme, target.Scheme) &&
+		strings.EqualFold(initial.URL.Hostname(), target.Hostname()) &&
+		portForURL(initial.URL) == portForURL(target)
 }
 
 func (d *safeDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if d.dialRetryTimeout <= 0 {
+		return d.dialOnce(ctx, network, address)
+	}
+	ctx, cancel := context.WithTimeout(ctx, d.dialRetryTimeout)
+	defer cancel()
+	for {
+		attemptCtx, cancelAttempt := context.WithTimeout(ctx, time.Second)
+		conn, err := d.dialOnce(attemptCtx, network, address)
+		cancelAttempt()
+		if err == nil {
+			return conn, nil
+		}
+		var netErr net.Error
+		if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.EHOSTUNREACH) && !errors.Is(err, syscall.ENETUNREACH) && (!errors.As(err, &netErr) || !netErr.Timeout()) {
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w: last dial error: %w", ctx.Err(), err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func (d *safeDialer) dialOnce(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
@@ -186,12 +243,6 @@ func (d *safeDialer) blockedReason(ip net.IP) string {
 		return "link-local"
 	}
 	return ""
-}
-
-type allowListEntry struct {
-	host   string
-	port   string
-	suffix bool
 }
 
 func parseAllowList(entries []string) []allowListEntry {

@@ -35,11 +35,13 @@ func TestClassifyMCPOutcome(t *testing.T) {
 
 func TestPresentMCPNormalizesSummaryAndDetails(t *testing.T) {
 	created := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	apiKeyID := uint(17)
 	log := gatewaytypes.MCPAuditLog{
 		ID: 7, CreatedAt: created, SourceType: api.AuditLogSourceTypeMCP,
-		UserID: "user-1", ClientIP: "127.0.0.1",
+		UserID: "user-1", APIKeyID: &apiKeyID, ClientIP: "127.0.0.1",
+		APIKeyName: "CLI token", APIKeyRevoked: true,
 		MCPFields: &gatewaytypes.MCPAuditLogFields{
-			APIKey: "credential-1", MCPID: "mcp-1", MCPServerDisplayName: "GitHub",
+			APIKey: "ok1-user-1-17-super-secret", MCPID: "mcp-1", MCPServerDisplayName: "GitHub",
 			CallType: "tools/call", CallIdentifier: "search", ResponseStatus: 200,
 			ResponseReceived: true, ProcessingTimeMs: 42, RequestBody: json.RawMessage(`{"q":"obot"}`),
 			SessionID: "session-1", ClientName: "client", ClientVersion: "1.0.0",
@@ -50,7 +52,7 @@ func TestPresentMCPNormalizesSummaryAndDetails(t *testing.T) {
 	if summary.Details != nil || summary.EventType != api.AuditLogEventTypeMCPCall {
 		t.Fatalf("unexpected summary: %#v", summary)
 	}
-	if summary.Actor.ActorType != api.AuditLogActorTypeUser || summary.Actor.ID != "user-1" || summary.Actor.CredentialID != "credential-1" {
+	if summary.Actor.ActorType != api.AuditLogActorTypeUser || summary.Actor.ID != "user-1" || summary.Actor.CredentialID != "CLI token (ok1-user-1-17-*****)" || !summary.Actor.APIKeyRevoked {
 		t.Fatalf("unexpected actor: %#v", summary.Actor)
 	}
 	if summary.Target.TargetType != api.AuditLogTargetTypeMCPTool || summary.Target.Parent == nil {
@@ -70,6 +72,51 @@ func TestPresentMCPNormalizesSummaryAndDetails(t *testing.T) {
 	}
 	if strings.Contains(string(data), "mcpFields") || strings.Contains(string(data), "localAgentToolCallFields") {
 		t.Fatalf("legacy subtype key leaked into normalized JSON: %s", data)
+	}
+	if strings.Contains(string(data), "super-secret") {
+		t.Fatalf("API key secret leaked into normalized JSON: %s", data)
+	}
+}
+
+func TestPresentMCPDoesNotDuplicateMaskedUnnamedAPIKey(t *testing.T) {
+	apiKeyID := uint(17)
+	log := gatewaytypes.MCPAuditLog{
+		SourceType: api.AuditLogSourceTypeMCP,
+		UserID:     "user-1",
+		APIKeyID:   &apiKeyID,
+		APIKeyName: "ok1-user-1-17-*****",
+		MCPFields:  &gatewaytypes.MCPAuditLogFields{},
+	}
+
+	if actor := Present(log, PresentOptions{}).Actor; actor.CredentialID != "ok1-user-1-17-*****" {
+		t.Fatalf("unexpected unnamed API key display: %#v", actor)
+	}
+}
+
+func TestPresentMCPDoesNotDeriveAPIKeyMaskFromHostedAgentActor(t *testing.T) {
+	apiKeyID := uint(42)
+	for _, test := range []struct {
+		name       string
+		apiKeyName string
+	}{
+		{name: "named key", apiKeyName: "CLI token"},
+		{name: "unnamed key", apiKeyName: "ok1-7-42-*****"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			log := gatewaytypes.MCPAuditLog{
+				SourceType:    api.AuditLogSourceTypeMCP,
+				UserID:        "hosted-agent:hai1abc",
+				APIKeyID:      &apiKeyID,
+				APIKeyName:    test.apiKeyName,
+				APIKeyRevoked: true,
+				MCPFields:     &gatewaytypes.MCPAuditLogFields{},
+			}
+
+			actor := Present(log, PresentOptions{}).Actor
+			if actor.CredentialID != test.apiKeyName || !actor.APIKeyRevoked {
+				t.Fatalf("credential display = %q, want %q", actor.CredentialID, test.apiKeyName)
+			}
+		})
 	}
 }
 
@@ -91,7 +138,7 @@ func TestPresentLocalAgentIdentityTargetAndTimestamp(t *testing.T) {
 	if event.Timestamp.OccurredAt.GetTime() != observed || event.Timestamp.RecordedAt.GetTime() != recorded || event.Timestamp.Source != api.AuditLogTimestampSourceClientReported {
 		t.Fatalf("unexpected timestamps: %#v", event.Timestamp)
 	}
-	if event.Actor.ActorType != api.AuditLogActorTypeDevice || event.Actor.ID != "device-1" {
+	if event.Actor.ActorType != api.AuditLogActorTypeDevice || event.Actor.ID != "device-1" || event.Actor.CredentialID != "" {
 		t.Fatalf("unexpected actor: %#v", event.Actor)
 	}
 	if event.Target.TargetType != api.AuditLogTargetTypeMCPTool || event.Target.Parent == nil || event.Target.Parent.Name != "github" {
@@ -102,10 +149,34 @@ func TestPresentLocalAgentIdentityTargetAndTimestamp(t *testing.T) {
 	}
 }
 
+func TestPresentLocalAgentIncludesAPIKeyCredential(t *testing.T) {
+	apiKeyID := uint(17)
+	log := gatewaytypes.MCPAuditLog{
+		SourceType:    api.AuditLogSourceTypeLocalAgentToolCall,
+		UserID:        "42",
+		APIKeyID:      &apiKeyID,
+		APIKeyName:    "Local CLI",
+		APIKeyRevoked: true,
+		LocalAgentToolCallFields: &gatewaytypes.LocalAgentToolCallAuditLogFields{
+			ActorType: api.AuditLogActorTypeUser,
+			ActorID:   "42",
+		},
+	}
+
+	actor := Present(log, PresentOptions{}).Actor
+	if actor.CredentialID != "Local CLI (ok1-42-17-*****)" || !actor.APIKeyRevoked {
+		t.Fatalf("unexpected API-key credential: %#v", actor)
+	}
+}
+
 func TestPresentUnknownActors(t *testing.T) {
-	mcp := gatewaytypes.MCPAuditLog{SourceType: api.AuditLogSourceTypeMCP, MCPFields: &gatewaytypes.MCPAuditLogFields{APIKey: "credential"}}
-	if actor := Present(mcp, PresentOptions{}).Actor; actor.ActorType != api.AuditLogActorTypeCredential || actor.ID != "credential" {
+	mcp := gatewaytypes.MCPAuditLog{SourceType: api.AuditLogSourceTypeMCP, APIKeyName: "credential", APIKeyRevoked: true, MCPFields: &gatewaytypes.MCPAuditLogFields{}}
+	if actor := Present(mcp, PresentOptions{}).Actor; actor.ActorType != api.AuditLogActorTypeCredential || actor.ID != "credential" || !actor.APIKeyRevoked {
 		t.Fatalf("unexpected credential actor: %#v", actor)
+	}
+	legacyMCP := gatewaytypes.MCPAuditLog{SourceType: api.AuditLogSourceTypeMCP, MCPFields: &gatewaytypes.MCPAuditLogFields{APIKey: "ok1-user-1-17-super-secret"}}
+	if actor := Present(legacyMCP, PresentOptions{}).Actor; actor.ActorType != api.AuditLogActorTypeUnknown || actor.ID != "" {
+		t.Fatalf("legacy API key must not become an actor: %#v", actor)
 	}
 	local := gatewaytypes.MCPAuditLog{SourceType: api.AuditLogSourceTypeLocalAgentToolCall, UserID: "reported", LocalAgentToolCallFields: &gatewaytypes.LocalAgentToolCallAuditLogFields{ActorType: api.AuditLogActorTypeUnknown}}
 	if actor := Present(local, PresentOptions{}).Actor; actor.ActorType != api.AuditLogActorTypeUnknown || actor.ID != "" {

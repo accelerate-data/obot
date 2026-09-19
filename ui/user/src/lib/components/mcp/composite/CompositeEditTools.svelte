@@ -9,6 +9,7 @@
 		duplicateToolNames,
 		effectiveToolName,
 		isDeprecatedMCPServer,
+		isToolCustomized,
 		MAX_TOOL_PREFIX_LENGTH,
 		TOOL_NAME_CHARSET_REGEX,
 		TOOL_NAME_SPECIAL_CHAR_WARNING,
@@ -17,6 +18,7 @@
 	import McpDeprecatedNotice from '../McpDeprecatedNotice.svelte';
 	import ToolNameIssueIcon from '../ToolNameIssueIcon.svelte';
 	import { TriangleAlert } from '@lucide/svelte';
+	import type { Snippet } from 'svelte';
 
 	interface Props {
 		configuringEntry?: MCPCatalogEntry | MCPCatalogServer;
@@ -30,6 +32,7 @@
 		// admin edits overrides or the prefix.
 		otherEffectiveNames?: string[];
 		otherToolPrefixes?: string[];
+		additionalActions?: Snippet;
 	}
 
 	let {
@@ -40,7 +43,8 @@
 		otherToolPrefixes,
 		onClose,
 		onCancel,
-		onSuccess
+		onSuccess,
+		additionalActions
 	}: Props = $props();
 
 	let ownEnabledEffectiveNames = $derived(
@@ -158,7 +162,7 @@
 	bind:this={dialog}
 	animate="slide"
 	title={`Configure ${configuringEntry?.manifest?.name ?? 'MCP Server'} Tools`}
-	class="bg-base-200 md:w-2xl"
+	class="bg-base-200 md:w-(--breakpoint-xl) md:max-w-(--breakpoint-xl)"
 	classes={{ content: 'p-0', header: 'p-4 pb-0' }}
 	onClickOutside={handleClose}
 >
@@ -233,13 +237,9 @@
 			placeholder="Search tools..."
 		/>
 		{#each visibleTools as tool (tool.id)}
-			{@const overrideName = (tool.overrideName || '').trim()}
-			{@const overrideDescription = (tool.overrideDescription || '').trim()}
-			{@const currentName = overrideName || tool.name}
-			{@const currentDescription = overrideDescription || tool.description}
-			{@const isCustomized =
-				(overrideName !== '' && overrideName !== tool.name) ||
-				(overrideDescription !== '' && overrideDescription !== tool.description)}
+			{@const currentName = (tool.overrideName || '').trim() || tool.name}
+			{@const currentDescription = (tool.overrideDescription || '').trim() || tool.description}
+			{@const isCustomized = isToolCustomized(tool)}
 
 			{@const effectiveName = effectiveToolName(tool.name, tool.overrideName, toolPrefix)}
 			{@const conflict = tool.enabled ? conflictIssue(effectiveName, conflictSet) : undefined}
@@ -339,17 +339,24 @@
 			</div>
 		{/each}
 	</div>
-	<div class="bg-base-200 sticky bottom-0 left-0 mt-4 flex w-full justify-end gap-2 p-4">
-		<button class="btn btn-secondary" onclick={handleCancel}>Cancel</button>
-		<button
-			id={CATALOG_SERVER_FIELD_IDS.compositeEntryConfigureToolsConfirmBtn}
-			class="btn btn-primary"
-			disabled={hasBlockingToolNameErrors || prefixIssue?.severity === 'error'}
-			onclick={() => {
-				onSuccess?.();
-				dialog?.close();
-			}}>Confirm</button
-		>
+	<div class="bg-base-200 sticky bottom-0 left-0 mt-4 flex w-full justify-between gap-2 p-4">
+		<div>
+			{#if additionalActions}
+				{@render additionalActions()}
+			{/if}
+		</div>
+		<div class="flex gap-2 items-center">
+			<button class="btn btn-secondary" onclick={handleCancel}>Cancel</button>
+			<button
+				id={CATALOG_SERVER_FIELD_IDS.compositeEntryConfigureToolsConfirmBtn}
+				class="btn btn-primary"
+				disabled={hasBlockingToolNameErrors || prefixIssue?.severity === 'error'}
+				onclick={() => {
+					onSuccess?.();
+					dialog?.close();
+				}}>Confirm</button
+			>
+		</div>
 	</div>
 </ResponsiveDialog>
 

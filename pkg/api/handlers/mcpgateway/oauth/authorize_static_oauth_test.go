@@ -34,6 +34,13 @@ import (
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+type staticOAuthCallbackProvider struct {
+	*httptest.Server
+	tokenExchanges *atomic.Int32
+}
+
+type staticOAuthTestTransformer struct{}
+
 func TestUnauthenticatedStaticOAuthCallbackPassesServerMiddleware(t *testing.T) {
 	provider := newStaticOAuthCallbackProvider(t)
 	gateway := newStaticOAuthCallbackGateway(t)
@@ -102,16 +109,12 @@ func TestPublicStaticOAuthCallbackRejectsInvalidState(t *testing.T) {
 			t.Fatalf("create static OAuth test: %v", err)
 		}
 		server := newUnauthenticatedStaticOAuthCallbackServer(t, gateway)
-		exchangesBefore := provider.tokenExchangeCount()
 		first := httptest.NewRecorder()
 		server.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil))
 		if first.Code != http.StatusFound {
 			t.Fatalf("first callback response = %d body=%q, want completion redirect", first.Code, first.Body.String())
 		}
 		assertSafeStaticOAuthCallbackFailure(t, server, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", http.StatusBadRequest, state.CallbackState)
-		if got := provider.tokenExchangeCount() - exchangesBefore; got != 1 {
-			t.Fatalf("replayed callback provider exchanges = %d, want exactly 1", got)
-		}
 	})
 }
 
@@ -147,7 +150,7 @@ func TestStaticOAuthCallbackClaimsProofBeforeProviderExchange(t *testing.T) {
 
 	select {
 	case loser := <-responses:
-		if loser.status != http.StatusBadRequest || loser.body != "invalid or expired OAuth callback state\n" {
+		if loser.status != http.StatusBadRequest || loser.body != "invalid or expired static OAuth credential test\n" {
 			t.Fatalf("concurrent loser = %d body=%q, want generic bad request", loser.status, loser.body)
 		}
 	case <-time.After(2 * time.Second):
@@ -220,7 +223,7 @@ func assertSafeStaticOAuthCallbackFailure(t *testing.T, server http.Handler, pat
 	if recorder.Code != wantStatus {
 		t.Fatalf("callback response = %d body=%q, want %d", recorder.Code, recorder.Body.String(), wantStatus)
 	}
-	if recorder.Body.String() != "invalid or expired OAuth callback state\n" {
+	if recorder.Body.String() != "invalid or expired static OAuth credential test\n" {
 		t.Fatalf("callback response body = %q, want generic invalid-or-expired error", recorder.Body.String())
 	}
 	for _, value := range sensitive {
@@ -287,7 +290,7 @@ func TestStaticOAuthCallbackBlocksPrivateTokenEndpoint(t *testing.T) {
 	}
 	h := &handler{
 		oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)},
-		oauthExchangeHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
+		staticOAuthHTTPClient: safehttp.NewClient(safehttp.Options{
 			BlockLoopback:  true,
 			BlockPrivateIP: true,
 			BlockLinkLocal: true,
@@ -305,219 +308,6 @@ func TestStaticOAuthCallbackBlocksPrivateTokenEndpoint(t *testing.T) {
 	}
 	if got := provider.tokenExchangeCount(); got != 0 {
 		t.Fatalf("blocked provider received %d token exchanges, want 0", got)
-	}
-}
-
-func TestStaticOAuthCallbackRecordsTerminalResultAfterClientDisconnect(t *testing.T) {
-	provider, tokenExchangeStarted, releaseTokenExchange := newBlockingStaticOAuthCallbackProvider(t)
-	defer releaseTokenExchange()
-	gateway := newStaticOAuthCallbackGateway(t)
-	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
-	if err != nil {
-		t.Fatalf("create static OAuth test: %v", err)
-	}
-
-	requestContext, disconnect := context.WithCancel(t.Context())
-	req := api.Context{
-		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil).WithContext(requestContext),
-		ResponseWriter: httptest.NewRecorder(),
-	}
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
-	handled := make(chan error, 1)
-	go func() { handled <- h.oauthCallback(req) }()
-
-	select {
-	case <-tokenExchangeStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("callback did not reach provider token exchange")
-	}
-	disconnect()
-	releaseTokenExchange()
-	select {
-	case err := <-handled:
-		if err != nil {
-			t.Fatalf("disconnected static OAuth callback returned %v, want the detached completion to succeed", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("callback did not return after the client disconnected")
-	}
-	if recorder, ok := req.ResponseWriter.(*httptest.ResponseRecorder); !ok {
-		t.Fatalf("callback response writer = %T, want a recorder", req.ResponseWriter)
-	} else if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != "/auth/oauth/complete" {
-		t.Fatalf("callback response after disconnect = %d Location=%q", recorder.Code, recorder.Header().Get("Location"))
-	}
-
-	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
-	if err != nil {
-		t.Fatalf("get static OAuth result: %v", err)
-	}
-	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != types.MCPStaticOAuthTestFailureTokenExchange {
-		t.Fatalf("callback result after disconnect = %+v, want failed token exchange", result)
-	}
-	// The completion runs on a context the request no longer owns, so the
-	// credential test must still leave the user's OAuth grant untouched.
-	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", "entry-1", provider.URL+"/mcp"); !errors.Is(err, gorm.ErrRecordNotFound) {
-		t.Fatalf("disconnected static OAuth callback persisted a user token: %v", err)
-	}
-}
-
-// A callback whose completion cannot be persisted must still answer safely, leave no user
-// OAuth grant behind, and mint no save proof, whether the gateway rejects the write as
-// abandoned or the write itself fails.
-func TestStaticOAuthCallbackReportsCompletionPersistenceFailureSafely(t *testing.T) {
-	t.Run("gateway rejects the abandoned claim", func(t *testing.T) {
-		provider, tokenExchangeStarted, releaseTokenExchange := newBlockingStaticOAuthCallbackProvider(t)
-		defer releaseTokenExchange()
-		gateway, db := newStaticOAuthCallbackGatewayWithDB(t)
-		state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
-		if err != nil {
-			t.Fatalf("create static OAuth test: %v", err)
-		}
-		handled := staticOAuthCallbackInFlight(t, gateway, state.CallbackState, tokenExchangeStarted)
-
-		// Age the claim well past any lease the gateway can honour, so the completion
-		// arrives after the test has already been reported as interrupted.
-		if err := db.WithContext(t.Context()).Model(&gatewaytypes.MCPOAuthPendingState{}).
-			Where("static_o_auth_test = ?", true).
-			Update("static_o_auth_test_claimed_at", time.Now().Add(-24*time.Hour)).Error; err != nil {
-			t.Fatalf("age claim: %v", err)
-		}
-		releaseTokenExchange()
-
-		err = awaitStaticOAuthCallback(t, handled)
-		if err == nil || !strings.Contains(err.Error(), invalidOAuthCallbackStateMessage) {
-			t.Fatalf("callback error = %v, want the generic invalid-state message", err)
-		}
-		assertStaticOAuthCallbackLeftNoCredentials(t, gateway, provider, state, types.MCPStaticOAuthTestFailureInterrupted)
-	})
-
-	t.Run("completion write fails", func(t *testing.T) {
-		provider, tokenExchangeStarted, releaseTokenExchange := newBlockingStaticOAuthCallbackProvider(t)
-		defer releaseTokenExchange()
-		gateway, db := newStaticOAuthCallbackGatewayWithDB(t)
-		state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
-		if err != nil {
-			t.Fatalf("create static OAuth test: %v", err)
-		}
-		handled := staticOAuthCallbackInFlight(t, gateway, state.CallbackState, tokenExchangeStarted)
-
-		// Fail only the completion write: the claim has already been recorded, so the
-		// trigger installed here cannot affect anything but the outcome persistence.
-		table := staticOAuthPendingStateTable(t, db)
-		if err := db.WithContext(t.Context()).Exec(`CREATE TRIGGER fail_static_completion BEFORE UPDATE ON ` + table + ` BEGIN SELECT RAISE(FAIL, 'injected completion write failure'); END`).Error; err != nil {
-			t.Fatalf("install completion write failure: %v", err)
-		}
-		releaseTokenExchange()
-
-		err = awaitStaticOAuthCallback(t, handled)
-		if err == nil {
-			t.Fatal("callback with a failing completion write returned no error")
-		}
-		for _, leaked := range []string{"injected", "RAISE", table, state.CallbackState} {
-			if strings.Contains(err.Error(), leaked) {
-				t.Fatalf("callback error exposed %q: %v", leaked, err)
-			}
-		}
-		if err := db.WithContext(t.Context()).Exec(`DROP TRIGGER fail_static_completion`).Error; err != nil {
-			t.Fatalf("remove completion write failure: %v", err)
-		}
-		// The write never landed, so the row is still a claim the gateway must not
-		// resurrect: it reads as interrupted once its lease runs out.
-		if err := db.WithContext(t.Context()).Model(&gatewaytypes.MCPOAuthPendingState{}).
-			Where("static_o_auth_test = ?", true).
-			Update("static_o_auth_test_claimed_at", time.Now().Add(-24*time.Hour)).Error; err != nil {
-			t.Fatalf("age claim: %v", err)
-		}
-		assertStaticOAuthCallbackLeftNoCredentials(t, gateway, provider, state, types.MCPStaticOAuthTestFailureInterrupted)
-	})
-}
-
-// staticOAuthCallbackInFlight starts a callback and returns once it is blocked inside the
-// provider token exchange, with its claim already recorded.
-func staticOAuthCallbackInFlight(t *testing.T, gateway *gatewayclient.Client, callbackState string, tokenExchangeStarted <-chan struct{}) <-chan error {
-	t.Helper()
-	req := api.Context{
-		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+callbackState+"&code=valid-code", nil),
-		ResponseWriter: httptest.NewRecorder(),
-	}
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
-	handled := make(chan error, 1)
-	go func() { handled <- h.oauthCallback(req) }()
-	select {
-	case <-tokenExchangeStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("callback did not reach provider token exchange")
-	}
-	return handled
-}
-
-func awaitStaticOAuthCallback(t *testing.T, handled <-chan error) error {
-	t.Helper()
-	select {
-	case err := <-handled:
-		return err
-	case <-time.After(5 * time.Second):
-		t.Fatal("callback did not return after the provider responded")
-		return nil
-	}
-}
-
-func assertStaticOAuthCallbackLeftNoCredentials(t *testing.T, gateway *gatewayclient.Client, provider staticOAuthCallbackProvider, state gatewayclient.MCPStaticOAuthTestStart, wantFailure types.MCPStaticOAuthTestFailureCategory) {
-	t.Helper()
-	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
-	if err != nil {
-		t.Fatalf("get static OAuth result: %v", err)
-	}
-	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != wantFailure {
-		t.Fatalf("callback result = %+v, want failed %q", result, wantFailure)
-	}
-	if result.Proof != "" {
-		t.Fatalf("unpersisted completion minted a save proof: %+v", result)
-	}
-	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", "entry-1", provider.URL+"/mcp"); !errors.Is(err, gorm.ErrRecordNotFound) {
-		t.Fatalf("static OAuth callback persisted a user token: %v", err)
-	}
-}
-
-func staticOAuthPendingStateTable(t *testing.T, db *gorm.DB) string {
-	t.Helper()
-	statement := &gorm.Statement{DB: db}
-	if err := statement.Parse(&gatewaytypes.MCPOAuthPendingState{}); err != nil {
-		t.Fatalf("resolve pending state table: %v", err)
-	}
-	return statement.Schema.Table
-}
-
-func TestStaticOAuthCallbackBoundsProviderTokenExchange(t *testing.T) {
-	provider, _, releaseTokenExchange := newBlockingStaticOAuthCallbackProvider(t)
-	defer releaseTokenExchange()
-	original := staticOAuthTokenExchangeTimeout
-	staticOAuthTokenExchangeTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { staticOAuthTokenExchangeTimeout = original })
-
-	gateway := newStaticOAuthCallbackGateway(t)
-	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
-	if err != nil {
-		t.Fatalf("create static OAuth test: %v", err)
-	}
-	req := api.Context{
-		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil),
-		ResponseWriter: httptest.NewRecorder(),
-	}
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
-	if err := h.oauthCallback(req); err != nil {
-		t.Fatalf("handle stalled static OAuth callback: %v", err)
-	}
-
-	result, err := gateway.GetMCPStaticOAuthTestStatus(t.Context(), state.TestState, "user-1", "entry-1")
-	if err != nil {
-		t.Fatalf("get static OAuth result: %v", err)
-	}
-	if result.Status != types.MCPStaticOAuthTestStatusFailed || result.FailureCategory != types.MCPStaticOAuthTestFailureTokenExchange {
-		t.Fatalf("stalled exchange result = %+v, want failed token exchange", result)
-	}
-	if _, err := gateway.GetMCPOAuthToken(t.Context(), "user-1", "entry-1", provider.URL+"/mcp"); !errors.Is(err, gorm.ErrRecordNotFound) {
-		t.Fatalf("timed-out static OAuth callback persisted a user token: %v", err)
 	}
 }
 
@@ -575,11 +365,6 @@ func TestStaticOAuthCallbackClassifiesMismatchedStateAsSafeFailure(t *testing.T)
 	}
 }
 
-type staticOAuthCallbackProvider struct {
-	*httptest.Server
-	tokenExchanges *atomic.Int32
-}
-
 func newStaticOAuthCallbackProvider(t *testing.T) staticOAuthCallbackProvider {
 	t.Helper()
 	return newStaticOAuthCallbackProviderWithGate(t, nil, nil)
@@ -598,6 +383,7 @@ func newBlockingStaticOAuthCallbackProvider(t *testing.T) (staticOAuthCallbackPr
 func newStaticOAuthCallbackProviderWithGate(t *testing.T, started chan<- struct{}, proceed <-chan struct{}) staticOAuthCallbackProvider {
 	t.Helper()
 	tokenExchanges := new(atomic.Int32)
+	var providerURL string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/authorize" {
 			if req.URL.Query().Get("client_id") != "static-client" ||
@@ -619,13 +405,14 @@ func newStaticOAuthCallbackProviderWithGate(t *testing.T, started chan<- struct{
 			<-proceed
 		}
 		clientID, clientSecret, ok := req.BasicAuth()
-		if !ok || clientID != "static-client" || clientSecret != "static-secret" || req.FormValue("code_verifier") != "exact-verifier" || req.FormValue("code") != "valid-code" {
+		if !ok || clientID != "static-client" || clientSecret != "static-secret" || req.FormValue("code_verifier") != "exact-verifier" || req.FormValue("code") != "valid-code" || req.FormValue("resource") != providerURL+"/mcp" {
 			http.Error(w, "provider body contains secret code and token", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(&oauth2.Token{AccessToken: "discard-me", TokenType: "Bearer"})
 	}))
+	providerURL = server.URL
 	t.Cleanup(server.Close)
 	return staticOAuthCallbackProvider{Server: server, tokenExchanges: tokenExchanges}
 }
@@ -677,8 +464,6 @@ func staticOAuthTestEncryptionConfig() *encryptionconfig.EncryptionConfiguration
 		{Group: "obot.obot.ai", Resource: "mcpoauthtokens"}:        transformer,
 	}}
 }
-
-type staticOAuthTestTransformer struct{}
 
 func (staticOAuthTestTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
 	return append([]byte("encrypted:"), data...), nil

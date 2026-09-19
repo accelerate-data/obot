@@ -36,6 +36,12 @@ export default defineConfig(({ mode }) => {
 						}
 		},
 		plugins: [sveltekit()],
+		optimizeDeps: {
+			// Only reachable via lazily-imported route nodes, so Vite would otherwise
+			// discover them mid-navigation and re-bundle, failing in-flight route
+			// imports with a 504.
+			include: ['d3', 'd3-time-format', 'date-fns', 'es-toolkit']
+		},
 		test: {
 			projects: [
 				{
@@ -43,6 +49,8 @@ export default defineConfig(({ mode }) => {
 					extends: true,
 					test: {
 						name: 'client',
+						// Concurrent browser files can exhaust the short interaction timeout.
+						fileParallelism: false,
 						// Timeout for browser tests - prevent hanging on element lookups
 						testTimeout: 2000,
 						browser: {

@@ -1,12 +1,91 @@
 package safehttp
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/oauth2"
 )
+
+func TestClientRetriesConnectionFailuresWithoutReplayingRequest(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		retryTimeout time.Duration
+		dialErrors   []error
+		wantDials    int
+		wantRequests int32
+		wantErr      error
+	}{
+		{
+			name:         "transient routing failures",
+			retryTimeout: time.Second,
+			dialErrors:   []error{syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH},
+			wantDials:    4,
+			wantRequests: 1,
+		},
+		{
+			name:       "retries disabled by default",
+			dialErrors: []error{syscall.ECONNREFUSED},
+			wantDials:  1,
+			wantErr:    syscall.ECONNREFUSED,
+		},
+		{
+			name:         "permanent failure is not retried",
+			retryTimeout: time.Second,
+			dialErrors:   []error{syscall.EPERM},
+			wantDials:    1,
+			wantErr:      syscall.EPERM,
+		},
+		{
+			name:         "retry budget expires",
+			retryTimeout: 10 * time.Millisecond,
+			dialErrors:   []error{syscall.ECONNREFUSED},
+			wantDials:    1,
+			wantErr:      context.DeadlineExceeded,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %s, want POST", r.Method)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			client := NewClient(Options{DialRetryTimeout: tt.retryTimeout})
+			transport := client.Transport.(checkingTransport)
+			defer transport.base.(*http.Transport).CloseIdleConnections()
+			var dials atomic.Int32
+			transport.dialer.dialer.Control = func(string, string, syscall.RawConn) error {
+				attempt := int(dials.Add(1))
+				if attempt <= len(tt.dialErrors) {
+					return tt.dialErrors[attempt-1]
+				}
+				return nil
+			}
+			resp, err := client.Post(server.URL, "application/json", strings.NewReader(`{"method":"initialize"}`))
+			if resp != nil {
+				resp.Body.Close()
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("Post() error = %v, want %v", err, tt.wantErr)
+			}
+			if int(dials.Load()) != tt.wantDials || requests.Load() != tt.wantRequests {
+				t.Fatalf("dials = %d, requests = %d; want %d dials and %d requests", dials.Load(), requests.Load(), tt.wantDials, tt.wantRequests)
+			}
+		})
+	}
+}
 
 func TestClientBlocksLoopbackLiteralIP(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -14,7 +93,7 @@ func TestClientBlocksLoopbackLiteralIP(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := NewClient(ClientOptions{BlockLoopback: true}).Get(ts.URL)
+	_, err := NewClient(Options{BlockLoopback: true}).Get(ts.URL)
 	if err == nil {
 		t.Fatal("expected loopback IP to be blocked")
 	}
@@ -29,7 +108,7 @@ func TestClientBlocksLoopbackHostname(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := NewClient(ClientOptions{BlockLoopback: true}).Get(strings.Replace(ts.URL, "127.0.0.1", "localhost", 1))
+	_, err := NewClient(Options{BlockLoopback: true}).Get(strings.Replace(ts.URL, "127.0.0.1", "localhost", 1))
 	if err == nil {
 		t.Fatal("expected localhost to resolve to a blocked loopback IP")
 	}
@@ -39,7 +118,7 @@ func TestClientBlocksLoopbackHostname(t *testing.T) {
 }
 
 func TestClientBlocksPrivateIP(t *testing.T) {
-	_, err := NewClient(ClientOptions{BlockPrivateIP: true}).Get("http://192.168.0.1/.well-known/oauth-protected-resource")
+	_, err := NewClient(Options{BlockPrivateIP: true}).Get("http://192.168.0.1/.well-known/oauth-protected-resource")
 	if err == nil {
 		t.Fatal("expected private IP to be blocked")
 	}
@@ -49,7 +128,7 @@ func TestClientBlocksPrivateIP(t *testing.T) {
 }
 
 func TestClientBlocksLinkLocalIP(t *testing.T) {
-	_, err := NewClient(ClientOptions{BlockLinkLocal: true}).Get("http://169.254.169.254/latest/meta-data")
+	_, err := NewClient(Options{BlockLinkLocal: true}).Get("http://169.254.169.254/latest/meta-data")
 	if err == nil {
 		t.Fatal("expected link-local IP to be blocked")
 	}
@@ -64,7 +143,7 @@ func TestClientAllowsExplicitlyDisabledBlockedRanges(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	resp, err := NewClient(ClientOptions{}).Get(ts.URL)
+	resp, err := NewClient(Options{}).Get(ts.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +165,7 @@ func TestClientAllowsBlockedIPWhenAllowListed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := NewClient(ClientOptions{
+	resp, err := NewClient(Options{
 		BlockLoopback: true,
 		AllowList:     []string{serverURL.Host},
 	}).Get(ts.URL)
@@ -112,7 +191,7 @@ func TestClientAllowsBlockedHostnameWhenAllowListed(t *testing.T) {
 	}
 	localURL := strings.Replace(ts.URL, "127.0.0.1", "localhost", 1)
 
-	resp, err := NewClient(ClientOptions{
+	resp, err := NewClient(Options{
 		BlockLoopback: true,
 		AllowList:     []string{"localhost:" + serverURL.Port()},
 	}).Get(localURL)
@@ -133,7 +212,7 @@ func TestClientBlocksAllowListedHostnameWithMismatchedPort(t *testing.T) {
 	defer ts.Close()
 
 	localURL := strings.Replace(ts.URL, "127.0.0.1", "localhost", 1)
-	_, err := NewClient(ClientOptions{
+	_, err := NewClient(Options{
 		BlockLoopback: true,
 		AllowList:     []string{"localhost:1"},
 	}).Get(localURL)
@@ -158,7 +237,7 @@ func TestClientAddsConfiguredHeadersWithoutMutatingRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client := NewClient(ClientOptions{
+	client := NewClient(Options{
 		BlockLoopback: true,
 		AllowList:     []string{serverURL.Host},
 		Headers: http.Header{
@@ -193,6 +272,62 @@ func TestClientAddsConfiguredHeadersWithoutMutatingRequest(t *testing.T) {
 	}
 	if request.Header.Get("X-Override") != "request" {
 		t.Fatalf("original request header = %q, want request", request.Header.Get("X-Override"))
+	}
+}
+
+func TestClientPreservesOAuthTokenOnlyForSameOriginRedirects(t *testing.T) {
+	var crossOriginAuthorization []string
+	crossOrigin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		crossOriginAuthorization = append(crossOriginAuthorization, req.Header.Get("Authorization"))
+		if req.URL.Path == "/hop" {
+			http.Redirect(w, req, "/final", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer crossOrigin.Close()
+
+	var sameOriginAuthorization string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Path {
+		case "/same-origin":
+			http.Redirect(w, req, "/same-origin-final", http.StatusFound)
+		case "/same-origin-final":
+			sameOriginAuthorization = req.Header.Get("Authorization")
+			w.WriteHeader(http.StatusNoContent)
+		case "/cross-origin":
+			http.Redirect(w, req, crossOrigin.URL+"/hop", http.StatusFound)
+		default:
+			http.NotFound(w, req)
+		}
+	}))
+	defer origin.Close()
+
+	client := NewClient(Options{
+		Headers:     http.Header{"Authorization": {"Bearer configured-token"}},
+		TokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "secret-token"}),
+	})
+	response, err := client.Get(origin.URL + "/same-origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if sameOriginAuthorization != "Bearer secret-token" {
+		t.Fatalf("same-origin authorization = %q, want bearer token", sameOriginAuthorization)
+	}
+
+	response, err = client.Get(origin.URL + "/cross-origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(crossOriginAuthorization) != 2 {
+		t.Fatalf("cross-origin requests = %d, want redirect and final request", len(crossOriginAuthorization))
+	}
+	for i, authorization := range crossOriginAuthorization {
+		if authorization != "" {
+			t.Fatalf("cross-origin request %d received authorization %q", i, authorization)
+		}
 	}
 }
 
@@ -267,51 +402,5 @@ func TestAllowListMatchesExactAndSuffixHosts(t *testing.T) {
 				t.Fatalf("isAllowed(%q, %q) = %v, want %v", tt.host, tt.port, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestNewClientRejectsRedirectsWhenBlocked(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		t.Error("redirect target must not be reached")
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer target.Close()
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
-	}))
-	defer origin.Close()
-
-	resp, err := NewClient(ClientOptions{BlockRedirects: true}).Post(origin.URL, "application/x-www-form-urlencoded", strings.NewReader("code=secret-code"))
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if err == nil {
-		t.Fatal("expected redirect to be rejected")
-	}
-	if !strings.Contains(err.Error(), "redirect") {
-		t.Fatalf("expected a redirect error, got %v", err)
-	}
-	if strings.Contains(err.Error(), "secret-code") {
-		t.Fatalf("error leaked the request body: %v", err)
-	}
-}
-
-func TestNewClientFollowsRedirectsByDefault(t *testing.T) {
-	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer target.Close()
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, target.URL, http.StatusFound)
-	}))
-	defer origin.Close()
-
-	resp, err := NewClient(ClientOptions{}).Get(origin.URL)
-	if err != nil {
-		t.Fatalf("expected redirect to be followed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", resp.StatusCode)
 	}
 }

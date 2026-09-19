@@ -3,12 +3,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	"github.com/obot-platform/obot/pkg/controller/data"
 	"github.com/obot-platform/obot/pkg/controller/handlers/adminworkspace"
+	"github.com/obot-platform/obot/pkg/controller/handlers/compositemigration"
 	"github.com/obot-platform/obot/pkg/controller/handlers/deployment"
 	"github.com/obot-platform/obot/pkg/controller/handlers/mcpcatalog"
 	"github.com/obot-platform/obot/pkg/controller/handlers/mdmassetsource"
@@ -29,12 +30,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
-
-	// Enable logrus logging in nah
-	_ "github.com/obot-platform/nah/pkg/logrus"
 )
-
-var log = logger.Package()
 
 type Controller struct {
 	services               *services.Services
@@ -129,15 +125,26 @@ func (c *Controller) PreStart(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure auth providers and model providers: %w", err)
 	}
 
+	if err := compositemigration.New(c.services.GatewayClient).MigrateAll(ctx, c.services.StorageClient); err != nil {
+		return fmt.Errorf("failed to migrate composite MCP servers: %w", err)
+	}
+
 	return nil
 }
 
 func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
-	internalURL := c.services.MCPSessionManager.TransformObotHostname(c.services.ServerURL)
-	image := c.services.MCPServerSearchImage
+	agentsEnabled, err := c.services.AgentsEnabled(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to resolve agents feature: %w", err)
+	}
 
+	internalURL := c.services.MCPSessionManager.TransformObotHostname(c.services.ServerURL)
+	return reconcileObotMCPServer(ctx, c.services.StorageClient, agentsEnabled, internalURL, c.services.MCPServerSearchImage)
+}
+
+func reconcileObotMCPServer(ctx context.Context, storageClient kclient.Client, agentsEnabled bool, internalURL, image string) error {
 	var existing v1.SystemMCPServer
-	err := c.services.StorageClient.Get(ctx, kclient.ObjectKey{
+	err := storageClient.Get(ctx, kclient.ObjectKey{
 		Namespace: system.DefaultNamespace,
 		Name:      system.ObotMCPServerName,
 	}, &existing)
@@ -145,9 +152,11 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 		// Reconcile all critical fields to ensure the server is correctly configured
 		var needsUpdate bool
 
-		if existing.Spec.Manifest.Enabled != nil && !*existing.Spec.Manifest.Enabled {
-			// Enabled by default
+		if agentsEnabled && existing.Spec.Manifest.Enabled != nil {
 			existing.Spec.Manifest.Enabled = nil
+			needsUpdate = true
+		} else if !agentsEnabled && (existing.Spec.Manifest.Enabled == nil || *existing.Spec.Manifest.Enabled) {
+			existing.Spec.Manifest.Enabled = new(false)
 			needsUpdate = true
 		}
 
@@ -186,28 +195,29 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 
 		// Check OBOT_URL env var
 		var foundOBOTURLEntry bool
-		for i, env := range existing.Spec.Manifest.Env {
+		for i, env := range existing.Spec.Manifest.Config {
 			if env.Key == "OBOT_URL" {
 				foundOBOTURLEntry = true
 				if env.Value != internalURL {
-					existing.Spec.Manifest.Env[i].Value = internalURL
+					existing.Spec.Manifest.Config[i].Value = internalURL
 					needsUpdate = true
 				}
 			}
 		}
 		if !foundOBOTURLEntry {
-			existing.Spec.Manifest.Env = append(existing.Spec.Manifest.Env, types.MCPEnv{
+			existing.Spec.Manifest.Config = append(existing.Spec.Manifest.Config, types.MCPConfig{
 				Name:     "OBOT_URL",
 				Key:      "OBOT_URL",
 				Required: true,
 				Value:    internalURL,
+				Usage:    types.Env,
 			})
 			needsUpdate = true
 		}
 
 		if needsUpdate {
-			log.Infof("Updating obot MCP server (image=%s)", image)
-			return c.services.StorageClient.Update(ctx, &existing)
+			slog.Info("Updating obot MCP server", "image", image)
+			return storageClient.Update(ctx, &existing)
 		}
 		return nil
 	}
@@ -216,7 +226,11 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 	}
 
 	// Create the SystemMCPServer
-	log.Infof("Creating obot MCP server (image=%s)", image)
+	slog.Info("Creating obot MCP server", "image", image)
+	var enabled *bool
+	if !agentsEnabled {
+		enabled = new(false)
+	}
 	server := &v1.SystemMCPServer{
 		Name:       system.ObotMCPServerName,
 		Namespace:  system.DefaultNamespace,
@@ -225,28 +239,33 @@ func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
 			Manifest: types.SystemMCPServerManifest{
 				Name:             "Obot MCP Server",
 				ShortDescription: "MCP server for discovering and searching available MCP servers",
+				Enabled:          enabled,
 				Runtime:          types.RuntimeContainerized,
 				ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 					Image: image,
 					Port:  8080,
 					Path:  "/mcp",
 				},
-				Env: []types.MCPEnv{
-					{
-						Name:     "OBOT_URL",
-						Key:      "OBOT_URL",
-						Required: true,
-						Value:    internalURL,
-					},
-				},
+				Config: []types.MCPConfig{{
+					Name:     "OBOT_URL",
+					Key:      "OBOT_URL",
+					Required: true,
+					Value:    internalURL,
+					Usage:    types.Env,
+				}},
 			},
 		},
 	}
 
-	return c.services.StorageClient.Create(ctx, server)
+	return storageClient.Create(ctx, server)
 }
 
 func (c *Controller) PostStart(ctx context.Context, client kclient.Client) {
+	// This process was just promoted. As a standby its watches waited on
+	// notifications, and a peer that was not sending them leaves the cache up to a
+	// poll interval behind. Have every watch list again before acting on it.
+	c.services.StorageDB.Refresh()
+
 	if err := providerconfigurationchange.CleanupOrphanedStagedCredentials(
 		ctx,
 		client,
@@ -328,11 +347,11 @@ func (c *Controller) retriggerCatalogEntries(ctx context.Context, client kclient
 	if err := client.List(ctx, &entries, &kclient.ListOptions{
 		Namespace: system.DefaultNamespace,
 	}); err != nil {
-		log.Errorf("Failed to list MCPServerCatalogEntries for re-trigger: %v", err)
+		slog.Error("Failed to list MCPServerCatalogEntries for re-trigger", "error", err)
 		return
 	}
 
-	log.Infof("Re-triggering %d MCPServerCatalogEntries to ensure MCPServer watches are established", len(entries.Items))
+	slog.Info("Re-triggering MCPServerCatalogEntries to ensure MCPServer watches are established", "count", len(entries.Items))
 
 	for _, entry := range entries.Items {
 		// Touch the entry's metadata to trigger reconciliation.
@@ -344,12 +363,12 @@ func (c *Controller) retriggerCatalogEntries(ctx context.Context, client kclient
 		entry.Annotations["obot.ai/startup-retrigger"] = time.Now().Format(time.RFC3339)
 
 		if err := client.Patch(ctx, &entry, patch); err != nil {
-			log.Warnf("Failed to re-trigger MCPServerCatalogEntry %s: %v", entry.Name, err)
+			slog.Warn("Failed to re-trigger MCPServerCatalogEntry", "name", entry.Name, "error", err)
 			continue
 		}
 	}
 
-	log.Infof("Completed re-triggering MCPServerCatalogEntries")
+	slog.Info("Completed re-triggering MCPServerCatalogEntries")
 }
 
 func (c *Controller) Start(ctx context.Context) error {

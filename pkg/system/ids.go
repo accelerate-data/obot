@@ -7,16 +7,14 @@ import (
 )
 
 const (
-	SystemThreadPrefix            = "st1"
-	ThreadPrefix                  = "t1"
-	ThreadAuthorizationPrefix     = "ta1"
-	RunPrefix                     = "r1"
 	ModelPrefix                   = "m1"
 	AliasPrefix                   = "al1"
 	DefaultModelAliasPrefix       = "dma1"
 	DeviceEnrollmentPrefix        = "ode1"
 	ProjectPrefix                 = "p1"
 	UserDeletePrefix              = "ud1"
+	AuthProviderCleanupPrefix     = "apc1"
+	ProviderChangePrefix          = "pcc1"
 	UserRoleChangePrefix          = "urc1"
 	UserGroupChangePrefix         = "ugc1"
 	GroupRoleChangePrefix         = "grc1"
@@ -24,9 +22,10 @@ const (
 	MCPTunnelPrefix               = "mt1"
 	MCPNetworkPolicyPrefix        = "mnp1"
 	MCPServerInstancePrefix       = "msi1"
+	VMCPPrefix                    = "vmcp1"
+	VMCPInstancePrefix            = "vmcpi1"
 	ImagePullSecretPrefix         = "ips1"
 	GitCredentialPrefix           = "gc1"
-	CatalogPrefix                 = "mcat1"
 	SystemCatalogPrefix           = "smcat1"
 	SkillRepositoryPrefix         = "skr1"
 	SkillPrefix                   = "sk1"
@@ -48,9 +47,7 @@ const (
 	MessagePolicyPrefix           = "mp1"
 	NanobotAgentPrefix            = "nba1"
 	PublishedArtifactPrefix       = "pa1"
-	OktaGroupMigrationPrefix      = "ogm1"
-	AuthProviderCleanupPrefix     = "apc1"
-	ProviderChangePrefix          = "pcc1"
+	APIKeyPrefix                  = "ok1"
 
 	ObotMCPServerName      = SystemMCPServerPrefix + "obot-mcp-server"
 	ProviderChangeAuthName = ProviderChangePrefix + "auth"
@@ -65,6 +62,13 @@ func IsMCPServerInstanceID(id string) bool {
 	return strings.HasPrefix(id, MCPServerInstancePrefix)
 }
 
+func IsVMCPID(id string) bool {
+	return strings.HasPrefix(id, VMCPPrefix)
+}
+
+func IsVMCPInstanceID(id string) bool {
+	return strings.HasPrefix(id, VMCPInstancePrefix)
+}
 func IsPowerUserWorkspaceID(id string) bool {
 	return strings.HasPrefix(id, PowerUserWorkspacePrefix)
 }

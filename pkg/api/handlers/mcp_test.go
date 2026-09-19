@@ -2,23 +2,16 @@ package handlers
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
-	gateway "github.com/obot-platform/obot/pkg/gateway/client"
-	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -26,10 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
-	kschema "k8s.io/apimachinery/pkg/runtime/schema"
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -63,10 +54,11 @@ func TestConvertMCPServer_StaticEnvIsConfigured(t *testing.T) {
 		Spec: v1.MCPServerSpec{
 			Manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{
 					Key:      "CATALOG_TOKEN",
 					Value:    "catalog-value",
 					Required: true,
+					Usage:    types.Env,
 				}},
 			},
 		},
@@ -76,75 +68,6 @@ func TestConvertMCPServer_StaticEnvIsConfigured(t *testing.T) {
 
 	assert.True(t, converted.Configured)
 	assert.Empty(t, converted.MissingRequiredEnvVars)
-}
-
-type conflictOnceStorage struct {
-	kclient.WithWatch
-	updates       int
-	mutateOnError func(*v1.MCPServer)
-}
-
-type blockingResponseWriter struct {
-	*httptest.ResponseRecorder
-	started chan struct{}
-	release chan struct{}
-}
-
-func (w *blockingResponseWriter) WriteHeader(statusCode int) {
-	close(w.started)
-	<-w.release
-	w.ResponseRecorder.WriteHeader(statusCode)
-}
-
-func (c *conflictOnceStorage) Update(ctx context.Context, obj kclient.Object, opts ...kclient.UpdateOption) error {
-	c.updates++
-	if c.updates == 1 {
-		if c.mutateOnError != nil {
-			var latest v1.MCPServer
-			if err := c.Get(ctx, kclient.ObjectKeyFromObject(obj), &latest); err != nil {
-				return err
-			}
-			c.mutateOnError(&latest)
-			if err := c.WithWatch.Update(ctx, &latest); err != nil {
-				return err
-			}
-		}
-		return apierrors.NewConflict(
-			kschema.GroupResource{Group: v1.SchemeGroupVersion.Group, Resource: "mcpservers"},
-			obj.GetName(),
-			fmt.Errorf("controller updated MCPServer status"),
-		)
-	}
-	return c.WithWatch.Update(ctx, obj, opts...)
-}
-
-type noopControllerTrigger struct{}
-
-func (noopControllerTrigger) Trigger(context.Context, kschema.GroupVersionKind, string, time.Duration) error {
-	return nil
-}
-
-// recordingControllerTrigger captures what a handler asked the controller to
-// reconcile, so a test can assert the enqueued kind and key rather than only
-// that some callback ran.
-type recordingControllerTrigger struct {
-	lock sync.Mutex
-	gvks []kschema.GroupVersionKind
-	keys []string
-}
-
-func (r *recordingControllerTrigger) Trigger(_ context.Context, gvk kschema.GroupVersionKind, key string, _ time.Duration) error {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	r.gvks = append(r.gvks, gvk)
-	r.keys = append(r.keys, key)
-	return nil
-}
-
-func (r *recordingControllerTrigger) recorded() ([]kschema.GroupVersionKind, []string) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	return append([]kschema.GroupVersionKind(nil), r.gvks...), append([]string(nil), r.keys...)
 }
 
 func TestConvertMCPResources(t *testing.T) {
@@ -157,32 +80,14 @@ func TestConvertMCPResources(t *testing.T) {
 		Name: "entry",
 		Spec: v1.MCPServerCatalogEntrySpec{
 			Manifest: types.MCPServerCatalogEntryManifest{
-				Name:           "entry",
-				Resources:      resources,
-				ServerUserType: types.ServerUserTypeSingleUser,
-				Runtime:        types.RuntimeRemote,
+				Name:      "entry",
+				Resources: resources,
+				Runtime:   types.RuntimeRemote,
 			},
 		},
 	}, "https://example.com")
 	assert.Equal(t, resources, entry.Manifest.Resources)
 	assert.Equal(t, "https://example.com/mcp-connect/entry", entry.ConnectURL)
-
-	compositeEntry := ConvertMCPServerCatalogEntry(v1.MCPServerCatalogEntry{
-		Name: "composite-entry",
-		Spec: v1.MCPServerCatalogEntrySpec{
-			Manifest: types.MCPServerCatalogEntryManifest{
-				Name:           "composite-entry",
-				ServerUserType: types.ServerUserTypeSingleUser,
-				Runtime:        types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{CatalogEntryID: "component"},
-					},
-				},
-			},
-		},
-	}, "https://example.com")
-	assert.Equal(t, "https://example.com/mcp-connect/composite-entry", compositeEntry.ConnectURL)
 
 	server := ConvertMCPServer(v1.MCPServer{
 		Name: "server",
@@ -203,12 +108,16 @@ func TestConvertMCPServerCatalogEntryDetached(t *testing.T) {
 			Editable:  true,
 			Detached:  true,
 			SourceURL: "https://github.com/obot-platform/mcp-catalog",
+			Manifest: types.MCPServerCatalogEntryManifest{
+				UpgradeNote: "Review the new settings.",
+			},
 		},
 	}, "https://example.com")
 
 	assert.True(t, entry.Detached)
 	assert.True(t, entry.Editable)
 	assert.Equal(t, "https://github.com/obot-platform/mcp-catalog", entry.SourceURL)
+	assert.Equal(t, "Review the new settings.", entry.Manifest.UpgradeNote)
 }
 
 func TestValidationOptionsWithResourceMaximumsIgnoresPersistedMaximumForNonKubernetesBackend(t *testing.T) {
@@ -235,62 +144,6 @@ func TestValidationOptionsWithResourceMaximumsIgnoresPersistedMaximumForNonKuber
 		},
 	}, false, options)
 	require.NoError(t, err)
-}
-
-func TestHideMultiUserCatalogEntry(t *testing.T) {
-	multiUserEntry := v1.MCPServerCatalogEntry{
-		Spec: v1.MCPServerCatalogEntrySpec{
-			Manifest: types.MCPServerCatalogEntryManifest{
-				ServerUserType: types.ServerUserTypeMultiUser,
-			},
-		},
-	}
-	singleUserEntry := v1.MCPServerCatalogEntry{
-		Spec: v1.MCPServerCatalogEntrySpec{
-			Manifest: types.MCPServerCatalogEntryManifest{
-				ServerUserType: types.ServerUserTypeSingleUser,
-			},
-		},
-	}
-
-	tests := []struct {
-		name  string
-		user  kuser.Info
-		entry v1.MCPServerCatalogEntry
-		want  bool
-	}{
-		{
-			name:  "basic user cannot see multi-user catalog entries",
-			user:  &kuser.DefaultInfo{Groups: types.RoleBasic.Groups()},
-			entry: multiUserEntry,
-			want:  true,
-		},
-		{
-			name:  "basic user can see single-user entries",
-			user:  &kuser.DefaultInfo{Groups: types.RoleBasic.Groups()},
-			entry: singleUserEntry,
-			want:  false,
-		},
-		{
-			name:  "admin can see multi-user catalog entries",
-			user:  &kuser.DefaultInfo{Groups: types.RoleAdmin.Groups()},
-			entry: multiUserEntry,
-			want:  false,
-		},
-		{
-			name:  "power user plus can see multi-user catalog entries",
-			user:  &kuser.DefaultInfo{Groups: types.RolePowerUserPlus.Groups()},
-			entry: multiUserEntry,
-			want:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := HideMultiUserCatalogEntry(api.Context{User: tt.user}, tt.entry)
-			assert.Equal(t, tt.want, got)
-		})
-	}
 }
 
 func TestUpdateServerAliasUnscopedSharedServer(t *testing.T) {
@@ -323,198 +176,14 @@ func TestUpdateServerAliasUnscopedSharedServer(t *testing.T) {
 	assert.Empty(t, updated.Spec.Alias)
 }
 
-func TestConfigureServerRetriesControllerUpdateConflict(t *testing.T) {
-	storage, err := configureServerWithInjectedConflict(t, func(server *v1.MCPServer) {
-		server.Status.DeploymentStatus = "Progressing"
-	})
-
-	require.NoError(t, err)
-	assert.Equal(t, 2, storage.updates)
-	var updated v1.MCPServer
-	require.NoError(t, storage.Get(t.Context(), kclient.ObjectKey{Name: "server", Namespace: system.DefaultNamespace}, &updated))
-	assert.Equal(t, "Progressing", updated.Status.DeploymentStatus)
-}
-
-func TestConfigureServerTriggersOwningServerUnderNamespacedKey(t *testing.T) {
-	entry, server := configureServerTestObjects()
-	storage := newFakeStorage(t, &entry, &server)
-	backend := &recordingControllerTrigger{}
-
-	require.NoError(t, configureServerRequestWithTrigger(storage, newHandlerTestGateway(t), `{"TOKEN":"value"}`, func(string) error { return nil }, backend))
-
-	gvks, keys := backend.recorded()
-	// A bare name resolves to the empty namespace, where no MCPServer is ever
-	// stored, so the reconcile would be dropped before any handler ran.
-	assert.Equal(t, []string{system.DefaultNamespace + "/server"}, keys)
-	for _, gvk := range gvks {
-		assert.Equal(t, "MCPServer", gvk.Kind)
-	}
-}
-
-func TestConfigureServerRejectsConcurrentSpecChange(t *testing.T) {
-	entry, server := configureServerTestObjects()
-	storage := &conflictOnceStorage{
-		WithWatch: newFakeStorage(t, &entry, &server),
-		mutateOnError: func(server *v1.MCPServer) {
-			server.Spec.Alias = "changed elsewhere"
-		},
-	}
-	gatewayClient := newHandlerTestGateway(t)
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: "default-server",
-		Name:    "server",
-		Secrets: map[string]string{"TOKEN": "original"},
-	}))
-
-	err := configureServerRequestWithConfig(storage, gatewayClient, `{"TOKEN":"attempted"}`, func(string) error { return nil })
-
-	var httpErr *types.ErrHTTP
-	require.ErrorAs(t, err, &httpErr)
-	assert.Equal(t, http.StatusConflict, httpErr.Code)
-	assert.Equal(t, 1, storage.updates)
-	var updated v1.MCPServer
-	require.NoError(t, storage.Get(t.Context(), kclient.ObjectKey{Name: "server", Namespace: system.DefaultNamespace}, &updated))
-	assert.Equal(t, "changed elsewhere", updated.Spec.Alias)
-	credential, err := gatewayClient.RevealCredential(t.Context(), []string{"default-server"}, "server")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]string{"TOKEN": "original"}, credential.Secrets)
-}
-
-func TestConfigureServerSerializesCredentialReplacement(t *testing.T) {
-	entry, server := configureServerTestObjects()
-	storage := newFakeStorage(t, &entry, &server)
-	gatewayClient := newHandlerTestGateway(t)
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: "default-server",
-		Name:    "server",
-		Secrets: map[string]string{"TOKEN": "initial"},
-	}))
-
-	firstDeleted := make(chan struct{})
-	secondDeleted := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	var shutdownCalls atomic.Int32
-	shutdown := func(string) error {
-		switch shutdownCalls.Add(1) {
-		case 1:
-			close(firstDeleted)
-			<-releaseFirst
-		case 2:
-			close(secondDeleted)
-		}
-		return nil
-	}
-
-	firstErr := make(chan error, 1)
-	go func() {
-		firstErr <- configureServerRequestWithConfig(storage, gatewayClient, `{"TOKEN":"first"}`, shutdown)
-	}()
-
-	select {
-	case <-firstDeleted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the first credential deletion")
-	}
-	_, err := gatewayClient.RevealCredential(t.Context(), []string{"default-server"}, "server")
-	var notFound gateway.CredentialNotFoundError
-	require.Error(t, err)
-	require.True(t, errors.As(err, &notFound))
-
-	secondErr := make(chan error, 1)
-	go func() {
-		secondErr <- configureServerRequestWithConfig(storage, gatewayClient, `{"TOKEN":"second"}`, shutdown)
-	}()
-	select {
-	case <-secondDeleted:
-		t.Fatal("second configuration replaced credentials before the first completed")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	close(releaseFirst)
-	require.NoError(t, <-firstErr)
-	require.NoError(t, <-secondErr)
-	credential, err := gatewayClient.RevealCredential(t.Context(), []string{"default-server"}, "server")
-	require.NoError(t, err)
-	assert.Equal(t, map[string]string{"TOKEN": "second"}, credential.Secrets)
-}
-
-func configureServerWithInjectedConflict(t *testing.T, mutateOnError func(*v1.MCPServer)) (*conflictOnceStorage, error) {
-	t.Helper()
-
-	entry, server := configureServerTestObjects()
-	storage := &conflictOnceStorage{
-		WithWatch:     newFakeStorage(t, &entry, &server),
-		mutateOnError: mutateOnError,
-	}
-
-	return storage, configureServerRequest(storage, newHandlerTestGateway(t))
-}
-
-func configureServerTestObjects() (v1.MCPServerCatalogEntry, v1.MCPServer) {
-	entry := v1.MCPServerCatalogEntry{
-		Name:      "entry",
-		Namespace: system.DefaultNamespace,
-		Spec: v1.MCPServerCatalogEntrySpec{
-			MCPCatalogName: "default",
-			Manifest: types.MCPServerCatalogEntryManifest{
-				Name:           "entry",
-				Runtime:        types.RuntimeRemote,
-				ServerUserType: types.ServerUserTypeMultiUser,
-			},
-		},
-	}
-	server := v1.MCPServer{
-		Name:      "server",
-		Namespace: system.DefaultNamespace,
-		Spec: v1.MCPServerSpec{
-			MCPCatalogID:              "default",
-			MCPServerCatalogEntryName: "entry",
-			Manifest: types.MCPServerManifest{
-				Name:         "server",
-				Runtime:      types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{URL: "https://example.com/mcp"},
-			},
-		},
-	}
-	return entry, server
-}
-
-func configureServerRequest(storage kclient.WithWatch, gatewayClient *gateway.Client) error {
-	return configureServerRequestWithConfig(storage, gatewayClient, `{}`, func(string) error { return nil })
-}
-
-func configureServerRequestWithConfig(storage kclient.WithWatch, gatewayClient *gateway.Client, config string, shutdown func(string) error) error {
-	return configureServerRequestWithTrigger(storage, gatewayClient, config, shutdown, noopControllerTrigger{})
-}
-
-func configureServerRequestWithTrigger(storage kclient.WithWatch, gatewayClient *gateway.Client, config string, shutdown func(string) error, backend nahbackend.Trigger) error {
-	request := httptest.NewRequest(http.MethodPost, "/api/mcp-catalogs/default/servers/server/configure", strings.NewReader(config))
-	request.SetPathValue("catalog_id", "default")
-	request.SetPathValue("mcp_server_id", "server")
-
-	err := (&MCPHandler{
-		controllerBackend: backend,
-		shutdownMCPServer: shutdown,
-	}).ConfigureServer(api.Context{
-		ResponseWriter: httptest.NewRecorder(),
-		Request:        request,
-		Storage:        storage,
-		GatewayClient:  gatewayClient,
-		User:           testUser("owner"),
-	})
-
-	return err
-}
-
 func TestMCPServerOrInstanceFromConnectURLRejectsCatalogEntryResourcesAboveMaximum(t *testing.T) {
 	entry := v1.MCPServerCatalogEntry{
 		Name:      "entry",
 		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerCatalogEntrySpec{
 			Manifest: types.MCPServerCatalogEntryManifest{
-				Name:           "entry",
-				ServerUserType: types.ServerUserTypeSingleUser,
-				Runtime:        types.RuntimeNPX,
+				Name:    "entry",
+				Runtime: types.RuntimeNPX,
 				NPXConfig: &types.NPXRuntimeConfig{
 					Package: "test-package",
 				},
@@ -556,6 +225,7 @@ func TestTriggerUpdateScope(t *testing.T) {
 		workspaceID     string
 		wantShutdown    bool
 		wantErrContains string
+		wantStatus      int
 	}
 
 	baseEntry := func(workspaceID string) *v1.MCPServerCatalogEntry {
@@ -641,6 +311,11 @@ func TestTriggerUpdateScope(t *testing.T) {
 				if tt.wantErrContains != "" {
 					require.Error(t, err)
 					assert.Contains(t, err.Error(), tt.wantErrContains)
+					if tt.wantStatus != 0 {
+						var httpErr *types.ErrHTTP
+						require.ErrorAs(t, err, &httpErr)
+						assert.Equal(t, tt.wantStatus, httpErr.Code)
+					}
 					return
 				}
 				require.NoError(t, err)
@@ -710,6 +385,28 @@ func TestTriggerUpdateScope(t *testing.T) {
 				}(),
 				entry:           baseEntry(""),
 				wantErrContains: "cannot trigger update on a component server",
+			},
+			{
+				name: "vMCP component server is rejected",
+				user: testUserWithRole("admin", types.GroupAdmin),
+				server: func() v1.MCPServer {
+					server := baseServer("creator")
+					server.Spec.VMCPID = "vmcp"
+					return server
+				}(),
+				wantErrContains: "update the vMCP instead",
+				wantStatus:      http.StatusBadRequest,
+			},
+			{
+				name: "vMCP instance component server is rejected",
+				user: testUser("owner"),
+				server: func() v1.MCPServer {
+					server := baseServer("owner")
+					server.Spec.VMCPInstanceID = "vmcp-instance"
+					return server
+				}(),
+				wantErrContains: "update the vMCP instead",
+				wantStatus:      http.StatusBadRequest,
 			},
 			{
 				name: "server without catalog entry is a no-op",
@@ -903,8 +600,7 @@ func TestApplyURLTemplate(t *testing.T) {
 				"API_HOST":  "api.example.com",
 				"EMPTY_VAR": "",
 			},
-			expected:    "https://api.example.com/api//data",
-			expectError: false,
+			expectError: true,
 		},
 		{
 			name:     "variable with spaces",
@@ -934,7 +630,7 @@ func TestApplyURLTemplate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := applyURLTemplate(tt.template, tt.envVars)
+			result, err := applyURLTemplate(tt.template, nil, tt.envVars)
 
 			if tt.expectError {
 				if err == nil {
@@ -959,11 +655,23 @@ func TestApplyRemoteURLTemplate(t *testing.T) {
 	manifest := types.MCPServerManifest{
 		Name:    "OAuth Remote",
 		Runtime: types.RuntimeRemote,
+
 		RemoteConfig: &types.RemoteRuntimeConfig{
 			IsTemplate:          true,
-			URLTemplate:         "https://${HOST}/mcp/projects/${PROJECT_ID}",
+			URLTemplate:         "https://${HOST}/mcp/${API_VERSION}/projects/${PROJECT_ID}",
 			StaticOAuthRequired: true,
 		},
+		Config: []types.MCPConfig{{
+			Key:   "HOST",
+			Value: "remote.example.com",
+			Usage: types.Env,
+		},
+
+			{
+				Key:   "API_VERSION",
+				Value: "v1",
+				Usage: types.Header,
+			}},
 	}
 	options := mcp.ValidationOptions{
 		RemoteMCPURLValidationConfig: mcp.RemoteMCPURLValidationConfig{
@@ -974,18 +682,54 @@ func TestApplyRemoteURLTemplate(t *testing.T) {
 	}
 
 	err := applyRemoteURLTemplate(t.Context(), &manifest, map[string]string{
-		"HOST":       "remote.example.com",
 		"PROJECT_ID": "project-123",
 	}, false, options)
 	require.NoError(t, err)
-	require.Equal(t, "https://remote.example.com/mcp/projects/project-123", manifest.RemoteConfig.URL)
+	require.Equal(t, "https://remote.example.com/mcp/v1/projects/project-123", manifest.RemoteConfig.URL)
 	require.True(t, manifest.RemoteConfig.StaticOAuthRequired)
 
 	server := v1.MCPServer{Name: "tool-preview", Spec: v1.MCPServerSpec{Manifest: manifest}}
-	serverConfig, missing, err := mcp.ServerToServerConfig(server, nil, "system", "temp", "default", nil, nil, nil)
+	serverConfig, missing, err := mcp.ServerToServerConfig(server, nil, "system", "temp", "default", nil)
 	require.NoError(t, err)
 	require.Empty(t, missing)
 	require.Equal(t, manifest.RemoteConfig.URL, serverConfig.URL)
+}
+
+func TestApplyURLTemplateStaticValuesOverrideSubmittedConfiguration(t *testing.T) {
+	result, err := applyURLTemplate(
+		"https://${HOST}/${VERSION}",
+		[]types.MCPConfig{{
+			Key:   "HOST",
+			Value: "catalog.example.com",
+			Usage: types.Env,
+		}, {
+			Key:   "VERSION",
+			Value: "v1",
+			Usage: types.Header,
+		}},
+		map[string]string{
+			"HOST":    "forged.example.com",
+			"VERSION": "forged",
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "https://catalog.example.com/v1", result)
+}
+
+func TestValidateConfiguredOptionsExcludesPerUserHeaders(t *testing.T) {
+	config := []types.MCPConfig{{
+		Key:         "X-Region",
+		Usage:       types.Header,
+		UserAllowed: true,
+		Required:    true,
+		Options:     []types.MCPConfigurationOption{{Name: "East", Value: "east"}},
+	}}
+	require.NoError(t, validateConfiguredOptions(config, nil))
+	missing, err := mcp.ValidateConfiguredOptions(config, nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"X-Region"}, missing)
+	server := v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: types.MCPServerManifest{Config: config}}}
+	require.Empty(t, ConvertMCPServer(server, nil, "", "").MissingRequiredHeaders)
 }
 
 func TestApplyRemoteURLTemplateRejectsInvalidRenderedURL(t *testing.T) {
@@ -1002,6 +746,22 @@ func TestApplyRemoteURLTemplateRejectsInvalidRenderedURL(t *testing.T) {
 	require.ErrorContains(t, err, "URL scheme must be either https or http")
 }
 
+func TestApplyRemoteURLTemplateRejectsMissingConfiguration(t *testing.T) {
+	manifest := types.MCPServerManifest{
+		Runtime: types.RuntimeRemote,
+		RemoteConfig: &types.RemoteRuntimeConfig{
+			IsTemplate:  true,
+			URLTemplate: "https://remote.example.com/mcp/${PROJECT_ID}",
+		},
+	}
+
+	err := applyRemoteURLTemplate(t.Context(), &manifest, nil, false, mcp.ValidationOptions{})
+	require.Error(t, err)
+	var configErr *urlTemplateConfigurationError
+	require.ErrorAs(t, err, &configErr)
+	require.ErrorContains(t, err, `configuration value "PROJECT_ID" referenced by remoteConfig.urlTemplate is required`)
+}
+
 func TestApplyURLTemplateEdgeCases(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1009,13 +769,14 @@ func TestApplyURLTemplateEdgeCases(t *testing.T) {
 		envVars     map[string]string
 		description string
 		expected    string
+		expectError bool
 	}{
 		{
-			name:        "unmatched variable remains",
+			name:        "unmatched variable is rejected",
 			template:    "https://${API_HOST}/api/${MISSING_VAR}/data",
 			envVars:     map[string]string{"API_HOST": "api.example.com"},
-			description: "Variables not in envVars should remain unchanged in the result",
-			expected:    "https://api.example.com/api/${MISSING_VAR}/data",
+			description: "Every referenced variable must resolve before the URL is used",
+			expectError: true,
 		},
 		{
 			name:        "case sensitive variables",
@@ -1028,7 +789,13 @@ func TestApplyURLTemplateEdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := applyURLTemplate(tt.template, tt.envVars)
+			result, err := applyURLTemplate(tt.template, nil, tt.envVars)
+			if tt.expectError {
+				require.Error(t, err)
+				var configErr *urlTemplateConfigurationError
+				require.ErrorAs(t, err, &configErr)
+				return
+			}
 
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
@@ -1058,7 +825,7 @@ func TestApplyURLTemplatePerformance(t *testing.T) {
 	}
 
 	start := time.Now()
-	result, err := applyURLTemplate(template.String(), largeEnvVars)
+	result, err := applyURLTemplate(template.String(), nil, largeEnvVars)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -1130,7 +897,7 @@ func TestApplyURLTemplateRealWorldExamples(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := applyURLTemplate(tt.template, tt.envVars)
+			result, err := applyURLTemplate(tt.template, nil, tt.envVars)
 
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
@@ -1146,14 +913,19 @@ func TestApplyURLTemplateRealWorldExamples(t *testing.T) {
 
 func TestSanitizeConfig(t *testing.T) {
 	manifest := types.MCPServerManifest{
-		Env: []types.MCPEnv{
-			{Key: "ENV_BOUND", SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "env"}},
+
+		RemoteConfig: &types.RemoteRuntimeConfig{},
+		Config: []types.MCPConfig{{
+			Key:           "ENV_BOUND",
+			SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "env"},
+			Usage:         types.Env,
 		},
-		RemoteConfig: &types.RemoteRuntimeConfig{
-			Headers: []types.MCPHeader{
-				{Key: "HEADER_BOUND", SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "header"}},
-			},
-		},
+
+			{
+				Key:           "HEADER_BOUND",
+				SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "header"},
+				Usage:         types.Header,
+			}},
 	}
 
 	config := map[string]string{
@@ -1172,27 +944,39 @@ func TestMarkAdminAddedSecretBindingsDerivesOwnershipFromCurrentCatalog(t *testi
 	catalogBinding := &types.MCPSecretBinding{Name: "catalog-secret", Key: "token"}
 	existing := types.MCPServerManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{{
+
+		RemoteConfig: &types.RemoteRuntimeConfig{},
+		Config: []types.MCPConfig{{
 			Key:           "API_TOKEN",
-			SecretBinding: catalogBinding}},
-		RemoteConfig: &types.RemoteRuntimeConfig{Headers: []types.MCPHeader{{
-			Key:           "Authorization",
 			SecretBinding: catalogBinding,
-		}}},
+			Usage:         types.Env,
+		},
+			{
+				Key:           "Authorization",
+				SecretBinding: catalogBinding,
+				Usage:         types.Header,
+			}},
 	}
 	updated := existing
 	source := &types.MCPServerCatalogEntryManifest{
-		Runtime:        types.RuntimeRemote,
-		Env:            []types.MCPEnv{{Key: "API_TOKEN"}},
-		RemoteConfig:   &types.RemoteCatalogConfig{Headers: []types.MCPHeader{{Key: "Authorization"}}},
-		ServerUserType: types.ServerUserTypeMultiUser,
+		Runtime: types.RuntimeRemote,
+		Config: []types.MCPConfig{
+			{
+				Key:   "API_TOKEN",
+				Usage: types.Env,
+			}, {
+				Key:   "Authorization",
+				Usage: types.Header,
+			},
+		},
+		RemoteConfig: &types.RemoteCatalogConfig{},
 	}
 
 	markAdminAddedSecretBindings(&updated, source)
 
-	assert.Equal(t, &types.MCPSecretBinding{Name: "catalog-secret", Key: "token", AdminAdded: true}, updated.Env[0].SecretBinding)
+	assert.Equal(t, &types.MCPSecretBinding{Name: "catalog-secret", Key: "token", AdminAdded: true}, updated.Config[0].SecretBinding)
 	require.NotNil(t, updated.RemoteConfig)
-	assert.Equal(t, &types.MCPSecretBinding{Name: "catalog-secret", Key: "token", AdminAdded: true}, updated.RemoteConfig.Headers[0].SecretBinding)
+	assert.Equal(t, &types.MCPSecretBinding{Name: "catalog-secret", Key: "token", AdminAdded: true}, updated.Config[1].SecretBinding)
 }
 
 func TestMarkAdminAddedSecretBindingsRecordsOnlyAdminOwnedBindings(t *testing.T) {
@@ -1200,51 +984,76 @@ func TestMarkAdminAddedSecretBindingsRecordsOnlyAdminOwnedBindings(t *testing.T)
 	adminBinding := &types.MCPSecretBinding{Name: "admin-secret", Key: "token"}
 	manifest := types.MCPServerManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{
-			{Key: "PINNED_ENV", SecretBinding: sourceBinding},
-			{Key: "ADMIN_ENV", SecretBinding: adminBinding},
+
+		RemoteConfig: &types.RemoteRuntimeConfig{},
+		Config: []types.MCPConfig{{
+			Key:           "PINNED_ENV",
+			SecretBinding: sourceBinding,
+			Usage:         types.Env,
 		},
-		RemoteConfig: &types.RemoteRuntimeConfig{Headers: []types.MCPHeader{
-			{Key: "Pinned-Header", SecretBinding: sourceBinding},
-			{Key: "Admin-Header", SecretBinding: adminBinding},
-		}},
+			{
+				Key:           "ADMIN_ENV",
+				SecretBinding: adminBinding,
+				Usage:         types.Env,
+			},
+
+			{
+				Key:           "Pinned-Header",
+				SecretBinding: sourceBinding,
+				Usage:         types.Header,
+			},
+			{
+				Key:           "Admin-Header",
+				SecretBinding: adminBinding,
+				Usage:         types.Header,
+			}},
 	}
 	source := &types.MCPServerCatalogEntryManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{
-			{Key: "PINNED_ENV", SecretBinding: sourceBinding},
+		Config: []types.MCPConfig{
+			{
+				Key:           "PINNED_ENV",
+				SecretBinding: sourceBinding,
+				Usage:         types.Env,
+			}, {
+				Key:           "Pinned-Header",
+				SecretBinding: sourceBinding,
+				Usage:         types.Header,
+			},
 		},
-		RemoteConfig: &types.RemoteCatalogConfig{Headers: []types.MCPHeader{
-			{Key: "Pinned-Header", SecretBinding: sourceBinding},
-		}},
+		RemoteConfig: &types.RemoteCatalogConfig{},
 	}
 
 	markAdminAddedSecretBindings(&manifest, source)
 
-	assert.False(t, manifest.Env[0].SecretBinding.AdminAdded)
-	assert.True(t, manifest.Env[1].SecretBinding.AdminAdded)
+	assert.False(t, manifest.Config[0].SecretBinding.AdminAdded)
+	assert.True(t, manifest.Config[1].SecretBinding.AdminAdded)
 	require.NotNil(t, manifest.RemoteConfig)
-	assert.False(t, manifest.RemoteConfig.Headers[0].SecretBinding.AdminAdded)
-	assert.True(t, manifest.RemoteConfig.Headers[1].SecretBinding.AdminAdded)
+	assert.False(t, manifest.Config[2].SecretBinding.AdminAdded)
+	assert.True(t, manifest.Config[3].SecretBinding.AdminAdded)
 }
 
 func TestMarkAdminAddedSecretBindingsClearsClientSuppliedMetadata(t *testing.T) {
 	manifest := types.MCPServerManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{{
+		Config: []types.MCPConfig{{
 			Key:           "PINNED_ENV",
-			SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token", AdminAdded: true}}},
+			SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token", AdminAdded: true},
+			Usage:         types.Env,
+		}},
 	}
 	source := &types.MCPServerCatalogEntryManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{{
+		Config: []types.MCPConfig{{
 			Key:           "PINNED_ENV",
-			SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token"}}},
+			SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token"},
+			Usage:         types.Env,
+		}},
 	}
 
 	markAdminAddedSecretBindings(&manifest, source)
 
-	assert.False(t, manifest.Env[0].SecretBinding.AdminAdded)
+	assert.False(t, manifest.Config[0].SecretBinding.AdminAdded)
 }
 
 // TestServerFromMultiUserTemplateMarksAdminAddedSecretBinding reproduces the bug where a
@@ -1252,21 +1061,29 @@ func TestMarkAdminAddedSecretBindingsClearsClientSuppliedMetadata(t *testing.T) 
 // template does not define) is not marked AdminAdded, so drift/diff treats it as catalog drift.
 func TestServerFromMultiUserTemplateMarksAdminAddedSecretBinding(t *testing.T) {
 	entry := types.MCPServerCatalogEntryManifest{
-		Name:           "tmpl",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
+		Name:    "tmpl",
+		Runtime: types.RuntimeContainerized,
 		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 			Image: "example/mcp:latest",
 			Port:  8080,
 			Path:  "/mcp",
 		},
-		Env: []types.MCPEnv{{Key: "GREETING", Name: "GREETING"}},
+		Config: []types.MCPConfig{{
+			Key:  "GREETING",
+			Name: "GREETING",
+			Usage: types.
+
+				// Admin selects a secret binding for GREETING at deploy time; the template has none.
+				Env,
+		}},
 	}
-	// Admin selects a secret binding for GREETING at deploy time; the template has none.
+
 	input := types.MCPServerManifest{
-		Env: []types.MCPEnv{{
+		Config: []types.MCPConfig{{
 			Key:           "GREETING",
-			SecretBinding: &types.MCPSecretBinding{Name: "test-secret-11", Key: "key1"}}},
+			SecretBinding: &types.MCPSecretBinding{Name: "test-secret-11", Key: "key1"},
+			Usage:         types.Env,
+		}},
 	}
 
 	manifest, err := serverManifestFromCatalogEntryManifest(false, false, entry, input)
@@ -1274,9 +1091,9 @@ func TestServerFromMultiUserTemplateMarksAdminAddedSecretBinding(t *testing.T) {
 	manifest = applySecretBindingOverlay(manifest, input)
 	markAdminAddedSecretBindings(&manifest, &entry)
 
-	require.Len(t, manifest.Env, 1)
-	require.NotNil(t, manifest.Env[0].SecretBinding)
-	assert.True(t, manifest.Env[0].SecretBinding.AdminAdded,
+	require.Len(t, manifest.Config, 1)
+	require.NotNil(t, manifest.Config[0].SecretBinding)
+	assert.True(t, manifest.Config[0].SecretBinding.AdminAdded,
 		"a secret binding selected at deploy time (absent from the multi-user template) must be marked AdminAdded")
 }
 
@@ -1284,25 +1101,35 @@ func TestRejectCatalogSecretBindingOverrides(t *testing.T) {
 	sourceBinding := &types.MCPSecretBinding{Name: "source-secret", Key: "token"}
 	source := &types.MCPServerCatalogEntryManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{{
-			Key:           "PINNED_ENV",
-			SecretBinding: sourceBinding}},
-		RemoteConfig: &types.RemoteCatalogConfig{Headers: []types.MCPHeader{{
-			Key:           "Pinned-Header",
-			SecretBinding: sourceBinding,
-		}}},
+		Config: []types.MCPConfig{
+			{
+				Key:           "PINNED_ENV",
+				SecretBinding: sourceBinding,
+				Usage:         types.Env,
+			}, {
+				Key:           "Pinned-Header",
+				SecretBinding: sourceBinding,
+				Usage:         types.Header,
+			},
+		},
+		RemoteConfig: &types.RemoteCatalogConfig{},
 	}
 
 	t.Run("allows matching catalog binding", func(t *testing.T) {
 		manifest := types.MCPServerManifest{
 			Runtime: types.RuntimeRemote,
-			Env: []types.MCPEnv{{
+
+			RemoteConfig: &types.RemoteRuntimeConfig{},
+			Config: []types.MCPConfig{{
 				Key:           "PINNED_ENV",
-				SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token", AdminAdded: true}}},
-			RemoteConfig: &types.RemoteRuntimeConfig{Headers: []types.MCPHeader{{
-				Key:           "Pinned-Header",
-				SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token"},
-			}}},
+				SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token", AdminAdded: true},
+				Usage:         types.Env,
+			},
+				{
+					Key:           "Pinned-Header",
+					SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token"},
+					Usage:         types.Header,
+				}},
 		}
 
 		require.Nil(t, rejectCatalogSecretBindingOverrides(manifest, source, true))
@@ -1311,9 +1138,11 @@ func TestRejectCatalogSecretBindingOverrides(t *testing.T) {
 	t.Run("rejects env override", func(t *testing.T) {
 		manifest := types.MCPServerManifest{
 			Runtime: types.RuntimeRemote,
-			Env: []types.MCPEnv{{
+			Config: []types.MCPConfig{{
 				Key:           "PINNED_ENV",
-				SecretBinding: &types.MCPSecretBinding{Name: "admin-secret", Key: "token"}}},
+				SecretBinding: &types.MCPSecretBinding{Name: "admin-secret", Key: "token"},
+				Usage:         types.Env,
+			}},
 		}
 
 		err := rejectCatalogSecretBindingOverrides(manifest, source, true)
@@ -1325,8 +1154,10 @@ func TestRejectCatalogSecretBindingOverrides(t *testing.T) {
 	t.Run("rejects env binding clear", func(t *testing.T) {
 		manifest := types.MCPServerManifest{
 			Runtime: types.RuntimeRemote,
-			Env: []types.MCPEnv{{
-				Key: "PINNED_ENV"}},
+			Config: []types.MCPConfig{{
+				Key:   "PINNED_ENV",
+				Usage: types.Env,
+			}},
 		}
 
 		err := rejectCatalogSecretBindingOverrides(manifest, source, true)
@@ -1336,7 +1167,9 @@ func TestRejectCatalogSecretBindingOverrides(t *testing.T) {
 	})
 
 	t.Run("rejects env binding omission for full update", func(t *testing.T) {
-		manifest := types.MCPServerManifest{Runtime: types.RuntimeRemote}
+		manifest := types.MCPServerManifest{
+			Runtime: types.RuntimeRemote,
+		}
 
 		err := rejectCatalogSecretBindingOverrides(manifest, source, true)
 		require.NotNil(t, err)
@@ -1345,7 +1178,9 @@ func TestRejectCatalogSecretBindingOverrides(t *testing.T) {
 	})
 
 	t.Run("allows env binding omission for partial overlay", func(t *testing.T) {
-		manifest := types.MCPServerManifest{Runtime: types.RuntimeRemote}
+		manifest := types.MCPServerManifest{
+			Runtime: types.RuntimeRemote,
+		}
 
 		require.Nil(t, rejectCatalogSecretBindingOverrides(manifest, source, false))
 	})
@@ -1353,13 +1188,18 @@ func TestRejectCatalogSecretBindingOverrides(t *testing.T) {
 	t.Run("rejects header override", func(t *testing.T) {
 		manifest := types.MCPServerManifest{
 			Runtime: types.RuntimeRemote,
-			Env: []types.MCPEnv{{
+
+			RemoteConfig: &types.RemoteRuntimeConfig{},
+			Config: []types.MCPConfig{{
 				Key:           "PINNED_ENV",
-				SecretBinding: sourceBinding}},
-			RemoteConfig: &types.RemoteRuntimeConfig{Headers: []types.MCPHeader{{
-				Key:           "Pinned-Header",
-				SecretBinding: &types.MCPSecretBinding{Name: "admin-secret", Key: "token"},
-			}}},
+				SecretBinding: sourceBinding,
+				Usage:         types.Env,
+			},
+				{
+					Key:           "Pinned-Header",
+					SecretBinding: &types.MCPSecretBinding{Name: "admin-secret", Key: "token"},
+					Usage:         types.Header,
+				}},
 		}
 
 		err := rejectCatalogSecretBindingOverrides(manifest, source, true)
@@ -1373,38 +1213,56 @@ func TestApplySecretBindingOverlayOnlyMatchesExistingFields(t *testing.T) {
 	binding := &types.MCPSecretBinding{Name: "allowed-secret", Key: "token"}
 	manifest := types.MCPServerManifest{
 		Runtime: types.RuntimeRemote,
-		Env: []types.MCPEnv{
-			{Key: "API_TOKEN", Value: "manual"},
-		},
+
 		RemoteConfig: &types.RemoteRuntimeConfig{
 			URL: "https://example.com/mcp",
-			Headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "manual"},
-			},
 		},
+		Config: []types.MCPConfig{{
+			Key:   "API_TOKEN",
+			Value: "manual",
+			Usage: types.Env,
+		},
+
+			{
+				Key:   "Authorization",
+				Value: "manual",
+				Usage: types.Header,
+			}},
 	}
 	overlay := types.MCPServerManifest{
-		Env: []types.MCPEnv{
-			{Key: "API_TOKEN", SecretBinding: binding},
-			{Key: "IGNORED", SecretBinding: binding},
+
+		RemoteConfig: &types.RemoteRuntimeConfig{},
+		Config: []types.MCPConfig{{
+			Key:           "API_TOKEN",
+			SecretBinding: binding,
+			Usage:         types.Env,
 		},
-		RemoteConfig: &types.RemoteRuntimeConfig{
-			Headers: []types.MCPHeader{
-				{Key: "Authorization", SecretBinding: binding},
-				{Key: "Ignored-Header", SecretBinding: binding},
+			{
+				Key:           "IGNORED",
+				SecretBinding: binding,
+				Usage:         types.Env,
 			},
-		},
+
+			{
+				Key:           "Authorization",
+				SecretBinding: binding,
+				Usage:         types.Header,
+			},
+			{
+				Key:           "Ignored-Header",
+				SecretBinding: binding,
+				Usage:         types.Header,
+			}},
 	}
 
 	result := applySecretBindingOverlay(manifest, overlay)
 
-	assert.Equal(t, binding, result.Env[0].SecretBinding)
-	assert.Empty(t, result.Env[0].Value)
+	assert.Equal(t, binding, result.Config[0].SecretBinding)
+	assert.Empty(t, result.Config[0].Value)
 	require.NotNil(t, result.RemoteConfig)
-	assert.Equal(t, binding, result.RemoteConfig.Headers[0].SecretBinding)
-	assert.Empty(t, result.RemoteConfig.Headers[0].Value)
-	assert.Len(t, result.Env, 1)
-	assert.Len(t, result.RemoteConfig.Headers, 1)
+	assert.Equal(t, binding, result.Config[1].SecretBinding)
+	assert.Empty(t, result.Config[1].Value)
+	assert.Len(t, result.Config, 2)
 }
 
 func TestCreateServerWorkspaceSecretBindingRejected(t *testing.T) {
@@ -1432,17 +1290,18 @@ func TestCreateServerRejectsMissingSecretBinding(t *testing.T) {
 		Spec: v1.MCPServerCatalogEntrySpec{
 			MCPCatalogName: "catalog-1",
 			Manifest: types.MCPServerCatalogEntryManifest{
-				Name:           "multi-user-entry",
-				Runtime:        types.RuntimeContainerized,
-				ServerUserType: types.ServerUserTypeMultiUser,
+				Name:    "multi-user-entry",
+				Runtime: types.RuntimeContainerized,
 				ContainerizedConfig: &types.ContainerizedRuntimeConfig{
 					Image: "example/mcp:latest",
 					Port:  8080,
 					Path:  "/mcp",
 				},
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{
 					Key:           "API_TOKEN",
-					SecretBinding: &types.MCPSecretBinding{Name: "missing-secret", Key: "token"}}},
+					SecretBinding: &types.MCPSecretBinding{Name: "missing-secret", Key: "token"},
+					Usage:         types.Env,
+				}},
 			},
 		},
 	}
@@ -1474,10 +1333,12 @@ func TestCreateServerRejectsMultiUserHeaderSecretBinding(t *testing.T) {
 			Port:  8080,
 			Path:  "/mcp",
 		},
-		MultiUserConfig: &types.MultiUserConfig{UserDefinedHeaders: []types.MCPHeader{{
+		Config: []types.MCPConfig{{
 			Key:           "X-API-Key",
 			SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token"},
-		}}},
+			Usage:         types.Header,
+			UserAllowed:   true,
+		}},
 	}
 
 	err := handler.CreateServer(newCreateServerSecretBindingRequest(t, storage, nil, "catalog-1", "", types.MCPServer{
@@ -1488,36 +1349,42 @@ func TestCreateServerRejectsMultiUserHeaderSecretBinding(t *testing.T) {
 	assert.Contains(t, err.Error(), "secretBinding is not supported for user-defined headers")
 }
 
-func TestCreateCatalogEntryRejectsMultiUserHeaderSecretBinding(t *testing.T) {
+func TestCreateCatalogEntryAllowsConfigurationOptions(t *testing.T) {
 	storage := newFakeStorage(t, &v1.MCPCatalog{Name: "catalog-1", Namespace: system.DefaultNamespace})
+	options := []types.MCPConfigurationOption{
+		{Name: "United States", Value: "us", Description: "US endpoint"},
+		{Name: "Europe", Value: "eu", Description: "EU endpoint"},
+	}
 	manifest := types.MCPServerCatalogEntryManifest{
-		Name:           "multi-user-entry",
-		Runtime:        types.RuntimeContainerized,
-		ServerUserType: types.ServerUserTypeMultiUser,
-		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-			Image: "example/mcp:latest",
-			Port:  8080,
-			Path:  "/mcp",
-		},
-		MultiUserConfig: &types.MultiUserConfig{UserDefinedHeaders: []types.MCPHeader{{
-			Key:           "X-API-Key",
-			SecretBinding: &types.MCPSecretBinding{Name: "source-secret", Key: "token"},
-		}}},
+		Name:      "option-entry",
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
+		Config: []types.MCPConfig{{
+			Key:      "REGION",
+			Name:     "Region",
+			Required: true,
+			Options:  options,
+			Usage:    types.Env,
+		}},
 	}
 	body, err := json.Marshal(manifest)
 	require.NoError(t, err)
 	req := httptest.NewRequest(http.MethodPost, "/api/mcp-catalogs/catalog-1/entries", bytes.NewReader(body))
 	req.SetPathValue("catalog_id", "catalog-1")
 
-	err = (&MCPCatalogHandler{mcpBackend: mcp.RuntimeBackendKubernetes, sessionManager: &mcp.SessionManager{}}).CreateEntry(api.Context{
+	err = (&MCPCatalogHandler{mcpBackend: "docker", sessionManager: &mcp.SessionManager{}}).CreateEntry(api.Context{
 		ResponseWriter: httptest.NewRecorder(),
 		Request:        req,
 		Storage:        storage,
 		User:           testUserWithRole("admin", types.GroupAdmin),
 	})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "secretBinding is not supported for user-defined headers")
+	require.NoError(t, err)
+	var entries v1.MCPServerCatalogEntryList
+	require.NoError(t, storage.List(t.Context(), &entries))
+	require.Len(t, entries.Items, 1)
+	require.Len(t, entries.Items[0].Spec.Manifest.Config, 1)
+	assert.Equal(t, options, entries.Items[0].Spec.Manifest.Config[0].Options)
 }
 
 func newCreateServerSecretBindingTestHandler() *MCPHandler {
@@ -1537,9 +1404,10 @@ func newCreateServerSecretBindingManifest(secretName, secretKey string) types.MC
 			Port:  8080,
 			Path:  "/mcp",
 		},
-		Env: []types.MCPEnv{{
+		Config: []types.MCPConfig{{
 			Key:           "API_TOKEN",
 			SecretBinding: &types.MCPSecretBinding{Name: secretName, Key: secretKey},
+			Usage:         types.Env,
 		}},
 	}
 }
@@ -1581,86 +1449,6 @@ func newCreateServerSecretBindingK8sClient(t *testing.T, objects ...kclient.Obje
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }
 
-func TestConvertMCPServerCompositeAggregatesOnlySecretBoundMissingConfig(t *testing.T) {
-	server := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				Env: []types.MCPEnv{
-					{Key: "PARENT_BOUND", Required: true, SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "parent"}},
-					{Key: "PARENT_USER", Required: true},
-				},
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{{CatalogEntryID: "entry-bound"}, {CatalogEntryID: "entry-user"}},
-				},
-			},
-		},
-	}
-
-	converted := ConvertMCPServer(server, map[string]string{}, "", "", types.MCPServer{
-		CatalogEntryID:         "entry-bound",
-		Configured:             false,
-		MissingRequiredEnvVars: []string{"BOUND_ENV", "USER_ENV"},
-		MissingRequiredHeaders: []string{"BOUND_HEADER", "USER_HEADER"},
-		MCPServerManifest: types.MCPServerManifest{
-			Runtime: types.RuntimeRemote,
-			Env: []types.MCPEnv{
-				{Key: "BOUND_ENV", SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "env"}},
-				{Key: "USER_ENV"},
-			},
-			RemoteConfig: &types.RemoteRuntimeConfig{
-				Headers: []types.MCPHeader{
-					{Key: "BOUND_HEADER", SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "header"}},
-					{Key: "USER_HEADER"},
-				},
-			},
-		},
-	}, types.MCPServer{
-		CatalogEntryID:         "entry-user",
-		Configured:             false,
-		MissingRequiredEnvVars: []string{"SHARED_KEY"},
-		MCPServerManifest: types.MCPServerManifest{
-			Env: []types.MCPEnv{{Key: "SHARED_KEY"}},
-		},
-	})
-
-	assert.False(t, converted.Configured)
-	assert.Equal(t, []string{"PARENT_BOUND", "BOUND_ENV"}, converted.MissingRequiredEnvVars)
-	assert.Equal(t, []string{"BOUND_HEADER"}, converted.MissingRequiredHeaders)
-}
-
-func TestConvertMCPServerCompositeSkipsDisabledAndConfiguredComponents(t *testing.T) {
-	server := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{
-					ComponentServers: []types.ComponentServer{
-						{CatalogEntryID: "entry-disabled", Disabled: true},
-						{CatalogEntryID: "entry-configured"},
-					},
-				},
-			},
-		},
-	}
-
-	converted := ConvertMCPServer(server, nil, "", "", types.MCPServer{
-		CatalogEntryID:         "entry-disabled",
-		Configured:             false,
-		MissingRequiredEnvVars: []string{"BOUND_DISABLED"},
-		MCPServerManifest: types.MCPServerManifest{
-			Env: []types.MCPEnv{{Key: "BOUND_DISABLED", SecretBinding: &types.MCPSecretBinding{Name: "secret", Key: "env"}}},
-		},
-	}, types.MCPServer{
-		CatalogEntryID: "entry-configured",
-		Configured:     true,
-	})
-
-	assert.True(t, converted.Configured)
-	assert.Empty(t, converted.MissingRequiredEnvVars)
-	assert.Empty(t, converted.MissingRequiredHeaders)
-}
-
 func TestServerManifestFromCatalogEntryManifestAllowsMissingRemoteHostname(t *testing.T) {
 	entry := types.MCPServerCatalogEntryManifest{
 		Runtime: types.RuntimeRemote,
@@ -1696,136 +1484,22 @@ func TestServerManifestFromCatalogEntryManifestPreservesRemoteURLTemplateConfig(
 	assert.True(t, manifest.RemoteConfig.IsTemplate)
 	assert.Equal(t, template, manifest.RemoteConfig.URLTemplate)
 	assert.Empty(t, manifest.RemoteConfig.URL)
-	assert.ElementsMatch(t, []types.MCPHeader{
-		{Name: "WORKSPACE", Key: "WORKSPACE", Description: "Automatically detected variable", Required: true},
-		{Name: "SPACE_ID", Key: "SPACE_ID", Description: "Automatically detected variable", Required: true},
-	}, manifest.RemoteConfig.Headers)
-}
-
-func TestServerManifestFromCatalogEntryManifestAllowsMissingCompositeRemoteHostname(t *testing.T) {
-	entry := types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{
-			ComponentServers: []types.CatalogComponentServer{
-				{
-					CatalogEntryID: "remote",
-					Manifest: types.MCPServerCatalogEntryManifest{
-						Runtime: types.RuntimeRemote,
-						RemoteConfig: &types.RemoteCatalogConfig{
-							Hostname: "api.example.com",
-						},
-					},
-				},
-			},
+	assert.ElementsMatch(t, []types.MCPConfig{
+		{
+			Name:        "WORKSPACE",
+			Key:         "WORKSPACE",
+			Description: "Automatically detected variable",
+			Required:    true,
+			Usage:       types.Header,
 		},
-	}
-
-	require.True(t, catalogEntryRequiresUserURL(entry))
-	manifest, err := serverManifestFromCatalogEntryManifest(false, true, entry, types.MCPServerManifest{})
-	require.NoError(t, err)
-	require.NotNil(t, manifest.CompositeConfig)
-	require.Len(t, manifest.CompositeConfig.ComponentServers, 1)
-	component := manifest.CompositeConfig.ComponentServers[0]
-	require.NotNil(t, component.Manifest.RemoteConfig)
-	assert.Equal(t, "api.example.com", component.Manifest.RemoteConfig.Hostname)
-	assert.Empty(t, component.Manifest.RemoteConfig.URL)
-}
-
-func TestAddExtractedEnvVarsToCatalogEntryRecursesIntoCompositeComponents(t *testing.T) {
-	const template = "https://${WORKSPACE}.example.com/mcp/${SPACE_ID}"
-	entry := v1.MCPServerCatalogEntry{
-		Spec: v1.MCPServerCatalogEntrySpec{
-			Manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeCatalogConfig{
-					ComponentServers: []types.CatalogComponentServer{
-						{
-							CatalogEntryID: "remote",
-							Manifest: types.MCPServerCatalogEntryManifest{
-								Runtime: types.RuntimeRemote,
-								RemoteConfig: &types.RemoteCatalogConfig{
-									URLTemplate: template,
-								},
-							},
-						},
-					},
-				},
-			},
+		{
+			Name:        "SPACE_ID",
+			Key:         "SPACE_ID",
+			Description: "Automatically detected variable",
+			Required:    true,
+			Usage:       types.Header,
 		},
-	}
-
-	addExtractedEnvVarsToCatalogEntry(&entry)
-	headers := entry.Spec.Manifest.CompositeConfig.ComponentServers[0].Manifest.RemoteConfig.Headers
-	assert.ElementsMatch(t, []types.MCPHeader{
-		{Name: "WORKSPACE", Key: "WORKSPACE", Description: "Automatically detected variable", Required: true},
-		{Name: "SPACE_ID", Key: "SPACE_ID", Description: "Automatically detected variable", Required: true},
-	}, headers)
-}
-
-func TestSyncConnectServerRemoteConfigFromCatalogEntryURLTemplate(t *testing.T) {
-	const template = "https://${WORKSPACE}.example.com/mcp/${SPACE_ID}"
-	server := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime:      types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{IsTemplate: true},
-			},
-		},
-	}
-	entry := v1.MCPServerCatalogEntry{
-		Spec: v1.MCPServerCatalogEntrySpec{
-			Manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					URLTemplate: template,
-					Headers: []types.MCPHeader{
-						{Name: "WORKSPACE", Key: "WORKSPACE", Required: true},
-					},
-				},
-			},
-		},
-	}
-
-	changed := syncConnectServerRemoteConfigFromCatalogEntry(&server, entry)
-	assert.True(t, changed)
-	require.NotNil(t, server.Spec.Manifest.RemoteConfig)
-	assert.True(t, server.Spec.NeedsURL)
-	assert.True(t, server.Spec.Manifest.RemoteConfig.IsTemplate)
-	assert.Equal(t, template, server.Spec.Manifest.RemoteConfig.URLTemplate)
-	assert.Equal(t, entry.Spec.Manifest.RemoteConfig.Headers, server.Spec.Manifest.RemoteConfig.Headers)
-}
-
-func TestSyncConnectServerRemoteConfigFromCatalogEntryHostname(t *testing.T) {
-	server := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					URL: "https://old.example.com/mcp",
-				},
-			},
-		},
-	}
-	entry := v1.MCPServerCatalogEntry{
-		Spec: v1.MCPServerCatalogEntrySpec{
-			Manifest: types.MCPServerCatalogEntryManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteCatalogConfig{
-					Hostname:   "api.example.com",
-					TunnelName: "mcptunnel-office",
-				},
-			},
-		},
-	}
-
-	changed := syncConnectServerRemoteConfigFromCatalogEntry(&server, entry)
-	assert.True(t, changed)
-	require.NotNil(t, server.Spec.Manifest.RemoteConfig)
-	assert.True(t, server.Spec.NeedsURL)
-	assert.Equal(t, "https://old.example.com/mcp", server.Spec.PreviousURL)
-	assert.Empty(t, server.Spec.Manifest.RemoteConfig.URL)
-	assert.Equal(t, "api.example.com", server.Spec.Manifest.RemoteConfig.Hostname)
-	assert.Equal(t, "mcptunnel-office", server.Spec.Manifest.RemoteConfig.TunnelName)
+	}, manifest.Config)
 }
 
 func TestEntryMissingAdminConfig(t *testing.T) {
@@ -1853,10 +1527,11 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 			name: "required env resolved binding",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{
 					Key:           "TOKEN",
 					Required:      true,
 					SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
+					Usage:         types.Env,
 				}},
 			},
 			client: newClient(t, secret("s", map[string][]byte{"k": []byte("v")})),
@@ -1865,10 +1540,11 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 			name: "required env missing binding",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{
 					Key:           "TOKEN",
 					Required:      true,
 					SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
+					Usage:         types.Env,
 				}},
 			},
 			client:     newClient(t),
@@ -1878,9 +1554,10 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 			name: "non-required env missing binding",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{
 					Key:           "TOKEN",
 					SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
+					Usage:         types.Env,
 				}},
 			},
 			client:     newClient(t),
@@ -1890,10 +1567,11 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 			name: "required env empty binding",
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime: types.RuntimeNPX,
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{
 					Key:           "TOKEN",
 					Required:      true,
 					SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
+					Usage:         types.Env,
 				}},
 			},
 			client:     newClient(t, secret("s", map[string][]byte{"k": []byte("")})),
@@ -1905,12 +1583,13 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteCatalogConfig{
 					FixedURL: "https://example.com",
-					Headers: []types.MCPHeader{{
-						Key:           "X-Api-Key",
-						Required:      true,
-						SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
-					}},
 				},
+				Config: []types.MCPConfig{{
+					Key:           "X-Api-Key",
+					Required:      true,
+					SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
+					Usage:         types.Header,
+				}},
 			},
 			client:     newClient(t),
 			wantFields: []string{"header X-Api-Key"},
@@ -1937,22 +1616,6 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 			},
 			oauthConfigured: true,
 		},
-		{
-			name: "composite component missing binding",
-			manifest: composite(types.CatalogComponentServer{
-				CatalogEntryID: "c1",
-				Manifest: types.MCPServerCatalogEntryManifest{
-					Runtime: types.RuntimeNPX,
-					Env: []types.MCPEnv{{
-						Key:           "TOKEN",
-						Required:      true,
-						SecretBinding: &types.MCPSecretBinding{Name: "s", Key: "k"},
-					}},
-				},
-			}),
-			client:     newClient(t),
-			wantFields: []string{"component c1 env TOKEN"},
-		},
 	}
 
 	for _, tt := range tests {
@@ -1977,209 +1640,6 @@ func TestEntryMissingAdminConfig(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, errHTTP.Code)
 			assert.Contains(t, errHTTP.Message, "catalog entry entry cannot be connected")
 		})
-	}
-}
-
-func TestStaticOAuthCredentialReadyUsesCredentialStoreInsteadOfCachedStatus(t *testing.T) {
-	const entryName = "entry-1"
-	entry := v1.MCPServerCatalogEntry{
-		Name: entryName,
-		Spec: v1.MCPServerCatalogEntrySpec{Manifest: types.MCPServerCatalogEntryManifest{
-			Runtime: types.RuntimeRemote,
-			RemoteConfig: &types.RemoteCatalogConfig{
-				FixedURL: "https://mcp.example/api", StaticOAuthRequired: true,
-			},
-		}},
-		Status: v1.MCPServerCatalogEntryStatus{OAuthCredentialConfigured: true},
-	}
-	gatewayClient := newOAuthCredentialTestGatewayClient(t)
-	storageClient := newFakeStorage(t, &entry)
-
-	release, _, ready, err := lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, storageClient, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name})
-	require.NoError(t, err)
-	release()
-	assert.False(t, ready, "stale configured status must not authorize creation after clear")
-
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
-		Secrets: map[string]string{"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1"},
-	}))
-	entry.Status.OAuthCredentialConfigured = false
-	release, _, ready, err = lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, storageClient, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name})
-	require.NoError(t, err)
-	release()
-	assert.False(t, ready, "legacy credentials without provider binding and generation must fail closed")
-
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entryName), Name: "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
-			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
-		},
-	}))
-	release, _, ready, err = lockStaticOAuthCredentialForCreate(t.Context(), gatewayClient, storageClient, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name})
-	require.NoError(t, err)
-	release()
-	assert.True(t, ready, "an exact provider-bound generated credential must authorize creation")
-}
-
-func TestCreateServerRereadsStaticOAuthProviderInsideCatalogMutationFence(t *testing.T) {
-	const catalogName = "default"
-	entry := staticOAuthTestEntry("entry-1", catalogName, "https://example.com/old")
-	entry.Spec.Manifest.Name = "entry-1"
-	storageClient := newFakeStorage(t,
-		&v1.MCPCatalog{Name: catalogName, Namespace: system.DefaultNamespace},
-		entry,
-	)
-	gatewayClient := newOAuthCredentialTestGatewayClient(t)
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
-			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
-		},
-	}))
-
-	releaseCatalogMutation, err := gatewayClient.AcquireCredentialLock(t.Context(), system.MCPStaticOAuthCatalogMutationLock)
-	require.NoError(t, err)
-	req := newCreateServerSecretBindingRequest(t, storageClient, nil, catalogName, "", types.MCPServer{CatalogEntryID: entry.Name})
-	req.GatewayClient = gatewayClient
-	result := make(chan error, 1)
-	go func() {
-		result <- newCreateServerSecretBindingTestHandler().CreateServer(req)
-	}()
-
-	select {
-	case err := <-result:
-		releaseCatalogMutation()
-		t.Fatalf("server creation bypassed the catalog mutation fence: %v", err)
-	case <-time.After(250 * time.Millisecond):
-	}
-
-	var updated v1.MCPServerCatalogEntry
-	require.NoError(t, storageClient.Get(t.Context(), kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name}, &updated))
-	updated.Spec.Manifest.RemoteConfig.FixedURL = "https://example.com/new"
-	require.NoError(t, storageClient.Update(t.Context(), &updated))
-	releaseCatalogMutation()
-
-	select {
-	case err := <-result:
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "requires OAuth configuration")
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for fenced server creation")
-	}
-	var servers v1.MCPServerList
-	require.NoError(t, storageClient.List(t.Context(), &servers))
-	require.Empty(t, servers.Items)
-}
-
-func TestCreateServerReleasesStaticOAuthFenceBeforeWritingResponse(t *testing.T) {
-	const catalogName = "default"
-	entry := staticOAuthTestEntry("entry-1", catalogName, "https://example.com/mcp")
-	entry.Spec.Manifest.Name = "entry-1"
-	storageClient := newFakeStorage(t,
-		&v1.MCPCatalog{Name: catalogName, Namespace: system.DefaultNamespace},
-		entry,
-	)
-	gatewayClient := newOAuthCredentialTestGatewayClient(t)
-	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entry.Name), Name: "oauth",
-		Secrets: map[string]string{
-			"CLIENT_ID": "client-1", "CLIENT_SECRET": "secret-1",
-			"MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL, "GENERATION": "generation-1",
-		},
-	}))
-
-	response := &blockingResponseWriter{
-		ResponseRecorder: httptest.NewRecorder(),
-		started:          make(chan struct{}),
-		release:          make(chan struct{}),
-	}
-	req := newCreateServerSecretBindingRequest(t, storageClient, nil, catalogName, "", types.MCPServer{CatalogEntryID: entry.Name})
-	req.GatewayClient = gatewayClient
-	req.ResponseWriter = response
-	handlerResult := make(chan error, 1)
-	go func() {
-		handlerResult <- newCreateServerSecretBindingTestHandler().CreateServer(req)
-	}()
-
-	select {
-	case <-response.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the post-create response")
-	}
-
-	type lockResult struct {
-		release func()
-		err     error
-	}
-	locked := make(chan lockResult, 1)
-	go func() {
-		release, err := gatewayClient.AcquireCredentialLock(t.Context(), system.MCPOAuthCredentialName(entry.Name))
-		locked <- lockResult{release: release, err: err}
-	}()
-
-	select {
-	case result := <-locked:
-		require.NoError(t, result.err)
-		result.release()
-		close(response.release)
-		require.NoError(t, <-handlerResult)
-	case <-time.After(time.Second):
-		close(response.release)
-		require.NoError(t, <-handlerResult)
-		result := <-locked
-		if result.err == nil {
-			result.release()
-		}
-		t.Fatal("static OAuth credential mutation remained blocked while the response writer stalled")
-	}
-}
-
-func TestNonStaticCreateDoesNotAcquireStaticOAuthCredentialLock(t *testing.T) {
-	entry := staticOAuthTestEntry("entry-1", "default", "https://example.com/mcp")
-	entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = false
-	storageClient := newFakeStorage(t, entry)
-	gatewayClient := newOAuthCredentialTestGatewayClient(t)
-
-	releaseCredential, err := gatewayClient.AcquireCredentialLock(t.Context(), system.MCPOAuthCredentialName(entry.Name))
-	require.NoError(t, err)
-	type lockResult struct {
-		release func()
-		ready   bool
-		err     error
-	}
-	result := make(chan lockResult, 1)
-	go func() {
-		release, _, ready, err := lockStaticOAuthCredentialForCreate(
-			t.Context(), gatewayClient, storageClient,
-			kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Name},
-		)
-		result <- lockResult{release: release, ready: ready, err: err}
-	}()
-
-	select {
-	case got := <-result:
-		require.NoError(t, got.err)
-		require.True(t, got.ready)
-		got.release()
-		releaseCredential()
-	case <-time.After(time.Second):
-		releaseCredential()
-		got := <-result
-		if got.err == nil {
-			got.release()
-		}
-		t.Fatal("non-static entry creation waited on the static OAuth credential lock")
-	}
-}
-
-// composite builds a composite catalog entry manifest from the given components.
-func composite(components ...types.CatalogComponentServer) types.MCPServerCatalogEntryManifest {
-	return types.MCPServerCatalogEntryManifest{
-		Runtime:         types.RuntimeComposite,
-		CompositeConfig: &types.CompositeCatalogConfig{ComponentServers: components},
 	}
 }
 

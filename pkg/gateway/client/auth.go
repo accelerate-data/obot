@@ -1,16 +1,29 @@
 package client
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 
-	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
+
+// UserLimit describes the maximum number of users an installation may have.
+// Maximum is ignored when Unlimited is true.
+type UserLimit struct {
+	Maximum   int64
+	Unlimited bool
+}
+
+// UserLimitProvider resolves the current license-derived user limit.
+type UserLimitProvider interface {
+	UserLimit(context.Context) (UserLimit, error)
+}
 
 type UserDecorator struct {
 	next              authenticator.Request
@@ -35,48 +48,52 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 	}
 
 	extra := resp.User.GetExtra()
-	authProviderNamespace := auth.FirstExtraValue(extra, "auth_provider_namespace")
-	authProviderName := auth.FirstExtraValue(extra, "auth_provider_name")
-	if authProviderNamespace == "" || authProviderName == "" {
+	var (
+		gatewayUser  *types.User
+		authGroupIDs []string
+	)
+	if authProviderNamespace, authProviderName := cmp.Or(extra["auth_provider_namespace"]...), cmp.Or(extra["auth_provider_name"]...); authProviderNamespace != "" && authProviderName != "" {
+		var emailVerified *bool
+		if raw := cmp.Or(extra["auth_provider_email_verified"]...); raw != "" {
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid auth_provider_email_verified value %q: %w", raw, err)
+			}
+			emailVerified = &parsed
+		}
+
+		identity := &types.Identity{
+			Email:                 cmp.Or(extra["email"]...),
+			AuthProviderName:      authProviderName,
+			AuthProviderNamespace: authProviderNamespace,
+			ProviderUsername:      resp.User.GetName(),
+			ProviderUserID:        resp.User.GetUID(),
+			ProviderIssuer:        cmp.Or(extra["auth_provider_issuer"]...),
+			ProviderEmailVerified: emailVerified,
+		}
+
+		userLimit, err := u.resolveUserLimit(req.Context())
+		if err != nil {
+			return nil, false, err
+		}
+
+		gatewayUser, err = u.client.EnsureIdentity(req.Context(), identity, req.Header.Get("X-Obot-User-Timezone"), userLimit)
+		if err != nil {
+			return nil, false, err
+		}
+
+		authGroupIDs = identity.GetAuthProviderGroupIDs()
+	} else {
 		return nil, false, nil
 	}
 
-	var emailVerified *bool
-	if raw := auth.FirstExtraValue(extra, "auth_provider_email_verified"); raw != "" {
-		parsed, err := strconv.ParseBool(raw)
-		if err != nil {
-			return nil, false, fmt.Errorf("invalid auth_provider_email_verified value %q: %w", raw, err)
-		}
-		emailVerified = &parsed
-	}
-
-	identity := &types.Identity{
-		Email:                 auth.FirstExtraValue(extra, "email"),
-		AuthProviderName:      authProviderName,
-		AuthProviderNamespace: authProviderNamespace,
-		ProviderUsername:      resp.User.GetName(),
-		ProviderUserID:        resp.User.GetUID(),
-		ProviderIssuer:        auth.FirstExtraValue(extra, "auth_provider_issuer"),
-		ProviderEmailVerified: emailVerified,
-	}
-	userLimit, err := u.resolveUserLimit(req.Context())
-	if err != nil {
-		return nil, false, err
-	}
-
-	gatewayUser, err := u.client.EnsureIdentity(req.Context(), identity, req.Header.Get("X-Obot-User-Timezone"), userLimit)
-	if err != nil {
-		return nil, false, err
-	}
-
-	authGroupIDs := identity.GetAuthProviderGroupIDs()
 	extra["auth_provider_groups"] = authGroupIDs
 
 	// Resolve effective role by merging individual + group roles
 	effectiveRole, err := u.client.ResolveUserEffectiveRole(req.Context(), gatewayUser, authGroupIDs)
 	if err != nil {
 		// Log error but don't fail authentication - fall back to individual role
-		log.Warnf("failed to resolve effective role for user with ID %d: %s", gatewayUser.ID, err.Error())
+		slog.Warn("failed to resolve effective role for user", "userID", gatewayUser.ID, "error", err)
 		effectiveRole = gatewayUser.Role
 	}
 
@@ -100,16 +117,4 @@ func (u UserDecorator) resolveUserLimit(ctx context.Context) (UserLimit, error) 
 	}
 
 	return userLimit, nil
-}
-
-// UserLimit describes the maximum number of users an installation may have.
-// Maximum is ignored when Unlimited is true.
-type UserLimit struct {
-	Maximum   int64
-	Unlimited bool
-}
-
-// UserLimitProvider resolves the current license-derived user limit.
-type UserLimitProvider interface {
-	UserLimit(context.Context) (UserLimit, error)
 }

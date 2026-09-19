@@ -24,30 +24,39 @@ type handler struct {
 	clientExpiration time.Duration
 
 	clientMetadataHTTPClient *http.Client
-	oauthExchangeHTTPClient  *http.Client
+	staticOAuthHTTPClient    *http.Client
 	clientMetadataCache      map[string]clientMetadataCacheEntry
 	clientMetadataCacheLock  sync.Mutex
+	clientIDNativeExceptions map[string]struct{}
 }
 
-func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, oauthConfig handlers.OAuthAuthorizationServerConfig, mcpSessionManager *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, baseURL string, clientSecretExpiration time.Duration, mux *server.Server) {
+func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, oauthConfig handlers.OAuthAuthorizationServerConfig, mcpSessionManager *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, baseURL string, clientSecretExpiration time.Duration, additionalClientIDNativeExceptions []string, mux *server.Server) {
 	remoteURLValidationConfig := mcpSessionManager.RemoteMCPURLValidationConfig()
 	h := &handler{
 		tokenStore:   tokenStore,
 		tokenService: tokenService,
 		oauthConfig:  oauthConfig,
-		clientMetadataHTTPClient: safehttp.NewClient(safehttp.ClientOptions{
+		clientMetadataHTTPClient: safehttp.NewClient(safehttp.Options{
 			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
 			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
 			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
 			Timeout:        clientMetadataFetchTimeout,
 		}),
-		oauthExchangeHTTPClient: newOAuthExchangeClient(remoteURLValidationConfig),
-		baseURL:                 baseURL,
-		oauthChecker:            oauthChecker,
-		acrHelper:               acrHelper,
-		clientExpiration:        clientSecretExpiration,
-		clientMetadataCache:     map[string]clientMetadataCacheEntry{},
+		staticOAuthHTTPClient: safehttp.NewClient(safehttp.Options{
+			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
+			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
+			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
+		}),
+		baseURL:                  baseURL,
+		oauthChecker:             oauthChecker,
+		acrHelper:                acrHelper,
+		clientExpiration:         clientSecretExpiration,
+		clientMetadataCache:      map[string]clientMetadataCacheEntry{},
+		clientIDNativeExceptions: newClientIDNativeExceptions(additionalClientIDNativeExceptions),
 	}
+	// Reuse the handler's SSRF-safe client metadata resolver when forwarding a
+	// downstream client's registered name to the upstream OAuth server.
+	oauthChecker.resolveOAuthClient = h.resolveOAuthClient
 
 	// Expose two sets of endpoints: one for clients that look at the oauth-protected-resource metadata and one for clients that don't.
 	// Clients that don't look at the metadata must use a resource parameter when authorizing.
@@ -79,7 +88,8 @@ func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTo
 	mux.HandleFunc("POST /oauth/replace-jwks", h.tokenService.ReplaceJWK)
 	mux.HandleFunc("GET "+system.OAuthClientIDMetadataPath, h.obotClientIDMetadata)
 
-	mux.HandleFunc("GET /api/oauth/composite/{mcp_id}", h.checkCompositeAuth)
+	mux.HandleFunc("GET /api/oauth/vmcp/{mcp_id}", h.checkVMCPAuth)
+	mux.HandleFunc("GET /api/oauth/vmcp/{mcp_id}/components/{component_mcp_id}", h.checkVMCPComponentAuth)
 
 	mux.HandleFunc("GET /oauth/userinfo", h.userInfo)
 }

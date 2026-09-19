@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -25,6 +26,13 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+const (
+	genericOAuthAuthProviderName           = "generic-oauth-auth-provider"
+	genericOAuthIssuerEnvVar               = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
+	genericOAuthTrustEmailLinkingVar       = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING"
+	userCreationAdvisoryLockID       int64 = 0x6f626f7455736572 // "obotUser"
+)
+
 var (
 	verifiedAuthProviders = []string{
 		"default/google-auth-provider",
@@ -35,13 +43,6 @@ var (
 		Group:    "obot.obot.ai",
 		Resource: "identities",
 	}
-)
-
-const (
-	genericOAuthAuthProviderName           = "generic-oauth-auth-provider"
-	genericOAuthIssuerEnvVar               = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
-	genericOAuthTrustEmailLinkingVar       = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING"
-	userCreationAdvisoryLockID       int64 = 0x6f626f7455736572 // "obotUser"
 )
 
 // FindIdentitiesForUser finds all identities for the given user.
@@ -147,7 +148,8 @@ func (c *Client) EncryptIdentities(ctx context.Context, force bool) error {
 				return fmt.Errorf("failed to encrypt identity: %w", err)
 			}
 
-			if err := tx.Updates(identities[i]).Error; err != nil {
+			// Omit the group check column to prevent resetting the group refresh window
+			if err := tx.Omit(groupsLastCheckedColumn).Updates(identities[i]).Error; err != nil {
 				return err
 			}
 		}
@@ -184,14 +186,16 @@ func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Iden
 			if err = c.encryptIdentity(ctx, id); err != nil {
 				return nil, false, fmt.Errorf("failed to encrypt identity: %w", err)
 			}
-			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(id)
-			if err = result.Error; err != nil {
+			// A concurrent request may win this insert on a first sign-in.
+			if err = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(id).Error; err != nil {
 				return nil, false, err
 			}
-			if result.RowsAffected == 0 {
-				if err = tx.First(id).Error; err != nil {
-					return nil, false, err
-				}
+			// Read back whichever row won, so both racers continue with the same user ID.
+			if err = tx.Where(
+				"auth_provider_name = ? AND auth_provider_namespace = ? AND hashed_provider_user_id = ?",
+				id.AuthProviderName, id.AuthProviderNamespace, id.HashedProviderUserID,
+			).First(id).Error; err != nil {
+				return nil, false, err
 			}
 		} else if err != nil {
 			return nil, false, err
@@ -428,7 +432,7 @@ func (c *Client) ensureIdentityProviderData(ctx context.Context, id *types.Ident
 	if id.ProviderGroupLookupID == "" {
 		// HTTP call, outside any transaction.
 		if lookupID, err := c.fetchProviderGroupLookupID(ctx); err != nil {
-			log.Warnf("failed to fetch provider group lookup ID: %v", err)
+			slog.Warn("failed to fetch provider group lookup ID", "error", err)
 		} else if lookupID != "" {
 			id.ProviderGroupLookupID = lookupID
 			if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -441,17 +445,8 @@ func (c *Client) ensureIdentityProviderData(ctx context.Context, id *types.Ident
 
 	// Ensure groups and group memberships are up to date. ensureGroups makes its own HTTP call to
 	// the auth provider (outside any transaction) and persists results in its own transaction.
-	groupsLastChecked := id.AuthProviderGroupsLastChecked
 	if err := c.ensureGroups(ctx, id); err != nil {
 		return fmt.Errorf("failed to update groups for identity: %w", err)
-	}
-	if !groupsLastChecked.Equal(id.AuthProviderGroupsLastChecked) {
-		// Groups were updated, so we should update the last checked time on the identity.
-		if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			return c.encryptAndUpdateIdentity(ctx, tx, *id)
-		}); err != nil {
-			return err
-		}
 	}
 
 	return nil
@@ -485,7 +480,8 @@ func (c *Client) genericOAuthTrustEmailLinking(ctx context.Context, issuer strin
 	if err != nil || cred.Secrets == nil {
 		return false
 	}
-	if cred.Secrets[genericOAuthIssuerEnvVar] != issuer {
+	configuredIssuer := strings.TrimRight(strings.TrimSpace(cred.Secrets[genericOAuthIssuerEnvVar]), "/")
+	if configuredIssuer == "" || configuredIssuer != strings.TrimRight(strings.TrimSpace(issuer), "/") {
 		return false
 	}
 
@@ -535,7 +531,8 @@ func (c *Client) encryptAndUpdateIdentity(ctx context.Context, tx *gorm.DB, id t
 		return fmt.Errorf("failed to encrypt identity: %w", err)
 	}
 
-	if err := tx.Updates(&id).Error; err != nil {
+	// Omit the group check column to prevent resetting the group refresh window
+	if err := tx.Omit(groupsLastCheckedColumn).Updates(&id).Error; err != nil {
 		return fmt.Errorf("failed to update identity: %w", err)
 	}
 

@@ -11,6 +11,8 @@
 	import type { Snippet } from 'svelte';
 	import { twMerge } from 'tailwind-merge';
 
+	export type ResponsiveDialogAnimate = 'slide' | 'fade' | null;
+
 	interface Props {
 		id?: string;
 		class?: string;
@@ -26,10 +28,16 @@
 		titleContent?: Snippet;
 		title?: string;
 		children: Snippet;
-		animate?: 'slide' | 'fade' | null;
+		animate?: ResponsiveDialogAnimate;
 		hideClose?: boolean;
 		disableClickOutside?: boolean;
 		disableMobileStyles?: boolean;
+		/**
+		 * Width in px of a panel on the right edge of the viewport that should stay visible and
+		 * usable while the dialog is open. The dialog and its dimming overlay are inset by this
+		 * much, and the dialog opens non-modal so the panel is not made inert.
+		 */
+		rightPanelWidth?: number;
 	}
 
 	let {
@@ -45,24 +53,40 @@
 		animate,
 		hideClose,
 		disableClickOutside,
-		disableMobileStyles
+		disableMobileStyles,
+		rightPanelWidth
 	}: Props = $props();
 	let dialog = $state<HTMLDialogElement>();
 
+	// max() so a dialog inset for its own panel still clears a wider open guide panel.
+	let inset = $derived(
+		rightPanelWidth
+			? `right: max(${rightPanelWidth}px, var(--guide-panel-width, 0px)); width: auto;`
+			: undefined
+	);
+
 	export function open() {
 		onOpen?.();
-		dialog?.showModal();
+		if (dialog && !dialog.open) {
+			dialog.showModal();
+		}
 	}
 
 	export function close() {
-		// Just close the dialog - onClose will be called via the native onclose event
-		dialog?.close();
+		// Just close the dialog - onClose will be called via the native onclose event.
+		// Skip if already closed so a delayed animation finish cannot start a second close
+		// that blocks the next open().
+		if (dialog?.open) {
+			dialog.close();
+		}
 	}
 </script>
 
 <dialog
 	bind:this={dialog}
 	class="dialog"
+	style={inset}
+	data-non-modal={rightPanelWidth ? 'true' : undefined}
 	use:dialogAnimation={{ type: animate }}
 	onclose={() => {
 		// Handle native dialog close (e.g., Escape key)

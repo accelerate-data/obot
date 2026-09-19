@@ -3,7 +3,7 @@
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
 
-This guide covers the step-by-step process to enable and configure authentication in Obot. Authentication must be setup to use one of the external providers in order to function properly. The bootstrap user is not implemented to operate as a regular user.
+This guide covers the step-by-step process to enable and configure authentication in Obot. Configure either the built-in Local provider or an external identity provider to enable user login. The bootstrap user is not implemented to operate as a regular user.
 
 :::note
 If any MCP servers were created with authentication disabled, they will be deleted when authentication is enabled.
@@ -33,14 +33,15 @@ config:
   # Required: Enable authentication
   OBOT_SERVER_ENABLE_AUTHENTICATION: "true"
 
-  # Required: Set a bootstrap token for initial login
-  OBOT_BOOTSTRAP_TOKEN: "your-secret-token"
-
   # Required: Set the owner email (can also be configured in the UI later)
   OBOT_SERVER_AUTH_OWNER_EMAILS: "owner@company.com"
 
   # Optional: Set additional admin emails
   OBOT_SERVER_AUTH_ADMIN_EMAILS: "admin1@company.com,admin2@company.com"
+
+secret:
+  # Optional: generated automatically when omitted from the chart-managed Secret
+  OBOT_BOOTSTRAP_TOKEN: "your-secret-token"
 ```
 
   </TabItem>
@@ -52,6 +53,9 @@ config:
 | `OBOT_BOOTSTRAP_TOKEN` | No | Token used for bootstrap login while no auth provider is configured or no non-bootstrap owner user exists. If not set, a token will be generated and printed to the logs. |
 | `OBOT_SERVER_AUTH_OWNER_EMAILS` | No | Email address that will have owner access after logging in via the auth provider. If not set, the bootstrap user will be prompted to log in via the auth provider and set themselves as the owner. |
 | `OBOT_SERVER_AUTH_ADMIN_EMAILS` | No | Additional email addresses that will have admin access |
+| `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_EMAIL` | No | Initial local-auth owner's email. Must be set with the setup token. |
+| `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN` | No | At least 32 characters of high-entropy, randomly generated secret material used to activate the initial owner. Store as a secret; `openssl rand -hex 32` is the recommended generator. |
+| `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN_EXPIRATION_HOURS` | No | Setup-link validity in hours. Defaults to `168`. |
 
 ## Step 2: Start Obot and Login
 
@@ -60,7 +64,7 @@ Start (or restart) your Obot deployment with the new environment variables. Navi
 ## Step 3: Configure Authentication Provider
 
 1. Go to **Auth Providers** under the **User Management** section in the left navigation
-2. Click **Configure** on your desired provider (GitHub, Google, Entra, Okta)
+2. Click **Configure** on your desired provider. Local, GitHub, and Google are available without registration; Entra, Okta, JumpCloud, and Auth0 require Community registration or an Enterprise license.
 3. Follow the provider-specific configuration steps
 
 For detailed provider configuration, see the [Auth Providers](../configuration/auth-providers.md) documentation.

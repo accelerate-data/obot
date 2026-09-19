@@ -47,7 +47,7 @@ func (*ProjectHandler) Create(req api.Context) error {
 		GenerateName: system.ProjectPrefix,
 		Namespace:    req.Namespace(),
 		Spec: v1.ProjectSpec{
-			ProjectManifest: types.ProjectManifest(manifest),
+			ProjectManifest: manifest,
 			UserID:          req.User.GetUID(),
 		},
 	}
@@ -83,7 +83,7 @@ func (*ProjectHandler) Update(req api.Context) error {
 		return err
 	}
 
-	project.Spec.ProjectManifest = types.ProjectManifest(manifest)
+	project.Spec.ProjectManifest = manifest
 	if err := req.Update(&project); err != nil {
 		return err
 	}
@@ -103,7 +103,7 @@ func (*ProjectHandler) Delete(req api.Context) error {
 func convertProject(project v1.Project) types.Project {
 	return types.Project{
 		Metadata:        MetadataFrom(&project),
-		ProjectManifest: types.ProjectManifest(project.Spec.ProjectManifest),
+		ProjectManifest: project.Spec.ProjectManifest,
 		UserID:          project.Spec.UserID,
 	}
 }

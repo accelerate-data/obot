@@ -3,8 +3,6 @@
 	import Loading from '$lib/icons/Loading.svelte';
 	import {
 		AdminService,
-		UserService,
-		type AccessControlRuleSubject,
 		type OrgUser,
 		type OrgGroup,
 		type HostedAgent,
@@ -13,7 +11,7 @@
 	} from '$lib/services';
 	import { errors } from '$lib/stores';
 	import { goto } from '$lib/url';
-	import { getUserDisplayName } from '$lib/utils';
+	import { convertSubjectsToTableData, resolveSubjects } from '../../subjectResolver';
 	import Confirm from '../Confirm.svelte';
 	import IconButton from '../primitives/IconButton.svelte';
 	import Table from '../table/Table.svelte';
@@ -93,44 +91,33 @@
 	$effect(() => {
 		// Prevent loading users and groups if the policy has no subjects
 		if (!policy.subjects || policy.subjects?.length === 0) {
+			loadingUsersAndGroups = false;
 			return;
 		}
 
 		loadingUsersAndGroups = true;
 
-		// Prevent refetching when adding new users or groups
-		const promises: [Promise<OrgUser[] | undefined>, Promise<OrgGroup[] | undefined>] = [
-			Promise.resolve(undefined),
-			Promise.resolve(undefined)
-		];
+		// Groups are resolved by ID, not listed: the directory can hold tens of thousands of them and
+		// only the ones attached here are needed.
+		const controller = new AbortController();
 
-		if (!usersAndGroups?.users) {
-			promises[0] = UserService.listUsers();
-		}
-		if (!usersAndGroups?.groups) {
-			promises[1] = UserService.listGroups();
-		}
-
-		Promise.all(promises)
-			.then(([users, groups]) => {
-				if (!usersAndGroups) {
-					usersAndGroups = { users: [], groups: [] };
-				}
-
-				if (users) {
-					usersAndGroups!.users = users;
-				}
-
-				if (groups) {
-					usersAndGroups!.groups = groups;
-				}
-
+		resolveSubjects(
+			policy.subjects,
+			untrack(() => usersAndGroups),
+			{ signal: controller.signal }
+		)
+			.then((resolved) => {
+				if (controller.signal.aborted) return;
+				usersAndGroups = resolved;
 				loadingUsersAndGroups = false;
 			})
 			.catch((error) => {
+				if (controller.signal.aborted) return;
 				console.error('Failed to load users and groups:', error);
 				loadingUsersAndGroups = false;
 			});
+
+		return () => controller.abort();
 	});
 
 	function convertResourcesToTableData(resources: HostedAgentAccessPolicyResource[]) {
@@ -156,48 +143,6 @@
 					return undefined;
 				})
 				.filter((resource) => resource !== undefined) ?? []
-		);
-	}
-
-	function convertSubjectsToTableData(
-		subjects: AccessControlRuleSubject[],
-		users: OrgUser[],
-		groups: OrgGroup[]
-	) {
-		const userMap = new Map(users?.map((user) => [user.id, user]));
-		const groupMap = new Map(groups?.map((group) => [group.id, group]));
-
-		return (
-			subjects
-				.map((subject) => {
-					if (subject.type === 'user') {
-						return {
-							id: subject.id,
-							displayName: getUserDisplayName(userMap, subject.id),
-							type: 'User'
-						};
-					}
-
-					if (subject.type === 'group') {
-						const group = groupMap.get(subject.id);
-						if (!group) {
-							return undefined;
-						}
-
-						return {
-							id: subject.id,
-							displayName: group.name,
-							type: 'Group'
-						};
-					}
-
-					return {
-						id: subject.id,
-						displayName: subject.id === '*' ? 'All Obot Users' : subject.id,
-						type: 'Selector'
-					};
-				})
-				.filter((subject) => subject !== undefined) ?? []
 		);
 	}
 
@@ -377,7 +322,7 @@
 					<button
 						class="btn btn-secondary text-sm"
 						onclick={() => {
-							goto('/admin/hosted-agent-access-policies');
+							goto('/hosted-agents?view=access-policies');
 						}}
 					>
 						Cancel
@@ -475,7 +420,7 @@
 		if (!policy.id) return;
 		saving = true;
 		await AdminService.deleteHostedAgentAccessPolicy(policy.id);
-		goto('/admin/hosted-agent-access-policies');
+		goto('/hosted-agents?view=access-policies');
 	}}
 	oncancel={() => (deletingPolicy = false)}
 />

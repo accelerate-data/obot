@@ -1,6 +1,8 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // Harness is the runtime a hosted agent is built on (for example "Claude
 // Code", "Codex", or a custom Python/Node image). The harness supplies the
@@ -24,6 +26,8 @@ type HarnessManifest struct {
 	Interactive bool `json:"interactive,omitempty"`
 }
 
+type HarnessList List[Harness]
+
 func (m HarnessManifest) Validate() error {
 	if m.Name == "" {
 		return fmt.Errorf("name is required")
@@ -33,5 +37,3 @@ func (m HarnessManifest) Validate() error {
 	}
 	return nil
 }
-
-type HarnessList List[Harness]

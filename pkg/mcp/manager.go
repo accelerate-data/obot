@@ -1,8 +1,10 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -11,7 +13,6 @@ import (
 
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/logger"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -25,11 +26,25 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var log = logger.Package()
+const (
+	streamableHTTPHealthcheckBody string = `{
+	"jsonrpc": "2.0",
+	"id": "1",
+    "method": "initialize",
+    "params": {
+        "capabilities": {},
+        "clientInfo": {
+            "name": "dummy",
+            "version": "dummy"
+        },
+        "protocolVersion": "2025-06-18"
+    }
+}`
+)
 
 type Options struct {
-	MCPBaseImage                      string   `usage:"The base image to use for MCP containers" default:"ghcr.io/obot-platform/mcp-images/stdio-wrapper:v0.24.2"`
-	MCPHTTPWebhookBaseImage           string   `usage:"The base image to use for HTTP-based MCP webhook containers" default:"ghcr.io/obot-platform/mcp-images/http-webhook-mcp-converter:v0.24.2"`
+	MCPBaseImage                      string   `usage:"The base image to use for MCP containers" default:"ghcr.io/obot-platform/mcp-images/stdio-wrapper:v0.26.0"`
+	MCPHTTPWebhookBaseImage           string   `usage:"The base image to use for HTTP-based MCP webhook containers" default:"ghcr.io/obot-platform/mcp-images/http-webhook-mcp-converter:v0.26.0"`
 	MCPNamespace                      string   `usage:"The namespace to use for MCP containers" default:"obot-mcp"`
 	MCPDockerNetwork                  string   `usage:"Docker network to attach MCP helper containers to; empty falls back to OBOT_CONTAINER_ENV auto-detection or the default bridge" default:"" name:"mcp-docker-network" env:"OBOT_MCP_DOCKER_NETWORK"`
 	MCPClusterDomain                  string   `usage:"The cluster domain to use for MCP containers" default:"cluster.local"`
@@ -91,7 +106,6 @@ type SessionManager struct {
 	tokenService              *persistent.TokenService
 	globalTokenStore          GlobalTokenStore
 	baseURL                   string
-	forceDynamicClient        bool
 	httpListenPort            int
 	remoteURLValidationConfig RemoteMCPURLValidationConfig
 	resourceMaximums          ResourceMaximums
@@ -111,21 +125,7 @@ type RemoteMCPURLValidationConfig struct {
 	AllowLinkLocalMCP bool
 }
 
-const streamableHTTPHealthcheckBody string = `{
-	"jsonrpc": "2.0",
-	"id": "1",
-    "method": "initialize",
-    "params": {
-        "capabilities": {},
-        "clientInfo": {
-            "name": "dummy",
-            "version": "dummy"
-        },
-        "protocolVersion": "2025-06-18"
-    }
-}`
-
-func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore GlobalTokenStore, tokenService *persistent.TokenService, baseURL string, forceDynamicClient bool, httpListenPort int, opts Options, webhookHelper *WebhookHelper, localK8sConfig *rest.Config, client, cachedClient, obotStorageClient kclient.WithWatch, gatewayClient *gateway.Client, obotNamespace string, tunnelManager *tunnel.Manager) (*SessionManager, error) {
+func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore GlobalTokenStore, tokenService *persistent.TokenService, baseURL string, httpListenPort int, opts Options, webhookHelper *WebhookHelper, localK8sConfig *rest.Config, client, cachedClient, obotStorageClient kclient.WithWatch, gatewayClient *gateway.Client, obotNamespace string, tunnelManager *tunnel.Manager) (*SessionManager, error) {
 	var backend backend
 	resourceMaximums, err := ParseResourceMaximums(opts)
 	if err != nil {
@@ -163,7 +163,7 @@ func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore G
 		}
 
 		if err := kclient.IgnoreAlreadyExists(client.Create(ctx, namespace)); err != nil {
-			log.Warnf("failed to create MCP namespace, namespace must exist for MCP deployments to work: %v", err)
+			slog.Warn("failed to create MCP namespace, namespace must exist for MCP deployments to work", "error", err)
 		}
 
 		clientset, err := kubernetes.NewForConfig(localK8sConfig)
@@ -191,7 +191,6 @@ func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore G
 		backend:                   backend,
 		runtimeBackend:            opts.MCPRuntimeBackend,
 		baseURL:                   baseURL,
-		forceDynamicClient:        forceDynamicClient,
 		httpListenPort:            httpListenPort,
 		resourceMaximums:          resourceMaximums,
 		storageClient:             obotStorageClient,
@@ -299,7 +298,7 @@ func (sm *SessionManager) Close() {
 	sm.sessions.Range(func(id, value any) bool {
 		value.(*sync.Map).Range(func(clientScope, session any) bool {
 			if s, ok := session.(*Client); ok && s.ClientSession != nil {
-				log.Infof("closing MCP session %s, %s", id, clientScope)
+				slog.Info("closing MCP session", "id", id, "clientScope", clientScope)
 				s.Close()
 				_ = s.Wait()
 			}
@@ -470,6 +469,8 @@ func ValidateRemoteMCPURL(ctx context.Context, rawURL string, config RemoteMCPUR
 func serverID(server ServerConfig) string {
 	// The user ID is not part of the server ID.
 	server.UserID = ""
+	// Audit attribution belongs to the client session, not the shared deployment.
+	server.AuditLogMetadata = nil
 	// Neither are the passthrough header values since they are per-user.
 	server.PassthroughHeaderValues = nil
 	// The Webhooks are handled dynamically and are not part of the server ID.
@@ -493,7 +494,7 @@ func serverID(server ServerConfig) string {
 }
 
 func clientID(server ServerConfig, clientScope string) string {
-	return serverID(server) + utils.Digest(server.PassthroughHeaderValues) + clientScope
+	return serverID(server) + utils.Digest(server.PassthroughHeaderValues) + utils.Digest(server.UserID) + clientScope
 }
 
 // GenerateToolPreviews creates a temporary MCP server from a catalog entry, lists its tools,
@@ -504,7 +505,7 @@ func (sm *SessionManager) GenerateToolPreviews(ctx context.Context, tempMCPServe
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if cleanupErr := sm.ShutdownServer(ctx, serverConfig.MCPServerName); cleanupErr != nil {
-			log.Errorf("failed to clean up temporary instance %s: %v", tempMCPServer.Name, cleanupErr)
+			slog.Error("failed to clean up temporary instance", "name", tempMCPServer.Name, "error", cleanupErr)
 		}
 	}()
 
@@ -519,7 +520,7 @@ func (sm *SessionManager) GenerateToolPreviews(ctx context.Context, tempMCPServe
 	// Create MCP client and list tools
 	client, err := sm.clientForServerWithOptions(ctx, "default", serverConfig, ClientOption{
 		ClientName:   "Obot Tool Preview",
-		TokenStorage: sm.globalTokenStore.ForUserAndMCP(serverConfig.UserID, serverConfig.MCPServerName, serverConfig.URL),
+		TokenStorage: sm.globalTokenStore.ForUserAndMCP(serverConfig.UserID, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig.URL),
 	})
 	if err != nil {
 		return nil, err

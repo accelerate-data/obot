@@ -7,180 +7,214 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 )
 
-var apiResources = map[string][]string{
-	types.GroupAPI: {
-		"GET    /api/hosted-agents",
-		"GET    /api/hosted-agents/{hosted_agent_id}",
-		"GET    /api/hosted-agent-instances",
-		"POST   /api/hosted-agent-instances",
-		"GET    /api/hosted-agent-instances/{hosted_agent_instance_id}",
-		"PUT    /api/hosted-agent-instances/{hosted_agent_instance_id}",
-		"DELETE /api/hosted-agent-instances/{hosted_agent_instance_id}",
-		"GET    /api/hosted-agent-instances/{hosted_agent_instance_id}/terminal",
-		"GET    /api/hosted-agent-pools",
-		"GET    /api/hosted-agent-pools/{hosted_agent_pool_id}",
-		"GET    /api/hosted-agent-pools/{hosted_agent_pool_id}/utilization",
-		"GET    /api/hosted-agent-pool-assignments",
-		"GET    /api/hosted-agent-pool-assignments/{hosted_agent_pool_assignment_id}",
-		"GET    /api/all-mcps/servers/{mcpserver_id}",
-		"GET    /api/all-mcps/servers/{mcpserver_id}/tools",
-		"GET    /api/all-mcps/servers/{mcpserver_id}/resources",
-		"GET    /api/all-mcps/servers/{mcpserver_id}/resources/{resource_uri}",
-		"GET    /api/all-mcps/servers/{mcpserver_id}/prompts",
-		"GET    /api/all-mcps/servers/{mcpserver_id}/prompts/{prompt_name}",
-		"GET    /api/all-mcps/entries/{entry_id}",
-		"GET    /oauth/callback/{oauth_request_id}",
-		"GET    /oauth/callback/{oauth_request_id}/{mcp_id}",
-		"GET    /oauth/mcp/callback",
-		"GET    /oauth/consent/{oauth_auth_request}",
-		"POST   /oauth/consent/{oauth_auth_request}/approve",
-		"POST   /oauth/consent/{oauth_auth_request}/cancel",
-		"GET    /oauth/complete/{oauth_auth_request}",
-		"GET    /api/oauth/composite/{mcp_id}",
-		"GET    /api/mcp-stats/{mcp_id}",
-		"GET    /api/mcp-audit-logs/{mcp_id}",
-		"GET    /api/mcp-server-instances",
-		"GET    /api/mcp-server-instances/{mcp_server_instance_id}",
-		"GET    /api/mcp-server-instances/{mcp_server_instance_id}/oauth-url",
-		"GET    /api/mcp-server-instances/{mcp_server_instance_id}/oauth-redirect",
-		"POST   /api/mcp-server-instances",
-		"DELETE /api/mcp-server-instances/{mcp_server_instance_id}",
-		"DELETE /api/mcp-server-instances/{mcp_server_instance_id}/oauth",
-		"POST   /api/mcp-server-instances/{mcp_server_instance_id}/reveal",
-		"POST   /api/mcp-server-instances/{mcp_server_instance_id}/configure",
-		"POST   /api/mcp-server-instances/{mcp_server_instance_id}/deconfigure",
-		"GET    /api/mcp-servers",
-		"GET    /api/mcp-servers/{mcpserver_id}",
-		"POST   /api/mcp-servers/{mcpserver_id}/launch",
-		"POST   /api/mcp-servers/{mcpserver_id}/check-oauth",
-		"GET    /api/mcp-servers/{mcpserver_id}/oauth-url",
-		"POST   /api/mcp-servers",
-		"DELETE /api/mcp-servers/{mcpserver_id}",
-		"DELETE /api/mcp-servers/{mcpserver_id}/oauth",
-		"GET    /api/mcp-servers/{mcpserver_id}/logs",
-		"PUT	/api/mcp-servers/{mcpserver_id}/alias",
-		"POST   /api/mcp-servers/{mcpserver_id}/update-url",
-		"POST   /api/mcp-servers/{mcpserver_id}/configure",
-		"POST   /api/mcp-servers/{mcpserver_id}/deconfigure",
-		"POST   /api/mcp-servers/{mcpserver_id}/reveal",
-		"POST   /api/mcp-servers/{mcpserver_id}/restart",
-		"POST   /api/mcp-servers/{mcpserver_id}/trigger-update",
-		"GET    /api/mcp-servers/{mcpserver_id}/tools",
-		"GET    /api/mcp-servers/{mcpserver_id}/resources",
-		"GET    /api/mcp-servers/{mcpserver_id}/resources/{resource_uri}",
-		"GET    /api/mcp-servers/{mcpserver_id}/prompts",
-		"GET    /api/mcp-servers/{mcpserver_id}/prompts/{prompt_name}",
-		"GET    /api/users/{user_id}",
-		"DELETE /api/users/{user_id}",
-		"PATCH  /api/users/{user_id}",
-		"GET    /api/users/{user_id}/activities",
-		"GET    /api/users/{user_id}/token-usage",
-		"GET    /api/users/{user_id}/total-token-usage",
-		"GET    /api/users/{user_id}/remaining-token-usage",
-		"GET    /api/workspaces",
-		"GET    /api/projects/{project_id}",
-		"PUT    /api/projects/{project_id}",
-		"DELETE /api/projects/{project_id}",
-		"POST   /api/projects/{project_id}/agents",
-		"GET    /api/projects/{project_id}/agents",
-		"GET    /api/projects/{project_id}/agents/{nanobot_agent_id}",
-		"PUT    /api/projects/{project_id}/agents/{nanobot_agent_id}",
-		"DELETE /api/projects/{project_id}/agents/{nanobot_agent_id}",
-		"POST   /api/projects/{project_id}/agents/{nanobot_agent_id}/launch",
-	},
-	types.GroupPowerUser: {
-		"GET    /api/workspaces/{workspace_id}",
-		"GET    /api/workspaces/{workspace_id}/entries",
-		"POST   /api/workspaces/{workspace_id}/entries",
-		"DELETE /api/workspaces/{workspace_id}/entries/{entry_id}",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}",
-		"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/generate-tool-previews",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/generate-tool-previews/oauth-url",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/details",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/logs",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/restart",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/trigger-update",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credential-tests/status",
-		"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
-		"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
-		"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
-		"DELETE /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
-	},
-	types.GroupPowerUserPlus: {
-		"GET    /api/workspaces/{workspace_id}/servers",
-		"POST   /api/workspaces/{workspace_id}/servers",
-		"DELETE /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
-		"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
-		"PUT    /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
-		"PUT    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/alias",
-		"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/launch",
-		"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/check-oauth",
-		"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/oauth-url",
-		"DELETE /api/workspaces/{workspace_id}/servers/{mcp_server_id}/oauth",
-		"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/configure",
-		"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/deconfigure",
-		"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/reveal",
-		"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/instances",
-		"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/details",
-		"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/logs",
-		"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/restart",
-		"GET    /api/workspaces/{workspace_id}/access-control-rules",
-		"POST   /api/workspaces/{workspace_id}/access-control-rules",
-		"DELETE /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
-		"GET    /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
-		"PUT    /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
-	},
-	types.GroupAuthenticated: {
-		// Reaching an agent's own HTTP port. Any authenticated user may match
-		// this route; checkHostedAgentInstance then narrows it to the instance's
-		// owner. No method is given because the agent behind it serves whatever
-		// it likes.
-		"/agent-connect/{hosted_agent_instance_id}",
-		"/agent-connect/{hosted_agent_instance_id}/{rest...}",
-	},
-	types.GroupMCP: {
-		"GET    /mcp-connect/{mcp_id}",
-		"POST   /mcp-connect/{mcp_id}",
-		"DELETE /mcp-connect/{mcp_id}",
-		"GET    /mcp-connect/{mcp_id}/",
-		"POST   /mcp-connect/{mcp_id}/",
-		"DELETE /mcp-connect/{mcp_id}/",
-	},
-	types.GroupCompositeMCP: {
-		"GET    /mcp-connect-composite/{mcp_id}",
-		"POST   /mcp-connect-composite/{mcp_id}",
-		"DELETE /mcp-connect-composite/{mcp_id}",
-	},
-	types.GroupSkills: {
-		"GET /api/skills/{skill_id}",
-		"GET /api/skills/{skill_id}/download",
-		"GET /api/skills/{skill_id}/preview",
-	},
-	types.GroupPublishedArtifacts: {
-		"GET    /api/published-artifacts/{artifact_id}",
-		"GET    /api/published-artifacts/{artifact_id}/download",
-		"GET    /api/published-artifacts/{artifact_id}/{artifact_version}/skill",
-		"PUT    /api/published-artifacts/{artifact_id}",
-		"DELETE /api/published-artifacts/{artifact_id}",
-	},
-	types.GroupDeviceScans: {
-		"GET    /api/devices/scans/{scan_id}",
-	},
-	UnauthenticatedGroup: {
-		// Allow unauthenticated access to MCP connect endpoints.
-		// This allows the authorization to pass, but the handler will issue the 401 with the WWW-Authenticate header.
-		"/mcp-connect/",
-	},
-}
+var (
+	apiResources = map[string][]string{
+		types.GroupAPI: {
+			"GET    /api/hosted-agents",
+			"GET    /api/hosted-agents/{hosted_agent_id}",
+			"GET    /api/hosted-agent-instances",
+			"POST   /api/hosted-agent-instances",
+			"GET    /api/hosted-agent-instances/{hosted_agent_instance_id}",
+			"PUT    /api/hosted-agent-instances/{hosted_agent_instance_id}",
+			"DELETE /api/hosted-agent-instances/{hosted_agent_instance_id}",
+			"GET    /api/hosted-agent-instances/{hosted_agent_instance_id}/terminal",
+			"GET    /api/hosted-agent-pools",
+			"GET    /api/hosted-agent-pools/{hosted_agent_pool_id}",
+			"GET    /api/hosted-agent-pools/{hosted_agent_pool_id}/utilization",
+			"GET    /api/hosted-agent-pool-assignments",
+			"GET    /api/hosted-agent-pool-assignments/{hosted_agent_pool_assignment_id}",
+			"GET    /api/all-mcps/servers/{mcpserver_id}",
+			"GET    /api/all-mcps/servers/{mcpserver_id}/tools",
+			"GET    /api/all-mcps/servers/{mcpserver_id}/resources",
+			"GET    /api/all-mcps/servers/{mcpserver_id}/resources/{resource_uri}",
+			"GET    /api/all-mcps/servers/{mcpserver_id}/prompts",
+			"GET    /api/all-mcps/servers/{mcpserver_id}/prompts/{prompt_name}",
+			"GET    /api/all-mcps/entries/{entry_id}",
+			"GET    /oauth/callback/{oauth_request_id}",
+			"GET    /oauth/callback/{oauth_request_id}/{mcp_id}",
+			"GET    /oauth/mcp/callback",
+			"GET    /oauth/consent/{oauth_auth_request}",
+			"POST   /oauth/consent/{oauth_auth_request}/approve",
+			"POST   /oauth/consent/{oauth_auth_request}/cancel",
+			"GET    /oauth/complete/{oauth_auth_request}",
+			"GET    /api/oauth/vmcp/{mcp_id}",
+			"GET    /api/oauth/vmcp/{mcp_id}/components/{component_mcp_id}",
+			"GET    /api/mcp-stats/{mcp_id}",
+			"GET    /api/mcp-audit-logs/{mcp_id}",
+			"GET    /api/mcp-server-instances",
+			"GET    /api/mcp-server-instances/{mcp_server_instance_id}",
+			"POST   /api/mcp-server-instances",
+			"DELETE /api/mcp-server-instances/{mcp_server_instance_id}",
+			"DELETE /api/mcp-server-instances/{mcp_server_instance_id}/oauth",
+			"GET    /api/mcp-server-instances/{mcp_server_instance_id}/oauth-url",
+			"GET    /api/mcp-server-instances/{mcp_server_instance_id}/oauth-redirect",
+			"POST   /api/mcp-server-instances/{mcp_server_instance_id}/reveal",
+			"POST   /api/mcp-server-instances/{mcp_server_instance_id}/configure",
+			"POST   /api/mcp-server-instances/{mcp_server_instance_id}/deconfigure",
+			"GET    /api/vmcps",
+			"POST   /api/vmcps",
+			"GET    /api/vmcps/{vmcp_id}",
+			"POST   /api/vmcps/{vmcp_id}/launch",
+			"POST   /api/vmcps/{vmcp_id}/check-oauth",
+			"GET    /api/vmcps/{vmcp_id}/oauth-url",
+			"DELETE /api/vmcps/{vmcp_id}/oauth",
+			"GET    /api/vmcps/{vmcp_id}/tools",
+			"GET    /api/vmcps/{vmcp_id}/resources",
+			"GET    /api/vmcps/{vmcp_id}/resources/{resource_uri}",
+			"GET    /api/vmcps/{vmcp_id}/prompts",
+			"GET    /api/vmcps/{vmcp_id}/prompts/{prompt_name}",
+			"PUT    /api/vmcps/{vmcp_id}",
+			"POST   /api/vmcps/{vmcp_id}/trigger-update",
+			"POST   /api/vmcps/{vmcp_id}/reveal",
+			"POST   /api/vmcps/{vmcp_id}/deconfigure",
+			"DELETE /api/vmcps/{vmcp_id}",
+			"POST   /api/vmcps/{vmcp_id}/components/{component_id}/generate-tool-previews",
+			"POST   /api/vmcps/{vmcp_id}/components/{component_id}/generate-tool-previews/oauth-url",
+			"GET    /api/vmcp-instances",
+			"POST   /api/vmcp-instances",
+			"GET    /api/vmcp-instances/{vmcp_instance_id}",
+			"PUT    /api/vmcp-instances/{vmcp_instance_id}",
+			"DELETE /api/vmcp-instances/{vmcp_instance_id}",
+			"POST   /api/vmcp-instances/{vmcp_instance_id}/configure",
+			"POST   /api/vmcp-instances/{vmcp_instance_id}/reveal",
+			"POST   /api/vmcp-instances/{vmcp_instance_id}/deconfigure",
+			"GET    /api/mcp-servers",
+			"GET    /api/mcp-servers/{mcpserver_id}",
+			"POST   /api/mcp-servers/{mcpserver_id}/launch",
+			"POST   /api/mcp-servers/{mcpserver_id}/check-oauth",
+			"GET    /api/mcp-servers/{mcpserver_id}/oauth-url",
+			"POST   /api/mcp-servers",
+			"DELETE /api/mcp-servers/{mcpserver_id}",
+			"DELETE /api/mcp-servers/{mcpserver_id}/oauth",
+			"GET    /api/mcp-servers/{mcpserver_id}/logs",
+			"PUT	/api/mcp-servers/{mcpserver_id}/alias",
+			"POST   /api/mcp-servers/{mcpserver_id}/update-url",
+			"POST   /api/mcp-servers/{mcpserver_id}/configure",
+			"POST   /api/mcp-servers/{mcpserver_id}/deconfigure",
+			"POST   /api/mcp-servers/{mcpserver_id}/reveal",
+			"POST   /api/mcp-servers/{mcpserver_id}/restart",
+			"POST   /api/mcp-servers/{mcpserver_id}/trigger-update",
+			"GET    /api/mcp-servers/{mcpserver_id}/tools",
+			"GET    /api/mcp-servers/{mcpserver_id}/resources",
+			"GET    /api/mcp-servers/{mcpserver_id}/resources/{resource_uri}",
+			"GET    /api/mcp-servers/{mcpserver_id}/prompts",
+			"GET    /api/mcp-servers/{mcpserver_id}/prompts/{prompt_name}",
+			"POST   /api/mcp-servers/{mcp_id}/tester/chat",
+			"GET    /api/users/{user_id}",
+			"DELETE /api/users/{user_id}",
+			"PATCH  /api/users/{user_id}",
+			"GET    /api/users/{user_id}/activities",
+			"GET    /api/users/{user_id}/token-usage",
+			"GET    /api/users/{user_id}/total-token-usage",
+			"GET    /api/users/{user_id}/remaining-token-usage",
+			"GET    /api/workspaces",
+			"GET    /api/projects/{project_id}",
+			"PUT    /api/projects/{project_id}",
+			"DELETE /api/projects/{project_id}",
+			"POST   /api/projects/{project_id}/agents",
+			"GET    /api/projects/{project_id}/agents",
+			"GET    /api/projects/{project_id}/agents/{nanobot_agent_id}",
+			"PUT    /api/projects/{project_id}/agents/{nanobot_agent_id}",
+			"DELETE /api/projects/{project_id}/agents/{nanobot_agent_id}",
+			"POST   /api/projects/{project_id}/agents/{nanobot_agent_id}/launch",
+		},
+		types.GroupPowerUser: {
+			"GET    /api/workspaces/{workspace_id}",
+			"GET    /api/workspaces/{workspace_id}/entries",
+			"POST   /api/workspaces/{workspace_id}/entries",
+			"DELETE /api/workspaces/{workspace_id}/entries/{entry_id}",
+			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}",
+			"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}",
+			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers",
+			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/generate-tool-previews",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/generate-tool-previews/oauth-url",
+			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/details",
+			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/logs",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/restart",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/trigger-update",
+			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
+			"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
+			"DELETE /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials/test",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials/test/status",
+		},
+		types.GroupPowerUserPlus: {
+			"GET    /api/workspaces/{workspace_id}/servers",
+			"POST   /api/workspaces/{workspace_id}/servers",
+			"DELETE /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
+			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
+			"PUT    /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
+			"PUT    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/alias",
+			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/launch",
+			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/check-oauth",
+			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/oauth-url",
+			"DELETE /api/workspaces/{workspace_id}/servers/{mcp_server_id}/oauth",
+			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/configure",
+			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/deconfigure",
+			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/reveal",
+			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/instances",
+			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/details",
+			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/logs",
+			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/restart",
+			"GET    /api/workspaces/{workspace_id}/access-control-rules",
+			"POST   /api/workspaces/{workspace_id}/access-control-rules",
+			"DELETE /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
+			"GET    /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
+			"PUT    /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
+		},
+		types.GroupAuthenticated: {
+			// Reaching an agent's own HTTP port. Any authenticated user may match
+			// this route; checkHostedAgentInstance then narrows it to the instance's
+			// owner. No method is given because the agent behind it serves whatever
+			// it likes.
+			"/agent-connect/{hosted_agent_instance_id}",
+			"/agent-connect/{hosted_agent_instance_id}/{rest...}",
+		},
+		types.GroupMCP: {
+			"GET    /mcp-connect/{mcp_id}",
+			"POST   /mcp-connect/{mcp_id}",
+			"DELETE /mcp-connect/{mcp_id}",
+			"GET    /mcp-connect/{mcp_id}/",
+			"POST   /mcp-connect/{mcp_id}/",
+			"DELETE /mcp-connect/{mcp_id}/",
+		},
+		types.GroupCompositeMCP: {
+			"GET    /mcp-connect-composite/{mcp_id}",
+			"POST   /mcp-connect-composite/{mcp_id}",
+			"DELETE /mcp-connect-composite/{mcp_id}",
+		},
+		types.GroupSkills: {
+			"GET /api/skills/{skill_id}",
+			"GET /api/skills/{skill_id}/download",
+			"GET /api/skills/{skill_id}/preview",
+		},
+		types.GroupPublishedArtifacts: {
+			"GET    /api/published-artifacts/{artifact_id}",
+			"GET    /api/published-artifacts/{artifact_id}/download",
+			"GET    /api/published-artifacts/{artifact_id}/{artifact_version}/skill",
+			"PUT    /api/published-artifacts/{artifact_id}",
+			"DELETE /api/published-artifacts/{artifact_id}",
+		},
+		types.GroupDeviceScans: {
+			"GET    /api/devices/scans/{scan_id}",
+		},
+		UnauthenticatedGroup: {
+			// Allow unauthenticated access to MCP connect endpoints.
+			// This allows the authorization to pass, but the handler will issue the 401 with the WWW-Authenticate header.
+			"/mcp-connect/",
+		},
+	}
+)
 
 type Resources struct {
 	MCPServerID             string
 	MCPServerInstanceID     string
 	MCPServerCatalogEntryID string
+	VMCPComponentMCPID      string
+	VMCPID                  string
+	VMCPInstanceID          string
 	// MCPID can be the ID of an MCPServer, an MCPServerInstance, or MCPServerCatalogEntry. It is used for interaction with the MCP gateway.
 	MCPID                 string
 	WorkspaceID           string
@@ -200,6 +234,8 @@ type ResourcesAuthorized struct {
 	MCPServer             *v1.MCPServer
 	MCPServerInstance     *v1.MCPServerInstance
 	MCPServerCatalogEntry *v1.MCPServerCatalogEntry
+	VMCP                  *v1.VMCP
+	VMCPInstance          *v1.VMCPInstance
 	PowerUserWorkspace    *v1.PowerUserWorkspace
 	NanobotAgent          *v1.NanobotAgent
 	Project               *v1.Project
@@ -214,7 +250,10 @@ func (a *Authorizer) evaluateResources(req *http.Request, vars GetVar, user User
 		MCPServerID:             vars("mcpserver_id"),
 		MCPServerInstanceID:     vars("mcp_server_instance_id"),
 		MCPServerCatalogEntryID: vars("entry_id"),
-		MCPID:                   vars("mcp_id"), // this can be a server ID, server instance ID, or a catalog entry ID
+		VMCPComponentMCPID:      vars("component_mcp_id"),
+		VMCPID:                  vars("vmcp_id"),
+		VMCPInstanceID:          vars("vmcp_instance_id"),
+		MCPID:                   vars("mcp_id"), // this can be a server ID, server instance ID, catalog entry ID, or vMCP ID
 		WorkspaceID:             vars("workspace_id"),
 		NanobotAgentID:          vars("nanobot_agent_id"),
 		ProjectID:               vars("project_id"),
@@ -243,11 +282,23 @@ func (a *Authorizer) evaluateResources(req *http.Request, vars GetVar, user User
 		return false, err
 	}
 
+	if ok, err := a.checkVMCP(req, &resources, user); !ok || err != nil {
+		return false, err
+	}
+
+	if ok, err := a.checkVMCPInstance(req, &resources, user); !ok || err != nil {
+		return false, err
+	}
+
 	if ok, err := a.checkCatalogEntry(req, &resources, user); !ok || err != nil {
 		return false, err
 	}
 
 	if ok, err := a.checkMCPID(req, &resources, user); !ok || err != nil {
+		return false, err
+	}
+
+	if ok, err := a.checkVMCPComponent(req, &resources, user); !ok || err != nil {
 		return false, err
 	}
 

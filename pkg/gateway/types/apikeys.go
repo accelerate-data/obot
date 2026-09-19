@@ -44,11 +44,18 @@ type APIKeyScopes struct {
 	CanAccessDeviceScans        bool `json:"canAccessDeviceScans" gorm:"default:false;not null"`
 	CanAccessPublishedArtifacts bool `json:"canAccessPublishedArtifacts" gorm:"default:false;not null"`
 
-	// MCPServerIDs contains Kubernetes resource names of MCPServers this key can access.
+	// MCPServerIDs contains resource names of MCPServers or VMCPs this key can access.
 	// Supports all server types: single-user, multi-user, remote, and composite.
 	// Use "*" as a wildcard to grant access to all servers the user can access.
 	// This may be empty for skills-only API keys.
 	MCPServerIDs []string `json:"mcpServerIds,omitempty" gorm:"serializer:json"`
+}
+
+// APIKeyCreateResponse is returned when creating an API key.
+// This is the only time the full key is visible.
+type APIKeyCreateResponse struct {
+	APIKey
+	Key string `json:"key"` // The full key, only shown once
 }
 
 func (as APIKeyScopes) Groups(u *User) []string {
@@ -80,11 +87,4 @@ func (as APIKeyScopes) Groups(u *User) []string {
 
 func (as APIKeyScopes) HasSomeScope() bool {
 	return as.CanAccessAPI || as.CanAccessSkills || as.CanAccessLLMProxy || as.CanAccessPublishedArtifacts || as.CanAccessDeviceScans || len(as.MCPServerIDs) != 0
-}
-
-// APIKeyCreateResponse is returned when creating an API key.
-// This is the only time the full key is visible.
-type APIKeyCreateResponse struct {
-	APIKey
-	Key string `json:"key"` // The full key, only shown once
 }

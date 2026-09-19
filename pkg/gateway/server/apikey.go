@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
@@ -27,6 +28,24 @@ type createAPIKeyRequest struct {
 	types.APIKeyScopes `json:",inline"`
 }
 
+// Authentication webhook endpoint
+
+type apiKeyAuthRequest struct {
+	MCPID        string `json:"mcpId,omitempty"`
+	ValidateOnly bool   `json:"validateOnly,omitempty"`
+}
+
+type apiKeyAuthResponse struct {
+	Allowed bool               `json:"allowed"`
+	Reason  string             `json:"reason,omitempty"`
+	Scopes  types.APIKeyScopes `json:"scopes"`
+
+	Subject           string `json:"sub,omitempty"`
+	Name              string `json:"name,omitempty"`
+	PreferredUsername string `json:"preferred_username,omitempty"`
+	Email             string `json:"email,omitempty"`
+}
+
 // createAPIKey creates an API key for the authenticated user.
 func (s *Server) createAPIKey(apiContext api.Context) error {
 	var req createAPIKeyRequest
@@ -44,7 +63,7 @@ func (s *Server) createAPIKey(apiContext api.Context) error {
 
 	userID := apiContext.UserID()
 	if userID == 0 {
-		pkgLog.Infof("Rejecting API key creation for unauthenticated request")
+		slog.Info("Rejecting API key creation for unauthenticated request")
 		return types2.NewErrHTTP(http.StatusUnauthorized, "user not authenticated")
 	}
 
@@ -55,6 +74,16 @@ func (s *Server) createAPIKey(apiContext api.Context) error {
 		if serverID == "*" {
 			// Wildcard - no validation needed at creation time
 			// Access is checked at authentication time
+			continue
+		}
+		if system.IsVMCPID(serverID) {
+			var vmcp v1.VMCP
+			if err := apiContext.Storage.Get(apiContext.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: serverID}, &vmcp); err != nil {
+				return types2.NewErrBadRequest("MCP server %q not found", serverID)
+			}
+			if !authz.UserCanReadVMCP(apiContext.User, &vmcp) {
+				errs = append(errs, fmt.Errorf("MCP server %q not found", serverID))
+			}
 			continue
 		}
 
@@ -74,7 +103,7 @@ func (s *Server) createAPIKey(apiContext api.Context) error {
 	}
 
 	if len(errs) > 0 {
-		pkgLog.Infof("Rejecting API key creation due to unauthorized MCP server selections: userID=%d requestedServers=%d deniedServers=%d", userID, len(req.MCPServerIDs), len(errs))
+		slog.Info("Rejecting API key creation due to unauthorized MCP server selections", "userID", userID, "requestedServers", len(req.MCPServerIDs), "deniedServers", len(errs))
 		return types2.NewErrHTTP(http.StatusBadRequest, errors.Join(errs...).Error())
 	}
 
@@ -82,7 +111,7 @@ func (s *Server) createAPIKey(apiContext api.Context) error {
 	if err != nil {
 		return types2.NewErrHTTP(http.StatusInternalServerError, fmt.Sprintf("failed to create API key: %v", err))
 	}
-	pkgLog.Infof("Created API key for user: userID=%d serverScopes=%d", userID, len(req.MCPServerIDs))
+	slog.Info("Created API key for user", "userID", userID, "serverScopes", len(req.MCPServerIDs))
 
 	return apiContext.WriteCreated(response)
 }
@@ -166,7 +195,7 @@ func (s *Server) revokeAPIKey(apiContext api.Context) error {
 	if err := apiContext.GatewayClient.RevokeAPIKey(apiContext.Context(), userID, uint(keyID)); err != nil {
 		return types2.NewErrHTTP(http.StatusInternalServerError, fmt.Sprintf("failed to revoke API key: %v", err))
 	}
-	pkgLog.Infof("Revoked API key for user: userID=%d keyID=%d", userID, keyID)
+	slog.Info("Revoked API key for user", "userID", userID, "keyID", keyID)
 
 	return apiContext.Write(map[string]any{"deleted": true})
 }
@@ -219,29 +248,11 @@ func (s *Server) deleteAnyAPIKey(apiContext api.Context) error {
 	return apiContext.Write(map[string]any{"deleted": true})
 }
 
-// Authentication webhook endpoint
-
-type apiKeyAuthRequest struct {
-	MCPID        string `json:"mcpId,omitempty"`
-	ValidateOnly bool   `json:"validateOnly,omitempty"`
-}
-
-type apiKeyAuthResponse struct {
-	Allowed bool               `json:"allowed"`
-	Reason  string             `json:"reason,omitempty"`
-	Scopes  types.APIKeyScopes `json:"scopes"`
-
-	Subject           string `json:"sub,omitempty"`
-	Name              string `json:"name,omitempty"`
-	PreferredUsername string `json:"preferred_username,omitempty"`
-	Email             string `json:"email,omitempty"`
-}
-
 func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 	// Extract API key from header
 	authHeader := apiContext.Request.Header.Get("Authorization")
 	if authHeader == "" {
-		pkgLog.Infof("Denied API key auth request: reason=missing_authorization_header")
+		slog.Info("Denied API key auth request", "reason", "missing_authorization_header")
 		return apiContext.Write(apiKeyAuthResponse{
 			Allowed: false,
 			Reason:  "missing Authorization header",
@@ -249,8 +260,8 @@ func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 	}
 
 	bearer, ok := strings.CutPrefix(authHeader, "Bearer ")
-	if !ok || !strings.HasPrefix(bearer, "ok1-") {
-		pkgLog.Infof("Denied API key auth request: reason=invalid_api_key_format")
+	if !ok || !strings.HasPrefix(bearer, system.APIKeyPrefix+"-") {
+		slog.Info("Denied API key auth request", "reason", "invalid_api_key_format")
 		return apiContext.Write(apiKeyAuthResponse{
 			Allowed: false,
 			Reason:  "invalid API key format",
@@ -260,7 +271,7 @@ func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 	// Parse request body for MCP server info
 	var req apiKeyAuthRequest
 	if err := apiContext.Read(&req); err != nil {
-		pkgLog.Infof("Denied API key auth request: reason=invalid_request_body")
+		slog.Info("Denied API key auth request", "reason", "invalid_request_body")
 		return apiContext.Write(apiKeyAuthResponse{
 			Allowed: false,
 			Reason:  "invalid request body",
@@ -270,7 +281,7 @@ func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 	// Validate the API key
 	apiKey, err := apiContext.GatewayClient.ValidateAPIKey(apiContext.Context(), bearer)
 	if err != nil {
-		pkgLog.Infof("Denied API key auth request: reason=invalid_or_expired_api_key mcpID=%s", req.MCPID)
+		slog.Info("Denied API key auth request", "reason", "invalid_or_expired_api_key", "mcpID", req.MCPID)
 		return apiContext.Write(apiKeyAuthResponse{
 			Allowed: false,
 			Reason:  "invalid or expired API key",
@@ -280,7 +291,7 @@ func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 	// Get user info
 	user, err := apiContext.GatewayClient.UserByID(apiContext.Context(), strconv.FormatUint(uint64(apiKey.UserID), 10))
 	if err != nil {
-		pkgLog.Infof("Denied API key auth request: reason=user_not_found keyUserID=%d mcpID=%s", apiKey.UserID, req.MCPID)
+		slog.Info("Denied API key auth request", "reason", "user_not_found", "keyUserID", apiKey.UserID, "mcpID", req.MCPID)
 		return apiContext.Write(apiKeyAuthResponse{
 			Allowed: false,
 			Reason:  "user not found",
@@ -291,7 +302,7 @@ func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 	if !req.ValidateOnly && !system.IsWebhookSystemMCPServerID(req.MCPID) {
 		hasAccess, err := authz.MCPIDIsAuthorized(apiContext.Context(), apiContext.Storage, apiKey.MCPServerIDs, strconv.FormatUint(uint64(apiKey.UserID), 10), req.MCPID)
 		if !hasAccess || err != nil {
-			pkgLog.Infof("Denied API key auth request: reason=api_key_scope_mismatch keyUserID=%d mcpID=%s", apiKey.UserID, req.MCPID)
+			slog.Info("Denied API key auth request", "reason", "api_key_scope_mismatch", "keyUserID", apiKey.UserID, "mcpID", req.MCPID)
 			return apiContext.Write(apiKeyAuthResponse{
 				Allowed: false,
 				Reason:  "API key does not have access to this MCP server",
@@ -299,11 +310,11 @@ func (s *Server) authenticateAPIKey(apiContext api.Context) error {
 		}
 	}
 
-	pkgLog.Debugf("Authorized API key request: keyUserID=%d mcpID=%s wildcardScope=%v validateOnly=%v", apiKey.UserID, req.MCPID, hasWildcard, req.ValidateOnly)
+	slog.Debug("Authorized API key request", "keyUserID", apiKey.UserID, "mcpID", req.MCPID, "wildcardScope", hasWildcard, "validateOnly", req.ValidateOnly)
 
 	// Update key's last used time
 	if keyErr := apiContext.GatewayClient.UpdateAPIKeyLastUsed(apiContext.Context(), apiKey); keyErr != nil {
-		log.Errorf("failed to update API key last used time: %v", keyErr)
+		slog.Error("failed to update API key last used time", "error", keyErr)
 	}
 
 	return apiContext.Write(apiKeyAuthResponse{

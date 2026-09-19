@@ -14,9 +14,12 @@ export const handlers = [
 		HttpResponse.json({ items: data.listAuthProvidersResponse })
 	),
 	http.get('/api/bootstrap', () => HttpResponse.json(data.getBootstrapStatusResponse)),
+	http.get('/api/local-auth/users', () => HttpResponse.json({ items: [] })),
 	http.get('/api/default-model-aliases', () =>
 		HttpResponse.json({ items: data.listDefaultModelAliasesResponse })
 	),
+	http.get('/api/image-pull-secrets/capability', () => HttpResponse.json({ available: false })),
+	http.get('/api/image-pull-secrets', () => HttpResponse.json({ items: [] })),
 	http.get('/api/eula', () => HttpResponse.json({ accepted: true })),
 	http.get('/api/license', () => HttpResponse.json(data.getLicenseResponse)),
 	http.delete('/api/license', () => HttpResponse.json(data.getLicenseResponse)),
@@ -34,6 +37,14 @@ export const handlers = [
 	http.get('/api/mcp-catalogs/default/entries/all-servers', () =>
 		HttpResponse.json({ items: data.listAllCatalogDeployedSingleRemoteServersResponse })
 	),
+	// Catalog entry and vMCP forms lazily load these on mount, so every spec that renders one needs
+	// them even when they are not what the spec is asserting.
+	http.get('/api/mcp-catalogs/:catalogID/access-control-rules', () =>
+		HttpResponse.json({ items: [] })
+	),
+	http.get('/api/mcp-catalogs/:catalogID/entries/:entryID/servers', () =>
+		HttpResponse.json({ items: [] })
+	),
 	http.get('/api/mcp-catalogs/default/servers', () =>
 		HttpResponse.json({ items: data.listMCPCatalogServersResponse })
 	),
@@ -47,7 +58,11 @@ export const handlers = [
 	http.get('/api/me', () => HttpResponse.json(data.getProfileResponse)),
 	http.get('/api/model-providers', () => HttpResponse.json({ items: [] })),
 	http.get('/api/models', () => HttpResponse.json({ items: data.listModelsResponse })),
+	http.get('/api/product-telemetry-consent', () => HttpResponse.json({})),
 	http.get('/api/users', () => HttpResponse.json({ items: data.listUsersResponse })),
+	http.get('/api/vmcps', () => HttpResponse.json({ items: [] })),
+	http.get('/api/vmcp-instances', () => HttpResponse.json({ items: [] })),
+	http.get('/api/groups', () => HttpResponse.json({ items: [] })),
 	http.get('/api/version', () => HttpResponse.json(data.getVersionResponse)),
 	http.get('/api/workspaces/all-entries', () =>
 		HttpResponse.json({ items: data.listAllUserWorkspaceCatalogEntriesResponse })

@@ -7,6 +7,7 @@
 		query?: string;
 		selected?: string | number;
 		multiple?: boolean;
+		valueFormat?: 'comma-separated' | 'json';
 		onSelect?: (option: T, value?: string | number) => void;
 		class?: string;
 		classes?: {
@@ -29,10 +30,12 @@
 		displayCount?: boolean;
 		ariaLabelledby?: string;
 		ariaDescribedby?: string;
+		invalid?: boolean;
 	}
 </script>
 
 <script lang="ts" generics="T extends { id: string | number; label: string; disabled?: boolean }">
+	import { parseMultiValue, serializeMultiValue } from '$lib/multiValue';
 	import { ChevronDown, X, Check, SearchIcon } from '@lucide/svelte';
 	import { tick, type Snippet } from 'svelte';
 	import { flip } from 'svelte/animate';
@@ -48,6 +51,7 @@
 		selected = $bindable(),
 		query = $bindable(),
 		multiple = false,
+		valueFormat = 'comma-separated',
 		class: klass,
 		classes,
 		position = 'bottom',
@@ -63,12 +67,14 @@
 		buttonTitle,
 		displayCount,
 		ariaLabelledby,
-		ariaDescribedby
+		ariaDescribedby,
+		invalid
 	}: SelectProps<T> = $props();
 
 	const selectedValues = $derived.by(() => {
 		if (multiple) {
 			if (typeof selected === 'string') {
+				if (valueFormat === 'json') return parseMultiValue(selected);
 				const values =
 					selected
 						.split(',')
@@ -125,6 +131,10 @@
 		query = (e.target as HTMLInputElement).value;
 	}
 
+	function serializeValues(values: (string | number)[]) {
+		return valueFormat === 'json' ? serializeMultiValue(values) : values.join(',');
+	}
+
 	function handleSelect(option: T) {
 		if (option.disabled) return;
 
@@ -133,9 +143,9 @@
 
 		if (multiple) {
 			if (isSelected) {
-				selected = selectedValues.filter((d) => d !== key).join(',');
+				selected = serializeValues(selectedValues.filter((d) => d !== key));
 			} else {
-				selected = [key, ...selectedValues].join(',');
+				selected = serializeValues([key, ...selectedValues]);
 			}
 		} else if (!isSelected) {
 			selected = key;
@@ -167,10 +177,12 @@
 			aria-haspopup="listbox"
 			aria-expanded={popover?.matches(':popover-open') ?? false}
 			aria-controls={`${id}-popover`}
+			aria-invalid={invalid || undefined}
 			class={twMerge(
 				'dark:bg-base-200 text-md bg-base-100 flex min-h-10 w-full grow cursor-pointer resize-none items-center gap-2 rounded-lg px-2 py-2 text-left shadow-sm',
 				disabled && 'pointer-events-none cursor-default opacity-50',
 				multiple && 'flex-wrap',
+				invalid && 'border border-error bg-error/20 ring-error ring-1',
 				klass
 			)}
 			style={`anchor-name: --${id}-anchor;`}
@@ -238,7 +250,7 @@
 
 											const filteredValues = selectedValues.filter((d) => d !== selectedOption.id);
 
-											selected = filteredValues.join(',');
+											selected = serializeValues(filteredValues);
 
 											onClear?.(selectedOption, selected);
 										}}
@@ -405,7 +417,7 @@
 				selectedValues.length > 0 &&
 				(query ?? '')?.length === 0
 			) {
-				selected = selectedValues.slice(0, -1).join(',');
+				selected = serializeValues(selectedValues.slice(0, -1));
 			}
 
 			if (e.key === 'Enter') {

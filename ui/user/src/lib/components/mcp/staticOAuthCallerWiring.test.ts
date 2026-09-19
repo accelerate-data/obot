@@ -5,7 +5,7 @@ import test from 'node:test';
 const callers = [
 	{
 		name: 'catalog entries view',
-		url: new URL('../../../routes/mcp-catalog/EntriesView.svelte', import.meta.url),
+		url: new URL('../../../routes/mcp-servers/EntriesView.svelte', import.meta.url),
 		deletesCredentials: true
 	},
 	{
@@ -93,6 +93,22 @@ test('static OAuth Clear services send the reviewed generation in a DELETE body'
 			source,
 			/expectedGeneration: string/,
 			`${name} Clear service must require a generation`
+		);
+	}
+});
+
+test('static OAuth test services use the v0.26 credential test routes', async () => {
+	for (const [name, url] of [
+		['admin', new URL('../../services/admin/operations.ts', import.meta.url)],
+		['workspace', new URL('../../services/user/operations.ts', import.meta.url)]
+	] as const) {
+		const source = await readFile(url, 'utf8');
+		assert.match(source, /oauth-credentials\/test`/);
+		assert.match(source, /oauth-credentials\/test\/status`/);
+		assert.doesNotMatch(
+			source,
+			/oauth-credential-tests/,
+			`${name} test service must use the restored backend route`
 		);
 	}
 });

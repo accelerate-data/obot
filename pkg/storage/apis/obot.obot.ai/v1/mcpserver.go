@@ -28,68 +28,6 @@ type MCPServer struct {
 	Status MCPServerStatus `json:"status"`
 }
 
-func (in *MCPServer) Has(field string) (exists bool) {
-	return slices.Contains(in.FieldNames(), field)
-}
-
-func (in *MCPServer) Get(field string) (value string) {
-	switch field {
-	case "spec.userID":
-		return in.Spec.UserID
-	case "spec.mcpServerCatalogEntryName":
-		return in.Spec.MCPServerCatalogEntryName
-	case "spec.mcpCatalogID":
-		return in.Spec.MCPCatalogID
-	case "spec.powerUserWorkspaceID":
-		return in.Spec.PowerUserWorkspaceID
-	case "spec.template":
-		return strconv.FormatBool(in.Spec.Template)
-	case "spec.compositeName":
-		return in.Spec.CompositeName
-	case "spec.manifest.runtime":
-		return string(in.Spec.Manifest.Runtime)
-	case "auditLogTokenHash":
-		return in.Status.AuditLogTokenHash
-	}
-	return ""
-}
-
-func (in *MCPServer) FieldNames() []string {
-	return []string{
-		"spec.userID",
-		"spec.mcpServerCatalogEntryName",
-		"spec.mcpCatalogID",
-		"spec.powerUserWorkspaceID",
-		"spec.template",
-		"spec.compositeName",
-		"spec.manifest.runtime",
-		"auditLogTokenHash",
-	}
-}
-
-func (in *MCPServer) DeleteRefs() []Ref {
-	refs := []Ref{
-		{ObjType: &MCPCatalog{}, Name: in.Spec.MCPCatalogID},
-		{ObjType: &PowerUserWorkspace{}, Name: in.Spec.PowerUserWorkspaceID},
-		{ObjType: &MCPServer{}, Name: in.Spec.CompositeName},
-		{ObjType: &NanobotAgent{}, Name: in.Spec.NanobotAgentID},
-	}
-	if in.Spec.CompositeName == "" {
-		// Only garbage collect an MCP server when the catalog entry is deleted if it's not a component of a composite MCP server.
-		// Component MCP servers get their manifest from the composite catalog entry instead.
-		refs = append(refs, Ref{ObjType: &MCPServerCatalogEntry{}, Name: in.Spec.MCPServerCatalogEntryName})
-	}
-	return refs
-}
-
-func (in *MCPServer) ValidConnectURLs(base string) []string {
-	var urls []string
-	if in.Spec.IsSingleUser() {
-		urls = append(urls, system.MCPConnectURL(base, in.Spec.MCPServerCatalogEntryName))
-	}
-	return append(urls, system.MCPConnectURL(base, in.Name))
-}
-
 type MCPServerSpec struct {
 	Manifest types.MCPServerManifest `json:"manifest"`
 	// List of tool names that are known to not work well in Obot.
@@ -119,30 +57,23 @@ type MCPServerSpec struct {
 	CompositeName string `json:"compositeName,omitempty"`
 	// NanobotAgentID is the name of the NanobotAgent that created this MCP server, if there is one.
 	NanobotAgentID string `json:"nanobotAgentID,omitempty"`
-}
-
-// IsSingleUser returns true if this is a single-user MCP server.
-func (s MCPServerSpec) IsSingleUser() bool {
-	return s.MCPCatalogID == "" && s.PowerUserWorkspaceID == ""
-}
-
-// IsOwnedBy returns true if the given user created this server and it is not
-// an admin-deployed catalog server. Covers personal and workspace servers.
-func (s MCPServerSpec) IsOwnedBy(userID string) bool {
-	return s.UserID == userID && !s.IsCatalogServer()
-}
-
-// IsCatalogServer returns true if this server is owned by a catalog (admin-deployed multi-user server).
-func (s MCPServerSpec) IsCatalogServer() bool {
-	return s.MCPCatalogID != ""
-}
-
-// IsPowerUserWorkspaceServer returns true if this server is owned by a PowerUserWorkspace.
-func (s MCPServerSpec) IsPowerUserWorkspaceServer() bool {
-	return s.PowerUserWorkspaceID != ""
+	// VMCPInstanceID is the VMCPInstance that owns this component server, if there is one.
+	VMCPInstanceID string `json:"vmcpInstanceID,omitempty"`
+	// VMCPID owns a shared component server, mutually exclusive with VMCPInstanceID.
+	VMCPID string `json:"vmcpID,omitempty"`
+	// VMCPComponentID identifies the VMCP component whose cached catalog entry was used to create this server.
+	VMCPComponentID string `json:"vmcpComponentID,omitempty"`
 }
 
 type MCPServerStatus struct {
+	// VMCPStaticConfigurationHash is the VMCP static configuration hash last copied to this server's credential.
+	VMCPStaticConfigurationHash string `json:"vmcpStaticConfigurationHash,omitempty"`
+	// VMCPUserConfigurationHash is the VMCP instance user configuration hash last copied to this server's credential.
+	VMCPUserConfigurationHash string `json:"vmcpUserConfigurationHash,omitempty"`
+	// VMCPSnapshotHash is the component catalog entry snapshot digest this server's credential and
+	// resolved remote URL were last synced for. The owning VMCP controllers rebuild Spec.Manifest
+	// from the snapshot without touching the configuration hashes, so this records that rebuild.
+	VMCPSnapshotHash string `json:"vmcpSnapshotHash,omitempty"`
 	// MCPCatalogID is the catalog ID of the catalog entry that this MCP server is based on.
 	MCPCatalogID string `json:"mcpCatalogID,omitempty"`
 	// NeedsUpdate indicates whether the configuration in this server's catalog entry has drift from this server's configuration.
@@ -165,14 +96,13 @@ type MCPServerStatus struct {
 	K8sSettingsHash string `json:"k8sSettingsHash,omitempty"`
 	// NeedsK8sUpdate indicates whether this server needs redeployment with new K8s settings
 	NeedsK8sUpdate bool `json:"needsK8sUpdate,omitempty"`
-	// AuditLogTokenHash is the hash of the token used to submit audit logs.
-	AuditLogTokenHash string `json:"auditLogTokenHash,omitempty"`
 	// ObservedCompositeManifestHash is the hash of the server's manifest the last time all component servers were updated to match the composite server.
 	// This field is only populated for composite MCP servers.
 	ObservedCompositeManifestHash string `json:"observedCompositeManifestHash,omitempty"`
 	// OAuthCredentialConfigured indicates whether OAuth credentials have been configured
 	// for this server's catalog entry. Only relevant for remote servers that require static OAuth.
-	OAuthCredentialConfigured bool `json:"oauthCredentialConfigured,omitempty"`
+	OAuthCredentialConfigured bool   `json:"oauthCredentialConfigured,omitempty"`
+	OAuthCredentialCheckHash  string `json:"oauthCredentialCheckHash,omitempty"`
 	// OAuthMetadata contains discovered OAuth metadata for remote MCP servers.
 	OAuthMetadata *OAuthMetadata `json:"oauthMetadata,omitempty"`
 	// UserHasAuthenticated indicates whether the user has authenticated with the third-party OAuth provider.
@@ -217,4 +147,115 @@ type MCPServerList struct {
 	metav1.ListMeta `json:"metadata"`
 
 	Items []MCPServer `json:"items"`
+}
+
+// CredentialContext scopes configuration to the owning vMCP, vMCP instance,
+// catalog, or workspace. Personal servers use the supplied user ID.
+func (in *MCPServer) CredentialContext(userID string) string {
+	var owner string
+	switch {
+	case in.Spec.VMCPID != "":
+		owner = in.Spec.VMCPID
+	case in.Spec.VMCPInstanceID != "":
+		owner = in.Spec.VMCPInstanceID
+	case in.Spec.IsCatalogServer():
+		owner = in.Spec.MCPCatalogID
+	case in.Spec.IsPowerUserWorkspaceServer():
+		owner = in.Spec.PowerUserWorkspaceID
+	default:
+		owner = userID
+	}
+
+	return owner + "-" + in.Name
+}
+
+func (in *MCPServer) Has(field string) (exists bool) {
+	return slices.Contains(in.FieldNames(), field)
+}
+
+func (in *MCPServer) Get(field string) (value string) {
+	switch field {
+	case "spec.userID":
+		return in.Spec.UserID
+	case "spec.mcpServerCatalogEntryName":
+		return in.Spec.MCPServerCatalogEntryName
+	case "spec.mcpCatalogID":
+		return in.Spec.MCPCatalogID
+	case "spec.powerUserWorkspaceID":
+		return in.Spec.PowerUserWorkspaceID
+	case "spec.template":
+		return strconv.FormatBool(in.Spec.Template)
+	case "spec.compositeName":
+		return in.Spec.CompositeName
+	case "spec.vmcpInstanceID":
+		return in.Spec.VMCPInstanceID
+	case "spec.vmcpID":
+		return in.Spec.VMCPID
+	case "spec.vmcpComponentID":
+		return in.Spec.VMCPComponentID
+	case "spec.manifest.runtime":
+		return string(in.Spec.Manifest.Runtime)
+	}
+	return ""
+}
+
+func (in *MCPServer) FieldNames() []string {
+	return []string{
+		"spec.userID",
+		"spec.mcpServerCatalogEntryName",
+		"spec.mcpCatalogID",
+		"spec.powerUserWorkspaceID",
+		"spec.template",
+		"spec.compositeName",
+		"spec.vmcpInstanceID",
+		"spec.vmcpID",
+		"spec.vmcpComponentID",
+		"spec.manifest.runtime",
+	}
+}
+
+func (in *MCPServer) DeleteRefs() []Ref {
+	refs := []Ref{
+		{ObjType: &MCPCatalog{}, Name: in.Spec.MCPCatalogID},
+		{ObjType: &PowerUserWorkspace{}, Name: in.Spec.PowerUserWorkspaceID},
+		{ObjType: &MCPServer{}, Name: in.Spec.CompositeName},
+		{ObjType: &NanobotAgent{}, Name: in.Spec.NanobotAgentID},
+		{ObjType: &VMCPInstance{}, Name: in.Spec.VMCPInstanceID},
+		{ObjType: &VMCP{}, Name: in.Spec.VMCPID},
+	}
+	if in.Spec.CompositeName == "" && in.Spec.VMCPComponentID == "" {
+		// Only garbage collect an MCP server when the catalog entry is deleted if it's not a component of a composite or vMCP server.
+		// Component MCP servers get their manifest from the composite catalog entry instead.
+		refs = append(refs, Ref{ObjType: &MCPServerCatalogEntry{}, Name: in.Spec.MCPServerCatalogEntryName})
+	}
+	return refs
+}
+
+func (in *MCPServer) ValidConnectURLs(base string) []string {
+	var urls []string
+	if in.Spec.IsSingleUser() && in.Spec.VMCPID == "" && in.Spec.VMCPInstanceID == "" {
+		urls = append(urls, system.MCPConnectURL(base, in.Spec.MCPServerCatalogEntryName))
+	}
+	return append(urls, system.MCPConnectURL(base, in.Name))
+}
+
+// IsSingleUser returns true if this is a single-user MCP server.
+func (s MCPServerSpec) IsSingleUser() bool {
+	return s.MCPCatalogID == "" && s.PowerUserWorkspaceID == "" && s.VMCPID == ""
+}
+
+// IsOwnedBy returns true if the given user created this server and it is not
+// an admin-deployed catalog server. Covers personal and workspace servers.
+func (s MCPServerSpec) IsOwnedBy(userID string) bool {
+	return s.UserID == userID && !s.IsCatalogServer()
+}
+
+// IsCatalogServer returns true if this server is owned by a catalog (admin-deployed multi-user server).
+func (s MCPServerSpec) IsCatalogServer() bool {
+	return s.VMCPComponentID == "" && s.MCPCatalogID != ""
+}
+
+// IsPowerUserWorkspaceServer returns true if this server is owned by a PowerUserWorkspace.
+func (s MCPServerSpec) IsPowerUserWorkspaceServer() bool {
+	return s.PowerUserWorkspaceID != ""
 }

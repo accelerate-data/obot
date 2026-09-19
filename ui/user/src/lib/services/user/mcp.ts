@@ -1,4 +1,3 @@
-import type { CompositeLaunchFormData } from '$lib/components/mcp/CatalogConfigureForm.svelte';
 import { encodeUtf8ToBase64 } from '$lib/format';
 import { mcpServersAndEntries, profile } from '$lib/stores';
 import { getUserDisplayName } from '$lib/utils';
@@ -6,8 +5,10 @@ import {
 	AdminService,
 	UserService,
 	type AccessControlRule,
+	type CompositeServerToolRow,
 	type LaunchServerType,
 	type MCPCatalogEntry,
+	type MCPCatalogEntryFieldManifest,
 	type MCPCatalogEntryServerManifest,
 	type MCPCatalogServer,
 	type MCPCatalogServerManifest,
@@ -18,7 +19,10 @@ import {
 	type MCPSubField,
 	type OrgUser,
 	type RuntimeFormData,
-	type SystemMCPServerCatalogEntry
+	type SystemMCPServerCatalogEntry,
+	type SystemMCPServerCatalogEntryManifest,
+	type ToolOverride,
+	type VMCPComponentCatalogEntrySnapshot
 } from '..';
 import { AiClient, MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH } from './constants';
 
@@ -38,7 +42,7 @@ export function getMCPDisplayName(
 
 export function supportsMCPBackendDetails(item?: { manifest?: { runtime?: string } }): boolean {
 	const runtime = item?.manifest?.runtime;
-	return runtime !== 'remote' && runtime !== 'composite';
+	return runtime !== 'remote';
 }
 
 export function isValidMcpConfig(mcpConfig: MCPServerInfo): boolean {
@@ -115,56 +119,58 @@ function hasEditableURL(remoteConfig?: { fixedURL?: string; hostname?: string } 
 	return Boolean(remoteConfig && !remoteConfig.fixedURL && remoteConfig.hostname);
 }
 
+// Present flattened configuration as the environment/header sections used by forms.
+export function getManifestConfiguration(
+	manifest?: MCPCatalogEntryServerManifest | MCPServer | SystemMCPServerCatalogEntryManifest
+): { env: MCPCatalogEntryFieldManifest[]; headers: MCPCatalogEntryFieldManifest[] } {
+	if (!manifest) return { env: [], headers: [] };
+	return {
+		env: (manifest.config ?? [])
+			.filter((field) => field.usage !== 'header')
+			.map(({ usage, ...field }) => ({
+				...field,
+				value: field.value ?? '',
+				file: usage === 'file' || usage === 'dynamicFile',
+				dynamicFile: usage === 'dynamicFile',
+				interpolated: usage === 'interpolated'
+			})),
+		headers: (manifest.config ?? [])
+			.filter((field) => field.usage === 'header' && !field.userAllowed)
+			.map(({ usage: _usage, ...field }) => ({ ...field, value: field.value ?? '' }))
+	};
+}
+
 export function hasEditableConfiguration(
-	item: MCPCatalogEntry | MCPCatalogServer | SystemMCPServerCatalogEntry
+	item:
+		| MCPCatalogEntry
+		| MCPCatalogServer
+		| SystemMCPServerCatalogEntry
+		| VMCPComponentCatalogEntrySnapshot
 ) {
 	if (!item.manifest) return false;
-	// For composite servers, check if any component has editable configuration
-	if ('compositeConfig' in item.manifest && item.manifest.runtime === 'composite') {
-		const componentServers = item.manifest.compositeConfig?.componentServers || [];
-		return componentServers.some((component) => {
-			const hasEnvs = hasEditableFields(component.manifest?.env);
-			const hasHeaders =
-				(component?.manifest?.remoteConfig?.headers?.filter?.(
-					(header) => !header.value && !hasSecretBinding(header)
-				)?.length ?? 0) > 0;
-			const hasUrlToFill = hasEditableURL(component.manifest?.remoteConfig);
-			return hasEnvs || hasHeaders || hasUrlToFill;
-		});
-	}
-
 	const hasUrlToFill = hasEditableURL(item.manifest?.remoteConfig);
-	const hasEnvsToFill = hasEditableFields(item.manifest?.env);
+	const fields = getManifestConfiguration(item.manifest);
+	const hasEnvsToFill = hasEditableFields(fields.env);
 	const hasHeadersToFill =
-		(item?.manifest?.remoteConfig?.headers?.filter?.(
-			(header) => !header.value && !hasSecretBinding(header)
-		)?.length ?? 0) > 0;
+		(fields.headers.filter((header) => !header.value && !hasSecretBinding(header))?.length ?? 0) >
+		0;
 
 	return hasUrlToFill || hasEnvsToFill || hasHeadersToFill;
 }
 
 type SecretBindingManifest = {
-	env?: MCPSubField[];
+	config?: (MCPSubField & { usage: string })[];
 	remoteConfig?: {
-		headers?: MCPSubField[];
+		fixedURL?: string;
+		hostname?: string;
+		urlTemplate?: string;
 	};
 	runtime?: string;
-	compositeConfig?: {
-		componentServers?: {
-			manifest?: SecretBindingManifest;
-		}[];
-	};
 };
 
 export function manifestHasSecretBindings(manifest?: SecretBindingManifest | null): boolean {
 	if (!manifest) return false;
-	if ((manifest.env ?? []).some(hasSecretBinding)) return true;
-	if ((manifest.remoteConfig?.headers ?? []).some(hasSecretBinding)) return true;
-	if (manifest.runtime === 'composite') {
-		return (manifest.compositeConfig?.componentServers ?? []).some((component) =>
-			manifestHasSecretBindings(component.manifest)
-		);
-	}
+	if ((manifest.config ?? []).some(hasSecretBinding)) return true;
 	return false;
 }
 
@@ -177,22 +183,15 @@ export function hasMissingSecretBindingConfig(
 	const missingEnvKeys = new Set(missingEnvVars ?? []);
 	const missingHeaderKeys = new Set(missingHeaders ?? []);
 
-	if ((manifest.env ?? []).some((env) => hasSecretBinding(env) && missingEnvKeys.has(env.key))) {
-		return true;
-	}
 	if (
-		(manifest.remoteConfig?.headers ?? []).some(
-			(header) => hasSecretBinding(header) && missingHeaderKeys.has(header.key)
+		(manifest.config ?? []).some(
+			(field) =>
+				hasSecretBinding(field) &&
+				(field.usage === 'header' ? missingHeaderKeys : missingEnvKeys).has(field.key)
 		)
 	) {
 		return true;
 	}
-	// Composite server responses aggregate only secret-bound missing config from
-	// their components. Avoid matching keys across component manifests here: the
-	// parent arrays already carry the filtered missing-secret state.
-	if (manifest.runtime === 'composite')
-		return missingEnvKeys.size > 0 || missingHeaderKeys.size > 0;
-
 	return false;
 }
 
@@ -380,7 +379,7 @@ function hasMissingSecretBinding(entry: MCPCatalogEntry, servers: MCPCatalogServ
 	return false;
 }
 
-function serverHasMissingSecretBinding(_entry: MCPCatalogEntry, server: MCPCatalogServer) {
+export function serverHasMissingSecretBinding(_entry: MCPCatalogEntry, server: MCPCatalogServer) {
 	return hasMissingSecretBindingConfig(
 		server.manifest,
 		server.missingRequiredEnvVars,
@@ -456,19 +455,13 @@ export function getServerTypeLabel(server?: MCPCatalogServer | MCPCatalogEntry) 
 
 	const runtime = server.manifest.runtime;
 	if (runtime === 'remote') return 'Remote';
-	if (runtime === 'composite') return 'Composite';
 
 	return 'Hosted';
 }
 
-export function isMultiUserCatalogEntry(entry?: MCPCatalogEntry | MCPCatalogServer) {
-	if (!entry) return false;
-	if (!('isCatalogEntry' in entry)) return false;
-	return (
-		entry?.manifest?.serverUserType === 'multiUser' &&
-		entry.manifest.runtime !== 'remote' &&
-		entry.manifest.runtime !== 'composite'
-	);
+export function isMultiUserCatalogEntry(_entry?: MCPCatalogEntry | MCPCatalogServer) {
+	// Sharing is configured on a vMCP, never on its source catalog entry.
+	return false;
 }
 
 export function isMultiUserServer(server?: MCPCatalogServer) {
@@ -483,124 +476,11 @@ export function getServerTypeLabelByType(type?: string) {
 			? 'Deployment'
 			: type === 'remote'
 				? 'Remote'
-				: 'Composite';
-}
-
-export function convertCompositeLaunchFormDataToPayload(lf: CompositeLaunchFormData) {
-	const payload: Record<
-		string,
-		{ config: Record<string, string>; url?: string; disabled?: boolean }
-	> = {};
-	for (const [id, comp] of Object.entries(lf.componentConfigs)) {
-		const config: Record<string, string> = {};
-		for (const f of [
-			...(comp.envs ?? ([] as Array<{ key: string; value: string }>)),
-			...(comp.headers ?? ([] as Array<{ key: string; value: string }>))
-		]) {
-			if (!hasSecretBinding(f) && !('isStatic' in f && f.isStatic) && f.value) {
-				config[f.key] = f.value;
-			}
-		}
-		payload[id] = {
-			config,
-			url: comp.url?.trim() || undefined,
-			disabled: comp.disabled ?? false
-		};
-	}
-	return payload;
-}
-
-export async function convertCompositeInfoToLaunchFormData(
-	server: MCPCatalogServer,
-	parent?: MCPCatalogEntry
-) {
-	let initial: Record<string, { config: Record<string, string>; url?: string; disabled?: boolean }>;
-	try {
-		const revealed = await UserService.revealCompositeMcpServer(server.id, {
-			dontLogErrors: true
-		});
-		const rc = revealed as unknown as {
-			componentConfigs?: Record<
-				string,
-				{ config: Record<string, string>; url?: string; disabled?: boolean }
-			>;
-		};
-		initial = rc.componentConfigs ?? {};
-	} catch (_error) {
-		initial = {} as Record<
-			string,
-			{ config: Record<string, string>; url?: string; disabled?: boolean }
-		>;
-	}
-	// Prefer existing server's runtime composite manifest for edit flows;
-	// fall back to parent catalog entry only if server lacks composite config
-	const components =
-		server?.manifest?.compositeConfig?.componentServers ||
-		(parent && 'manifest' in parent ? parent?.manifest?.compositeConfig?.componentServers : []) ||
-		[];
-	const componentConfigs: Record<
-		string,
-		{
-			name?: string;
-			icon?: string;
-			deprecated?: boolean;
-			hostname?: string;
-			url?: string;
-			disabled?: boolean;
-			isMultiUser?: boolean;
-			envs?: Array<Record<string, unknown> & { key: string; value: string }>;
-			headers?: Array<Record<string, unknown> & { key: string; value: string }>;
-		}
-	> = {};
-	for (const c of components) {
-		const id = c.catalogEntryID || c.mcpServerID;
-		if (!c.manifest || !id) continue;
-		const m = c.manifest;
-		const init = initial?.[id];
-		// Treat components that reference an MCP server ID (and not a catalog
-		// entry) as multi-user. Their composite component instance can collect
-		// per-user headers from the server's multi-user configuration.
-		const isMultiUser = !!c.mcpServerID && !c.catalogEntryID;
-		componentConfigs[id] = {
-			name: m.name,
-			icon: m.icon,
-			deprecated: isDeprecatedMCPServer({ manifest: m }),
-			hostname:
-				isMultiUser || !(m.remoteConfig && 'hostname' in m.remoteConfig)
-					? ''
-					: m.remoteConfig.hostname,
-			url: isMultiUser ? undefined : (init?.url ?? m.remoteConfig?.fixedURL ?? ''),
-			disabled: init?.disabled ?? false,
-			isMultiUser,
-			envs: isMultiUser
-				? []
-				: (m.env ?? []).map((e) => ({
-						...(e as unknown as Record<string, unknown>),
-						key: e.key,
-						value: init?.config?.[e.key] ?? e.value ?? '',
-						isStatic: !init?.config?.[e.key] && Boolean(e.value)
-					})),
-			headers: isMultiUser
-				? (m.multiUserConfig?.userDefinedHeaders ?? []).map((h) => ({
-						...(h as unknown as Record<string, unknown>),
-						key: h.key,
-						value: init?.config?.[h.key] ?? '',
-						isStatic: false
-					}))
-				: (m.remoteConfig?.headers ?? []).map((h) => ({
-						...(h as unknown as Record<string, unknown>),
-						key: h.key,
-						value: init?.config?.[h.key] ?? h.value ?? '',
-						isStatic: !init?.config?.[h.key] && Boolean(h.value)
-					}))
-		};
-	}
-	return { componentConfigs } as CompositeLaunchFormData;
+				: '';
 }
 
 export function getServerUrl(d: MCPCatalogServer, prefixPath?: string) {
-	const prefix = prefixPath ?? '/mcp-catalog';
-	const adminPrefix = `/admin${prefix}`;
+	const prefix = prefixPath ?? '/mcp-servers';
 	const belongsToWorkspace = d.powerUserWorkspaceID ? true : false;
 	// Route by the server's actual user type, not by the presence of a catalog
 	// entry. Multi-user servers deployed from a catalog entry carry a
@@ -614,18 +494,18 @@ export function getServerUrl(d: MCPCatalogServer, prefixPath?: string) {
 		if (isMulti && d.catalogEntryID) {
 			url =
 				belongsToWorkspace && d.powerUserWorkspaceID
-					? `${adminPrefix}/s/${d.id}/details?wid=${encodeURIComponent(d.powerUserWorkspaceID)}`
-					: `${adminPrefix}/s/${d.id}/details`;
+					? `${prefix}/s/${d.id}/details?wid=${encodeURIComponent(d.powerUserWorkspaceID)}`
+					: `${prefix}/s/${d.id}/details`;
 		} else if (isMulti) {
 			url =
 				belongsToWorkspace && d.powerUserWorkspaceID
-					? `${adminPrefix}/s/${d.id}?wid=${encodeURIComponent(d.powerUserWorkspaceID)}`
-					: `${adminPrefix}/s/${d.id}`;
+					? `${prefix}/s/${d.id}?wid=${encodeURIComponent(d.powerUserWorkspaceID)}`
+					: `${prefix}/s/${d.id}`;
 		} else {
 			url =
 				belongsToWorkspace && d.powerUserWorkspaceID
-					? `${adminPrefix}/c/${d.catalogEntryID}/instance/${d.id}/details?wid=${encodeURIComponent(d.powerUserWorkspaceID)}`
-					: `${adminPrefix}/c/${d.catalogEntryID}/instance/${d.id}/details`;
+					? `${prefix}/c/${d.catalogEntryID}/instance/${d.id}/details?wid=${encodeURIComponent(d.powerUserWorkspaceID)}`
+					: `${prefix}/c/${d.catalogEntryID}/instance/${d.id}/details`;
 		}
 	} else {
 		url = isMulti
@@ -699,18 +579,52 @@ export const getMcpServerDeploymentStatus = (
 	return { updateStatus, updatesAvailable, updateStatusTooltip };
 };
 
+function hasCompleteConfigurationOptions(env: NonNullable<MCPServerInfo['env']>[number]) {
+	if (!env.options?.length) return false;
+	if (env.value || hasSecretBinding(env)) return false;
+
+	return env.options.every((option) => Boolean(option.name.trim() && option.value.trim()));
+}
+
+function hasDuplicateConfigurationOptionValues(
+	fields: MCPServerInfo['env'] | MCPServerInfo['headers']
+) {
+	return fields?.some((field) => {
+		const values = new Set<string>();
+		return field.options?.some((option) => {
+			if (!option.value.trim()) return false;
+			if (values.has(option.value)) return true;
+			values.add(option.value);
+			return false;
+		});
+	});
+}
+
 function validateEnvs(type: LaunchServerType | 'filter', envs: MCPServerInfo['env']) {
-	if (!envs || type === 'composite') return true;
+	if (!envs) return true;
 
 	if (type === 'remote') {
-		return envs.every((env) => Boolean(env.key.trim()));
+		return envs.every(
+			(env) =>
+				Boolean(env.key.trim()) && (!env.options?.length || hasCompleteConfigurationOptions(env))
+		);
 	}
 
-	return envs.every(
-		(env) =>
-			Boolean(env.key.trim()) &&
-			(Boolean(env.value?.trim()) || hasSecretBinding(env) || Boolean(env.name.trim()))
-	);
+	return envs.every((env) => {
+		if (!env.key.trim()) return false;
+		if (env.options?.length) return hasCompleteConfigurationOptions(env);
+		return Boolean(env.value?.trim()) || hasSecretBinding(env) || Boolean(env.name.trim());
+	});
+}
+
+function validateHeaders(type: LaunchServerType | 'filter', headers: MCPServerInfo['headers']) {
+	if (!headers) return true;
+
+	return headers.every((header) => {
+		if (!header.key.trim()) return false;
+		if (header.options?.length) return hasCompleteConfigurationOptions(header);
+		return Boolean(header.value?.trim()) || hasSecretBinding(header) || Boolean(header.name.trim());
+	});
 }
 
 export const validateRuntimeForm = (
@@ -743,6 +657,9 @@ export const validateRuntimeForm = (
 
 	if (!validateEnvs(type, formData.env)) {
 		missingFields.env = true;
+	}
+	if (hasDuplicateConfigurationOptionValues(formData.env)) {
+		invalid.env = true;
 	}
 
 	// Runtime-specific validation
@@ -779,6 +696,13 @@ export const validateRuntimeForm = (
 					missingFields.fixedURL = true;
 					missingFields.hostname = true;
 					missingFields.urlTemplate = true;
+				}
+
+				if (!validateHeaders(type, formData.remoteConfig?.headers)) {
+					missingFields.headers = true;
+				}
+				if (hasDuplicateConfigurationOptionValues(formData.remoteConfig?.headers)) {
+					invalid.headers = true;
 				}
 				break;
 			} else {
@@ -880,8 +804,32 @@ export const convertServerRuntimeFormDataToManifest = (
 				? { shortDescription: baseData.shortDescription }
 				: {}),
 			icon: baseData.icon,
-			env: baseData.env,
-			multiUserConfig: baseData.multiUserConfig,
+			config: [
+				...baseData.env.map(({ file, dynamicFile, interpolated, ...field }) => ({
+					...field,
+					usage: interpolated
+						? ('interpolated' as const)
+						: file
+							? dynamicFile
+								? ('dynamicFile' as const)
+								: ('file' as const)
+							: ('env' as const)
+				})),
+				...(baseData.remoteServerConfig?.headers ?? []).map(
+					({ file: _file, dynamicFile: _dynamicFile, interpolated: _interpolated, ...field }) => ({
+						...field,
+						usage: 'header' as const
+					})
+				),
+				...(baseData.multiUserConfig?.userDefinedHeaders ?? []).map(
+					({ file: _file, dynamicFile: _dynamicFile, interpolated: _interpolated, ...field }) => ({
+						...field,
+						value: field.value ?? '',
+						usage: 'header' as const,
+						userAllowed: true
+					})
+				)
+			],
 			runtime: baseData.runtime,
 			...(resources ? { resources } : {}),
 			...convertCategoriesToMetadata(categories, metadata)
@@ -932,7 +880,6 @@ export const convertServerRuntimeFormDataToManifest = (
 			if (baseData.remoteServerConfig) {
 				serverManifest.manifest.remoteConfig = {
 					url: baseData.remoteServerConfig.url,
-					headers: baseData.remoteServerConfig.headers || [],
 					tunnelName: baseData.remoteServerConfig.tunnelName
 				};
 			}
@@ -977,6 +924,29 @@ export function effectiveToolName(
 	return (toolPrefix ?? '') + base;
 }
 
+// toolOverrideValue returns the override to persist, or undefined when it only
+// differs from the server's own value by surrounding whitespace.
+export function toolOverrideValue(
+	override: string | undefined,
+	original: string | undefined
+): string | undefined {
+	const normalized = (override ?? '').trim();
+	if (!normalized || normalized === (original ?? '').trim()) return undefined;
+	return normalized;
+}
+
+export function isToolCustomized(tool: {
+	name: string;
+	description?: string;
+	overrideName?: string;
+	overrideDescription?: string;
+}): boolean {
+	return (
+		toolOverrideValue(tool.overrideName, tool.name) !== undefined ||
+		toolOverrideValue(tool.overrideDescription, tool.description) !== undefined
+	);
+}
+
 // toolNameIssue returns the highest-priority interop issue with an effective
 // tool name, or undefined if the name is clean. Callers pass the FINAL name
 // (prefix + override || original). Errors are checked before warnings; within
@@ -1004,6 +974,22 @@ export function toolNameIssue(effectiveName: string): ToolNameIssue | undefined 
 		};
 	}
 	return undefined;
+}
+
+export function toolOverridesFromRows(rows: CompositeServerToolRow[]): ToolOverride[] {
+	return rows.map((row) => {
+		// Persist the description snapshot for display in future edits.
+		const overrideName = toolOverrideValue(row.overrideName, row.name);
+		const overrideDescription = toolOverrideValue(row.overrideDescription, row.description);
+
+		return {
+			name: row.name,
+			description: row.description,
+			overrideName,
+			overrideDescription,
+			enabled: row.enabled
+		};
+	});
 }
 
 type ToolOverrideLike = { name: string; overrideName?: string; enabled?: boolean };

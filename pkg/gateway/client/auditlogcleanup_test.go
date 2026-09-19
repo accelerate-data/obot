@@ -5,14 +5,14 @@ import (
 	"errors"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
 )
 
-func newTestDB(t *testing.T) *gatewaydb.DB {
+func newTestClient(t *testing.T) *Client {
 	t.Helper()
 
 	services, err := sservices.New(sservices.Config{
@@ -29,13 +29,6 @@ func newTestDB(t *testing.T) *gatewaydb.DB {
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatalf("failed to auto-migrate: %v", err)
 	}
-	return db
-}
-
-func newTestClient(t *testing.T) *Client {
-	t.Helper()
-
-	db := newTestDB(t)
 
 	return &Client{
 		db:                        db,
@@ -68,7 +61,7 @@ func countAuditLogs(t *testing.T, c *Client) int64 {
 
 func insertLLMAuditLog(t *testing.T, c *Client, createdAt time.Time) {
 	t.Helper()
-	entry := types.LLMAuditLog{ID: uuid.NewString(), CreatedAt: createdAt}
+	entry := types.LLMAuditLog{ID: uuid.New().String(), CreatedAt: createdAt}
 	if err := c.db.WithContext(t.Context()).Create(&entry).Error; err != nil {
 		t.Fatalf("failed to insert LLM audit log: %v", err)
 	}
@@ -83,7 +76,7 @@ func countLLMAuditLogs(t *testing.T, c *Client) int64 {
 	return count
 }
 
-func insertAPIKey(t *testing.T, c *Client, revokedAt *time.Time) uint {
+func insertAPIKey(t *testing.T, c *Client, revokedAt *time.Time) {
 	t.Helper()
 	entry := types.APIKey{
 		UserID:    1,
@@ -94,7 +87,6 @@ func insertAPIKey(t *testing.T, c *Client, revokedAt *time.Time) uint {
 	if err := c.db.WithContext(t.Context()).Create(&entry).Error; err != nil {
 		t.Fatalf("failed to insert API key: %v", err)
 	}
-	return entry.ID
 }
 
 func countAPIKeys(t *testing.T, c *Client) int64 {

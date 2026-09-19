@@ -109,7 +109,7 @@ func (p *PowerUserWorkspaceHandler) ListAllServers(req api.Context) error {
 	// Build credential contexts for all filtered servers
 	credCtxs := make([]string, 0, len(filteredServers))
 	for _, server := range filteredServers {
-		credCtxs = append(credCtxs, fmt.Sprintf("%s-%s", server.Spec.PowerUserWorkspaceID, server.Name))
+		credCtxs = append(credCtxs, server.CredentialContext(server.Spec.UserID))
 	}
 
 	var credMap map[string]map[string]string
@@ -143,7 +143,7 @@ func (p *PowerUserWorkspaceHandler) ListAllServers(req api.Context) error {
 			return fmt.Errorf("failed to determine slug: %w", err)
 		}
 
-		mergedEnv, err := mcp.MergeBoundCreds(req.Context(), req.LocalK8sClient, req.ObotNamespace, server.Spec.Manifest.Env, server.Spec.Manifest.RemoteConfig, credMap[server.Name], p.secretBindingAllowedLabel)
+		mergedEnv, err := mcp.MergeBoundCreds(req.Context(), req.LocalK8sClient, req.ObotNamespace, server.Spec.Manifest.Config, credMap[server.Name], p.secretBindingAllowedLabel)
 		if err != nil {
 			return fmt.Errorf("failed to resolve secret bindings for server %s: %w", server.Name, err)
 		}
@@ -214,7 +214,7 @@ func (p *PowerUserWorkspaceHandler) ListAllServersForAllEntries(req api.Context)
 	// Build credential contexts for all filtered servers
 	credCtxs := make([]string, 0, len(filteredServers))
 	for _, server := range filteredServers {
-		credCtxs = append(credCtxs, fmt.Sprintf("%s-%s", server.Spec.UserID, server.Name))
+		credCtxs = append(credCtxs, server.CredentialContext(server.Spec.UserID))
 	}
 
 	var credMap map[string]map[string]string

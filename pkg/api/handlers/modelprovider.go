@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/obot-platform/obot/apiclient/types"
@@ -39,12 +40,7 @@ func (mp *ModelProviderHandler) ByID(req api.Context) error {
 		return err
 	}
 
-	resp, err := mp.convertModelProvider(modelProvider, *mps)
-	if err != nil {
-		return err
-	}
-
-	return req.Write(resp)
+	return req.Write(mp.convertModelProvider(modelProvider, *mps))
 }
 
 func (mp *ModelProviderHandler) List(req api.Context) error {
@@ -62,12 +58,7 @@ func (mp *ModelProviderHandler) List(req api.Context) error {
 			return err
 		}
 
-		modelProviderResp, err := mp.convertModelProvider(modelProvider, *mps)
-		if err != nil {
-			log.Errorf("failed to convert model provider %q: %v", modelProvider.Name, err)
-			continue
-		}
-		resp = append(resp, modelProviderResp)
+		resp = append(resp, mp.convertModelProvider(modelProvider, *mps))
 	}
 
 	return req.Write(types.ModelProviderList{Items: resp})
@@ -83,7 +74,7 @@ func (mp *ModelProviderHandler) Validate(req api.Context) error {
 		return err
 	}
 
-	log.Debugf("Validating model provider %q", modelProvider.Name)
+	slog.Debug("Validating model provider", "modelProviderName", modelProvider.Name)
 
 	var envVars map[string]string
 	if err := req.Read(&envVars); err != nil {
@@ -181,10 +172,7 @@ func (mp *ModelProviderHandler) RefreshModels(req api.Context) error {
 		return err
 	}
 
-	resp, err := mp.convertModelProvider(modelProvider, *mps)
-	if err != nil {
-		return err
-	}
+	resp := mp.convertModelProvider(modelProvider, *mps)
 	if !resp.Configured {
 		return types.NewErrBadRequest("model provider %s is not configured, missing configuration parameters: %s", resp.Name, strings.Join(resp.MissingConfigurationParameters, ", "))
 	}
@@ -205,10 +193,10 @@ func (mp *ModelProviderHandler) RefreshModels(req api.Context) error {
 	return req.Write(resp)
 }
 
-func (mp *ModelProviderHandler) convertModelProvider(modelProvider v1.ModelProvider, modelProviderStatus types.ModelProviderStatus) (types.ModelProvider, error) {
+func (mp *ModelProviderHandler) convertModelProvider(modelProvider v1.ModelProvider, modelProviderStatus types.ModelProviderStatus) types.ModelProvider {
 	return types.ModelProvider{
 		Metadata:              MetadataFrom(&modelProvider),
 		ModelProviderManifest: modelProvider.Spec.ModelProviderManifest,
 		ModelProviderStatus:   modelProviderStatus,
-	}, nil
+	}
 }

@@ -3,6 +3,9 @@ import type { MCPCatalogEntryServerManifest } from '$lib/services/admin/types';
 import type { MCPServer } from '$lib/services/user/types';
 
 type ManifestDiff = MCPCatalogEntryServerManifest | MCPServer;
+type DiffManifest = ManifestDiff & {
+	config?: DiffField[];
+};
 
 /**
  * Strips fields from a manifest that should not be considered when computing
@@ -11,16 +14,11 @@ type ManifestDiff = MCPCatalogEntryServerManifest | MCPServer;
  *
  * - `entryKey`: identifies an entry within its catalog source, not server configuration
  * - `repoURL`: tracks the source repository, not server configuration
- * - `serverUserType`: exists only on catalog entry manifests
+ * - `upgradeNote`: informational catalog metadata shown before an upgrade
  * - `remoteConfig.fixedURL`: catalog-only field translated to `url` at deploy time
  * - `remoteConfig.url`: runtime-only field derived from catalog's `fixedURL`
  * - `remoteConfig.isTemplate`: runtime-only field not present on catalog manifests
  * - `secretBinding.adminAdded`: runtime-only ownership metadata
- *
- * For composite manifests, the same fields are stripped from each component's
- * nested manifest at `compositeConfig.componentServers[].manifest`. Nested
- * composites are not possible — the backend rejects them — so a single pass over
- * the component list is sufficient.
  */
 export function stripManifestMetadata<T>(
 	manifest: T,
@@ -31,63 +29,42 @@ export function stripManifestMetadata<T>(
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const clone: any = JSON.parse(JSON.stringify(manifest));
 
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	const stripFields = (m: any) => {
-		if (!m || typeof m !== 'object') return;
-		delete m.entryKey;
-		delete m.repoURL;
-		delete m.serverUserType;
-		if (m.remoteConfig) {
-			delete m.remoteConfig.fixedURL;
-			delete m.remoteConfig.url;
-			delete m.remoteConfig.isTemplate;
-		}
-		if (!options?.keepSecretBindingMetadata) stripSecretBindingMetadata(m);
-	};
-
-	stripFields(clone);
-	for (const component of clone.compositeConfig?.componentServers ?? []) {
-		stripFields(component?.manifest);
+	delete clone.entryKey;
+	delete clone.repoURL;
+	delete clone.upgradeNote;
+	if (clone.remoteConfig) {
+		delete clone.remoteConfig.fixedURL;
+		delete clone.remoteConfig.url;
+		delete clone.remoteConfig.isTemplate;
 	}
+	if (!options?.keepSecretBindingMetadata) stripSecretBindingMetadata(clone);
 
 	return clone as T;
 }
 
-export function normalizeManifestsForDiff<T>(currentManifest: T, newManifest: T): [T, T] {
+export function normalizeManifestsForDiff<Current, Next>(
+	currentManifest: Current,
+	newManifest: Next
+): [Current, Next] {
 	const current = stripManifestMetadata(currentManifest, {
 		keepSecretBindingMetadata: true
-	}) as ManifestDiff;
+	}) as DiffManifest;
 	const next = stripManifestMetadata(newManifest, {
 		keepSecretBindingMetadata: true
-	}) as ManifestDiff;
+	}) as DiffManifest;
 
 	// stripManifestMetadata returns undefined for an undefined manifest. Bail out before
 	// dereferencing so callers fall through to their "unable to compare" fallback UI
-	// instead of throwing on current.compositeConfig.
+	// instead of throwing on current.config.
 	if (!current || !next) {
-		return [current as T, next as T];
+		return [current as Current, next as Next];
 	}
 
-	const normalize = (currentShape?: ManifestDiff, nextShape?: ManifestDiff) => {
-		if (!currentShape || !nextShape) return;
-		normalizeFieldList(currentShape.env, nextShape.env);
-		normalizeFieldList(currentShape.remoteConfig?.headers, nextShape.remoteConfig?.headers);
-		normalizeFieldList(
-			currentShape.multiUserConfig?.userDefinedHeaders,
-			nextShape.multiUserConfig?.userDefinedHeaders
-		);
-	};
-
-	normalize(current, next);
-	for (let i = 0; i < (current.compositeConfig?.componentServers ?? []).length; i++) {
-		const currentComponent = current.compositeConfig?.componentServers?.[i];
-		const nextComponent = next.compositeConfig?.componentServers?.[i];
-		normalize(currentComponent?.manifest, nextComponent?.manifest);
-	}
+	normalizeFieldList(current.config, next.config);
 
 	stripSecretBindingMetadata(current);
 	stripSecretBindingMetadata(next);
-	return [current as T, next as T];
+	return [current as Current, next as Next];
 }
 
 type DiffField = {
@@ -141,24 +118,11 @@ function normalizeAdminAddedFieldBindings(
 	}
 }
 
-function stripSecretBindingMetadata(manifest?: ManifestDiff) {
+function stripSecretBindingMetadata(manifest?: DiffManifest) {
 	if (!manifest || typeof manifest !== 'object') return;
 
-	const stripFields = (m?: ManifestDiff) => {
-		for (const field of m?.env ?? []) {
-			if (field.secretBinding) delete field.secretBinding.adminAdded;
-		}
-		for (const field of m?.remoteConfig?.headers ?? []) {
-			if (field.secretBinding) delete field.secretBinding.adminAdded;
-		}
-		for (const field of m?.multiUserConfig?.userDefinedHeaders ?? []) {
-			if (field.secretBinding) delete field.secretBinding.adminAdded;
-		}
-	};
-
-	stripFields(manifest);
-	for (const component of manifest.compositeConfig?.componentServers ?? []) {
-		stripFields(component?.manifest);
+	for (const field of manifest.config ?? []) {
+		if (field.secretBinding) delete field.secretBinding.adminAdded;
 	}
 }
 
@@ -424,7 +388,48 @@ export function formatDiffLine(line: string, type: 'added' | 'removed' | 'unchan
 				? 'bg-error/10 text-error'
 				: 'text-muted-content';
 
-	return `<div class="${baseClass} ${typeClass} px-2 py-0.5">${prefix}${line}</div>`;
+	return `<div class="${baseClass} ${typeClass} px-2 py-0.5">${prefix}${escapeHtml(line)}</div>`;
+}
+
+function highlightEscapedJsonLine(escapedLine: string): string {
+	let highlightedLine = escapedLine;
+
+	highlightedLine = highlightedLine.replace(
+		/: (\d+\.\d+)/g,
+		': <span class="text-primary">$1</span>'
+	);
+
+	highlightedLine = highlightedLine.replace(
+		/: (\d+)(?!\d*\.)/g,
+		': <span class="text-primary">$1</span>'
+	);
+
+	highlightedLine = highlightedLine.replace(
+		/&quot;(.*?)&quot;:/g,
+		'<span class="text-primary">&quot;$1&quot;</span>:'
+	);
+
+	highlightedLine = highlightedLine.replace(
+		/: &quot;(.*?)&quot;/g,
+		': <span class="text-gray-600 dark:text-gray-300 whitespace-normal wrap-break-word">&quot;$1&quot;</span>'
+	);
+
+	highlightedLine = highlightedLine.replace(
+		/: (null)/g,
+		': <span class="text-muted-content">$1</span>'
+	);
+
+	highlightedLine = highlightedLine.replace(
+		/(&quot;.*?&quot;)|([{}[\]])/g,
+		(_match, stringContent: string | undefined, bracket: string | undefined) => {
+			if (stringContent) {
+				return stringContent;
+			}
+			return `<span class="text-base-content">${bracket}</span>`;
+		}
+	);
+
+	return highlightedLine;
 }
 
 export function formatJsonWithDiffHighlighting(
@@ -445,78 +450,27 @@ export function formatJsonWithDiffHighlighting(
 	try {
 		let highlighted = '';
 
-		// Filter diff operations based on which version we're displaying
 		const relevantOps = diff.diffOps.filter((op) => {
 			if (isOldVersion) {
-				// For old version: show unchanged and removed lines
 				return op.type === 'unchanged' || op.type === 'removed';
-			} else {
-				// For new version: show unchanged and added lines
-				return op.type === 'unchanged' || op.type === 'added';
 			}
+			return op.type === 'unchanged' || op.type === 'added';
 		});
 
 		for (const op of relevantOps) {
-			const line = op.line;
-
-			// Determine line styling based on operation type
 			let lineClass = 'text-muted-content';
-
 			if (op.type === 'removed') {
 				lineClass = 'bg-error/10 text-error';
 			} else if (op.type === 'added') {
 				lineClass = 'bg-success/10 text-success';
 			}
 
-			// Apply JSON syntax highlighting
-			let highlightedLine = line;
-
-			// Replace decimal numbers
-			highlightedLine = highlightedLine.replace(
-				/: (\d+\.\d+)/g,
-				': <span class="text-primary">$1</span>'
-			);
-
-			// Replace integer numbers
-			highlightedLine = highlightedLine.replace(
-				/: (\d+)(?!\d*\.)/g,
-				': <span class="text-primary">$1</span>'
-			);
-
-			// Replace keys
-			highlightedLine = highlightedLine.replace(
-				/"([^"]+)":/g,
-				'<span class="text-primary">"$1"</span>:'
-			);
-
-			// Replace string values
-			highlightedLine = highlightedLine.replace(
-				/: "([^"]+)"/g,
-				': <span class="text-gray-600 dark:text-gray-300 whitespace-normal wrap-break-word">"$1"</span>'
-			);
-
-			// Replace null
-			highlightedLine = highlightedLine.replace(
-				/: (null)/g,
-				': <span class="text-muted-content">$1</span>'
-			);
-
-			// Replace brackets and braces
-			highlightedLine = highlightedLine.replace(
-				/(".*?")|([{}[\]])/g,
-				(match, stringContent, bracket) => {
-					if (stringContent) {
-						return stringContent;
-					}
-					return `<span class="text-base-content">${bracket}</span>`;
-				}
-			);
-
+			const highlightedLine = highlightEscapedJsonLine(escapeHtml(op.line));
 			highlighted += `<div class="font-mono text-sm ${lineClass} px-2 py-0.5">${highlightedLine}</div>`;
 		}
 
 		return highlighted;
 	} catch (_error) {
-		return String(json);
+		return escapeHtml(String(json));
 	}
 }

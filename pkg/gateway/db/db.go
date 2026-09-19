@@ -80,6 +80,10 @@ func (db *DB) AutoMigrate() (err error) {
 		return fmt.Errorf("failed to drop session_cookies table: %w", err)
 	}
 
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "drop_sessions", dropSessionsTable); err != nil {
+		return fmt.Errorf("failed to drop sessions table: %w", err)
+	}
+
 	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "remove_github_groups", removeGitHubGroups); err != nil {
 		return fmt.Errorf("failed to remove GitHub groups: %w", err)
 	}
@@ -98,6 +102,28 @@ func (db *DB) AutoMigrate() (err error) {
 
 	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "apikey_skills_access_backfill", migrateAPIKeySkillsAccess); err != nil {
 		return fmt.Errorf("failed to migrate API key skills access: %w", err)
+	}
+
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, uiCatalogConfigMigrationName, migrateUICatalogEntryConfig); err != nil {
+		return fmt.Errorf("failed to migrate UI catalog entry configuration: %w", err)
+	}
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, uiSystemCatalogConfigMigrationName, func(tx *gorm.DB) error {
+		return migrateUICatalogConfigTable(tx, "systemmcpservercatalogentry")
+	}); err != nil {
+		return fmt.Errorf("failed to migrate UI system catalog entry configuration: %w", err)
+	}
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, mcpServerConfigMigrationName, func(tx *gorm.DB) error {
+		if err := migrateUICatalogConfigTable(tx, "mcpserver"); err != nil {
+			return err
+		}
+		return migrateUICatalogConfigTable(tx, "mcpserverinstance")
+	}); err != nil {
+		return fmt.Errorf("failed to migrate MCP server configuration: %w", err)
+	}
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, systemMCPServerConfigMigrationName, func(tx *gorm.DB) error {
+		return migrateUICatalogConfigTable(tx, "systemmcpserver")
+	}); err != nil {
+		return fmt.Errorf("failed to migrate system MCP server configuration: %w", err)
 	}
 
 	if err := tx.AutoMigrate(

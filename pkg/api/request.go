@@ -2,6 +2,7 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,37 +14,50 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/pkg/auth"
 	gclient "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/storage"
 	"github.com/obot-platform/obot/pkg/system"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/authentication/user"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-type Context struct {
-	http.ResponseWriter
-	*http.Request
-	Storage       storage.Client
-	GatewayClient *gclient.Client
-	User          user.Info
-	APIBaseURL    string
+const (
+	defaultMaxBodyBytes int64 = 8 * 1024 * 1024
 
-	// LocalK8sClient is a kclient for the local Kubernetes cluster — the
-	// cluster the obot pod runs in, where source Secrets for
-	// secretBindings live. Nil on the docker backend
-	LocalK8sClient client.Client
-
-	// ObotNamespace is the Kubernetes namespace in which the obot server
-	// runs; mcp.MergeBoundCreds reads source Secrets from here. Empty
-	// when LocalK8sClient is nil.
-	ObotNamespace string
-}
+	// maxDecoderWindowBytes caps the window a zstd frame may declare. The decoder
+	// allocates it from the frame header, before any output the decoded cap could
+	// bound.
+	maxDecoderWindowBytes = 64 * 1024 * 1024
+)
 
 type (
+	Context struct {
+		http.ResponseWriter
+		*http.Request
+		Storage       storage.Client
+		GatewayClient *gclient.Client
+		User          user.Info
+		APIBaseURL    string
+
+		// LocalK8sClient is a kclient for the local Kubernetes cluster — the
+		// cluster the obot pod runs in, where source Secrets for
+		// secretBindings live. Nil on the docker backend
+		LocalK8sClient kclient.Client
+
+		// ObotNamespace is the Kubernetes namespace in which the obot server
+		// runs; mcp.MergeBoundCreds reads source Secrets from here. Empty
+		// when LocalK8sClient is nil.
+		ObotNamespace string
+	}
+
 	HandlerFunc func(Context) error
 	Middleware  func(HandlerFunc) HandlerFunc
+
+	BodyOptions struct {
+		// MaxBytes caps the body, applied to the compressed and decoded streams alike.
+		MaxBytes int64
+	}
 )
 
 func (r *Context) IsStreamRequested() bool {
@@ -64,18 +78,6 @@ func (r *Context) Read(obj any) error {
 	}
 	return json.Unmarshal(data, obj)
 }
-
-type BodyOptions struct {
-	// MaxBytes caps the body, applied to the compressed and decoded streams alike.
-	MaxBytes int64
-}
-
-const defaultMaxBodyBytes int64 = 8 * 1024 * 1024
-
-// maxDecoderWindowBytes caps the window a zstd frame may declare. The decoder
-// allocates it from the frame header, before any output the decoded cap could
-// bound.
-const maxDecoderWindowBytes = 64 * 1024 * 1024
 
 func (r *Context) Body(opts ...BodyOptions) (_ []byte, err error) {
 	defer func() {
@@ -163,16 +165,16 @@ func (r *Context) Flush() {
 	}
 }
 
-func (r *Context) List(obj client.ObjectList, opts ...client.ListOption) error {
+func (r *Context) List(obj kclient.ObjectList, opts ...kclient.ListOption) error {
 	namespace := r.Namespace()
-	return r.Storage.List(r.Context(), obj, slices.Concat([]client.ListOption{
-		&client.ListOptions{
+	return r.Storage.List(r.Context(), obj, slices.Concat([]kclient.ListOption{
+		&kclient.ListOptions{
 			Namespace: namespace,
 		},
 	}, opts)...)
 }
 
-func (r *Context) Delete(obj client.Object) error {
+func (r *Context) Delete(obj kclient.Object) error {
 	err := r.Storage.Delete(r.Context(), obj)
 	if apierrors.IsNotFound(err) {
 		return nil
@@ -180,16 +182,16 @@ func (r *Context) Delete(obj client.Object) error {
 	return err
 }
 
-func (r *Context) Get(obj client.Object, name string) error {
+func (r *Context) Get(obj kclient.Object, name string) error {
 	namespace := r.Namespace()
-	return r.Storage.Get(r.Context(), client.ObjectKey{Namespace: namespace, Name: name}, obj)
+	return r.Storage.Get(r.Context(), kclient.ObjectKey{Namespace: namespace, Name: name}, obj)
 }
 
-func (r *Context) Create(obj client.Object) error {
+func (r *Context) Create(obj kclient.Object) error {
 	return r.Storage.Create(r.Context(), obj)
 }
 
-func (r *Context) Update(obj client.Object) error {
+func (r *Context) Update(obj kclient.Object) error {
 	return r.Storage.Update(r.Context(), obj)
 }
 
@@ -234,12 +236,12 @@ func (r *Context) UserID() uint {
 }
 
 func (r *Context) AuthProviderUserID() string {
-	return auth.FirstExtraValue(r.User.GetExtra(), "auth_provider_user_id")
+	return cmp.Or(r.User.GetExtra()["auth_provider_user_id"]...)
 }
 
 func (r *Context) AuthProviderNameAndNamespace() (string, string) {
-	return auth.FirstExtraValue(r.User.GetExtra(), "auth_provider_name"),
-		auth.FirstExtraValue(r.User.GetExtra(), "auth_provider_namespace")
+	return cmp.Or(r.User.GetExtra()["auth_provider_name"]...),
+		cmp.Or(r.User.GetExtra()["auth_provider_namespace"]...)
 }
 
 func (r *Context) UserTimezone() string {

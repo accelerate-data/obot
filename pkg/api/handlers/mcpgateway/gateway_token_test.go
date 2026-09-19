@@ -8,8 +8,6 @@ import (
 	"time"
 
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
-	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/system"
@@ -136,145 +134,22 @@ func TestGatewayTokenUsesExactServerAudienceBelowBasePath(t *testing.T) {
 	require.Equal(t, "https://studio.example.test/obot/mcp-connect/ms1server", minted.Audience)
 }
 
-func TestProxyReplacesInboundStudioBearerForNanobotAgent(t *testing.T) {
-	receivedAuthorization := make(chan string, 1)
-	nanobot := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
-		receivedAuthorization <- request.Header.Get("Authorization")
-		rw.WriteHeader(http.StatusNoContent)
-	}))
-	t.Cleanup(nanobot.Close)
-	handler := Handler{
-		transport: http.DefaultTransport,
-		resolveServer: func(api.Context) (resolvedServer, error) {
-			return resolvedServer{
-				mcpID: "ms1server",
-				config: mcp.ServerConfig{
-					URL:              nanobot.URL,
-					MCPServerName:    "ms1server",
-					NanobotAgentName: "studio-agent",
-					Audiences:        []string{"https://obot.example.test/mcp-connect/ms1server"},
-				},
-			}, nil
-		},
-		mintToken: func(context.Context, persistent.TokenContext) (string, error) {
-			return "scoped-gateway-token", nil
-		},
-	}
-	req, response := authenticatedProxyContext()
+func TestWithGatewayTokenReplacesInboundBearer(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://obot.test/mcp-connect/ms1server", nil)
+	req.Header.Set("Authorization", "Bearer studio-iat")
 
-	err := handler.Proxy(req)
+	ctx := withGatewayToken(req.Context(), req, "scoped-gateway-token")
 
-	require.NoError(t, err)
-	require.Equal(t, http.StatusNoContent, response.Code)
-	require.Equal(t, "Bearer scoped-gateway-token", <-receivedAuthorization)
+	require.Equal(t, "Bearer scoped-gateway-token", req.Header.Get("Authorization"))
+	require.Equal(t, "scoped-gateway-token", nmcp.TokenFromContext(ctx))
 }
 
-func TestProxyReplacesInboundStudioBearerForEmbeddedNanobot(t *testing.T) {
-	receivedAuthorization := make(chan string, 1)
-	receivedToken := make(chan string, 1)
-	var minted persistent.TokenContext
-	handler := Handler{
-		resolveServer: func(api.Context) (resolvedServer, error) {
-			return resolvedServer{
-				mcpID: "msi1user-server",
-				config: mcp.ServerConfig{
-					MCPServerName: "ms1server",
-					Audiences:     []string{"https://obot.example.test/mcp-connect/ms1server"},
-				},
-			}, nil
-		},
-		mintToken: func(_ context.Context, tokenContext persistent.TokenContext) (string, error) {
-			minted = tokenContext
-			return "scoped-gateway-token", nil
-		},
-		nanobot: http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
-			receivedAuthorization <- request.Header.Get("Authorization")
-			receivedToken <- nmcp.TokenFromContext(request.Context())
-			rw.WriteHeader(http.StatusNoContent)
-		}),
-	}
-	req, response := authenticatedProxyContext()
+func TestWithGatewayTokenRemovesInboundBearerWhenAuthenticationIsDisabled(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://obot.test/mcp-connect/ms1server", nil)
+	req.Header.Set("Authorization", "Bearer studio-iat")
 
-	err := handler.Proxy(req)
+	ctx := withGatewayToken(req.Context(), req, "")
 
-	require.NoError(t, err)
-	require.Equal(t, http.StatusNoContent, response.Code)
-	require.Equal(t, "Bearer scoped-gateway-token", <-receivedAuthorization)
-	require.Equal(t, "scoped-gateway-token", <-receivedToken)
-	require.Equal(t, "msi1user-server", minted.MCPID)
-	require.Equal(t, "https://obot.example.test/mcp-connect/ms1server", minted.Audience)
-}
-
-func TestProxyRemovesInboundStudioBearerWhenAuthenticationIsDisabled(t *testing.T) {
-	receivedAuthorization := make(chan string, 1)
-	handler := Handler{
-		resolveServer: func(api.Context) (resolvedServer, error) {
-			return resolvedServer{
-				mcpID:  "ms1server",
-				config: mcp.ServerConfig{MCPServerName: "ms1server"},
-			}, nil
-		},
-		mintToken: func(context.Context, persistent.TokenContext) (string, error) {
-			return "unexpected", nil
-		},
-		nanobot: http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
-			receivedAuthorization <- request.Header.Get("Authorization")
-			require.Empty(t, nmcp.TokenFromContext(request.Context()))
-			rw.WriteHeader(http.StatusNoContent)
-		}),
-	}
-	req, response := authenticatedProxyContext()
-
-	err := handler.Proxy(req)
-
-	require.NoError(t, err)
-	require.Equal(t, http.StatusNoContent, response.Code)
-	require.Empty(t, <-receivedAuthorization)
-}
-
-func TestProxyRemovesInboundStudioBearerForNanobotAgentWhenAuthenticationIsDisabled(t *testing.T) {
-	receivedAuthorization := make(chan string, 1)
-	nanobot := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, request *http.Request) {
-		receivedAuthorization <- request.Header.Get("Authorization")
-		rw.WriteHeader(http.StatusNoContent)
-	}))
-	t.Cleanup(nanobot.Close)
-	handler := Handler{
-		transport: http.DefaultTransport,
-		resolveServer: func(api.Context) (resolvedServer, error) {
-			return resolvedServer{
-				mcpID: "ms1server",
-				config: mcp.ServerConfig{
-					URL:              nanobot.URL,
-					MCPServerName:    "ms1server",
-					NanobotAgentName: "studio-agent",
-				},
-			}, nil
-		},
-		mintToken: func(context.Context, persistent.TokenContext) (string, error) {
-			return "unexpected", nil
-		},
-	}
-	req, response := authenticatedProxyContext()
-
-	err := handler.Proxy(req)
-
-	require.NoError(t, err)
-	require.Equal(t, http.StatusNoContent, response.Code)
-	require.Empty(t, <-receivedAuthorization)
-}
-
-func authenticatedProxyContext() (api.Context, *httptest.ResponseRecorder) {
-	request := httptest.NewRequest(http.MethodPost, "http://obot.test/mcp-connect/ms1server", nil)
-	request.Header.Set("Authorization", "Bearer studio-iat")
-	request.SetPathValue("mcp_id", "ms1server")
-	response := httptest.NewRecorder()
-	return api.Context{
-		ResponseWriter: response,
-		Request:        request,
-		User: &user.DefaultInfo{
-			UID:    "42",
-			Groups: []string{types.GroupAuthenticated},
-		},
-	}, response
+	require.Empty(t, req.Header.Get("Authorization"))
+	require.Empty(t, nmcp.TokenFromContext(ctx))
 }

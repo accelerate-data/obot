@@ -7,7 +7,10 @@ import (
 
 const (
 	// MCPOAuthCredentialContextPrefix is the credential context prefix for MCP OAuth credentials
-	MCPOAuthCredentialContextPrefix   = "mcp-oauth"
+	MCPOAuthCredentialContextPrefix = "mcp-oauth"
+	// StaticOAuthCredentialName is the credential name for an MCP server's static OAuth client, stored
+	// in the context returned by MCPOAuthCredentialName.
+	StaticOAuthCredentialName         = "oauth"
 	MCPStaticOAuthCatalogMutationLock = "mcp-static-oauth-catalog-mutation"
 	OAuthClientIDMetadataPath         = "/oauth/client-metadata.json"
 )
@@ -46,5 +49,9 @@ func MCPOAuthCallbackURL(serverURL string) string {
 }
 
 func OAuthClientIDMetadataURL(serverURL string) string {
+	if !strings.HasPrefix(serverURL, "https://") {
+		// Client Metadata is only supported for HTTPS.
+		return ""
+	}
 	return strings.TrimRight(serverURL, "/") + OAuthClientIDMetadataPath
 }

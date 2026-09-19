@@ -11,20 +11,16 @@
 	} from '$lib/services';
 	import type { EventStreamService } from '$lib/services/admin/eventstream.svelte';
 	import {
-		convertCompositeInfoToLaunchFormData,
-		convertCompositeLaunchFormDataToPayload,
 		convertEnvHeadersToRecord,
 		getMCPDisplayName,
+		getManifestConfiguration,
 		getSecretBindingEngineError,
 		hasSecretBinding,
 		isDeprecatedMCPServer,
 		isKubernetesRuntimeBackend
 	} from '$lib/services/user/mcp';
 	import { errors, version } from '$lib/stores';
-	import CatalogConfigureForm, {
-		type CompositeLaunchFormData,
-		type LaunchFormData
-	} from './CatalogConfigureForm.svelte';
+	import CatalogConfigureForm, { type LaunchFormData } from './CatalogConfigureForm.svelte';
 	import CatalogEditAliasForm from './CatalogEditAliasForm.svelte';
 	import { CircleAlert } from '@lucide/svelte';
 	import { fade } from 'svelte/transition';
@@ -36,7 +32,7 @@
 	let { onUpdateConfigure }: Props = $props();
 
 	let configDialog = $state<ReturnType<typeof CatalogConfigureForm>>();
-	let configureForm = $state<LaunchFormData | CompositeLaunchFormData>();
+	let configureForm = $state<LaunchFormData>();
 	let editAliasDialog = $state<ReturnType<typeof CatalogEditAliasForm>>();
 
 	let entry = $state<MCPCatalogEntry>();
@@ -109,8 +105,8 @@
 		};
 		const updated = {
 			...manifest,
-			env: manifest.env?.map((field) => {
-				const formField = envByKey.get(field.key);
+			config: manifest.config?.map((field) => {
+				const formField = (field.usage === 'header' ? headerByKey : envByKey).get(field.key);
 				if (!formField?.secretBinding) return withoutSecretBinding(field);
 				return { ...field, value: '', secretBinding: formField.secretBinding };
 			})
@@ -118,12 +114,7 @@
 		if (manifest.remoteConfig) {
 			updated.remoteConfig = {
 				...manifest.remoteConfig,
-				...(form.url?.trim() ? { url: form.url.trim() } : {}),
-				headers: manifest.remoteConfig.headers?.map((field) => {
-					const formField = headerByKey.get(field.key);
-					if (!formField?.secretBinding) return withoutSecretBinding(field);
-					return { ...field, value: '', secretBinding: formField.secretBinding };
-				})
+				...(form.url?.trim() ? { url: form.url.trim() } : {})
 			};
 		}
 		return updated as unknown as MCPCatalogServerManifest['manifest'];
@@ -143,11 +134,6 @@
 			? undefined
 			: getSecretBindingEngineError(initServer.manifest);
 
-		if (entry?.manifest.runtime === 'composite') {
-			configureForm = await convertCompositeInfoToLaunchFormData(server);
-			configDialog?.open();
-			return;
-		}
 		if (
 			isKubernetesRuntimeBackend(version.current.engine) &&
 			initServer.mcpCatalogID &&
@@ -174,15 +160,16 @@
 			}
 			values = {};
 		}
-		const templateEnvBindings = templateBindingByKey(entry?.manifest.env);
-		const templateHeaderBindings = templateBindingByKey(entry?.manifest.remoteConfig?.headers);
+		const templateConfiguration = getManifestConfiguration(entry?.manifest);
+		const templateEnvBindings = templateBindingByKey(templateConfiguration.env);
+		const templateHeaderBindings = templateBindingByKey(templateConfiguration.headers);
 		configureForm = {
 			name: server.alias || '',
-			envs: server.manifest.env?.map((env) => ({
+			envs: getManifestConfiguration(server.manifest).env?.map((env) => ({
 				...markPinnedSecretBinding(env, templateEnvBindings),
 				value: values[env.key] ?? ''
 			})),
-			headers: server.manifest.remoteConfig?.headers?.map((header) => ({
+			headers: getManifestConfiguration(server.manifest).headers?.map((header) => ({
 				...markPinnedSecretBinding(header, templateHeaderBindings),
 				value: values[header.key] ?? '',
 				isStatic: header.value !== ''
@@ -240,14 +227,15 @@
 			values = {};
 		}
 
-		const templateEnvBindings = templateBindingByKey(entry?.manifest.env);
-		const templateHeaderBindings = templateBindingByKey(entry?.manifest.remoteConfig?.headers);
+		const templateConfiguration = getManifestConfiguration(entry?.manifest);
+		const templateEnvBindings = templateBindingByKey(templateConfiguration.env);
+		const templateHeaderBindings = templateBindingByKey(templateConfiguration.headers);
 		const form: LaunchFormData = {
-			envs: updatedServer.manifest.env?.map((env) => ({
+			envs: getManifestConfiguration(updatedServer.manifest).env?.map((env) => ({
 				...markPinnedSecretBinding(env, templateEnvBindings),
 				value: values[env.key] ?? ''
 			})),
-			headers: updatedServer.manifest.remoteConfig?.headers?.map((header) => ({
+			headers: getManifestConfiguration(updatedServer.manifest).headers?.map((header) => ({
 				...markPinnedSecretBinding(header, templateHeaderBindings),
 				value: values[header.key] ?? '',
 				isStatic: header.value !== ''
@@ -438,16 +426,6 @@
 		server = await configureSharedServer(server, envs);
 	}
 
-	async function updateExistingComposite(lf: CompositeLaunchFormData) {
-		if (!server) return;
-		// Composite flow using CatalogConfigureForm data
-		if ('componentConfigs' in lf) {
-			const payload = convertCompositeLaunchFormDataToPayload(lf);
-			await UserService.configureCompositeMcpServer(server.id, payload);
-		}
-		await updateServerAlias(lf.name?.trim() ?? '');
-	}
-
 	async function handleConfigureForm() {
 		if (!server) return;
 		if (!configureForm) return;
@@ -458,12 +436,8 @@
 			if (mode === 'catalog-update') {
 				const lf = configureForm as LaunchFormData;
 				await configureUpdatedCatalogServer(lf);
-			} else if (entry?.manifest.runtime === 'composite') {
-				const lf = configureForm as CompositeLaunchFormData;
-				await updateExistingComposite(lf);
 			} else {
-				const lf = configureForm as LaunchFormData;
-				await updateExistingRemoteOrSingleUser(lf);
+				await updateExistingRemoteOrSingleUser(configureForm);
 			}
 			launchProgress = 100;
 			clearTimeout(timeout1);

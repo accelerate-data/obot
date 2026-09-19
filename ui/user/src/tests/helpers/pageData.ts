@@ -6,6 +6,7 @@ import {
 	appPreferences,
 	defaultModelAliases,
 	license as licenseStore,
+	productTelemetryConsent,
 	profile,
 	userDeviceSettings,
 	version
@@ -37,6 +38,7 @@ export function createMockProfile(groups: string[] = [Group.ADMIN]): Profile {
 		hasAdminAccess: () => groups.includes(Group.ADMIN) || groups.includes(Group.AUDITOR),
 		isAdmin: () => groups.includes(Group.ADMIN),
 		isAdminReadonly: () => !groups.includes(Group.ADMIN) && groups.includes(Group.AUDITOR),
+		isOwner: () => groups.includes(Group.OWNER),
 		isBootstrapUser: () => false
 	};
 }
@@ -60,6 +62,8 @@ export function createPageData<T = LayoutData>(overrides: PageDataOverrides = {}
 		defaultModelAliases: listDefaultModelAliasesResponse,
 		models: listModelsResponse,
 		appNotification: getAppNotificationResponse,
+		productTelemetryConsent: { consent: false },
+		productTelemetryConsentAvailable: true,
 		...overrides
 	} as T;
 }
@@ -82,6 +86,10 @@ export async function initializePageStores(data: LayoutData) {
 	if (data.appNotification) {
 		await appNotification.initialize(data.appNotification);
 	}
+	productTelemetryConsent.initialize(
+		data.productTelemetryConsent,
+		data.productTelemetryConsentAvailable
+	);
 
 	licenseStore.initialize(data.license);
 

@@ -1,23 +1,43 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import Layout from '$lib/components/Layout.svelte';
 	import McpServerEntryForm from '$lib/components/admin/McpServerEntryForm.svelte';
-	import McpDeprecatedNotice from '$lib/components/mcp/McpDeprecatedNotice.svelte';
-	import McpServerActions from '$lib/components/mcp/McpServerActions.svelte';
+	import McpDetachedNotice from '$lib/components/mcp/McpDetachedNotice.svelte';
 	import { VirtualPageViewport } from '$lib/components/ui/virtual-page';
-	import { PAGE_TRANSITION_DURATION } from '$lib/constants';
-	import { getMCPDisplayName, isDeprecatedMCPServer } from '$lib/services/user/mcp';
-	import type { Component } from 'svelte';
+	import { DEFAULT_MCP_CATALOG_ID, PAGE_TRANSITION_DURATION } from '$lib/constants';
+	import { AdminService } from '$lib/services';
+	import { getMCPDisplayName } from '$lib/services/user/mcp.js';
+	import { profile } from '$lib/stores';
+	import { isConnectorsNavigation } from '../../../../utils.js';
+	import { type Component } from 'svelte';
 	import { fly } from 'svelte/transition';
 
 	const duration = PAGE_TRANSITION_DURATION;
 
 	let { data } = $props();
-	let { workspaceId, catalogEntry, mcpServer } = $derived(data);
+	let { catalogEntry, mcpServer } = $derived(data);
+
+	let sourceEntity = $derived(
+		catalogEntry?.powerUserWorkspaceID ? ('workspace' as const) : ('catalog' as const)
+	);
+	let sourceID = $derived(catalogEntry?.powerUserWorkspaceID || DEFAULT_MCP_CATALOG_ID);
+
+	let isAdminReadonly = $derived(profile.current.isAdminReadonly?.());
+	let isSourcedEntry = $derived(
+		catalogEntry && 'sourceURL' in catalogEntry && !!catalogEntry.sourceURL
+	);
+	let preview = $derived(isConnectorsNavigation(page.url));
+
+	async function acceptOwnership() {
+		if (!catalogEntry) return;
+		catalogEntry = await AdminService.acceptMCPCatalogEntryOwnership(
+			DEFAULT_MCP_CATALOG_ID,
+			catalogEntry.id
+		);
+	}
+
 	let title = $derived(
 		getMCPDisplayName(mcpServer) || getMCPDisplayName(catalogEntry) || 'MCP Server'
-	);
-	let deprecated = $derived(
-		isDeprecatedMCPServer(catalogEntry) || isDeprecatedMCPServer(mcpServer)
 	);
 </script>
 
@@ -29,31 +49,28 @@
 	{title}
 	showBackButton
 >
-	{#snippet rightNavActions()}
-		<McpServerActions entry={catalogEntry} server={mcpServer} />
-	{/snippet}
 	<div class="flex h-full flex-col gap-6" in:fly={{ x: 100, delay: duration, duration }}>
-		<McpDeprecatedNotice {deprecated} variant="notification" />
-
-		{#if catalogEntry}
-			<McpServerEntryForm
-				entry={catalogEntry}
-				server={mcpServer}
-				type={catalogEntry?.manifest.runtime === 'composite'
-					? 'composite'
-					: catalogEntry?.manifest.runtime === 'remote'
-						? 'remote'
-						: 'hosted'}
-				readonly={catalogEntry && 'sourceURL' in catalogEntry && !!catalogEntry.sourceURL}
-				id={workspaceId}
-				entity="workspace"
-				connectOnly
-				limitViews={['overview', 'tools']}
+		{#if profile.current.hasAdminAccess?.()}
+			<McpDetachedNotice
+				detached={catalogEntry?.detached}
+				sourceURL={catalogEntry?.sourceURL}
+				variant="notification"
+				onAcceptOwnership={isAdminReadonly ? undefined : acceptOwnership}
 			/>
 		{/if}
+
+		<McpServerEntryForm
+			entry={catalogEntry}
+			server={mcpServer}
+			type={catalogEntry?.manifest.runtime === 'remote' ? 'remote' : 'hosted'}
+			readonly={isAdminReadonly || isSourcedEntry}
+			id={sourceID}
+			entity={sourceEntity}
+			limitViews={preview ? ['overview', 'tools'] : undefined}
+		/>
 	</div>
 </Layout>
 
 <svelte:head>
-	<title>Obot | {title}</title>
+	<title>Obot | {catalogEntry?.manifest?.name ?? 'MCP Server'}</title>
 </svelte:head>

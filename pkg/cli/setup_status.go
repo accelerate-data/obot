@@ -14,11 +14,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var setupCapabilities = []string{
-	"setup.nonInteractive",
-	"setup.detectClients",
-	"setup.progressJSON",
-}
+var (
+	setupCapabilities = []string{
+		"setup.nonInteractive",
+		"setup.detectClients",
+		"setup.progressJSON",
+	}
+)
 
 type setupTokenValidator func(context.Context, string) (bool, error)
 
@@ -26,6 +28,29 @@ type SetupStatus struct {
 	JSON bool `usage:"Print status as JSON"`
 
 	tokenValid setupTokenValidator
+}
+
+type setupStatusOutput struct {
+	Version       string   `json:"version"`
+	Capabilities  []string `json:"capabilities"`
+	DefaultURL    string   `json:"defaultURL"`
+	TokenValid    bool     `json:"tokenValid"`
+	SetupComplete bool     `json:"setupComplete"`
+}
+
+type SetupDetectClients struct {
+	JSON bool `usage:"Print detected clients as JSON"`
+}
+
+type setupDetectClientsOutput struct {
+	Clients []setupDetectedClient `json:"clients"`
+}
+
+type setupDetectedClient struct {
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+	State       string `json:"state"`
+	Reason      string `json:"reason"`
 }
 
 func (s *SetupStatus) Customize(cmd *cobra.Command) {
@@ -80,18 +105,6 @@ func (s *SetupStatus) status(ctx context.Context) (setupStatusOutput, error) {
 	}, nil
 }
 
-type setupStatusOutput struct {
-	Version       string   `json:"version"`
-	Capabilities  []string `json:"capabilities"`
-	DefaultURL    string   `json:"defaultURL"`
-	TokenValid    bool     `json:"tokenValid"`
-	SetupComplete bool     `json:"setupComplete"`
-}
-
-type SetupDetectClients struct {
-	JSON bool `usage:"Print detected clients as JSON"`
-}
-
 func (s *SetupDetectClients) Customize(cmd *cobra.Command) {
 	cmd.Use = "detect-clients"
 	cmd.Short = "Detect supported local clients"
@@ -133,17 +146,6 @@ func detectSetupClients(ctx context.Context) setupDetectClientsOutput {
 		})
 	}
 	return result
-}
-
-type setupDetectClientsOutput struct {
-	Clients []setupDetectedClient `json:"clients"`
-}
-
-type setupDetectedClient struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"displayName"`
-	State       string `json:"state"`
-	Reason      string `json:"reason"`
 }
 
 func writeJSON(cmd *cobra.Command, value any) error {

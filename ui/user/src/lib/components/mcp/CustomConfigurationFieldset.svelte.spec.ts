@@ -22,6 +22,7 @@ async function renderFieldset(
 		serverUserType: 'singleUser' | 'multiUser';
 		readonly: boolean;
 		showRequired: boolean;
+		showInvalid: boolean;
 	}> = {}
 ) {
 	await render(CustomConfigurationFieldset, {
@@ -84,6 +85,45 @@ describe('CustomConfigurationFieldset.svelte', () => {
 			.toHaveAttribute('aria-invalid', 'true');
 	});
 
+	it('clears a secret binding when switching to options', async () => {
+		const data: MCPSubField & { secretBindingSource?: string } = field({
+			key: 'API_KEY',
+			secretBinding: { name: 'api-credentials', key: 'api-key' }
+		});
+		data.secretBindingSource = 'secret';
+		await renderFieldset({ data });
+
+		await page.getByCSS('#env-value-type-test').click();
+		await page.getByRole('button', { name: 'Options', exact: true }).click();
+
+		expect(data.secretBinding).toBeUndefined();
+		expect(data.secretBindingSource).toBe('value');
+		expect(data.options).toEqual([{ name: '', value: '', description: '' }]);
+	});
+
+	it('shows an error on duplicate option values after invalid validation', async () => {
+		await renderFieldset({
+			data: field({
+				key: 'REGION',
+				options: [
+					{ name: 'United States', value: 'us' },
+					{ name: 'US fallback', value: 'us' }
+				]
+			}),
+			showInvalid: true
+		});
+
+		await expect
+			.element(page.getByCSS('#env-option-value-test-0'))
+			.not.toHaveAttribute('aria-invalid', 'true');
+		await expect
+			.element(page.getByCSS('#env-option-value-test-1'))
+			.toHaveAttribute('aria-invalid', 'true');
+		await expect
+			.element(page.getByCSS('#env-option-value-test-1-error'))
+			.toHaveTextContent('Option values must be unique.');
+	});
+
 	it('omits aria-required when the fieldset is readonly', async () => {
 		await renderFieldset({
 			data: field({ key: 'API_KEY', value: 'secret', required: true }),
@@ -94,5 +134,31 @@ describe('CustomConfigurationFieldset.svelte', () => {
 			.element(page.getByRole('textbox', { name: 'Key' }))
 			.not.toHaveAttribute('aria-required');
 		await expect.element(page.getByLabelText('Static Value')).not.toHaveAttribute('aria-required');
+	});
+
+	it('shows an existing secret binding when the fieldset is readonly without binding targets', async () => {
+		await renderFieldset({
+			data: field({
+				key: 'EXA_API_KEY',
+				secretBinding: { name: 'my-secret', key: 'api_key' }
+			}),
+			readonly: true
+		});
+
+		const valueSource = page.getByCSS('#secret-binding-source-EXA_API_KEY');
+		const secret = page.getByCSS('#secret-binding-secret-EXA_API_KEY');
+		const secretKey = page.getByCSS('#secret-binding-key-EXA_API_KEY');
+
+		await expect.element(valueSource).toHaveTextContent('Kubernetes Secret');
+		await expect.element(secret).toHaveTextContent('my-secret');
+		await expect.element(secretKey).toHaveTextContent('api_key');
+		await expect.element(secret).not.toHaveTextContent('not available');
+		await expect.element(secretKey).not.toHaveTextContent('not available');
+		await expect.element(valueSource).toHaveAttribute('tabindex', '-1');
+		await expect.element(secret).toHaveAttribute('tabindex', '-1');
+		await expect.element(secretKey).toHaveAttribute('tabindex', '-1');
+		await expect.element(valueSource).toHaveClass(/opacity-50/);
+		await expect.element(secret).toHaveClass(/opacity-50/);
+		await expect.element(secretKey).toHaveClass(/opacity-50/);
 	});
 });

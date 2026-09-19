@@ -37,6 +37,8 @@ type fakeSkillRepositoryCredentialClient struct {
 	credential gatewaytypes.Credential
 }
 
+type credentialNotFoundClient struct{}
+
 func newHandlerTestGateway(t *testing.T) *gclient.Client {
 	t.Helper()
 	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
@@ -69,8 +71,6 @@ func TestRevealSkillRepositoryToken(t *testing.T) {
 	_, err = revealSkillRepositoryToken(t.Context(), credentialNotFoundClient{}, skill)
 	require.NoError(t, err)
 }
-
-type credentialNotFoundClient struct{}
 
 func (credentialNotFoundClient) RevealCredential(_ context.Context, contexts []string, name string) (gatewaytypes.Credential, error) {
 	return gatewaytypes.Credential{}, gclient.CredentialNotFoundError{Contexts: contexts, Name: name}
@@ -614,13 +614,13 @@ func newFakeStorage(t *testing.T, objects ...kclient.Object) kclient.WithWatch {
 	return builder.Build()
 }
 
-func testUser(userID string, groups ...string) kuser.Info {
+func testUser(userID string) kuser.Info {
 	return &kuser.DefaultInfo{
 		Name:   userID,
 		UID:    userID,
 		Groups: []string{types.GroupBasic, types.GroupAuthenticated},
 		Extra: map[string][]string{
-			"auth_provider_groups": groups,
+			"auth_provider_groups": nil,
 		},
 	}
 }

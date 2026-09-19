@@ -75,13 +75,31 @@ export const dialogAnimation: Action<HTMLDialogElement, DialogAnimationParams> =
 	const originalShow = node.show;
 	const originalClose = node.close;
 
+	let closingContentAnimation: Animation | undefined;
+	let closingBackdropAnimation: Animation | undefined;
+
+	const cancelClosingAnimations = () => {
+		closingContentAnimation?.cancel();
+		closingContentAnimation = undefined;
+		closingBackdropAnimation?.cancel();
+		closingBackdropAnimation = undefined;
+	};
+
 	node.showModal = function () {
-		// Keep the guide panel interactive: modal dialogs inert the document and their
-		// ::backdrop covers the full viewport in the top layer.
-		if (shouldOpenDialogNonModal(node)) {
-			originalShow.call(node);
-		} else {
-			originalShowModal.call(node);
+		cancelClosingAnimations();
+		// Reopening mid-close means the dialog never actually closed, and showModal() throws on an
+		// already-open dialog.
+		const interruptedClose = node.hasAttribute('closing');
+		node.removeAttribute('closing');
+
+		// Mid-close the element is still open; skip showModal() so it does not throw.
+		// A close() on an already-closed dialog can also leave `closing` set — still show.
+		if (!interruptedClose || !node.open) {
+			if (shouldOpenDialogNonModal(node)) {
+				originalShow.call(node);
+			} else {
+				originalShowModal.call(node);
+			}
 		}
 
 		const backdrop = getBackdropElement();
@@ -104,7 +122,7 @@ export const dialogAnimation: Action<HTMLDialogElement, DialogAnimationParams> =
 
 	// Override the dialog.close method
 	node.close = function () {
-		if (node.hasAttribute('closing')) return;
+		if (!node.open || node.hasAttribute('closing')) return;
 		node.setAttribute('closing', '');
 
 		const content = getContentElement();
@@ -121,14 +139,20 @@ export const dialogAnimation: Action<HTMLDialogElement, DialogAnimationParams> =
 			type === 'drawer' ? drawerOut : type === 'slide' ? slideOut : fadeOut,
 			getAnimationOptions(type)
 		);
+		closingContentAnimation = contentAnimation;
 
 		// Keep backdrop visible when another dialog is taking over the overlay.
 		// Defer one frame so close-then-open in the same tick still detects the incoming dialog.
 		const animateBackdropOut = () => {
+			if (!node.hasAttribute('closing')) return;
+
 			if (hasOtherActiveDialog()) {
-				backdrop?.animate([{ opacity: 1 }], { duration: 0, fill: 'forwards' });
+				closingBackdropAnimation = backdrop?.animate([{ opacity: 1 }], {
+					duration: 0,
+					fill: 'forwards'
+				});
 			} else {
-				backdrop?.animate(backdropFadeOut, backdropAnimationOptions);
+				closingBackdropAnimation = backdrop?.animate(backdropFadeOut, backdropAnimationOptions);
 			}
 		};
 		requestAnimationFrame(animateBackdropOut);

@@ -8,10 +8,67 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
-	"github.com/obot-platform/obot/pkg/system"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+func TestServerToServerConfigComponentAuditLogs(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		spec      v1.MCPServerSpec
+		component bool
+	}{
+		{
+			name: "standalone",
+		},
+		{
+			name: "shared vMCP component",
+			spec: v1.MCPServerSpec{
+				VMCPID:          "vmcp1shared",
+				VMCPComponentID: "component",
+			},
+			component: true,
+		},
+		{
+			name: "dedicated vMCP component",
+			spec: v1.MCPServerSpec{
+				VMCPInstanceID:  "vmcpi1user",
+				VMCPComponentID: "component",
+			},
+			component: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := v1.MCPServer{
+				Name: "ms1server",
+				Spec: test.spec,
+			}
+			server.Spec.Manifest = types.MCPServerManifest{
+				Runtime: types.RuntimeRemote,
+				RemoteConfig: &types.RemoteRuntimeConfig{
+					URL: "https://example.com/mcp",
+				},
+			}
+			config, _, err := ServerToServerConfig(server, nil, "user", "scope", "default", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if config.ComponentMCPServer != test.component {
+				t.Fatalf("ComponentMCPServer = %v, want %v", config.ComponentMCPServer, test.component)
+			}
+			if ignored := config.AuditLogMetadata[AuditLogIgnore] == "true"; ignored != test.component {
+				t.Fatalf("audit ignore = %v, want %v", ignored, test.component)
+			}
+			if test.component {
+				if len(config.AuditLogMetadata) != 1 {
+					t.Fatalf("unexpected component audit attribution: %#v", config.AuditLogMetadata)
+				}
+			} else if config.AuditLogMetadata["mcpID"] != server.Name {
+				t.Fatalf("missing server audit attribution: %#v", config.AuditLogMetadata)
+			}
+		})
+	}
+}
 
 func TestCoreResourceRequirements(t *testing.T) {
 	t.Run("nil resources returns nil", func(t *testing.T) {
@@ -74,6 +131,7 @@ func assertQuantityEqual(t *testing.T, got, want resource.Quantity, name string)
 func TestServerToServerConfig_ContainerizedHealthzPath(t *testing.T) {
 	baseURL := "http://localhost:8080"
 	mcpServer := v1.MCPServer{
+		Name: "test-server",
 		Spec: v1.MCPServerSpec{
 			Manifest: types.MCPServerManifest{
 				Runtime: types.RuntimeContainerized,
@@ -85,10 +143,9 @@ func TestServerToServerConfig_ContainerizedHealthzPath(t *testing.T) {
 				},
 			},
 		},
+	}
 
-		Name: "test-server"}
-
-	config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", nil, nil, nil)
+	config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -97,6 +154,91 @@ func TestServerToServerConfig_ContainerizedHealthzPath(t *testing.T) {
 	}
 	if config.HealthzPath != "/healthz" {
 		t.Fatalf("expected healthz path /healthz, got %q", config.HealthzPath)
+	}
+}
+
+func TestServerToServerConfig_ConfigurationOptions(t *testing.T) {
+	manifest := types.MCPServerManifest{
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{Package: "example-server"},
+		Config: []types.MCPConfig{{Usage: types.Env,
+			Key:      "REGION",
+			Required: true,
+			Options:  []types.MCPConfigurationOption{{Name: "US", Value: "us"}}}},
+	}
+	server := v1.MCPServer{Name: "test-server", Spec: v1.MCPServerSpec{Manifest: manifest}}
+
+	_, missing, err := ServerToServerConfig(server, server.ValidConnectURLs("http://localhost:8080"), "test-user-id", "test-scope", "test-catalog", nil)
+	if err != nil {
+		t.Fatalf("expected missing option to be reported without an error, got %v", err)
+	}
+	if !slices.Equal(missing, []string{"REGION"}) {
+		t.Fatalf("expected REGION to be missing, got %v", missing)
+	}
+
+	_, _, err = ServerToServerConfig(server, server.ValidConnectURLs("http://localhost:8080"), "test-user-id", "test-scope", "test-catalog", map[string]string{"REGION": "stale"})
+	if err == nil || !strings.Contains(err.Error(), `env "REGION" value "stale" is not one of the configured options`) {
+		t.Fatalf("expected invalid option error, got %v", err)
+	}
+}
+
+func TestServerToServerConfigIgnoresStalePerUserOptionValues(t *testing.T) {
+	manifest := types.MCPServerManifest{
+		Runtime:      types.RuntimeRemote,
+		RemoteConfig: &types.RemoteRuntimeConfig{URL: "https://example.com/mcp"},
+		Config: []types.MCPConfig{
+			{
+				Key:         "X-REGION",
+				Usage:       types.Header,
+				UserAllowed: true,
+				Required:    true,
+				Options:     []types.MCPConfigurationOption{{Name: "US", Value: "us"}},
+			},
+		},
+	}
+	stale := map[string]string{"X-REGION": "stale"}
+	server := v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: manifest}}
+	config, missing, err := ServerToServerConfig(server, nil, "user", "scope", "catalog", stale)
+	if err != nil || len(missing) != 0 || len(config.Headers) != 0 || !slices.Equal(config.PassthroughHeaderNames, []string{"X-REGION"}) {
+		t.Fatalf("unexpected shared configuration: config=%#v missing=%v err=%v", config, missing, err)
+	}
+	instance := v1.MCPServerInstance{Spec: v1.MCPServerInstanceSpec{Config: manifest.UserConfig()}}
+	names, values, missing := serverInstanceHeaders(instance, stale)
+	if len(names) != 0 || len(values) != 0 || !slices.Equal(missing, []string{"X-REGION"}) {
+		t.Fatalf("invalid user selection was accepted: names=%v values=%v missing=%v", names, values, missing)
+	}
+	names, values, missing = serverInstanceHeaders(instance, map[string]string{"X-REGION": "us"})
+	if !slices.Equal(names, []string{"X-REGION"}) || !slices.Equal(values, []string{"us"}) || len(missing) != 0 {
+		t.Fatalf("valid user selection was rejected: names=%v values=%v missing=%v", names, values, missing)
+	}
+	server.Spec.Manifest.Config[0].UserAllowed = false
+	if _, _, err := ServerToServerConfig(server, nil, "user", "scope", "catalog", stale); err == nil {
+		t.Fatal("expected stale server-owned option value to be rejected")
+	}
+}
+
+func TestSystemServerToServerConfig_ConfigurationOptions(t *testing.T) {
+	manifest := types.SystemMCPServerManifest{
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: &types.NPXRuntimeConfig{Package: "example-server"},
+		Config: []types.MCPConfig{{Usage: types.Env,
+			Key:      "REGION",
+			Required: true,
+			Options:  []types.MCPConfigurationOption{{Name: "US", Value: "us"}}}},
+	}
+	server := v1.SystemMCPServer{Name: "test-system-server", Spec: v1.SystemMCPServerSpec{Manifest: manifest}}
+
+	_, missing, err := SystemServerToServerConfig(server, server.ValidConnectURLs("http://localhost:8080"), "test-user-id", nil)
+	if err != nil {
+		t.Fatalf("expected missing option to be reported without an error, got %v", err)
+	}
+	if !slices.Equal(missing, []string{"REGION"}) {
+		t.Fatalf("expected REGION to be missing, got %v", missing)
+	}
+
+	_, _, err = SystemServerToServerConfig(server, server.ValidConnectURLs("http://localhost:8080"), "test-user-id", map[string]string{"REGION": "stale"})
+	if err == nil || !strings.Contains(err.Error(), `env "REGION" value "stale" is not one of the configured options`) {
+		t.Fatalf("expected invalid option error, got %v", err)
 	}
 }
 
@@ -110,7 +252,7 @@ func TestServerToServerConfig_UsesStaticCatalogEnvValue(t *testing.T) {
 					Package: "example-server",
 					Args:    []string{"--token=${CATALOG_TOKEN}"},
 				},
-				Env: []types.MCPEnv{{
+				Config: []types.MCPConfig{{Usage: types.Env,
 					Key:      "CATALOG_TOKEN",
 					Value:    "catalog-value",
 					Prefix:   "Bearer ",
@@ -119,7 +261,8 @@ func TestServerToServerConfig_UsesStaticCatalogEnvValue(t *testing.T) {
 			},
 		},
 
-		Name: "test-server"}
+		Name: "test-server",
+	}
 
 	config, missing, err := ServerToServerConfig(
 		mcpServer,
@@ -127,8 +270,6 @@ func TestServerToServerConfig_UsesStaticCatalogEnvValue(t *testing.T) {
 		"test-user-id",
 		"test-scope",
 		"test-catalog",
-		nil,
-		nil,
 		nil,
 	)
 	if err != nil {
@@ -142,6 +283,77 @@ func TestServerToServerConfig_UsesStaticCatalogEnvValue(t *testing.T) {
 	}
 	if !slices.Equal(config.Args, []string{"example-server", "--token=catalog-value"}) {
 		t.Fatalf("expected static env value to expand runtime arguments, got %v", config.Args)
+	}
+}
+
+func TestServerToServerConfig_InterpolatedValueIsNotInjected(t *testing.T) {
+	server := v1.MCPServer{
+		Name: "test-server",
+		Spec: v1.MCPServerSpec{Manifest: types.MCPServerManifest{
+			Runtime:   types.RuntimeNPX,
+			NPXConfig: &types.NPXRuntimeConfig{Package: "example-server", Args: []string{"--tag=${TAG}"}},
+			Config:    []types.MCPConfig{{Key: "TAG", Value: "v1", Usage: types.Interpolated}},
+		}},
+	}
+
+	config, missing, err := ServerToServerConfig(server, nil, "user", "scope", "catalog", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 || len(config.Env) != 0 || !slices.Equal(config.Args, []string{"example-server", "--tag=v1"}) {
+		t.Fatalf("config = %#v, missing = %v", config, missing)
+	}
+}
+
+func TestFlattenedServerConfigurationUsages(t *testing.T) {
+	fields := []types.MCPConfig{
+		{
+			Key:   "TOKEN",
+			Usage: types.Env,
+			Value: "token",
+		},
+		{
+			Key:   "TAG",
+			Usage: types.Interpolated,
+			Value: "v1",
+		},
+		{
+			Key:   "STATIC_FILE",
+			Usage: types.File,
+			Value: "static contents",
+		},
+		{
+			Key:   "DYNAMIC_FILE",
+			Usage: types.DynamicFile,
+			Value: "dynamic contents",
+		},
+	}
+	runtime := &types.NPXRuntimeConfig{Package: "example-server", Args: []string{"--tag=${TAG}", "--token=${TOKEN}"}}
+	server := v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: types.MCPServerManifest{
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: runtime,
+		Config:    fields,
+	}}}
+	ordinary, missing, err := ServerToServerConfig(server, nil, "user", "scope", "catalog", nil)
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("server configuration: missing=%v err=%v", missing, err)
+	}
+	systemServer := v1.SystemMCPServer{Spec: v1.SystemMCPServerSpec{Manifest: types.SystemMCPServerManifest{
+		Runtime:   types.RuntimeNPX,
+		NPXConfig: runtime,
+		Config:    fields,
+	}}}
+	systemConfig, missing, err := SystemServerToServerConfig(systemServer, nil, "user", nil)
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("system configuration: missing=%v err=%v", missing, err)
+	}
+	for _, config := range []ServerConfig{ordinary, systemConfig} {
+		if !slices.Equal(config.Env, []string{"TOKEN=token"}) || !slices.Equal(config.Args, []string{"example-server", "--tag=v1", "--token=token"}) {
+			t.Fatalf("unexpected flattened configuration: env=%v args=%v", config.Env, config.Args)
+		}
+		if len(config.Files) != 2 || config.Files[0].EnvKey != "STATIC_FILE" || config.Files[0].Dynamic || config.Files[0].Data != "static contents" || config.Files[1].EnvKey != "DYNAMIC_FILE" || !config.Files[1].Dynamic || config.Files[1].Data != "dynamic contents" {
+			t.Fatalf("unexpected file configuration: %#v", config.Files)
+		}
 	}
 }
 
@@ -162,7 +374,7 @@ func TestServerToServerConfig_StartupTimeoutFromRuntimeConfig(t *testing.T) {
 
 		Name: "test-server"}
 
-	config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", nil, nil, nil)
+	config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -174,51 +386,11 @@ func TestServerToServerConfig_StartupTimeoutFromRuntimeConfig(t *testing.T) {
 	}
 }
 
-func TestServerToServerConfig_StaticOAuthCredentials(t *testing.T) {
-	mcpServer := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					URL: "https://example.com/mcp",
-				},
-			},
-		},
-
-		Name: "test-server"}
-
-	config, missing, err := ServerToServerConfig(
-		mcpServer,
-		mcpServer.ValidConnectURLs("https://obot.example.com"),
-		"test-user-id",
-		"test-scope",
-		"test-catalog",
-		nil,
-		nil,
-		map[string]string{
-			"CLIENT_ID":     "static-client-id",
-			"CLIENT_SECRET": "static-client-secret",
-		},
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(missing) != 0 {
-		t.Fatalf("expected no missing config, got %v", missing)
-	}
-	if config.StaticOAuthClientID != "static-client-id" {
-		t.Fatalf("StaticOAuthClientID = %q, want %q", config.StaticOAuthClientID, "static-client-id")
-	}
-	if config.StaticOAuthClientSecret != "static-client-secret" {
-		t.Fatalf("StaticOAuthClientSecret = %q, want %q", config.StaticOAuthClientSecret, "static-client-secret")
-	}
-}
-
 func TestServerToServerConfig_MultiUserPassthroughHeaders(t *testing.T) {
 	baseURL := "http://localhost:8080"
 	tests := []struct {
 		name     string
-		config   *types.MultiUserConfig
+		config   []types.MCPConfig
 		expected []string
 	}{
 		{
@@ -227,13 +399,18 @@ func TestServerToServerConfig_MultiUserPassthroughHeaders(t *testing.T) {
 		},
 		{
 			name: "user-defined headers",
-			config: &types.MultiUserConfig{
-				UserDefinedHeaders: []types.MCPHeader{
-					{Key: "X-Tenant-ID", Required: true},
-					{Key: "X-Account-ID"},
-				},
+			config: []types.MCPConfig{
+				{Key: "X-Tenant-ID", Usage: types.Header, UserAllowed: true, Required: true},
+				{Key: "X-Account-ID", Usage: types.Header, UserAllowed: true},
 			},
 			expected: []string{"X-Tenant-ID", "X-Account-ID"},
+		},
+		{
+			name: "per-user values are not shared",
+			config: []types.MCPConfig{
+				{Key: "X-Tenant-ID", Usage: types.Header, UserAllowed: true, Required: true, Value: "tenant"},
+			},
+			expected: []string{"X-Tenant-ID"},
 		},
 	}
 
@@ -246,18 +423,21 @@ func TestServerToServerConfig_MultiUserPassthroughHeaders(t *testing.T) {
 						RemoteConfig: &types.RemoteRuntimeConfig{
 							URL: "https://example.com/mcp",
 						},
-						MultiUserConfig: tt.config,
+						Config: tt.config,
 					},
 				},
 
 				Name: "test-server"}
 
-			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", nil, nil, nil)
+			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if len(missing) > 0 {
 				t.Fatalf("expected no missing config, got %v", missing)
+			}
+			if len(config.Headers) != 0 || len(config.Env) != 0 {
+				t.Fatalf("per-user headers must not be shared: headers=%v env=%v", config.Headers, config.Env)
 			}
 
 			if !slices.Equal(config.PassthroughHeaderNames, tt.expected) {
@@ -267,236 +447,19 @@ func TestServerToServerConfig_MultiUserPassthroughHeaders(t *testing.T) {
 	}
 }
 
-func TestServerToServerConfig_RemoteHeadersAreDeploymentConfigAndMultiUserHeadersArePassthrough(t *testing.T) {
-	baseURL := "http://localhost:8080"
-	requiredHeader := types.MCPHeader{Key: "X-API-Key", Required: true, Sensitive: true}
-	tests := []struct {
-		name                       string
-		manifest                   types.MCPServerManifest
-		credEnv                    map[string]string
-		expectedMissing            []string
-		expectedHeaders            []string
-		expectedPassthroughHeaders []string
-	}{
-		{
-			name: "remote header without deployment credential is missing server config",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					URL:     "https://example.com/mcp",
-					Headers: []types.MCPHeader{requiredHeader},
-				},
-			},
-			expectedMissing: []string{"X-API-Key"},
-		},
-		{
-			name: "multi-user header is passthrough and not missing server config",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					URL: "https://example.com/mcp",
-				},
-				MultiUserConfig: &types.MultiUserConfig{
-					UserDefinedHeaders: []types.MCPHeader{requiredHeader},
-				},
-			},
-			expectedPassthroughHeaders: []string{"X-API-Key"},
-		},
-		{
-			name: "remote header with deployment credential becomes server header",
-			manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeRemote,
-				RemoteConfig: &types.RemoteRuntimeConfig{
-					URL:     "https://example.com/mcp",
-					Headers: []types.MCPHeader{requiredHeader},
-				},
-			},
-			credEnv:         map[string]string{"X-API-Key": "server-secret"},
-			expectedHeaders: []string{"X-API-Key=server-secret"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mcpServer := v1.MCPServer{
-				Spec: v1.MCPServerSpec{
-					Manifest: tt.manifest,
-				},
-
-				Name: "test-server"}
-
-			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv, nil, nil)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if !slices.Equal(missing, tt.expectedMissing) {
-				t.Fatalf("expected missing config %v, got %v", tt.expectedMissing, missing)
-			}
-			if !slices.Equal(config.Headers, tt.expectedHeaders) {
-				t.Fatalf("expected server headers %v, got %v", tt.expectedHeaders, config.Headers)
-			}
-			if !slices.Equal(config.PassthroughHeaderNames, tt.expectedPassthroughHeaders) {
-				t.Fatalf("expected passthrough headers %v, got %v", tt.expectedPassthroughHeaders, config.PassthroughHeaderNames)
-			}
-		})
-	}
-}
-
-func TestCompositeServerToServerConfig_OmittedToolOverridesRemainNil(t *testing.T) {
-	baseURL := "http://localhost:8080"
-	mcpServer := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{ComponentServers: []types.ComponentServer{
-					{CatalogEntryID: "search"},
-				}},
-			},
-		},
-
-		Name: "composite"}
-	component := v1.MCPServer{Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "search"},
-		Name: "search-server"}
-
-	config, missing, err := CompositeServerToServerConfig(mcpServer, []v1.MCPServer{component}, nil, mcpServer.ValidConnectURLs(baseURL), 8080, "test-user-id", "test-scope", "test-catalog", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(missing) > 0 {
-		t.Fatalf("expected no missing config, got %v", missing)
-	}
-	if len(config.Components) != 1 {
-		t.Fatalf("expected one component, got %d", len(config.Components))
-	}
-	if len(config.Components[0].Tools) != 0 {
-		t.Fatalf("expected omitted tool overrides to have empty tools, got %#v", config.Components[0].Tools)
-	}
-	if config.Components[0].noTools {
-		t.Fatal("expected omitted tool overrides not to disable tools")
-	}
-}
-
-func TestCompositeServerToServerConfig_TokenExchangeConfig(t *testing.T) {
-	const baseURL = "https://obot.example.com"
-	mcpServer := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime:         types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{},
-			},
-		},
-
-		Name: "composite"}
-
-	config, missing, err := CompositeServerToServerConfig(
-		mcpServer,
-		nil,
-		nil,
-		mcpServer.ValidConnectURLs(baseURL),
-		8080,
-		"test-user-id",
-		"test-scope",
-		"test-catalog",
-		nil,
-		map[string]string{
-			"TOKEN_EXCHANGE_CLIENT_ID":     "client-id",
-			"TOKEN_EXCHANGE_CLIENT_SECRET": "client-secret",
-		},
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(missing) > 0 {
-		t.Fatalf("expected no missing config, got %v", missing)
-	}
-	if config.TokenExchangeClientID != "client-id" {
-		t.Fatalf("token exchange client ID = %q, want client-id", config.TokenExchangeClientID)
-	}
-	if config.TokenExchangeClientSecret != "client-secret" {
-		t.Fatalf("token exchange client secret = %q, want client-secret", config.TokenExchangeClientSecret)
-	}
-}
-
-func TestCompositeServerToServerConfig_AllDisabledToolOverridesSetNoTools(t *testing.T) {
-	baseURL := "http://localhost:8080"
-	mcpServer := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{ComponentServers: []types.ComponentServer{
-					{CatalogEntryID: "search", ToolOverrides: []types.ToolOverride{
-						{Name: "search", Enabled: false},
-					}},
-				}},
-			},
-		},
-
-		Name: "composite"}
-	component := v1.MCPServer{Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "search"},
-		Name: "search-server"}
-
-	config, missing, err := CompositeServerToServerConfig(mcpServer, []v1.MCPServer{component}, nil, mcpServer.ValidConnectURLs(baseURL), 8080, "test-user-id", "test-scope", "test-catalog", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(missing) > 0 {
-		t.Fatalf("expected no missing config, got %v", missing)
-	}
-	if len(config.Components) != 1 {
-		t.Fatalf("expected one component, got %d", len(config.Components))
-	}
-	if len(config.Components[0].Tools) != 0 {
-		t.Fatalf("expected all disabled tools to be filtered out, got %#v", config.Components[0].Tools)
-	}
-	if !config.Components[0].noTools {
-		t.Fatal("expected all disabled tool overrides to disable tools")
-	}
-}
-
-func TestCompositeServerToServerConfig_ConnectCompositeURL(t *testing.T) {
-	baseURL := "http://localhost:8080"
-	mcpServer := v1.MCPServer{
-		Spec: v1.MCPServerSpec{
-			Manifest: types.MCPServerManifest{
-				Runtime: types.RuntimeComposite,
-				CompositeConfig: &types.CompositeRuntimeConfig{ComponentServers: []types.ComponentServer{
-					{CatalogEntryID: "search"},
-				}},
-			},
-		},
-
-		Name: "composite"}
-	component := v1.MCPServer{Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "search"},
-		Name: "search-server"}
-
-	config, missing, err := CompositeServerToServerConfig(mcpServer, []v1.MCPServer{component}, nil, mcpServer.ValidConnectURLs(baseURL), 8080, "test-user-id", "test-scope", "test-catalog", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(missing) > 0 {
-		t.Fatalf("expected no missing config, got %v", missing)
-	}
-	if len(config.Components) != 1 {
-		t.Fatalf("expected one component, got %d", len(config.Components))
-	}
-	if config.URL != system.MCPConnectCompositeURL(mcpServer.Name, 8080) {
-		t.Fatalf("expected URL %s, got %s", system.MCPConnectCompositeURL(mcpServer.Name, 8080), config.URL)
-	}
-}
-
 func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 	baseURL := "http://localhost:8080"
 	tests := []struct {
 		name            string
-		headers         []types.MCPHeader
+		headers         []types.MCPConfig
 		credEnv         map[string]string
 		expectedHeaders []string
 		expectedMissing []string
 	}{
 		{
 			name: "static header only",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "Bearer static-token"},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "Bearer static-token"},
 			},
 			credEnv:         map[string]string{},
 			expectedHeaders: []string{"Authorization=Bearer static-token"},
@@ -504,8 +467,8 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "user-configurable header only",
-			headers: []types.MCPHeader{
-				{Key: "X-API-Key", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "X-API-Key", Required: true},
 			},
 			credEnv:         map[string]string{"X-API-Key": "user-key"},
 			expectedHeaders: []string{"X-API-Key=user-key"},
@@ -513,9 +476,9 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "mixed static and user-configurable",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "Bearer static-token"},
-				{Key: "X-API-Key", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "Bearer static-token"},
+				{Usage: types.Header, Key: "X-API-Key", Required: true},
 			},
 			credEnv:         map[string]string{"X-API-Key": "user-key"},
 			expectedHeaders: []string{"Authorization=Bearer static-token", "X-API-Key=user-key"},
@@ -523,9 +486,9 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "missing required user-configurable header",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "Bearer static-token"},
-				{Key: "X-API-Key", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "Bearer static-token"},
+				{Usage: types.Header, Key: "X-API-Key", Required: true},
 			},
 			credEnv:         map[string]string{},
 			expectedHeaders: []string{"Authorization=Bearer static-token"},
@@ -533,9 +496,9 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "optional user-configurable header missing",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "Bearer static-token"},
-				{Key: "X-Optional", Required: false},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "Bearer static-token"},
+				{Usage: types.Header, Key: "X-Optional", Required: false},
 			},
 			credEnv:         map[string]string{},
 			expectedHeaders: []string{"Authorization=Bearer static-token"},
@@ -543,8 +506,8 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "static header overrides credential",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "Bearer static-token"},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "Bearer static-token"},
 			},
 			credEnv:         map[string]string{"Authorization": "Bearer user-token"},
 			expectedHeaders: []string{"Authorization=Bearer static-token"},
@@ -552,8 +515,8 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "empty static value falls back to credential",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "", Required: true},
 			},
 			credEnv:         map[string]string{"Authorization": "Bearer user-token"},
 			expectedHeaders: []string{"Authorization=Bearer user-token"},
@@ -561,8 +524,8 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 		},
 		{
 			name: "empty credential value is ignored",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "", Required: true},
 			},
 			credEnv:         map[string]string{"Authorization": ""},
 			expectedHeaders: []string{},
@@ -577,15 +540,15 @@ func TestServerToServerConfig_StaticHeaders_Remote(t *testing.T) {
 					Manifest: types.MCPServerManifest{
 						Runtime: types.RuntimeRemote,
 						RemoteConfig: &types.RemoteRuntimeConfig{
-							URL:     "https://example.com/mcp",
-							Headers: tt.headers,
+							URL: "https://example.com/mcp",
 						},
+						Config: tt.headers,
 					},
 				},
 
 				Name: "test-server"}
 
-			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv, nil, nil)
+			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv)
 
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -652,7 +615,7 @@ func TestServerToServerConfig_RemoteTunnelName(t *testing.T) {
 
 		Name: "test-server"}
 
-	config, missing, err := ServerToServerConfig(mcpServer, nil, "test-user-id", "test-scope", "test-catalog", nil, nil, nil)
+	config, missing, err := ServerToServerConfig(mcpServer, nil, "test-user-id", "test-scope", "test-catalog", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -671,8 +634,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 	baseURL := "http://localhost:8080"
 	tests := []struct {
 		name            string
-		headers         []types.MCPHeader
-		env             []types.MCPEnv
+		headers         []types.MCPConfig
+		env             []types.MCPConfig
 		credEnv         map[string]string
 		expectedHeaders []string
 		expectedEnv     []string
@@ -680,8 +643,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 	}{
 		{
 			name: "header with prefix applied to user value",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Prefix: "Bearer ", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Prefix: "Bearer ", Required: true},
 			},
 			credEnv:         map[string]string{"Authorization": "my-token"},
 			expectedHeaders: []string{"Authorization=Bearer my-token"},
@@ -689,8 +652,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "header with prefix not applied to static value",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Value: "static-token", Prefix: "Bearer "},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Value: "static-token", Prefix: "Bearer "},
 			},
 			credEnv:         map[string]string{},
 			expectedHeaders: []string{"Authorization=static-token"},
@@ -698,8 +661,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "env var with Bearer prefix",
-			env: []types.MCPEnv{
-				{Key: "API_KEY", Prefix: "Bearer ", Required: true},
+			env: []types.MCPConfig{
+				{Usage: types.Env, Key: "API_KEY", Prefix: "Bearer ", Required: true},
 			},
 			credEnv:         map[string]string{"API_KEY": "secret-key-123"},
 			expectedEnv:     []string{"API_KEY=Bearer secret-key-123"},
@@ -707,8 +670,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "env var with sk- prefix (OpenAI style)",
-			env: []types.MCPEnv{
-				{Key: "OPENAI_API_KEY", Prefix: "sk-", Required: true},
+			env: []types.MCPConfig{
+				{Usage: types.Env, Key: "OPENAI_API_KEY", Prefix: "sk-", Required: true},
 			},
 			credEnv:         map[string]string{"OPENAI_API_KEY": "proj-abc123xyz"},
 			expectedEnv:     []string{"OPENAI_API_KEY=sk-proj-abc123xyz"},
@@ -716,13 +679,13 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "multiple headers and env vars with different prefixes",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Prefix: "Bearer ", Required: true},
-				{Key: "X-API-Key", Prefix: "Key ", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Prefix: "Bearer ", Required: true},
+				{Usage: types.Header, Key: "X-API-Key", Prefix: "Key ", Required: true},
 			},
-			env: []types.MCPEnv{
-				{Key: "TOKEN", Prefix: "Token ", Required: true},
-				{Key: "SECRET", Required: true}, // No prefix
+			env: []types.MCPConfig{
+				{Usage: types.Env, Key: "TOKEN", Prefix: "Token ", Required: true},
+				{Usage: types.Env, Key: "SECRET", Required: true}, // No prefix
 			},
 			credEnv: map[string]string{
 				"Authorization": "auth-token",
@@ -736,8 +699,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "prefix not applied when value is empty",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Prefix: "Bearer ", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Prefix: "Bearer ", Required: true},
 			},
 			credEnv:         map[string]string{},
 			expectedHeaders: []string{},
@@ -745,8 +708,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "prefix not duplicated when user already included it in header",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Prefix: "Bearer ", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Prefix: "Bearer ", Required: true},
 			},
 			credEnv:         map[string]string{"Authorization": "Bearer my-token"},
 			expectedHeaders: []string{"Authorization=Bearer my-token"},
@@ -754,8 +717,8 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "prefix not duplicated when user already included it in env var",
-			env: []types.MCPEnv{
-				{Key: "API_KEY", Prefix: "sk-", Required: true},
+			env: []types.MCPConfig{
+				{Usage: types.Env, Key: "API_KEY", Prefix: "sk-", Required: true},
 			},
 			credEnv:         map[string]string{"API_KEY": "sk-proj-abc123"},
 			expectedEnv:     []string{"API_KEY=sk-proj-abc123"},
@@ -763,12 +726,12 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 		},
 		{
 			name: "mixed - some with prefix already included, some without",
-			headers: []types.MCPHeader{
-				{Key: "Authorization", Prefix: "Bearer ", Required: true},
+			headers: []types.MCPConfig{
+				{Usage: types.Header, Key: "Authorization", Prefix: "Bearer ", Required: true},
 			},
-			env: []types.MCPEnv{
-				{Key: "API_KEY", Prefix: "sk-", Required: true},
-				{Key: "TOKEN", Prefix: "Token ", Required: true},
+			env: []types.MCPConfig{
+				{Usage: types.Env, Key: "API_KEY", Prefix: "sk-", Required: true},
+				{Usage: types.Env, Key: "TOKEN", Prefix: "Token ", Required: true},
 			},
 			credEnv: map[string]string{
 				"Authorization": "Bearer already-has-it",
@@ -788,16 +751,15 @@ func TestServerToServerConfig_WithPrefix(t *testing.T) {
 					Manifest: types.MCPServerManifest{
 						Runtime: types.RuntimeRemote,
 						RemoteConfig: &types.RemoteRuntimeConfig{
-							URL:     "https://example.com/mcp",
-							Headers: tt.headers,
+							URL: "https://example.com/mcp",
 						},
-						Env: tt.env,
+						Config: append(tt.env, tt.headers...),
 					},
 				},
 
 				Name: "test-server"}
 
-			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv, nil, nil)
+			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv)
 
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -855,9 +817,9 @@ func TestServerToServerConfig_StaticHeaders_EdgeCases(t *testing.T) {
 				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteRuntimeConfig{
 					URL: "https://example.com/mcp",
-					Headers: []types.MCPHeader{
-						{Key: "Authorization", Value: "Bearer token-with-special!@#$%^&*()characters"},
-					},
+				},
+				Config: []types.MCPConfig{
+					{Usage: types.Header, Key: "Authorization", Value: "Bearer token-with-special!@#$%^&*()characters"},
 				},
 			},
 			credEnv:         map[string]string{},
@@ -885,7 +847,7 @@ func TestServerToServerConfig_StaticHeaders_EdgeCases(t *testing.T) {
 
 				Name: "test-server"}
 
-			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv, nil, nil)
+			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv)
 
 			if tt.expectError {
 				if err == nil {
@@ -918,6 +880,111 @@ func TestServerToServerConfig_StaticHeaders_EdgeCases(t *testing.T) {
 						t.Errorf("missing header %d: expected %s, got %s", i, expected, missing[i])
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestServerToServerConfig_RemoteURLTemplate(t *testing.T) {
+	tests := []struct {
+		name         string
+		remoteConfig *types.RemoteRuntimeConfig
+		config       []types.MCPConfig
+		credEnv      map[string]string
+		expectedURL  string
+		expectedMiss []string
+	}{
+		{
+			name: "template expanded from configuration",
+			remoteConfig: &types.RemoteRuntimeConfig{
+				IsTemplate:  true,
+				URLTemplate: "https://${MIXPANEL_HOST}/mcp",
+			},
+			config: []types.MCPConfig{
+				{
+					Key:      "MIXPANEL_HOST",
+					Name:     "Data Region",
+					Usage:    types.Env,
+					Required: true,
+				},
+			},
+			credEnv:     map[string]string{"MIXPANEL_HOST": "mcp.mixpanel.com"},
+			expectedURL: "https://mcp.mixpanel.com/mcp",
+		},
+		{
+			name: "template expanded from a static catalog value",
+			remoteConfig: &types.RemoteRuntimeConfig{
+				IsTemplate:  true,
+				URLTemplate: "https://${MIXPANEL_HOST}/mcp",
+			},
+			config: []types.MCPConfig{
+				{
+					Key:   "MIXPANEL_HOST",
+					Name:  "Data Region",
+					Usage: types.Env,
+					Value: "mcp.eu.mixpanel.com",
+				},
+			},
+			expectedURL: "https://mcp.eu.mixpanel.com/mcp",
+		},
+		{
+			name: "unconfigured references are reported once as missing",
+			remoteConfig: &types.RemoteRuntimeConfig{
+				IsTemplate:  true,
+				URLTemplate: "https://${MIXPANEL_HOST}/mcp/${MIXPANEL_HOST}",
+			},
+			config: []types.MCPConfig{
+				{
+					Key:      "MIXPANEL_HOST",
+					Name:     "Data Region",
+					Usage:    types.Env,
+					Required: true,
+				},
+			},
+			expectedMiss: []string{"MIXPANEL_HOST"},
+		},
+		{
+			name: "persisted URL wins over the template",
+			remoteConfig: &types.RemoteRuntimeConfig{
+				IsTemplate:  true,
+				URL:         "https://mcp.mixpanel.com/mcp",
+				URLTemplate: "https://${MIXPANEL_HOST}/mcp",
+			},
+			config: []types.MCPConfig{
+				{
+					Key:   "MIXPANEL_HOST",
+					Name:  "Data Region",
+					Usage: types.Env,
+				},
+			},
+			credEnv:     map[string]string{"MIXPANEL_HOST": "mcp.eu.mixpanel.com"},
+			expectedURL: "https://mcp.mixpanel.com/mcp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mcpServer := v1.MCPServer{
+				Name: "test-server",
+				Spec: v1.MCPServerSpec{
+					VMCPComponentID: "component-1",
+					Manifest: types.MCPServerManifest{
+						Runtime:      types.RuntimeRemote,
+						Config:       tt.config,
+						RemoteConfig: tt.remoteConfig,
+					},
+				},
+			}
+
+			config, missing, err := ServerToServerConfig(mcpServer, nil, "test-user-id", "test-scope", "test-catalog", tt.credEnv)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !slices.Equal(missing, tt.expectedMiss) {
+				t.Fatalf("missing = %v, want %v", missing, tt.expectedMiss)
+			}
+			if config.URL != tt.expectedURL {
+				t.Fatalf("URL = %q, want %q", config.URL, tt.expectedURL)
 			}
 		})
 	}

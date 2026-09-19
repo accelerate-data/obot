@@ -1,10 +1,10 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -29,9 +29,17 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	"k8s.io/apiserver/pkg/storage/value"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type oauthServerListErrorStorage struct {
+	storage.Client
+}
+
+type toggleCredentialWriteErrorTransformer struct {
+	failWrite bool
+}
 
 func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *testing.T) {
 	provider := newStaticOAuthTestProvider(t)
@@ -82,6 +90,17 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	if authURL.Query().Get("state") == "" || authURL.Query().Get("state") == started["testState"] {
 		t.Fatalf("callback state was missing or reused the body-only test state: %s", authURL.RawQuery)
 	}
+	resourceURL := provider.URL + "/resource"
+	if authURL.Query().Get("resource") != resourceURL {
+		t.Fatalf("authorization resource = %q, want %q", authURL.Query().Get("resource"), resourceURL)
+	}
+	pending, err := gateway.GetMCPOAuthPendingState(t.Context(), authURL.Query().Get("state"))
+	if err != nil {
+		t.Fatalf("get pending static OAuth test: %v", err)
+	}
+	if pending.ResourceURL != resourceURL {
+		t.Fatalf("pending resource = %q, want %q", pending.ResourceURL, resourceURL)
+	}
 	authResponse, err := http.Get(started["oauthURL"])
 	if err != nil {
 		t.Fatalf("open provider authorization URL: %v", err)
@@ -130,7 +149,8 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 	)
 	entry := staticOAuthTestEntry(entryName, "default", mcpURL)
 	instance := &v1.MCPServerInstance{
-		Name: mcpID, Namespace: system.DefaultNamespace,
+		Name:      mcpID,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
 			UserID:                    "user-1",
 			MCPServerCatalogEntryName: entryName,
@@ -138,10 +158,10 @@ func TestFailedClearRefreshCannotResurrectAfterSuccessfulRetry(t *testing.T) {
 	}
 	storageClient := fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
-		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+		WithIndex(&v1.MCPServer{}, "spec.mcpServerCatalogEntryName", func(object kclient.Object) []string {
 			return []string{object.(*v1.MCPServer).Spec.MCPServerCatalogEntryName}
 		}).
-		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object client.Object) []string {
+		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(object kclient.Object) []string {
 			return []string{object.(*v1.MCPServerInstance).Spec.MCPServerCatalogEntryName}
 		}).
 		WithObjects(
@@ -238,9 +258,6 @@ func TestStartOAuthCredentialTestRejectsWrongScopeShapeCandidatesAndBlockedURL(t
 		allowLocal bool
 	}{
 		{name: "catalog scope mismatch", body: "{\"clientID\":\"client\",\"clientSecret\":\"secret\"}", configure: func(entry *v1.MCPServerCatalogEntry) { entry.Spec.MCPCatalogName = "other" }, allowLocal: true},
-		{name: "single user", body: "{\"clientID\":\"client\",\"clientSecret\":\"secret\"}", configure: func(entry *v1.MCPServerCatalogEntry) {
-			entry.Spec.Manifest.ServerUserType = types.ServerUserTypeSingleUser
-		}, allowLocal: true},
 		{name: "not remote", body: "{\"clientID\":\"client\",\"clientSecret\":\"secret\"}", configure: func(entry *v1.MCPServerCatalogEntry) { entry.Spec.Manifest.Runtime = types.RuntimeNPX }, allowLocal: true},
 		{name: "missing fixed URL", body: "{\"clientID\":\"client\",\"clientSecret\":\"secret\"}", configure: func(entry *v1.MCPServerCatalogEntry) { entry.Spec.Manifest.RemoteConfig.FixedURL = "" }, allowLocal: true},
 		{name: "static OAuth not required", body: "{\"clientID\":\"client\",\"clientSecret\":\"secret\"}", configure: func(entry *v1.MCPServerCatalogEntry) { entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = false }, allowLocal: true},
@@ -441,12 +458,12 @@ func TestGetOAuthCredentialTestReturnsSafeBadRequestForUnavailableProof(t *testi
 
 func staticOAuthTestEntry(name, catalogName, fixedURL string) *v1.MCPServerCatalogEntry {
 	return &v1.MCPServerCatalogEntry{
-		Name: name, Namespace: system.DefaultNamespace,
+		Name:      name,
+		Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerCatalogEntrySpec{
 			MCPCatalogName: catalogName,
 			Manifest: types.MCPServerCatalogEntryManifest{
-				Runtime:        types.RuntimeRemote,
-				ServerUserType: types.ServerUserTypeMultiUser,
+				Runtime: types.RuntimeRemote,
 				RemoteConfig: &types.RemoteCatalogConfig{
 					FixedURL:            fixedURL,
 					StaticOAuthRequired: true,
@@ -456,7 +473,7 @@ func staticOAuthTestEntry(name, catalogName, fixedURL string) *v1.MCPServerCatal
 	}
 }
 
-func newStaticOAuthTestRequest(t *testing.T, method, target, body string, recorder *httptest.ResponseRecorder, gateway *gatewayclient.Client, objects ...client.Object) api.Context {
+func newStaticOAuthTestRequest(t *testing.T, method, target, body string, recorder *httptest.ResponseRecorder, gateway *gatewayclient.Client, objects ...kclient.Object) api.Context {
 	t.Helper()
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	return api.Context{
@@ -483,16 +500,6 @@ func staticOAuthStatusBody(t *testing.T, state string) string {
 func newOAuthCredentialTestGatewayClient(t *testing.T) *gatewayclient.Client {
 	t.Helper()
 	return newOAuthCredentialTestGatewayClientWithOptions(t, staticOAuthTestEncryptionConfig(), nil)
-}
-
-func newOAuthCredentialTestGatewayClientWithEncryption(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration) *gatewayclient.Client {
-	t.Helper()
-	return newOAuthCredentialTestGatewayClientWithOptions(t, encryptionConfig, nil)
-}
-
-func newOAuthCredentialTestGatewayClientWithTriggerAndDB(t *testing.T, trigger func(context.Context, string) error) (*gatewayclient.Client, *gorm.DB) {
-	t.Helper()
-	return newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, staticOAuthTestEncryptionConfig(), trigger)
 }
 
 func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) *gatewayclient.Client {
@@ -540,31 +547,7 @@ func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptio
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(
-		t.Context(), database, nil, encryptionConfig,
-		&mcpIDRecordingBackend{trigger: trigger}, nil, nil, time.Hour, 10, 0, 0, 0, false,
-	), services.DB.DB
-}
-
-// mcpIDRecordingBackend lets a test keep asserting on MCP IDs while the gateway
-// client under test builds its real trigger, so the enqueued key is the one
-// production would enqueue.
-type mcpIDRecordingBackend struct {
-	trigger func(context.Context, string) error
-}
-
-func (b *mcpIDRecordingBackend) Trigger(ctx context.Context, gvk schema.GroupVersionKind, key string, _ time.Duration) error {
-	if b.trigger == nil {
-		return nil
-	}
-	if want := v1.SchemeGroupVersion.WithKind("MCPServer"); gvk != want {
-		return fmt.Errorf("triggered kind %s, want %s", gvk, want)
-	}
-	namespace, name, ok := strings.Cut(key, "/")
-	if !ok || namespace != system.DefaultNamespace {
-		return fmt.Errorf("triggered key %q is not namespace-qualified under %s", key, system.DefaultNamespace)
-	}
-	return b.trigger(ctx, name)
+	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
 }
 
 func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
@@ -579,7 +562,7 @@ func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
 			http.NotFound(w, req)
 		case "/.well-known/oauth-protected-resource":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"resource":              providerURL + "/mcp",
+				"resource":              providerURL + "/resource",
 				"authorization_servers": []string{providerURL},
 			})
 		case "/.well-known/oauth-authorization-server":
@@ -592,7 +575,7 @@ func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
 				"token_endpoint_auth_methods_supported": []string{"client_secret_basic"},
 			})
 		case "/authorize":
-			if req.URL.Query().Get("client_id") != "  static-client  " || req.URL.Query().Get("code_challenge") == "" || req.URL.Query().Get("code_challenge_method") != "S256" {
+			if req.URL.Query().Get("client_id") != "  static-client  " || req.URL.Query().Get("code_challenge") == "" || req.URL.Query().Get("code_challenge_method") != "S256" || req.URL.Query().Get("resource") != providerURL+"/resource" {
 				http.Error(w, "invalid authorization request", http.StatusBadRequest)
 				return
 			}
@@ -637,4 +620,42 @@ func newStaticOAuthMetadataProvider(t *testing.T, authorizationEndpoint, tokenEn
 	providerURL = server.URL
 	t.Cleanup(server.Close)
 	return server
+}
+
+func (oauthServerListErrorStorage) List(_ context.Context, list kclient.ObjectList, _ ...kclient.ListOption) error {
+	if _, ok := list.(*v1.MCPServerList); ok {
+		return errors.New("server list unavailable")
+	}
+	return errors.New("unexpected list type")
+}
+
+func pendingStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Client, entryName, fixedURL, userID string) gatewayclient.MCPStaticOAuthTestStart {
+	t.Helper()
+	proof, err := gateway.CreateMCPStaticOAuthTest(t.Context(), userID, entryName, fixedURL, "verifier", &oauth2.Config{
+		ClientID: "candidate-client", ClientSecret: "candidate-secret",
+		Endpoint: oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: "https://provider.example/token"},
+	})
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+	return proof
+}
+
+func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.Client, proof, userID, entryName, fixedURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
+	claim, err := gateway.ClaimMCPStaticOAuthCredentialProof(ctx, proof, userID, entryName, fixedURL, clientID, clientSecret)
+	if err != nil {
+		return err
+	}
+	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
+}
+
+func (t *toggleCredentialWriteErrorTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
+	if t.failWrite {
+		return nil, errors.New("credential encryption unavailable")
+	}
+	return append([]byte("encrypted:"), data...), nil
+}
+
+func (*toggleCredentialWriteErrorTransformer) TransformFromStorage(_ context.Context, data []byte, _ value.Context) ([]byte, bool, error) {
+	return bytes.TrimPrefix(data, []byte("encrypted:")), false, nil
 }

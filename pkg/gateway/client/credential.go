@@ -22,11 +22,6 @@ import (
 	"k8s.io/apiserver/pkg/storage/value"
 )
 
-var credentialGroupResource = schema.GroupResource{
-	Group:    "obot.obot.ai",
-	Resource: "credentials",
-}
-
 const (
 	credentialEncryptedSecretsKey = "_obot_encrypted_env"
 	credentialLockRetryInterval   = 25 * time.Millisecond
@@ -34,9 +29,26 @@ const (
 	credentialLockMaxIdleConns    = 2
 )
 
+var (
+	credentialGroupResource = schema.GroupResource{
+		Group:    "obot.obot.ai",
+		Resource: "credentials",
+	}
+)
+
+type ListCredentialsOptions struct {
+	CredentialContexts []string
+	AllContexts        bool
+}
+
+type CredentialNotFoundError struct {
+	Contexts []string
+	Name     string
+}
+
 // AcquireCredentialLock serializes operations for one credential key. PostgreSQL
-// uses a transaction-scoped advisory lock so independent Obot processes share the
-// same lock; non-PostgreSQL databases use a context-aware process-local semaphore.
+// uses an advisory lock so independent Obot processes share the same lock;
+// other databases use a context-aware process-local semaphore.
 func (c *Client) AcquireCredentialLock(ctx context.Context, key string) (func(), error) {
 	if key == "" {
 		return nil, fmt.Errorf("credential lock key is required")
@@ -55,8 +67,6 @@ func (c *Client) AcquireCredentialLock(ctx context.Context, key string) (func(),
 
 func (c *Client) postgresCredentialLockPool(db *gorm.DB) (*sql.DB, error) {
 	c.credentialLockPoolOnce.Do(func() {
-		// Advisory-lock holders retain their connection for the protected operation.
-		// A separate pool prevents those holders from starving normal database work.
 		dialector, ok := db.Dialector.(*gormpostgres.Dialector)
 		if !ok || dialector.Config == nil || dialector.DSN == "" {
 			c.credentialLockPoolErr = fmt.Errorf("failed to determine PostgreSQL credential lock database configuration")
@@ -93,7 +103,6 @@ func acquirePostgresCredentialLock(ctx context.Context, sqlDB *sql.DB, key strin
 			_ = conn.Close()
 			return nil, fmt.Errorf("failed to acquire credential lock: %w", err)
 		}
-
 		if acquired {
 			var release sync.Once
 			return func() {
@@ -142,11 +151,6 @@ func (c *Client) acquireProcessCredentialLock(ctx context.Context, key string) (
 	}, nil
 }
 
-type ListCredentialsOptions struct {
-	CredentialContexts []string
-	AllContexts        bool
-}
-
 // ListCredentials returns the credentials in the given context.
 // If AllContexts is true, CredentialContexts is ignored and credentials from all contexts are returned.
 // The secrets in the returned credentials are blanked out for security; use RevealCredential to get the secrets for a specific credential.
@@ -173,11 +177,6 @@ func (c *Client) ListCredentials(ctx context.Context, opts ListCredentialsOption
 	}
 
 	return credentials, nil
-}
-
-type CredentialNotFoundError struct {
-	Contexts []string
-	Name     string
 }
 
 func (e CredentialNotFoundError) Unwrap() error {
@@ -268,16 +267,13 @@ func (c *Client) encryptCredential(ctx context.Context, credential *types.Creden
 }
 
 func (c *Client) decryptCredential(ctx context.Context, credential *types.Credential) error {
-	if !credential.Encrypted {
+	if !credential.Encrypted || len(credential.Secrets) != 1 || c.encryptionConfig == nil {
 		return nil
-	}
-	if len(credential.Secrets) != 1 || c.encryptionConfig == nil {
-		return fmt.Errorf("credential is encrypted but encryption is not configured")
 	}
 
 	transformer := c.encryptionConfig.Transformers[credentialGroupResource]
 	if transformer == nil {
-		return fmt.Errorf("credential is encrypted but no credential transformer is configured")
+		return nil
 	}
 
 	encryptedSecrets := credential.Secrets[credentialEncryptedSecretsKey]

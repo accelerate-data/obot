@@ -5,10 +5,10 @@ import (
 )
 
 const (
-	ProductTelemetryDistributionUnlicensed ProductTelemetryDistribution = "Unlicensed"
-	ProductTelemetryDistributionCommunity  ProductTelemetryDistribution = "Community"
-	ProductTelemetryDistributionEnterprise ProductTelemetryDistribution = "Enterprise"
-	ProductTelemetryDistributionCloud      ProductTelemetryDistribution = "Cloud"
+	ProductTelemetryDistributionUnregistered ProductTelemetryDistribution = "Unregistered"
+	ProductTelemetryDistributionRegistered   ProductTelemetryDistribution = "Registered"
+	ProductTelemetryDistributionEnterprise   ProductTelemetryDistribution = "Enterprise"
+	ProductTelemetryDistributionCloud        ProductTelemetryDistribution = "Cloud"
 )
 
 // ProductTelemetryDistribution identifies the Obot distribution sending telemetry.
@@ -40,7 +40,7 @@ type ProductTelemetryMetrics struct {
 	CustomMCPServerEntryCount   *int64                              `json:"customMCPServerEntryCount"`
 	BuiltInMCPServers           *[]ProductTelemetryBuiltInMCPServer `json:"builtInMCPServers"`
 	AuthProviderType            *string                             `json:"authProviderType"`
-	MCPAuditLogCount            *int64                              `json:"mcpAuditLogCount"`
+	MCPToolCallCount            *int64                              `json:"mcpToolCallCount"`
 	LLMAuditLogCount            *int64                              `json:"llmAuditLogCount"`
 	SentryScanCount             *int64                              `json:"sentryScanCount"`
 	SentryEnforcementEventCount *int64                              `json:"sentryEnforcementEventCount"`
@@ -52,7 +52,6 @@ type ProductTelemetryMetrics struct {
 // +k8s:openapi-gen=false
 type ProductTelemetryBuiltInMCPServer struct {
 	ID              string `json:"id"`
-	Name            string `json:"name"`
-	DeploymentCount int64  `json:"deploymentCount"`
-	UserCount       int64  `json:"userCount"`
+	DeploymentCount int64  `json:"deployments"`
+	UserCount       int64  `json:"users"`
 }

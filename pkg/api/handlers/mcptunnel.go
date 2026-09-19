@@ -168,22 +168,16 @@ func mcpTunnelDisplayName(tunnel v1.MCPTunnel) string {
 }
 
 func listMCPTunnelCatalogEntries(req api.Context, tunnelName string) ([]v1.MCPServerCatalogEntry, error) {
-	var referencingEntries []v1.MCPServerCatalogEntry
-	seen := map[kclient.ObjectKey]struct{}{}
-	for _, fields := range []kclient.MatchingFields{
-		{"spec.manifest.remoteConfig.tunnelName": tunnelName},
-		{"spec.manifest.runtime": string(types.RuntimeComposite)},
-	} {
-		var list v1.MCPServerCatalogEntryList
-		if err := req.List(&list, fields); err != nil {
-			return nil, err
-		}
-		for _, entry := range list.Items {
-			key := kclient.ObjectKeyFromObject(&entry)
-			if _, ok := seen[key]; !ok && catalogEntryManifestUsesTunnel(entry.Spec.Manifest, tunnelName) {
-				referencingEntries = append(referencingEntries, entry)
-				seen[key] = struct{}{}
-			}
+	var (
+		referencingEntries []v1.MCPServerCatalogEntry
+		list               v1.MCPServerCatalogEntryList
+	)
+	if err := req.List(&list, kclient.MatchingFields{"spec.manifest.remoteConfig.tunnelName": tunnelName}); err != nil {
+		return nil, err
+	}
+	for _, entry := range list.Items {
+		if catalogEntryManifestUsesTunnel(entry.Spec.Manifest, tunnelName) {
+			referencingEntries = append(referencingEntries, entry)
 		}
 	}
 
@@ -237,15 +231,6 @@ func catalogEntryManifestTunnelTargets(manifest types.MCPServerCatalogEntryManif
 		if manifest.RemoteConfig.Hostname != "" {
 			return []string{manifest.RemoteConfig.Hostname}
 		}
-	case types.RuntimeComposite:
-		if manifest.CompositeConfig == nil {
-			return nil
-		}
-		var targets []string
-		for _, component := range manifest.CompositeConfig.ComponentServers {
-			targets = append(targets, catalogEntryManifestTunnelTargets(component.Manifest, tunnelName)...)
-		}
-		return targets
 	}
 	return nil
 }
@@ -254,15 +239,6 @@ func catalogEntryManifestUsesTunnel(manifest types.MCPServerCatalogEntryManifest
 	switch manifest.Runtime {
 	case types.RuntimeRemote:
 		return manifest.RemoteConfig != nil && manifest.RemoteConfig.TunnelName == tunnelName
-	case types.RuntimeComposite:
-		if manifest.CompositeConfig == nil {
-			return false
-		}
-		for _, component := range manifest.CompositeConfig.ComponentServers {
-			if catalogEntryManifestUsesTunnel(component.Manifest, tunnelName) {
-				return true
-			}
-		}
 	}
 	return false
 }

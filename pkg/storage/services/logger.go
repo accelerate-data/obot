@@ -6,6 +6,10 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+type parameterizedLogger struct {
+	logger.Interface
+}
+
 // newParameterizedLogger wraps a GORM logger so that bound query parameter
 // values are replaced with placeholders in slow-query and error logs. The
 // storage and gateway tables hold secrets that are encrypted at rest but appear
@@ -15,10 +19,6 @@ func newParameterizedLogger(inner logger.Interface) logger.Interface {
 		inner = logger.Default
 	}
 	return parameterizedLogger{Interface: inner}
-}
-
-type parameterizedLogger struct {
-	logger.Interface
 }
 
 // ParamsFilter marks the logger so GORM leaves bound values out of traced SQL.

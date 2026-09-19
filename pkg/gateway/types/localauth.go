@@ -1,7 +1,9 @@
 //nolint:revive
 package types
 
-import "time"
+import (
+	"time"
+)
 
 // LocalAuthUser is a username/password user managed by the local auth provider.
 // The email address is the login name and is also what identifies the user to the rest of Obot,
@@ -13,7 +15,12 @@ type LocalAuthUser struct {
 	Email        string    `json:"email"`
 	HashedEmail  string    `json:"-" gorm:"uniqueIndex"`
 	PasswordHash string    `json:"-"`
-	Encrypted    bool      `json:"-"`
+	// RequirePasswordChange restricts this user's session to changing their password until they
+	// have chosen a new one. It is set for initial and administrator-reset passwords.
+	RequirePasswordChange bool       `json:"requirePasswordChange" gorm:"not null;default:false"`
+	SetupTokenHash        string     `json:"-" gorm:"index;not null;default:''"`
+	SetupTokenExpiresAt   *time.Time `json:"-"`
+	Encrypted             bool       `json:"-"`
 }
 
 // LocalAuthSession is a login session created by the local auth provider.

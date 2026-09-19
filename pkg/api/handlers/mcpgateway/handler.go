@@ -1,9 +1,12 @@
 package mcpgateway
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httputil"
@@ -12,17 +15,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/obot-platform/nanobot/pkg/llm"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/obot-platform/mmmcp"
+	mmmcpconfig "github.com/obot-platform/mmmcp/config"
 	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
-	"github.com/obot-platform/nanobot/pkg/mcp/auditlogs"
-	"github.com/obot-platform/nanobot/pkg/runtime"
-	"github.com/obot-platform/nanobot/pkg/server"
-	"github.com/obot-platform/nanobot/pkg/session"
-	ntypes "github.com/obot-platform/nanobot/pkg/types"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
-	"github.com/obot-platform/obot/pkg/auth"
-	"github.com/obot-platform/obot/pkg/controller/handlers/systemmcpserver"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
@@ -30,20 +29,35 @@ import (
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/tunnel"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"github.com/obot-platform/obot/pkg/version"
+	"golang.org/x/oauth2"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
+const (
+	maxJSONRPCErrorRequestBody = 1 << 20
+	gatewayTokenExpiration     = 5 * time.Minute
+)
+
+var (
+	errMCPServerRequiresConfiguration = errors.New("mcp server requires configuration")
+)
+
 type Handler struct {
+	ctx                       context.Context
+	cancel                    func()
 	mcpSessionManager         *mcp.SessionManager
-	transport                 http.RoundTripper
-	nanobot                   http.Handler
-	mintToken                 func(context.Context, persistent.TokenContext) (string, error)
-	resolveServer             func(api.Context) (resolvedServer, error)
-	secretBindingAllowedLabel string
+	globalTokenStore          mcp.GlobalTokenStore
+	tokenService              *persistent.TokenService
+	auditLogCollector         proxyAuditCollector
+	composite                 *mmmcp.Composite
+	hookRunner                mcp.HookRunner
 	tunnelManager             *tunnel.Manager
+	secretBindingAllowedLabel string
+	serverURL                 string
+	mintToken                 func(context.Context, persistent.TokenContext) (string, error)
 }
 
 func auditLogMetadataForPrincipal(metadata map[string]string, user user.Info) map[string]string {
@@ -60,76 +74,107 @@ func auditLogMetadataForPrincipal(metadata map[string]string, user user.Info) ma
 	return result
 }
 
-type resolvedServer struct {
-	mcpID  string
-	config mcp.ServerConfig
+func writeMCPJSONRPCError(w http.ResponseWriter, req *http.Request, rpcErr error) bool {
+	if req.Method != http.MethodPost {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxJSONRPCErrorRequestBody+1))
+	if err != nil || len(body) > maxJSONRPCErrorRequestBody {
+		return false
+	}
+
+	msg, err := jsonrpc.DecodeMessage(body)
+	if err != nil {
+		return false
+	}
+	call, ok := msg.(*jsonrpc.Request)
+	if !ok || call == nil || !call.IsCall() {
+		return false
+	}
+
+	response, err := jsonrpc.EncodeMessage(&jsonrpc.Response{
+		ID: call.ID,
+		Error: &jsonrpc.Error{
+			Code:    jsonrpc.CodeInternalError,
+			Message: rpcErr.Error(),
+		},
+	})
+	if err != nil {
+		return false
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(response)
+	return true
 }
 
-var errMCPServerRequiresConfiguration = errors.New("mcp server requires configuration")
+func compositeLoopbackURLs(serverURL, mcpServerName string, transform func(string) string) (audienceURL, targetURL string) {
+	audienceURL = fmt.Sprintf("%s/mcp-connect-composite/%s", strings.TrimSuffix(serverURL, "/"), mcpServerName)
+	return audienceURL, transform(audienceURL)
+}
 
-const gatewayTokenExpiration = 5 * time.Minute
+func compositeSessionKey(serverConfig mcp.ServerConfig) string {
+	return tunnel.CompositeSessionKey(serverConfig.MCPServerName)
+}
 
-func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, tokenService *persistent.TokenService, auditLogCollector auditlogs.Collector, serverURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager) (*Handler, error) {
-	sessionStore, err := session.NewStoreFromDSN(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create session store: %w", err)
-	}
+func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, globalTokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, auditLogCollector proxyAuditCollector, serverURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager) (*Handler, error) {
+	ctx, cancel := context.WithCancel(ctx)
 
-	// TODO(thedadams): do we want to make this gcPeriod configurable?
-	sessionManager := session.NewManager(ctx, sessionStore, 24*7*time.Hour)
-	remoteValidationConfig, allowedHosts := mcpSessionManager.RemoteConfigForBackend()
-	if tunnelManager != nil {
-		allowedHosts = append(allowedHosts, tunnelManager.BridgeHost())
-	}
-
-	runtime, err := runtime.NewRuntime(ctx, llm.Config{}, runtime.Options{
-		TokenExchangeEndpoint: mcpSessionManager.TransformObotHostname(fmt.Sprintf("%s/oauth/token", serverURL)),
-		BlockLoopback:         !remoteValidationConfig.AllowLocalhostMCP,
-		BlockPrivateIP:        !remoteValidationConfig.AllowPrivateIPMCP,
-		BlockLinkLocal:        !remoteValidationConfig.AllowLinkLocalMCP,
-		AllowedHosts:          allowedHosts,
-		Store:                 sessionStore,
-		AuditLogCollector:     auditLogCollector,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	var mcpServer nmcp.MessageHandler = server.NewServer(runtime, nil, sessionManager, server.Options{
-		ForceFetchToolList: true,
-	})
-
-	otelEnv := mcp.OTELEnv("obot-proxy", serverURL)
-	otelEnvMap := make(map[string]string, len(otelEnv))
-	for k, v := range otelEnv {
-		otelEnvMap[k] = string(v)
-	}
-
-	envProvider := func() (map[string]string, error) {
-		return otelEnvMap, nil
-	}
-
-	nanobotHTTPServer, err := nmcp.NewHTTPServer(envProvider, mcpServer, nmcp.HTTPServerOptions{
-		SessionStore:      sessionManager,
-		AuditLogCollector: auditLogCollector,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP server: %w", err)
-	}
-
-	handler := &Handler{
-		mcpSessionManager: mcpSessionManager,
-		transport:         otelhttp.NewTransport(http.DefaultTransport),
-		nanobot:           nanobotHTTPServer,
-		mintToken: func(ctx context.Context, tokenContext persistent.TokenContext) (string, error) {
-			_, token, err := tokenService.NewToken(ctx, tokenContext)
-			return token, err
+	composite, err := mmmcp.New(ctx, &mmmcpconfig.Config{}, mmmcp.Options{
+		Logger:            slog.Default(),
+		DSN:               dsn,
+		ForwardClientInfo: true,
+		ClientInfo: &gomcp.Implementation{
+			Name:    "Obot MCP Gateway",
+			Version: version.Get().String(),
 		},
-		secretBindingAllowedLabel: secretBindingAllowedLabel,
-		tunnelManager:             tunnelManager,
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create composite MCP server: %w", err)
 	}
-	handler.resolveServer = handler.ensureServerIsDeployed
-	return handler, nil
+
+	mintToken := func(ctx context.Context, tokenContext persistent.TokenContext) (string, error) {
+		_, token, err := tokenService.NewToken(ctx, tokenContext)
+		return token, err
+	}
+
+	return &Handler{
+		ctx:                       ctx,
+		cancel:                    cancel,
+		mcpSessionManager:         mcpSessionManager,
+		globalTokenStore:          globalTokenStore,
+		tokenService:              tokenService,
+		auditLogCollector:         auditLogCollector,
+		composite:                 composite,
+		hookRunner:                mcp.NewHookRunner(mcpSessionManager),
+		tunnelManager:             tunnelManager,
+		secretBindingAllowedLabel: secretBindingAllowedLabel,
+		serverURL:                 serverURL,
+		mintToken:                 mintToken,
+	}, nil
+}
+
+// Close releases the MMMCP composite server and its component resources.
+func (h *Handler) Close() error {
+	if h == nil {
+		return nil
+	}
+
+	if h.cancel != nil {
+		h.cancel()
+	}
+	if h.tunnelManager != nil {
+		h.tunnelManager.CloseCompositeSessions()
+	}
+
+	if h.composite != nil {
+		return h.composite.Close()
+	}
+
+	return nil
 }
 
 func (h *Handler) Proxy(req api.Context) error {
@@ -138,92 +183,159 @@ func (h *Handler) Proxy(req api.Context) error {
 		return nil
 	}
 
-	resolved, err := h.resolveServer(req)
+	serverConfig, err := h.ensureServerIsDeployed(req)
 	if err != nil {
 		if errors.Is(err, errMCPServerRequiresConfiguration) {
 			return nil
 		}
-		return fmt.Errorf("failed to ensure server is deployed: %v", err)
-	}
-	serverConfig := resolved.config
-
-	var bridgeAuthorizationName, bridgeAuthorizationValue string
-	if serverConfig.TunnelName != "" {
-		if h.tunnelManager == nil {
-			return fmt.Errorf("tunnel manager is not configured")
+		err = fmt.Errorf("failed to ensure server is deployed: %w", err)
+		if writeMCPJSONRPCError(req.ResponseWriter, req.Request, err) {
+			return nil
 		}
-		serverConfig.URL, err = h.tunnelManager.BridgeURL(serverConfig.TunnelName, serverConfig.URL)
-		if err != nil {
-			return fmt.Errorf("failed to prepare tunneled MCP server URL: %w", err)
-		}
-		bridgeAuthorizationName, bridgeAuthorizationValue = h.tunnelManager.BridgeAuthorization()
-		serverConfig.Headers = append(serverConfig.Headers, fmt.Sprintf("%s=%s", bridgeAuthorizationName, bridgeAuthorizationValue))
+		return err
 	}
 
-	gatewayToken, err := h.gatewayToken(req.Context(), req.User, resolved.mcpID, serverConfig)
+	gatewayToken, err := h.gatewayToken(req.Context(), req.User, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig)
 	if err != nil {
 		return fmt.Errorf("failed to mint MCP gateway token: %w", err)
 	}
+	req.Request = req.WithContext(withGatewayToken(req.Context(), req.Request, gatewayToken))
 
-	if serverConfig.NanobotAgentName != "" {
-		// We need to just reverse-proxy to the nanobot agent because the UI will make non-MCP requests
+	isCompositeRequest := strings.HasSuffix(req.URL.Path, "/mcp-connect-composite/"+req.PathValue("mcp_id"))
+	if isCompositeRequest {
+		ownerMarkerPresent, ownerLocal := h.tunnelManager.ConsumeCompositeOwnerRequest(req.Request)
+		if ownerMarkerPresent && !ownerLocal {
+			http.Error(req.ResponseWriter, "invalid composite owner marker", http.StatusForbidden)
+			return nil
+		}
+		if !ownerLocal {
+			key := compositeSessionKey(serverConfig)
+			if !h.tunnelManager.HasCompositeSession(key) {
+				if err := h.tunnelManager.ClaimCompositeSession(req.Context(), h.ctx, key); err != nil {
+					http.Error(req.ResponseWriter, "composite owner is unavailable", http.StatusServiceUnavailable)
+					return nil
+				}
+			}
+			if err := h.tunnelManager.ForwardComposite(req.ResponseWriter, req.Request, key, serverConfig.MCPServerName); err != nil {
+				http.Error(req.ResponseWriter, "composite owner is unavailable", http.StatusServiceUnavailable)
+			}
+			return nil
+		}
+	}
+
+	var (
+		token       string
+		tokenSource oauth2.TokenSource
+		now         = time.Now()
+	)
+	if !isCompositeRequest {
+		// For aggregate runtimes, the /mcp-connect/{mcp_id} path only handles audit logs and hooks.
+		// The URL is changed to /mcp-connect-composite/{mcp_id} which comes back here and handles
+		// the multi-MCP server configuration (and calls no audit logs nor hooks).
+		if serverConfig.Runtime == types.RuntimeVMCP {
+			compositeAudienceURL, compositeTargetURL := compositeLoopbackURLs(h.serverURL, serverConfig.MCPServerName, h.mcpSessionManager.TransformObotHostname)
+			serverConfig.URL = compositeTargetURL
+
+			authorizedMCPIDs := make([]string, 0, len(serverConfig.Components))
+			for _, component := range serverConfig.Components {
+				authorizedMCPIDs = append(authorizedMCPIDs, component.ConnectID())
+			}
+
+			// In order for the loopback to work, we need to authenticate as a composite MCP server.
+			_, token, err = h.tokenService.NewToken(req.Context(), persistent.TokenContext{
+				Audience:         compositeAudienceURL,
+				IssuedAt:         persistent.NewTime(now),
+				ExpiresAt:        persistent.NewTime(now.Add(10 * time.Minute)),
+				UserID:           req.User.GetUID(),
+				UserName:         req.User.GetName(),
+				UserEmail:        cmp.Or(req.User.GetExtra()["email"]...),
+				UserGroups:       []string{types.GroupMCP, types.GroupCompositeMCP, types.GroupAuthenticated},
+				MCPID:            serverConfig.MCPServerName,
+				AuthorizedMCPIDs: authorizedMCPIDs,
+			})
+			if err != nil {
+				return err
+			}
+		} else if serverConfig.MCPServerName == system.ObotMCPServerName {
+			// If this is contacting the Obot system MCP server, then we need to mint a token that has access
+			// to the APIs the user has access to so the MCP server can list/connect to MCP servers.
+			_, token, err = h.tokenService.NewToken(req.Context(), persistent.TokenContext{
+				Audience:   h.serverURL,
+				IssuedAt:   persistent.NewTime(now),
+				ExpiresAt:  persistent.NewTime(now.Add(time.Hour)),
+				UserID:     serverConfig.UserID,
+				UserGroups: []string{types.GroupAPI, types.GroupAuthenticated},
+				Namespace:  system.DefaultNamespace,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to generate token: %w", err)
+			}
+		} else {
+			tokenSource, err = h.globalTokenStore.ForUserAndMCP(serverConfig.UserID, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig.URL).TokenSource(h.ctx)
+			if err != nil {
+				return fmt.Errorf("failed to get token source: %w", err)
+			}
+		}
+
+		if token != "" {
+			serverConfig.Headers = append(serverConfig.Headers, "Authorization=Bearer "+token)
+		}
+
+		client, err := h.mcpSessionManager.HTTPClientForServer(serverConfig, mcp.HTTPClientOptions{TokenSource: tokenSource, DirectConnect: true})
+		if err != nil {
+			return fmt.Errorf("failed to get HTTP client for server: %w", err)
+		}
+
 		u, err := url.Parse(serverConfig.URL)
 		if err != nil {
-			http.Error(req.ResponseWriter, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+
+		hookConfig, hookServers := mcp.ServerHookConfig(serverConfig)
+
+		audit, err := newProxyAudit(req.Request, serverConfig.AuditLogMetadata, h.auditLogCollector, req.Storage)
+		if err != nil {
+			return fmt.Errorf("failed to prepare MCP request audit log: %w", err)
+		}
+
+		hooks, err := newHookProcessor(req.Request, h.hookRunner, hookConfig, hookServers, audit, newHookCorrelationStore(req.Storage, serverConfig.AuditLogMetadata))
+		if err != nil {
+			return fmt.Errorf("failed to prepare MCP request hooks: %w", err)
+		}
+
+		audit.recordRequest()
+
+		if body, blocked, hookErr := hooks.blockedRequest(); blocked {
+			audit.recordBlockedRequest(body, hookErr)
+			req.ResponseWriter.Header().Set("Content-Type", "application/json")
+			req.WriteHeader(http.StatusOK)
+			_, _ = req.ResponseWriter.Write(body)
 			return nil
 		}
 
 		(&httputil.ReverseProxy{
-			Transport: h.transport,
+			Transport: client.Transport,
 			Rewrite: func(r *httputil.ProxyRequest) {
-				// SetXForwarded preserves the X-Forwarded-For handling that
-				// ReverseProxy applied automatically under the deprecated Director.
-				// It also writes X-Forwarded-Host and X-Forwarded-Proto, so the
-				// values this handler cares about are re-applied afterwards: the
-				// scheme is derived from the inbound host rather than from whether
-				// this hop happens to be TLS.
-				r.SetXForwarded()
-
-				if bridgeAuthorizationName != "" {
-					r.Out.Header.Set(bridgeAuthorizationName, bridgeAuthorizationValue)
+				rewriteProxyRequest(r, u)
+			},
+			ModifyResponse: func(resp *http.Response) error {
+				rewriteMCPAuthResponse(req, resp)
+				if err := hooks.filterResponse(resp); err != nil {
+					return err
 				}
-				if gatewayToken == "" {
-					r.Out.Header.Del("Authorization")
-				} else {
-					r.Out.Header.Set("Authorization", "Bearer "+gatewayToken)
-				}
-				r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
-				scheme := "https"
-				if strings.HasPrefix(r.In.Host, "localhost") || strings.HasPrefix(r.In.Host, "127.0.0.1") || strings.HasPrefix(r.In.Host, "[::1]") {
-					scheme = "http"
-				}
-				r.Out.Header.Set("X-Forwarded-Proto", scheme)
-
-				r.Out.Host = u.Host
-				r.Out.URL.Scheme = u.Scheme
-				r.Out.URL.Host = u.Host
-				r.Out.URL.Path = u.Path
-				if rest := r.In.PathValue("rest"); rest != "" {
-					if strings.HasPrefix(rest, "/") {
-						r.Out.URL.Path = rest
-					} else {
-						r.Out.URL.Path = "/" + rest
-					}
-				}
-
-				// Merge query parameters from the incoming request and the upstream URL.
-				// Preserve all values; if a key exists in both, both values will be present.
-				upstreamQuery := u.Query()
-				origQuery := r.In.URL.Query()
-				for k, vs := range origQuery {
-					for _, v := range vs {
-						upstreamQuery.Add(k, v)
-					}
-				}
-				r.Out.URL.RawQuery = upstreamQuery.Encode()
+				return audit.wrapResponse(resp)
 			},
 			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
-				http.Error(w, fmt.Sprintf("failed to proxy request to Nanobot agent %s: %v", serverConfig.NanobotAgentName, err), http.StatusBadGateway)
+				audit.recordTransportError(err, http.StatusBadGateway)
+				if serverConfig.IsAgentServer() {
+					http.Error(w, fmt.Sprintf("failed to proxy request to Nanobot agent %s: %v", serverConfig.AgentName, err), http.StatusBadGateway)
+				} else {
+					mcpServerName := serverConfig.MCPServerDisplayName
+					if mcpServerName == "" {
+						mcpServerName = serverConfig.MCPServerName
+					}
+					http.Error(w, fmt.Sprintf("failed to proxy request to MCP server %s: %v", mcpServerName, err), http.StatusBadGateway)
+				}
 			},
 		}).ServeHTTP(req.ResponseWriter, req.Request)
 
@@ -236,24 +348,9 @@ func (h *Handler) Proxy(req api.Context) error {
 		}
 	}
 
-	isCompositeLoopback := strings.HasSuffix(req.URL.Path, "/mcp-connect-composite/"+req.PathValue("mcp_id"))
-	nanobotCtx := ntypes.Context{
-		Config: func(context.Context, string) (ntypes.Config, error) {
-			return mcp.ServerNanobotConfig(serverConfig, isCompositeLoopback), nil
-		},
-	}
-
-	ctx := req.Context()
-	ctx = ntypes.WithNanobotContext(ctx, nanobotCtx)
-	if isCompositeLoopback {
-		// Don't audit log composite loopback requests, they are internal to the MCP gateway
-		ctx = nmcp.WithAuditLogMetadata(ctx, map[string]string{mcp.AuditLogIgnore: "true"})
-	} else {
-		ctx = nmcp.WithAuditLogMetadata(ctx, auditLogMetadataForPrincipal(serverConfig.AuditLogMetadata, req.User))
-	}
-	ctx = withGatewayToken(ctx, req.Request, gatewayToken)
-
-	h.nanobot.ServeHTTP(req.ResponseWriter, req.WithContext(ctx))
+	ctx := mmmcp.ContextWithConfig(req.Context(), mcp.MMMCPConfig(serverConfig, nil))
+	ctx = mmmcp.ContextWithConfigID(ctx, fmt.Sprintf("%s++%s", serverConfig.MCPServerName, serverConfig.UserID))
+	h.composite.HTTPHandler().ServeHTTP(req.ResponseWriter, req.WithContext(ctx))
 	return nil
 }
 
@@ -265,11 +362,7 @@ func (h *Handler) gatewayToken(ctx context.Context, authenticatedUser user.Info,
 	if err != nil {
 		return "", err
 	}
-	token, err := h.mintToken(ctx, gatewayTokenContext(authenticatedUser, mcpID, audience, time.Now()))
-	if err != nil {
-		return "", err
-	}
-	return token, nil
+	return h.mintToken(ctx, gatewayTokenContext(authenticatedUser, mcpID, audience, time.Now()))
 }
 
 func gatewayAudience(server mcp.ServerConfig) (string, error) {
@@ -300,62 +393,135 @@ func gatewayTokenContext(authenticatedUser user.Info, mcpID, audience string, no
 		ExpiresAt:             persistent.NewTime(now.Add(gatewayTokenExpiration)),
 		UserID:                authenticatedUser.GetUID(),
 		UserName:              authenticatedUser.GetName(),
-		UserEmail:             auth.FirstExtraValue(extra, "email"),
+		UserEmail:             cmp.Or(extra["email"]...),
 		UserGroups:            []string{types.GroupMCP, types.GroupAuthenticated},
-		AuthProviderName:      auth.FirstExtraValue(extra, "auth_provider_name"),
-		AuthProviderNamespace: auth.FirstExtraValue(extra, "auth_provider_namespace"),
-		AuthProviderUserID:    auth.FirstExtraValue(extra, "auth_provider_user_id"),
+		AuthProviderName:      cmp.Or(extra["auth_provider_name"]...),
+		AuthProviderNamespace: cmp.Or(extra["auth_provider_namespace"]...),
+		AuthProviderUserID:    cmp.Or(extra["auth_provider_user_id"]...),
 		MCPID:                 mcpID,
 	}
 }
 
-func (h *Handler) ensureServerIsDeployed(req api.Context) (resolvedServer, error) {
+func rewriteProxyRequest(r *httputil.ProxyRequest, upstreamURL *url.URL) {
+	// These headers may authenticate the client to Obot and must not cross the
+	// trust boundary to the upstream MCP server. The transport adds any
+	// explicitly configured upstream credentials after this rewrite.
+	for _, header := range []string{"Authorization", "Cookie", "Proxy-Authorization", "X-API-Key"} {
+		r.Out.Header.Del(header)
+	}
+
+	// SetXForwarded preserves the X-Forwarded-For handling that ReverseProxy
+	// applied automatically under the deprecated Director. It also writes
+	// X-Forwarded-Host and X-Forwarded-Proto, so the values this handler cares
+	// about are re-applied afterwards: the scheme is derived from the inbound
+	// host rather than from whether this hop happens to be TLS.
+	r.SetXForwarded()
+
+	r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
+	scheme := "https"
+	if strings.HasPrefix(r.In.Host, "localhost") || strings.HasPrefix(r.In.Host, "127.0.0.1") || strings.HasPrefix(r.In.Host, "[::1]") {
+		scheme = "http"
+	}
+	r.Out.Header.Set("X-Forwarded-Proto", scheme)
+
+	r.Out.Host = upstreamURL.Host
+	r.Out.URL.Scheme = upstreamURL.Scheme
+	r.Out.URL.Host = upstreamURL.Host
+	r.Out.URL.Path = upstreamURL.Path
+	if rest := r.In.PathValue("rest"); rest != "" {
+		if strings.HasPrefix(rest, "/") {
+			r.Out.URL.Path = rest
+		} else {
+			r.Out.URL.Path = "/" + rest
+		}
+	}
+
+	// Merge query parameters from the incoming request and the upstream URL.
+	// Preserve all values; if a key exists in both, both values will be present.
+	upstreamQuery := upstreamURL.Query()
+	origQuery := r.In.URL.Query()
+	for k, vs := range origQuery {
+		for _, v := range vs {
+			upstreamQuery.Add(k, v)
+		}
+	}
+	r.Out.URL.RawQuery = upstreamQuery.Encode()
+}
+
+func (h *Handler) ensureServerIsDeployed(req api.Context) (mcp.ServerConfig, error) {
 	mcpID := req.PathValue("mcp_id")
 
 	if system.IsSystemMCPServerID(mcpID) {
-		config, err := h.ensureSystemServerIsDeployed(req, mcpID)
-		return resolvedServer{mcpID: mcpID, config: config}, err
+		return h.ensureSystemServerIsDeployed(req, mcpID)
+	}
+	if system.IsVMCPID(mcpID) || system.IsVMCPInstanceID(mcpID) {
+		return h.mcpSessionManager.ServerConfigForVMCP(req.Context(), mcpID, principal.ResourceOwnerID(req.User))
 	}
 
 	mcpID, mcpServer, mcpServerConfig, missingConfig, err := h.mcpSessionManager.ServerForActionWithConnectIDAllowMissingConfig(req.Context(), mcpID, principal.ResourceOwnerID(req.User))
 	if err != nil {
-		return resolvedServer{}, fmt.Errorf("failed to get mcp server config: %w", err)
+		return mcp.ServerConfig{}, fmt.Errorf("failed to get mcp server config: %w", err)
 	}
 	if mcpServer.Spec.Template {
-		return resolvedServer{}, apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
+		return mcp.ServerConfig{}, apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
 	}
 	if len(missingConfig) > 0 {
 		writeMCPAuthRequired(req, true)
-		return resolvedServer{}, errMCPServerRequiresConfiguration
+		return mcp.ServerConfig{}, errMCPServerRequiresConfiguration
 	}
 
 	// Add-hoc authorization for nanobot agents
-	if mcpServerConfig.NanobotAgentName != "" {
+	if mcpServerConfig.IsAgentServer() {
 		var agent v1.NanobotAgent
-		if err = req.Get(&agent, mcpServerConfig.NanobotAgentName); err != nil {
-			return resolvedServer{}, fmt.Errorf("failed to get nanobot agent %q: %w", mcpServerConfig.NanobotAgentName, err)
+		if err = req.Get(&agent, mcpServerConfig.AgentName); err != nil {
+			return mcp.ServerConfig{}, fmt.Errorf("failed to get nanobot agent %q: %w", mcpServerConfig.AgentName, err)
 		}
 		if agent.Spec.UserID != req.User.GetUID() && (!req.UserCanImpersonate() || !req.UserIsAdmin()) {
-			return resolvedServer{}, types.NewErrForbidden("user is not authorized to access nanobot agent %q", mcpServerConfig.NanobotAgentName)
+			return mcp.ServerConfig{}, types.NewErrForbidden("user is not authorized to access nanobot agent %q", mcpServerConfig.AgentName)
 		}
 	}
 
 	mcpServerConfig, err = h.mcpSessionManager.LaunchServer(req.Context(), mcpServerConfig)
 	if err != nil {
-		return resolvedServer{}, fmt.Errorf("failed to launch mcp server: %w", err)
+		return mcp.ServerConfig{}, fmt.Errorf("failed to launch mcp server: %w", err)
 	}
 
-	return resolvedServer{mcpID: mcpID, config: mcpServerConfig}, nil
+	return mcpServerConfig, nil
 }
 
-func writeMCPAuthRequired(req api.Context, requiresConfig bool) {
+func mcpAuthChallenge(req api.Context) string {
 	baseURL := strings.TrimSuffix(req.APIBaseURL, "/api")
 	connectPath := "mcp-connect"
 	if strings.HasPrefix(req.URL.Path, "/mcp-connect-composite/") {
 		connectPath = "mcp-connect-composite"
 	}
 
-	req.ResponseWriter.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="Obot MCP Gateway", resource_metadata="%s/.well-known/oauth-protected-resource/%s/%s"`, baseURL, connectPath, req.PathValue("mcp_id")))
+	return fmt.Sprintf(`Bearer realm="Obot MCP Gateway", resource_metadata="%s/.well-known/oauth-protected-resource/%s/%s"`, baseURL, connectPath, req.PathValue("mcp_id"))
+}
+
+// Upstream authentication challenges must lead clients back through Obot,
+// including when the upstream is an aggregate's internal loopback endpoint.
+func rewriteMCPAuthResponse(req api.Context, resp *http.Response) {
+	if resp.StatusCode != http.StatusUnauthorized {
+		return
+	}
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	const body = "MCP server requires authentication\n"
+	resp.Header = http.Header{
+		"Www-Authenticate":       {mcpAuthChallenge(req)},
+		"Content-Type":           {"text/plain; charset=utf-8"},
+		"X-Content-Type-Options": {"nosniff"},
+	}
+	resp.Body = io.NopCloser(strings.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	resp.TransferEncoding = nil
+	resp.Trailer = nil
+}
+
+func writeMCPAuthRequired(req api.Context, requiresConfig bool) {
+	req.ResponseWriter.Header().Set("WWW-Authenticate", mcpAuthChallenge(req))
 	if requiresConfig {
 		http.Error(req.ResponseWriter, "MCP server requires configuration", http.StatusUnauthorized)
 	} else {
@@ -378,7 +544,7 @@ func (h *Handler) ensureSystemServerIsDeployed(req api.Context, mcpID string) (m
 	// obot-mcp-server where all env vars have static values.
 	credEnv := make(map[string]string)
 	var needsCredentials bool
-	for _, env := range systemServer.Spec.Manifest.Env {
+	for _, env := range systemServer.Spec.Manifest.Config {
 		if env.Value == "" {
 			needsCredentials = true
 			break
@@ -394,12 +560,7 @@ func (h *Handler) ensureSystemServerIsDeployed(req api.Context, mcpID string) (m
 			return mcp.ServerConfig{}, fmt.Errorf("failed to list credentials for system server: %w", err)
 		}
 
-		secretToolName := systemmcpserver.SecretInfoToolName(systemServer.Name)
 		for _, cred := range creds {
-			// Skip the secret info credential — those vars go to the shim only, not the MCP server.
-			if cred.Name == secretToolName {
-				continue
-			}
 			credDetail, err := req.GatewayClient.RevealCredential(req.Context(), []string{credCtx}, cred.Name)
 			if err != nil {
 				continue
@@ -408,14 +569,7 @@ func (h *Handler) ensureSystemServerIsDeployed(req api.Context, mcpID string) (m
 		}
 	}
 
-	// Retrieve the token exchange credential
-	var secretsCred map[string]string
-	tokenExchangeCred, err := req.GatewayClient.RevealCredential(req.Context(), []string{systemServer.Name}, systemmcpserver.SecretInfoToolName(systemServer.Name))
-	if err == nil {
-		secretsCred = tokenExchangeCred.Secrets
-	}
-
-	credEnv, err = mcp.MergeBoundCreds(req.Context(), req.LocalK8sClient, req.ObotNamespace, systemServer.Spec.Manifest.Env, systemServer.Spec.Manifest.RemoteConfig, credEnv, h.secretBindingAllowedLabel)
+	credEnv, err := mcp.MergeBoundCreds(req.Context(), req.LocalK8sClient, req.ObotNamespace, systemServer.Spec.Manifest.Config, credEnv, h.secretBindingAllowedLabel)
 	if err != nil {
 		return mcp.ServerConfig{}, fmt.Errorf("failed to resolve secret bindings: %w", err)
 	}
@@ -425,7 +579,7 @@ func (h *Handler) ensureSystemServerIsDeployed(req api.Context, mcpID string) (m
 
 	// Ownership, not the acting identity: a system server deployed for an agent
 	// belongs to the person who created that agent.
-	serverConfig, _, err := mcp.SystemServerToServerConfig(systemServer, audiences, principal.ResourceOwnerID(req.User), credEnv, secretsCred)
+	serverConfig, _, err := mcp.SystemServerToServerConfig(systemServer, audiences, principal.ResourceOwnerID(req.User), credEnv)
 	if err != nil {
 		return mcp.ServerConfig{}, fmt.Errorf("failed to convert system server to config: %w", err)
 	}

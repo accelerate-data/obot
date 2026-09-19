@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
@@ -23,7 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-const postgresUserLimitTestDSNEnv = "OBOT_TEST_POSTGRES_DSN"
+const (
+	postgresUserLimitTestDSNEnv = "OBOT_TEST_POSTGRES_DSN"
+)
 
 func TestEnsureIdentityWithRoleEnforcesUserLimitAcrossPostgresClients(t *testing.T) {
 	postgresDSN := os.Getenv(postgresUserLimitTestDSNEnv)
@@ -36,7 +38,7 @@ func TestEnsureIdentityWithRoleEnforcesUserLimitAcrossPostgresClients(t *testing
 		t.Fatalf("opening PostgreSQL admin connection: %v", err)
 	}
 
-	schema := "obot_user_limit_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	schema := "obot_user_limit_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 	if err := adminServices.DB.DB.Exec("CREATE SCHEMA " + schema).Error; err != nil {
 		_ = adminServices.DB.SQLDB.Close()
 		t.Fatalf("creating isolated PostgreSQL schema: %v", err)

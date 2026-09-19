@@ -124,15 +124,15 @@
 	let restartableConfiguredServers = $derived(
 		configuredServers.filter((server) => supportsMCPBackendDetails(server))
 	);
-
 	// Connecting from a multi-user catalog entry row always starts a new shared server deployment.
 	let isMultiUserCatalogEntryRow = $derived(isMultiUserCatalogEntry(entry) && !server);
 	let requiresUpdate = $derived(server && requiresUserUpdate(server));
 	let canReauthenticate = $derived(
-		server?.manifest.runtime === 'remote' && Object.keys(server.oauthMetadata ?? {}).length > 0
+		server?.manifest.runtime === 'remote' &&
+			Object.keys(server.oauthMetadata ?? {}).length > 0 &&
+			!hasEditableConfiguration(server)
 	);
 	let canDebugOauth = $derived(canReauthenticate && profile.current?.hasAdminAccess?.());
-	let belongsToComposite = $derived(Boolean(server && server.compositeName));
 	let deprecated = $derived(isDeprecatedMCPServer(entry) || isDeprecatedMCPServer(server));
 	let configurableItem = $derived(server ?? entry);
 	// True when the user can manage the server deployment (restart, rename, edit config).
@@ -143,10 +143,7 @@
 			(server?.powerUserWorkspaceID && server?.userID === profile.current.id)
 	);
 	let canConfigure = $derived(
-		configurableItem &&
-			(configurableItem.manifest.runtime === 'composite' ||
-				hasEditableConfiguration(configurableItem)) &&
-			isServerOwner
+		configurableItem && hasEditableConfiguration(configurableItem) && isServerOwner
 	);
 	let canEditMultiUserServerConfiguration = $derived(
 		Boolean(
@@ -155,7 +152,9 @@
 			!readonly &&
 			allowMultiUserServerConfigurationEdit &&
 			instance &&
-			(server.manifest.multiUserConfig?.userDefinedHeaders?.length ?? 0) > 0
+			((server.manifest.config ?? []).filter(
+				(field) => field.usage === 'header' && field.userAllowed
+			)?.length ?? 0) > 0
 		)
 	);
 	let canDeleteMultiUserServer = $derived(
@@ -228,7 +227,6 @@
 			true;
 		return entryCanConnect && serverCanConnect;
 	});
-
 	let requiresStaticOAuth = $derived(
 		entry?.manifest?.runtime === 'remote' && entry?.manifest?.remoteConfig?.staticOAuthRequired
 	);
@@ -238,6 +236,25 @@
 		oauthConfiguredOverride !== undefined
 			? oauthConfiguredOverride
 			: !requiresStaticOAuth || entry?.oauthCredentialConfigured
+	);
+	let showConnectButton = $derived(
+		!hideActions &&
+			Boolean(
+				(entry && !server) ||
+				(server &&
+					(isMultiUserServer(server) ||
+						!server.catalogEntryID ||
+						(server.catalogEntryID && server.userID === profile.current.id)))
+			)
+	);
+	let connectionDisabled = $derived(
+		Boolean(
+			loading ||
+			hasLicenseEntitlementViolations ||
+			(isMultiUserCatalogEntryRow && !catalogID && !workspaceID) ||
+			!canConnect ||
+			(requiresStaticOAuth && oauthConfigured === false)
+		)
 	);
 
 	function refresh() {
@@ -329,16 +346,10 @@
 </script>
 
 <!-- Use class:hidden to avoid Svelte 5 production build with conditional DOM cleanup -->
-<div class="contents" class:hidden={belongsToComposite || hideActions}>
+<div class="contents" class:hidden={hideActions}>
 	<button
 		class="btn btn-primary flex w-full items-center gap-1 text-sm disabled:cursor-not-allowed disabled:opacity-50 md:w-fit"
-		class:hidden={!(
-			(entry && !server) ||
-			(server &&
-				(isMultiUserServer(server) ||
-					!server.catalogEntryID ||
-					(server.catalogEntryID && server.userID === profile.current.id)))
-		)}
+		class:hidden={!showConnectButton}
 		use:tooltip={{
 			text: hasLicenseEntitlementViolations
 				? MCP_CONNECTION_INVALID_LICENSE_MESSAGE
@@ -381,11 +392,7 @@
 				});
 			}
 		}}
-		disabled={loading ||
-			hasLicenseEntitlementViolations ||
-			(isMultiUserCatalogEntryRow && !catalogID && !workspaceID) ||
-			!canConnect ||
-			(requiresStaticOAuth && oauthConfigured === false)}
+		disabled={connectionDisabled}
 	>
 		{#if loading}
 			<Loading class="size-4" />
@@ -414,6 +421,21 @@
 		refresh();
 	}}
 	{skipConnectDialog}
+	onEdit={({ entry, server, instance }) => {
+		if (server && instance && isMultiUserServer(server)) {
+			connectToServerDialog?.open({ server, instance, configureInstance: true });
+		} else if (entry && server) {
+			editExistingDialog?.edit({
+				server,
+				entry
+			});
+		}
+	}}
+	onReauthenticate={({ server }) => {
+		if (server) {
+			reauthenticateServer(server);
+		}
+	}}
 />
 
 <EditExistingDeployment bind:this={editExistingDialog} onUpdateConfigure={refresh} />
@@ -792,7 +814,7 @@
 
 	{#if (showDisconnectUser && server) || (entry && configuredServers.length > 0)}
 		<div class="flex flex-col gap-2 p-2 pt-1">
-			{#if entry && configuredServers.length > 0}
+			{#if entry && !isMultiUserCatalogEntry(entry) && configuredServers.length > 0}
 				<button
 					class="menu-button"
 					onclick={(e) => {
@@ -881,7 +903,9 @@
 		// Show the connect dialog if this was part of the initial creation flow
 		if (isInitialOAuthConfig) {
 			isInitialOAuthConfig = false;
-			launchDialog?.open();
+			if (!skipConnectDialog) {
+				launchDialog?.open();
+			}
 		}
 	}}
 />

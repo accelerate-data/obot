@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { toAuditLogFilterSelectOption, toStringFilterSelectOptions } from '$lib/auditlogs';
 	import type { DateRange } from '$lib/components/Calendar.svelte';
 	import Select from '$lib/components/Select.svelte';
 	import {
@@ -15,16 +16,19 @@
 	} from '$lib/components/admin/audit-log-exports/filterFields';
 	import AuditLogCalendar from '$lib/components/admin/audit-logs/AuditLogCalendar.svelte';
 	import Loading from '$lib/icons/Loading.svelte';
+	import { parseMultiValue, serializeMultiValue } from '$lib/multiValue';
 	import {
 		AdminService,
 		Group,
 		UserService,
 		type AuditLogExport,
+		type AuditLogFilterOption,
 		type LLMAuditLogURLFilters,
 		type OrgUser,
 		type AuditLogURLFilters
 	} from '$lib/services';
 	import { profile } from '$lib/stores';
+	import { getUserDisplayName } from '$lib/utils';
 	import { TriangleAlert, ChevronDown, ChevronUp } from '@lucide/svelte';
 	import { subDays, set } from 'date-fns';
 	import { onMount } from 'svelte';
@@ -33,6 +37,7 @@
 	import { twMerge } from 'tailwind-merge';
 
 	type AuditLogExportMultiSelectFilterKey =
+		| 'api_key_id'
 		| 'actor'
 		| 'operation'
 		| 'mcp_server'
@@ -56,6 +61,7 @@
 		| 'tool_kind'
 		| 'device_id';
 	type LLMAuditLogExportMultiSelectFilterKey =
+		| 'api_key_id'
 		| 'user_id'
 		| 'user_agent'
 		| 'client_session_id'
@@ -107,6 +113,12 @@
 				filterKey: 'client',
 				title: 'Clients',
 				description: 'MCP clients and local-agent providers'
+			},
+			// API-key attribution is shared by every audit-log source.
+			{
+				filterKey: 'api_key_id',
+				title: 'API Keys',
+				description: 'API keys used for the requests'
 			},
 			// Single-source filters. Shown only when exactly one log source is selected.
 			{
@@ -194,6 +206,11 @@
 	const LLM_AUDIT_LOG_EXPORT_FILTER_FIELDS: AuditLogExportFilterFieldConfig<LLMAuditLogExportMultiSelectFilterKey>[] =
 		[
 			{
+				filterKey: 'api_key_id',
+				title: 'API Keys',
+				description: 'API keys used for the requests'
+			},
+			{
 				filterKey: 'user_id',
 				title: 'Users',
 				description: 'List of users',
@@ -268,6 +285,7 @@
 		endTime: set(new Date(), { milliseconds: 0, seconds: 59 }),
 		sourceTypes: [...ALL_SOURCE_TYPES] as string[],
 		filters: {
+			api_key_id: '',
 			actor: '',
 			operation: '',
 			mcp_server: '',
@@ -310,6 +328,7 @@
 		'tool',
 		'outcome',
 		'client',
+		'api_key_id',
 		'mcp_id',
 		'user_id',
 		'mcp_server_catalog_entry_name',
@@ -328,6 +347,7 @@
 		'device_id'
 	];
 	let llmFiltersIds = [
+		'api_key_id',
 		'user_id',
 		'user_agent',
 		'client_session_id',
@@ -341,7 +361,7 @@
 	let filtersIds = $derived(logType === 'llm' ? llmFiltersIds : mcpFiltersIds);
 
 	let usersMap = new SvelteMap<string, OrgUser>();
-	let filtersOptions: Record<string, string[]> = $state({});
+	let filtersOptions: Record<string, AuditLogFilterOption[]> = $state({});
 
 	onMount(async () => {
 		if (initialData && (mode === 'view' || mode === 'edit')) {
@@ -354,6 +374,7 @@
 			if (logType === 'llm' && initialData.llmFilters) {
 				const filters = initialData.llmFilters;
 				form.filters = {
+					api_key_id: join(filters.apiKeyIDs),
 					user_id: join(filters.userIDs),
 					model_provider: join(filters.modelProviders),
 					target_model: join(filters.targetModels),
@@ -373,9 +394,10 @@
 				const filters = initialData.filters;
 				form.sourceTypes = normalizeSourceTypes(filters.sourceTypes);
 				form.filters = {
+					api_key_id: join(filters.apiKeyIDs),
 					actor: join(filters.actors),
 					operation: join(filters.operations),
-					mcp_server: join(filters.mcpServers),
+					mcp_server: serializeMultiValue(filters.mcpServers ?? []),
 					tool: join(filters.tools),
 					outcome: join(filters.outcomes),
 					client: join(filters.clients),
@@ -447,7 +469,7 @@
 	});
 
 	$effect(() => {
-		UserService.listUsers().then((res) => {
+		UserService.listUsersIncludeDeleted().then((res) => {
 			res.forEach((user) => {
 				usersMap.set(user.id, user);
 			});
@@ -508,7 +530,7 @@
 		)
 	);
 
-	function join(array: string[] | undefined): string {
+	function join(array: (string | number)[] | undefined): string {
 		return array ? array.join(',') : '';
 	}
 
@@ -564,6 +586,7 @@
 					startTime: form.startTime.toISOString(),
 					endTime: form.endTime.toISOString(),
 					llmFilters: {
+						apiKeyIDs: splitNumbers(form.filters.api_key_id),
 						userIDs: split(form.filters.user_id),
 						modelProviders: split(form.filters.model_provider),
 						targetModels: split(form.filters.target_model),
@@ -595,10 +618,11 @@
 				startTime: form.startTime.toISOString(),
 				endTime: form.endTime.toISOString(),
 				filters: {
+					apiKeyIDs: splitNumbers(form.filters.api_key_id),
 					sourceTypes: normalizeSourceTypes(form.sourceTypes),
 					actors: split(form.filters.actor),
 					operations: split(form.filters.operation),
-					mcpServers: split(form.filters.mcp_server),
+					mcpServers: parseMultiValue(form.filters.mcp_server),
 					tools: split(form.filters.tool),
 					outcomes: split(form.filters.outcome),
 					clients: split(form.filters.client),
@@ -646,10 +670,17 @@
 	): { id: string; label: string }[] {
 		const opts = filtersOptions[field.filterKey];
 		if (!opts?.map) return [];
+		const resolveUserDisplayName = (id: string) =>
+			usersMap.has(id) ? getUserDisplayName(usersMap, id) : id;
 		if (field.useUserDisplayNames) {
-			return opts.map((d) => ({ id: d, label: usersMap.get(d)?.displayName ?? d }));
+			return toStringFilterSelectOptions(opts, resolveUserDisplayName);
 		}
-		return opts.map((d) => ({ id: d, label: field.getOptionLabel?.(d) ?? d }));
+		return opts.map((d) => {
+			const option = toAuditLogFilterSelectOption(d, resolveUserDisplayName);
+			return typeof d === 'string' && field.getOptionLabel
+				? { ...option, label: field.getOptionLabel(d) }
+				: option;
+		});
 	}
 </script>
 
@@ -845,6 +876,7 @@
 								disabled={isViewMode}
 								readonly={isViewMode}
 								multiple
+								valueFormat={filterKey === 'mcp_server' ? 'json' : 'comma-separated'}
 							/>
 							{#if (isViewMode && form.filters[filterKey]) || !isViewMode}
 								<p class="text-muted-content text-xs">{description}</p>

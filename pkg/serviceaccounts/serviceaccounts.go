@@ -17,6 +17,22 @@ const (
 	ExpiresAtKey            = "expiresAt"
 )
 
+var (
+	accounts = map[string]Account{
+		NetworkPolicyProvider: {
+			Name:                         NetworkPolicyProvider,
+			Username:                     "system:serviceaccount:" + NetworkPolicyProvider,
+			UID:                          "system:serviceaccount:" + NetworkPolicyProvider,
+			Group:                        fmt.Sprintf("%s:%s", Group, NetworkPolicyProvider),
+			SecretName:                   NetworkPolicySecretName,
+			SecretKey:                    NetworkPolicySecretKey,
+			SecretManaged:                true,
+			RequiredMCPBackend:           "kubernetes",
+			RequiredNetworkPolicyEnabled: true,
+		},
+	}
+)
+
 type Account struct {
 	Name                         string
 	Username                     string
@@ -27,20 +43,6 @@ type Account struct {
 	SecretManaged                bool
 	RequiredMCPBackend           string
 	RequiredNetworkPolicyEnabled bool
-}
-
-var accounts = map[string]Account{
-	NetworkPolicyProvider: {
-		Name:                         NetworkPolicyProvider,
-		Username:                     "system:serviceaccount:" + NetworkPolicyProvider,
-		UID:                          "system:serviceaccount:" + NetworkPolicyProvider,
-		Group:                        fmt.Sprintf("%s:%s", Group, NetworkPolicyProvider),
-		SecretName:                   NetworkPolicySecretName,
-		SecretKey:                    NetworkPolicySecretKey,
-		SecretManaged:                true,
-		RequiredMCPBackend:           "kubernetes",
-		RequiredNetworkPolicyEnabled: true,
-	},
 }
 
 func All() []Account {

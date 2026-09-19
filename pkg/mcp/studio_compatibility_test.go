@@ -9,20 +9,12 @@ import (
 
 func TestStudioCompatibilityAllowsMultiUserRemoteCatalogEntries(t *testing.T) {
 	manifest := types.MCPServerCatalogEntryManifest{
-		ServerUserType: types.ServerUserTypeMultiUser,
-		Runtime:        types.RuntimeRemote,
+		Runtime: types.RuntimeRemote,
 		RemoteConfig: &types.RemoteCatalogConfig{
 			FixedURL: "https://8.8.8.8/mcp",
 		},
-		MultiUserConfig: &types.MultiUserConfig{
-			UserDefinedHeaders: []types.MCPHeader{
-				{
-					Name:      "API Key",
-					Key:       "X-API-Key",
-					Required:  true,
-					Sensitive: true,
-				},
-			},
+		Config: []types.MCPConfig{
+			{Name: "API Key", Key: "X-API-Key", Required: true, Sensitive: true, Usage: types.Header},
 		},
 	}
 
