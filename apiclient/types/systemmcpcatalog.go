@@ -58,6 +58,18 @@ type SystemMCPServerCatalogEntryManifest struct {
 	Config []MCPConfig `json:"config,omitempty"`
 
 	Resources *MCPResourceRequirements `json:"resources,omitempty"`
+
+	// Deprecated: retained to decode catalog source files still using the pre-vMCP schema; migrated into Config on load.
+	DeprecatedServerUserType  ServerUserType   `json:"serverUserType,omitempty"`
+	DeprecatedMultiUserConfig *MultiUserConfig `json:"multiUserConfig,omitempty"`
+	DeprecatedEnv             []MCPEnv         `json:"env,omitempty"`
+}
+
+// MigrateDeprecatedCatalogFields folds the pre-vMCP catalog fields into the
+// unified Config list, matching MCPServerCatalogEntryManifest. It is called
+// once per decode.
+func (m *SystemMCPServerCatalogEntryManifest) MigrateDeprecatedCatalogFields() {
+	m.Config = append(m.Config, deprecatedCatalogConfig(m.DeprecatedEnv, m.RemoteConfig, m.DeprecatedMultiUserConfig)...)
 }
 
 func (m SystemMCPServerCatalogEntryManifest) ValidateConfig() error {

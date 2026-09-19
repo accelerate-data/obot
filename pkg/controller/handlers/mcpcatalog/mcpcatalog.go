@@ -612,6 +612,7 @@ func readCatalogManifests[T any](ctx context.Context, httpClient *http.Client, s
 		if err = yaml.UnmarshalStrict(contents, &entries); err != nil {
 			return nil, fmt.Errorf("failed to decode catalog %s: %w", sourceURL, err)
 		}
+		catalogvalidation.MigrateDeprecatedCatalogFields(entries)
 		return entries, nil
 	}
 
@@ -636,6 +637,7 @@ func readCatalogManifests[T any](ctx context.Context, httpClient *http.Client, s
 	if err = yaml.UnmarshalStrict(contents, &entries); err != nil {
 		return nil, fmt.Errorf("failed to decode catalog %s: %w", sourceURL, err)
 	}
+	catalogvalidation.MigrateDeprecatedCatalogFields(entries)
 	return entries, nil
 }
 

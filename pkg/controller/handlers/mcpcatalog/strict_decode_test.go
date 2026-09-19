@@ -30,19 +30,20 @@ func TestReadCatalogManifestsStrict(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "removed env field",
+			name:    "legacy env field is migrated",
 			content: "- name: Test\n  env: []\n",
-			wantErr: true,
 		},
 		{
-			name:    "removed headers field",
+			name:    "legacy remote headers field is migrated",
 			content: "- name: Test\n  remoteConfig:\n    headers: []\n",
-			wantErr: true,
 		},
 		{
-			name:    "removed server user type",
+			name:    "legacy server user type field is migrated",
 			content: "- name: Test\n  serverUserType: singleUser\n",
-			wantErr: true,
+		},
+		{
+			name:    "legacy multi user config field is migrated",
+			content: "- name: Test\n  multiUserConfig:\n    userDefinedHeaders: []\n",
 		},
 		{
 			name:    "duplicate field",
@@ -85,7 +86,9 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 			}
 
 			writeParseTestManifest(t, dir, "Valid", "original")
-			require.NoError(t, os.WriteFile(filepath.Join(dir, "legacy.yaml"), []byte("name: Legacy\nenv: []\n"), 0o600))
+			// The legacy schema fields are accepted now, so a strict schema error
+			// must come from a genuinely unknown field.
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "schema-error.yaml"), []byte("name: Legacy\nunknownField: true\n"), 0o600))
 			corruptParseTestManifest(t, writeParseTestManifest(t, dir, "Broken", "original"))
 
 			var logs bytes.Buffer
@@ -96,17 +99,17 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 			// Both schema and syntax errors must survive every reader layer
 			// alongside valid entries, so sync can identify an incomplete source.
 			entries, err := readCatalogManifests[types.MCPServerCatalogEntryManifest](t.Context(), http.DefaultClient, dir, "")
-			require.ErrorContains(t, err, "legacy.yaml")
+			require.ErrorContains(t, err, "schema-error.yaml")
 			require.ErrorContains(t, err, "Broken.yaml")
 			require.Len(t, entries, 1)
 			require.Equal(t, "Valid", entries[0].Name)
 
 			require.Contains(t, logs.String(), "level=WARN")
-			require.Contains(t, logs.String(), "legacy.yaml")
+			require.Contains(t, logs.String(), "schema-error.yaml")
 			require.Contains(t, logs.String(), "Broken.yaml")
 
 			objects, err := (&Handler{}).readMCPCatalog(t.Context(), "default", dir, "")
-			require.ErrorContains(t, err, "legacy.yaml")
+			require.ErrorContains(t, err, "schema-error.yaml")
 			require.ErrorContains(t, err, "Broken.yaml")
 			require.Len(t, objects, 1)
 		})
