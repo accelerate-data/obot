@@ -43,8 +43,10 @@ RUN git clone --branch v0.8.1 https://github.com/pgvector/pgvector.git && \
   rm -rf pgvector
 
 FROM ${PROVIDERS_IMAGE} AS providers
+# The enterprise-providers image is scratch-based (no /bin/sh) and already
+# ships /obot-providers, so the final stage copies it directly rather than
+# creating the directory with a RUN.
 FROM ${ENTERPRISE_PROVIDERS_IMAGE} AS enterprise-providers
-RUN mkdir -p /obot-providers
 FROM ${ENCRYPTION_BINS_IMAGE} AS encryption-bins
 
 FROM final-base AS final
