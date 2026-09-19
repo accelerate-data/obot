@@ -1,10 +1,13 @@
 package git
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -242,5 +245,29 @@ func TestRepositorySizeChecksReturnSentinel(t *testing.T) {
 
 		err := checkGitLabRepoSize(t.Context(), "gitlab.com", "example/repo", 100, "token")
 		assert.ErrorIs(t, err, errRepoTooLarge)
+	})
+}
+
+func TestShouldAbortRepositorySizeCheck(t *testing.T) {
+	t.Run("oversized repository", func(t *testing.T) {
+		assert.True(t, shouldAbortRepositorySizeCheck(t.Context(), errRepoTooLarge))
+	})
+
+	t.Run("cancelled clone context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		assert.True(t, shouldAbortRepositorySizeCheck(ctx, errors.New("metadata request failed")))
+	})
+
+	t.Run("expired clone context", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		assert.True(t, shouldAbortRepositorySizeCheck(ctx, context.DeadlineExceeded))
+	})
+
+	t.Run("transient metadata timeout", func(t *testing.T) {
+		assert.False(t, shouldAbortRepositorySizeCheck(t.Context(), context.DeadlineExceeded))
 	})
 }

@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/obot-platform/obot/pkg/version"
+	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/bridges/otellogrus"
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -82,6 +84,18 @@ func New(ctx context.Context) (o *Otel, err error) {
 	}
 	o.shutdown = append(o.shutdown, loggerProvider.Shutdown)
 	global.SetLoggerProvider(loggerProvider)
+
+	// Bridge logrus into the provider. Every obot log goes through
+	// logrus.StandardLogger() (see logger/log.go), but a LoggerProvider on its
+	// own exports nothing: without a hook the process emits zero OTLP log
+	// records even with OTEL_LOGS_EXPORTER=otlp set, and obot's logs reach a
+	// backend only where something tails container stdout. Entries logged with
+	// a context carry that context's span, so trace/log correlation works for
+	// request-scoped logs.
+	logrus.AddHook(otellogrus.NewHook(
+		"github.com/obot-platform/obot",
+		otellogrus.WithLoggerProvider(loggerProvider),
+	))
 
 	return
 }

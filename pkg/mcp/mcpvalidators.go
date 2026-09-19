@@ -368,7 +368,26 @@ func (v ContainerizedValidator) ValidateCatalogConfig(_ context.Context, manifes
 		}
 	}
 
-	return v.validateContainerizedConfig(*manifest.ContainerizedConfig)
+	if err := v.validateContainerizedConfig(*manifest.ContainerizedConfig); err != nil {
+		return err
+	}
+	if oauth := manifest.ContainerizedConfig.OAuth; oauth != nil {
+		declaredEnv := make(map[string]struct{}, len(manifest.Config))
+		for _, config := range manifest.Config {
+			if config.Usage == types.Env {
+				declaredEnv[config.Key] = struct{}{}
+			}
+		}
+		for field, key := range map[string]string{
+			"authorityEnv": oauth.AuthorityEnv, "tenantIDEnv": oauth.TenantIDEnv,
+			"clientIDEnv": oauth.ClientIDEnv, "clientSecretEnv": oauth.ClientSecretEnv,
+		} {
+			if _, ok := declaredEnv[key]; !ok {
+				return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: "containerizedConfig.oauth." + field, Message: fmt.Sprintf("environment key %q is not declared in env", key)}
+			}
+		}
+	}
+	return nil
 }
 
 func (v ContainerizedValidator) ValidateSystemConfig(_ context.Context, manifest types.SystemMCPServerManifest) error {
@@ -432,6 +451,32 @@ func (v ContainerizedValidator) validateContainerizedConfig(config types.Contain
 	}
 	if err := validateStartupTimeout(types.RuntimeContainerized, "containerizedConfig.startupTimeoutSeconds", config.StartupTimeoutSeconds); err != nil {
 		return err
+	}
+	if config.OAuth != nil {
+		if config.OAuth.Provider != types.ContainerOAuthProviderMicrosoftEntra {
+			return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: "containerizedConfig.oauth.provider", Message: "provider must be microsoftEntra"}
+		}
+		for field, value := range map[string]string{
+			"authorityEnv": config.OAuth.AuthorityEnv, "tenantIDEnv": config.OAuth.TenantIDEnv,
+			"clientIDEnv": config.OAuth.ClientIDEnv, "clientSecretEnv": config.OAuth.ClientSecretEnv,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: "containerizedConfig.oauth." + field, Message: "field cannot be empty"}
+			}
+		}
+		if len(config.OAuth.Scopes) == 0 {
+			return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: "containerizedConfig.oauth.scopes", Message: "at least one scope is required"}
+		}
+		for i, scope := range config.OAuth.Scopes {
+			if strings.TrimSpace(scope) == "" {
+				return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: fmt.Sprintf("containerizedConfig.oauth.scopes[%d]", i), Message: "scope cannot be empty"}
+			}
+			for _, match := range containerOAuthTemplate.FindAllStringSubmatch(scope, -1) {
+				if match[1] != config.OAuth.ClientIDEnv {
+					return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: fmt.Sprintf("containerizedConfig.oauth.scopes[%d]", i), Message: "scope templates may only reference clientIDEnv"}
+				}
+			}
+		}
 	}
 
 	return nil
@@ -793,6 +838,16 @@ func ValidateServerManifest(ctx context.Context, manifest types.MCPServerManifes
 				Runtime: manifest.Runtime,
 				Field:   "config",
 				Message: "userAllowed may only be set for multi-user headers",
+			}
+		}
+	}
+	if manifest.ContainerizedConfig != nil && manifest.ContainerizedConfig.OAuth != nil {
+		if !isMultiUser {
+			return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: "containerizedConfig.oauth", Message: "container OAuth requires a multi-user server"}
+		}
+		for _, config := range manifest.Config {
+			if config.Usage == types.Header && config.UserAllowed && strings.EqualFold(strings.TrimSpace(config.Key), "Authorization") {
+				return types.RuntimeValidationError{Runtime: types.RuntimeContainerized, Field: "config", Message: "Authorization cannot be user-defined when container OAuth is configured"}
 			}
 		}
 	}

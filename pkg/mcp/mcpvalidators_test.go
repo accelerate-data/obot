@@ -31,6 +31,48 @@ func TestValidateServerManifestForCatalog_MultiUserConfig(t *testing.T) {
 	require.NoError(t, ValidateServerManifest(t.Context(), manifest, true, ValidationOptions{}))
 }
 
+func TestValidateCatalogEntryManifest_ContainerOAuth(t *testing.T) {
+	manifest := types.MCPServerCatalogEntryManifest{
+		Runtime: types.RuntimeContainerized,
+		ContainerizedConfig: &types.ContainerizedRuntimeConfig{
+			Image: "example.test/mcp:1", Port: 8080, Path: "/mcp",
+			OAuth: &types.ContainerOAuthConfig{
+				Provider:        types.ContainerOAuthProviderMicrosoftEntra,
+				AuthorityEnv:    "ENTRA_INSTANCE",
+				TenantIDEnv:     "ENTRA_TENANT_ID",
+				ClientIDEnv:     "ENTRA_CLIENT_ID",
+				ClientSecretEnv: "ENTRA_CLIENT_SECRET",
+				Scopes:          []string{"api://${ENTRA_CLIENT_ID}/Mcp.Tools.ReadWrite"},
+			},
+		},
+		Config: []types.MCPConfig{
+			{Key: "ENTRA_INSTANCE", Usage: types.Env},
+			{Key: "ENTRA_TENANT_ID", Usage: types.Env},
+			{Key: "ENTRA_CLIENT_ID", Usage: types.Env},
+			{Key: "ENTRA_CLIENT_SECRET", Usage: types.Env},
+		},
+	}
+
+	require.NoError(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}))
+
+	manifest.ContainerizedConfig.OAuth.Provider = "arbitrary"
+	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "provider must be microsoftEntra")
+
+	manifest.ContainerizedConfig.OAuth.Provider = types.ContainerOAuthProviderMicrosoftEntra
+	manifest.ContainerizedConfig.OAuth.Scopes = []string{"api://${ENTRA_CLIENT_SECRET}/Mcp.Tools.ReadWrite"}
+	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "scope templates may only reference clientIDEnv")
+
+	manifest.ContainerizedConfig.OAuth.Scopes = []string{"api://${ENTRA_CLIENT_ID}/Mcp.Tools.ReadWrite"}
+	manifest.Config = manifest.Config[:3]
+	require.ErrorContains(t, ValidateCatalogEntryManifest(t.Context(), manifest, true, ValidationOptions{}), "is not declared in env")
+
+	server, err := types.MapCatalogEntryToServer(manifest, "", false)
+	require.NoError(t, err)
+	require.ErrorContains(t, ValidateServerManifest(t.Context(), server, false, ValidationOptions{}), "container OAuth requires a multi-user server")
+	server.Config = append(server.Config, types.MCPConfig{Key: "Authorization", Usage: types.Header, UserAllowed: true})
+	require.ErrorContains(t, ValidateServerManifest(t.Context(), server, true, ValidationOptions{}), "Authorization cannot be user-defined")
+}
+
 func TestRemoteValidator_validateRemoteCatalogConfig(t *testing.T) {
 	validator := RemoteValidator{}
 

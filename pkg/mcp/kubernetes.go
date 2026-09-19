@@ -83,8 +83,9 @@ type kubernetesDeploymentCacheEntry struct {
 }
 
 type podHealthCheckState struct {
-	podUID                  ktypes.UID
-	firstServiceUnavailable time.Time
+	podUID                   ktypes.UID
+	firstServiceUnavailable  time.Time
+	firstInternalServerError time.Time
 }
 
 func newKubernetesBackend(
@@ -151,6 +152,15 @@ func (k *kubernetesBackend) deployServerObjects(ctx context.Context, server Serv
 }
 
 func (k *kubernetesBackend) ensureServerDeployment(ctx context.Context, server ServerConfig) (ServerConfig, error) {
+	// Kubernetes has no separate image-acquisition phase to decouple (the
+	// kubelet pulls images as part of pod scheduling, bounded by
+	// updatedMCPPodName's own StartupTimeout-based watch loop below), but
+	// ensureServerDeployment now owns applying its own StartupTimeout bound
+	// on ctx, since that responsibility moved out of the shared caller
+	// (SessionManager.ensureDeployment) and into each backend individually.
+	ctx, cancel := context.WithTimeout(ctx, server.StartupTimeout)
+	defer cancel()
+
 	for i, component := range server.Components {
 		component.URL = k.transformObotHostname(component.URL)
 		server.Components[i] = component
@@ -876,7 +886,11 @@ func analyzePodStatusWithClient(ctx context.Context, pod *corev1.Pod, server Ser
 			health.firstServiceUnavailable = time.Time{}
 		}
 		if resp.StatusCode == http.StatusInternalServerError {
-			return false, fmt.Errorf("%w: internal server error: %s", ErrHealthCheckFailed, body)
+			if health.firstInternalServerError.IsZero() {
+				health.firstInternalServerError = time.Now()
+			} else if time.Since(health.firstInternalServerError) > internalServerErrorGracePeriod {
+				return false, fmt.Errorf("%w: internal server error: %s", ErrHealthCheckFailed, body)
+			}
 		}
 		if err != nil {
 			return true, err

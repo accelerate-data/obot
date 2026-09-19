@@ -13,12 +13,14 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/go-connections/nat"
+	"github.com/docker/go-units"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/filters"
@@ -30,6 +32,13 @@ import (
 	otypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/utils"
 	"golang.org/x/sync/singleflight"
+)
+
+// dockerMinMemoryBytes is Docker's own floor for a container memory limit. The
+// daemon rejects anything smaller when it creates the container, so accepting it
+// here would leave Obot running while every MCP server failed to start.
+const (
+	dockerMinMemoryBytes int64 = 6 * 1024 * 1024
 )
 
 var (
@@ -50,6 +59,7 @@ type dockerBackend struct {
 	ensureGroup            singleflight.Group
 	fileSyncMu             sync.RWMutex
 	syncedFilesHash        map[string]string
+	mcpResources           container.Resources
 }
 
 type dockerDeploymentCacheEntry struct {
@@ -69,6 +79,15 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 		return nil, err
 	}
 
+	// An explicit OBOT_MCP_DOCKER_NETWORK pins MCP child containers to a known
+	// network, overriding whatever was auto-detected.
+	network = chooseMCPNetwork(opts.MCPDockerNetwork, network)
+
+	mcpResources, err := mcpDockerResources(opts.MCPDockerMemory, opts.MCPDockerCPUs, opts.MCPDockerPidsLimit)
+	if err != nil {
+		return nil, err
+	}
+
 	d := &dockerBackend{
 		client:                 cli,
 		containerEnv:           containerEnv,
@@ -77,6 +96,7 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 		hostBaseURL:            "http://" + host,
 		hostBaseURLWithPort:    "http://" + fmt.Sprintf("%s:%d", host, exposedPort),
 		containerizedBaseImage: opts.MCPBaseImage,
+		mcpResources:           mcpResources,
 		authEnabled:            authEnabled,
 		deploymentCache:        map[string]*dockerDeploymentCacheEntry{},
 		syncedFilesHash:        map[string]string{},
@@ -87,6 +107,92 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 	}
 	d.startDeploymentCacheEventWatcher(ctx)
 	return d, nil
+}
+
+func chooseMCPNetwork(optNetwork string, autoDetected string) string {
+	if optNetwork != "" {
+		return optNetwork
+	}
+	if autoDetected != "" {
+		return autoDetected
+	}
+	return "bridge"
+}
+
+// newMCPServerHostConfig builds the HostConfig for an MCP server container.
+//
+// It maps host.docker.internal to the host gateway so MCP server containers (the
+// remote shim in particular) can reach services published on the host, the same
+// way Obot's own container is reached. Docker Desktop injects this mapping
+// automatically, but native Linux dockerd does not — so a remote MCP server whose
+// URL resolves to host.docker.internal is reachable from Obot itself yet
+// unreachable from the shim Obot deploys. Adding it keeps the shim's host
+// reachability consistent with Obot's.
+//
+// Resources carries the operator-configured ceiling. Compose cannot reach these
+// containers — they are created through the mounted Docker socket, outside the
+// Compose project — so this is the only place a Compose deployment can bound
+// them. The Kubernetes backend gets the same bound from a namespace LimitRange.
+func newMCPServerHostConfig(containerPortStr string, mounts []mount.Mount, resources container.Resources) *container.HostConfig {
+	return &container.HostConfig{
+		PortBindings: map[nat.Port][]nat.PortBinding{nat.Port(containerPortStr): {{HostIP: "127.0.0.1"}}},
+		Mounts:       mounts,
+		ExtraHosts:   []string{"host.docker.internal:host-gateway"},
+		RestartPolicy: container.RestartPolicy{
+			Name: "unless-stopped",
+		},
+		Resources: resources,
+	}
+}
+
+// mcpDockerResources turns the operator-facing ceiling strings into a resource
+// block for every MCP server container. An empty value leaves that dimension
+// uncapped, which is the behaviour deployments had before these knobs existed,
+// so clearing one variable is a complete escape hatch. Parsing here rather than
+// at spawn time turns a typo into one clear startup failure instead of an opaque
+// Docker API error on every server. Out-of-range values are rejected for the
+// same reason as malformed ones — Docker refuses them at container-create time,
+// which would break every MCP server rather than bounding it.
+func mcpDockerResources(memory, cpus, pidsLimit string) (container.Resources, error) {
+	var res container.Resources
+
+	if memory = strings.TrimSpace(memory); memory != "" {
+		parsed, err := units.RAMInBytes(memory)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker memory ceiling %q: %w", memory, err)
+		}
+		if parsed < dockerMinMemoryBytes {
+			return container.Resources{}, fmt.Errorf(
+				"invalid MCP Docker memory ceiling %q: must be at least %s, Docker's own minimum",
+				memory, units.BytesSize(float64(dockerMinMemoryBytes)),
+			)
+		}
+		res.Memory = parsed
+	}
+
+	if cpus = strings.TrimSpace(cpus); cpus != "" {
+		parsed, err := strconv.ParseFloat(cpus, 64)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: %w", cpus, err)
+		}
+		if parsed <= 0 {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker CPU ceiling %q: must be greater than 0", cpus)
+		}
+		res.NanoCPUs = int64(parsed * 1e9)
+	}
+
+	if pidsLimit = strings.TrimSpace(pidsLimit); pidsLimit != "" {
+		parsed, err := strconv.ParseInt(pidsLimit, 10, 64)
+		if err != nil {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: %w", pidsLimit, err)
+		}
+		if parsed < 1 {
+			return container.Resources{}, fmt.Errorf("invalid MCP Docker pids ceiling %q: must be at least 1", pidsLimit)
+		}
+		res.PidsLimit = &parsed
+	}
+
+	return res, nil
 }
 
 func detectDockerBackendNetwork(ctx context.Context, cli *client.Client) (bool, string, string, error) {
@@ -228,6 +334,10 @@ func (d *dockerBackend) deployServer(ctx context.Context, server ServerConfig) e
 		return nil
 	}
 
+	if err := d.pullDeploymentImage(ctx, server); err != nil {
+		return fmt.Errorf("failed to ensure image exists: %w", err)
+	}
+
 	_, _, err = d.createAndStartContainer(ctx, server, server.MCPServerName, configHash, fileEnvKeysHash(server.Files))
 	return err
 }
@@ -295,25 +405,31 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 	configHash := serverID(server)
 	desiredFileEnvKeysHash := fileEnvKeysHash(server.Files)
 
-	// Check if container already exists
 	existing, err := d.getContainer(ctx, server.MCPServerName)
-	if err == nil && existing != nil {
-		currentFileEnvKeysHash, hasFileEnvHash := existing.Labels["mcp.file.env.keys.hash"]
-		if !hasFileEnvHash {
-			currentFileEnvKeysHash = ""
-		}
+	if err != nil {
+		existing = nil
+	}
 
-		desiredImage := d.deploymentImage(server)
-		if existing.Labels["mcp.config.hash"] != configHash ||
-			currentFileEnvKeysHash != desiredFileEnvKeysHash ||
-			existing.NetworkSettings == nil ||
-			existing.NetworkSettings.Networks[d.network] == nil ||
-			desiredImage != "" && existing.Image != desiredImage {
-			// Clear the state. The below logic will remove and recreate the container.
-			existing.State = ""
-		}
+	needsRecreate := dockerContainerNeedsRecreate(existing, configHash, desiredFileEnvKeysHash, d.network, d.deploymentImage(server))
 
-		// Container exists, check state
+	// A recreate requires pulling the image first; a reuse of an
+	// already-running (or already-created) container does not. Either way,
+	// server.StartupTimeout must bound only the creation/start/readiness
+	// work below it, not image acquisition, so the timeout is applied fresh
+	// after any pull rather than around this whole call.
+	return acquireImageThenBoundStartup(ctx, server.StartupTimeout, needsRecreate,
+		func(ctx context.Context) error {
+			return d.pullDeploymentImage(ctx, server)
+		},
+		func(ctx context.Context) (ServerConfig, error) {
+			return d.createOrReuseContainer(ctx, server, mcpServerName, configHash, desiredFileEnvKeysHash, containerEnv, existing, needsRecreate)
+		},
+	)
+}
+
+func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server ServerConfig, mcpServerName, configHash, desiredFileEnvKeysHash string, containerEnv bool, existing *container.Summary, needsRecreate bool) (ServerConfig, error) {
+	if existing != nil && !needsRecreate {
+		// Container exists, is valid, and is created or running.
 		switch existing.State {
 		case container.StateCreated:
 			// Container exists and is created, start it and wait for it to be ready.
@@ -325,6 +441,7 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 				return ServerConfig{}, fmt.Errorf("failed to wait for container: %w", err)
 			}
 
+			var err error
 			existing, err = d.getContainer(ctx, server.MCPServerName)
 			if err != nil {
 				return ServerConfig{}, fmt.Errorf("failed to get running container: %w", err)
@@ -346,32 +463,91 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 				containerPort = server.ContainerPort
 			}
 
-			if err = d.ensureServerReady(ctx, existing, server, containerPort); err != nil {
+			if err := d.ensureServerReady(ctx, existing, server, containerPort); err != nil {
 				return ServerConfig{}, fmt.Errorf("server running, but readiness check failed: %w", err)
 			}
 
 			return d.buildServerConfig(server, existing, containerPort, containerEnv)
-		default:
-			// Container exists but not running, remove it and recreate
-			if err := d.client.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); cerrdefs.IsConflict(err) {
-				// The container is already being removed, wait for it to finish
-				statusCh, errCh := d.client.ContainerWait(ctx, existing.ID, container.WaitConditionRemoved)
-				select {
-				case err := <-errCh:
-					// It's OK if the container is already gone.
-					if err != nil && !cerrdefs.IsNotFound(err) {
-						return ServerConfig{}, fmt.Errorf("error waiting for stopped container to be removed: %w", err)
-					}
-				case <-statusCh:
+		}
+	}
+
+	if existing != nil {
+		// Container exists but is stale or otherwise not reusable, remove it and recreate.
+		if err := d.client.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); cerrdefs.IsConflict(err) {
+			// The container is already being removed, wait for it to finish
+			statusCh, errCh := d.client.ContainerWait(ctx, existing.ID, container.WaitConditionRemoved)
+			select {
+			case err := <-errCh:
+				// It's OK if the container is already gone.
+				if err != nil && !cerrdefs.IsNotFound(err) {
+					return ServerConfig{}, fmt.Errorf("error waiting for stopped container to be removed: %w", err)
 				}
-			} else if err != nil {
-				return ServerConfig{}, fmt.Errorf("failed to remove stopped container: %w", err)
+			case <-statusCh:
 			}
+		} else if err != nil {
+			return ServerConfig{}, fmt.Errorf("failed to remove stopped container: %w", err)
 		}
 	}
 
 	// Create new container
 	return d.createAndStartAndWaitForContainer(ctx, server, mcpServerName, configHash, desiredFileEnvKeysHash, containerEnv)
+}
+
+// dockerContainerNeedsRecreate reports whether ensureDeployment must remove
+// and recreate existing (and therefore must pull the desired image first)
+// rather than reusing it as-is. A nil existing container always needs
+// creating. Otherwise, a config/env/network/image mismatch invalidates the
+// container regardless of its state; absent that, only a Created or Running
+// container is reusable.
+func dockerContainerNeedsRecreate(existing *container.Summary, configHash, desiredFileEnvKeysHash, networkName, desiredImage string) bool {
+	if existing == nil {
+		return true
+	}
+
+	currentFileEnvKeysHash, hasFileEnvHash := existing.Labels["mcp.file.env.keys.hash"]
+	if !hasFileEnvHash {
+		currentFileEnvKeysHash = ""
+	}
+
+	invalidated := existing.Labels["mcp.config.hash"] != configHash ||
+		currentFileEnvKeysHash != desiredFileEnvKeysHash ||
+		existing.NetworkSettings == nil ||
+		existing.NetworkSettings.Networks[networkName] == nil ||
+		desiredImage != "" && existing.Image != desiredImage
+	if invalidated {
+		return true
+	}
+
+	switch existing.State {
+	case container.StateCreated, container.StateRunning:
+		return false
+	default:
+		return true
+	}
+}
+
+// acquireImageThenBoundStartup runs pull (unbounded by startupTimeout, since
+// a registry pull can be legitimately slow) only when needsPull is true, then
+// invokes createOrReuse under a fresh startupTimeout deadline measured from
+// after the pull completes. This keeps image-acquisition time from eating
+// into the tight budget meant for container creation/start/readiness.
+func acquireImageThenBoundStartup(
+	ctx context.Context,
+	startupTimeout time.Duration,
+	needsPull bool,
+	pull func(ctx context.Context) error,
+	createOrReuse func(ctx context.Context) (ServerConfig, error),
+) (ServerConfig, error) {
+	if needsPull {
+		if err := pull(ctx); err != nil {
+			return ServerConfig{}, err
+		}
+	}
+
+	boundedCtx, cancel := context.WithTimeout(ctx, startupTimeout)
+	defer cancel()
+
+	return createOrReuse(boundedCtx)
 }
 
 func (d *dockerBackend) deploymentImage(server ServerConfig) string {
@@ -381,6 +557,33 @@ func (d *dockerBackend) deploymentImage(server ServerConfig) string {
 	default:
 		return ""
 	}
+}
+
+// resolveDeploymentImage determines the image createAndStartContainer will
+// use for server, so it can be pulled ahead of container creation. Unlike
+// deploymentImage (which only tracks the image for runtimes whose identity
+// is invalidated by an image change), this resolves the image for every
+// runtime that createAndStartContainer can actually start.
+func (d *dockerBackend) resolveDeploymentImage(server ServerConfig) (string, error) {
+	switch server.Runtime {
+	case otypes.RuntimeUVX, otypes.RuntimeNPX:
+		return d.containerizedBaseImage, nil
+	case otypes.RuntimeContainerized:
+		if server.ContainerImage == "" {
+			return "", fmt.Errorf("container image must be specified for containerized runtime")
+		}
+		return server.ContainerImage, nil
+	default:
+		return "", fmt.Errorf("unsupported runtime: %s", server.Runtime)
+	}
+}
+
+func (d *dockerBackend) pullDeploymentImage(ctx context.Context, server ServerConfig) error {
+	image, err := d.resolveDeploymentImage(server)
+	if err != nil {
+		return err
+	}
+	return d.pullImage(ctx, image, false)
 }
 
 func (d *dockerBackend) streamServerLogs(ctx context.Context, id string) (io.ReadCloser, error) {
@@ -524,6 +727,13 @@ func (d *dockerBackend) restartServer(ctx context.Context, server ServerConfig) 
 	if containerName == "" {
 		containerName = id
 	}
+
+	// The stored host config predates this ceiling on any container created
+	// before it existed. Copy the three fields individually — assigning the
+	// whole Resources struct would discard everything else recorded there.
+	inspect.HostConfig.Memory = d.mcpResources.Memory
+	inspect.HostConfig.NanoCPUs = d.mcpResources.NanoCPUs
+	inspect.HostConfig.PidsLimit = d.mcpResources.PidsLimit
 
 	resp, err := d.client.ContainerCreate(ctx, inspect.Config, inspect.HostConfig, networkingConfig, nil, containerName)
 	if err != nil {
@@ -1028,18 +1238,8 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 		}
 	}
 
-	// Host config with port bindings and volume mounts
-	hostConfig := &container.HostConfig{
-		PortBindings: map[nat.Port][]nat.PortBinding{nat.Port(containerPortStr): {{HostIP: "127.0.0.1"}}},
-		Mounts:       volumeMounts,
-		RestartPolicy: container.RestartPolicy{
-			Name: "unless-stopped",
-		},
-	}
-
-	if err := d.pullImage(ctx, image, false); err != nil {
-		return "", 0, fmt.Errorf("failed to ensure image exists: %w", err)
-	}
+	// Host config with port bindings and volume mounts.
+	hostConfig := newMCPServerHostConfig(containerPortStr, volumeMounts, d.mcpResources)
 
 	// Configure network
 	networkingConfig := &network.NetworkingConfig{}
