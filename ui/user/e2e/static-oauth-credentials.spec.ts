@@ -94,7 +94,7 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 	);
 
 	await page.route(
-		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credential-tests`,
+		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credentials/test`,
 		async (route) => {
 			attempt += 1;
 			const request = route.request().postDataJSON() as Record<string, string>;
@@ -110,7 +110,7 @@ test('static OAuth modal tests exact credentials, expires proof, saves, and clea
 		}
 	);
 	await page.route(
-		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credential-tests/status`,
+		`**/api/mcp-catalogs/default/entries/${entry.id}/oauth-credentials/test/status`,
 		async (route) => {
 			const { testState } = route.request().postDataJSON() as { testState: string };
 			const reads = (statusReads.get(testState) ?? 0) + 1;
@@ -237,7 +237,8 @@ async function loginAsBootstrapOwner(page: Page) {
 	await page.goto('/admin');
 	await page.locator('input[name="bootstrap-token"]').fill('bootstrap-token');
 	await page.getByRole('button', { name: 'Login' }).click();
-	await expect(page).toHaveURL(/\/admin\/auth-providers/);
+	// The bootstrap owner lands on the dedicated setup route, not the auth-providers list.
+	await expect(page).toHaveURL(/\/admin\/setup/);
 }
 
 async function createStaticOAuthEntry(page: Page): Promise<{ id: string }> {

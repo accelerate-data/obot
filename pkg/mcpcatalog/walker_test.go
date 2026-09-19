@@ -248,3 +248,117 @@ func TestNormalizeSystemManifest(t *testing.T) {
 	require.Equal(t, "API-KEY", entry.Config[1].Key)
 	require.Equal(t, types.Header, entry.Config[1].Usage)
 }
+
+// The pre-vMCP catalog schema put per-user and deployment inputs in env,
+// remoteConfig.headers, and multiUserConfig.userDefinedHeaders. Those fields no
+// longer exist on the catalog-entry manifest, so DecodeCatalogFile must both
+// accept them (Deprecated* fields) and fold them into Config (equal to
+// flattenStoredMCPConfig's server=false conversion) or MapCatalogEntryToServer
+// would deploy an entry with no configuration.
+func TestDecodeCatalogFileMigratesDeprecatedCatalogSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`name: Legacy
+shortDescription: Legacy entry
+description: Legacy entry
+icon: https://example.test/legacy.png
+runtime: remote
+serverUserType: multiUser
+remoteConfig:
+  fixedURL: https://example.com/mcp
+  headers:
+    - key: AUTHORIZATION
+      required: true
+      sensitive: true
+env:
+  - key: WORKSPACE
+    required: true
+multiUserConfig:
+  userDefinedHeaders:
+    - key: X-USER
+      prefix: "Bearer "
+`), 0o600))
+
+	entries, isArray, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
+	require.NoError(t, err)
+	require.False(t, isArray)
+	require.Len(t, entries, 1)
+
+	entry := entries[0]
+	require.Equal(t, []types.MCPConfig{
+		{Key: "WORKSPACE", Required: true, Usage: types.Env},
+		{Key: "AUTHORIZATION", Required: true, Sensitive: true, Usage: types.Header},
+		{Key: "X-USER", Prefix: "Bearer ", Usage: types.Header},
+	}, entry.Config)
+	for _, config := range entry.Config {
+		require.False(t, config.UserAllowed, "catalog entries never carry deployment-policy UserAllowed")
+	}
+	// Existing API consumers still read the deprecated fields, so they stay populated.
+	require.Equal(t, types.ServerUserTypeMultiUser, entry.DeprecatedServerUserType) //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+	require.Len(t, entry.DeprecatedEnv, 1)                                          //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+	require.Len(t, entry.RemoteConfig.DeprecatedHeaders, 1)                         //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+	require.Len(t, entry.DeprecatedMultiUserConfig.UserDefinedHeaders, 1)           //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+
+	require.NoError(t, entry.ValidateConfig())
+}
+
+func TestDecodeCatalogFileMigratesDeprecatedSystemCatalogSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-system.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`name: Filter
+shortDescription: Filter
+description: Filter
+icon: icon
+systemMCPServerType: filter
+filterConfig:
+  toolName: filter
+runtime: remote
+serverUserType: singleUser
+env:
+  - key: TOKEN
+    required: true
+remoteConfig:
+  fixedURL: https://example.com/mcp
+  headers:
+    - key: Authorization
+      prefix: 'Bearer '
+`), 0o600))
+
+	entries, _, err := DecodeCatalogFile[types.SystemMCPServerCatalogEntryManifest](path, true)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, []types.MCPConfig{
+		{Key: "TOKEN", Required: true, Usage: types.Env},
+		{Key: "Authorization", Prefix: "Bearer ", Usage: types.Header},
+	}, entries[0].Config)
+}
+
+func TestDecodeCatalogFileLeavesConfigSchemaUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "modern.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`name: Modern
+shortDescription: Modern entry
+description: Modern entry
+icon: https://example.test/modern.png
+runtime: remote
+remoteConfig:
+  fixedURL: https://example.com/mcp
+config:
+  - key: AUTHORIZATION
+    usage: header
+    required: true
+    sensitive: true
+`), 0o600))
+
+	entries, _, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, []types.MCPConfig{
+		{Key: "AUTHORIZATION", Required: true, Sensitive: true, Usage: types.Header},
+	}, entries[0].Config)
+}
+
+func TestMigrateDeprecatedCatalogFieldsIsNoOpForNewSchema(t *testing.T) {
+	entry := types.MCPServerCatalogEntryManifest{
+		Config: []types.MCPConfig{{Key: "AUTHORIZATION", Usage: types.Header}},
+	}
+	entry.MigrateDeprecatedCatalogFields()
+	require.Equal(t, []types.MCPConfig{{Key: "AUTHORIZATION", Usage: types.Header}}, entry.Config)
+}

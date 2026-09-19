@@ -404,16 +404,6 @@ icon: icon
 runtime: npx
 npxConfig:
   package: test`,
-		"legacy-schema.yaml": `name: Legacy
-shortDescription: Legacy
-description: Legacy
-icon: icon
-runtime: npx
-npxConfig:
-  package: test
-serverUserType: singleUser
-env:
-  - key: TOKEN`,
 		"invalid-config.yaml": `name: Invalid Config
 shortDescription: Invalid Config
 description: Invalid Config
@@ -442,8 +432,6 @@ config:
 		"filterConfig is required",
 		"invalid-name.yaml",
 		"invalid system catalog entry name after sanitization",
-		"legacy-schema.yaml",
-		"unknown field \"env\"",
 		"invalid-config.yaml",
 		"invalid usage \"unknown\" for config key \"TOKEN\"",
 	} {

@@ -125,6 +125,8 @@ type RemoteCatalogConfig struct {
 	URLTemplate         string `json:"urlTemplate,omitempty"`         // URL template for user URLs
 	Hostname            string `json:"hostname,omitempty"`            // Required hostname for user URLs
 	StaticOAuthRequired bool   `json:"staticOAuthRequired,omitempty"` // Indicates static OAuth configuration is required
+	// Deprecated: retained to decode catalog source files still using the pre-vMCP schema; migrated into Config on load.
+	DeprecatedHeaders []MCPHeader `json:"headers,omitempty"`
 }
 
 // MultiUserConfig is retained only for storage migrations.
@@ -202,6 +204,39 @@ type MCPServerCatalogEntryManifest struct {
 	Config []MCPConfig `json:"config,omitempty"`
 
 	Resources *MCPResourceRequirements `json:"resources,omitempty"`
+
+	// Deprecated: retained to decode catalog source files still using the pre-vMCP schema; migrated into Config on load.
+	DeprecatedServerUserType  ServerUserType   `json:"serverUserType,omitempty"`
+	DeprecatedMultiUserConfig *MultiUserConfig `json:"multiUserConfig,omitempty"`
+	DeprecatedEnv             []MCPEnv         `json:"env,omitempty"`
+}
+
+// MigrateDeprecatedCatalogFields folds the pre-vMCP catalog fields (env,
+// remoteConfig.headers, multiUserConfig.userDefinedHeaders) into the unified
+// Config list so MapCatalogEntryToServer deploys a catalog entry's
+// configuration. Catalog entries never carry UserAllowed — that is deployment
+// policy — and the deprecated fields are intentionally left populated because
+// existing API consumers still read them. It is called once per decode.
+func (m *MCPServerCatalogEntryManifest) MigrateDeprecatedCatalogFields() {
+	m.Config = append(m.Config, deprecatedCatalogConfig(m.DeprecatedEnv, m.RemoteConfig, m.DeprecatedMultiUserConfig)...)
+}
+
+func deprecatedCatalogConfig(env []MCPEnv, remote *RemoteCatalogConfig, multi *MultiUserConfig) []MCPConfig {
+	var config []MCPConfig
+	for _, item := range env {
+		config = append(config, ConfigFromEnv(item))
+	}
+	if remote != nil {
+		for _, item := range remote.DeprecatedHeaders {
+			config = append(config, ConfigFromHeader(item))
+		}
+	}
+	if multi != nil {
+		for _, item := range multi.UserDefinedHeaders {
+			config = append(config, ConfigFromHeader(item))
+		}
+	}
+	return config
 }
 
 // ToolOverride defines how a single component tool is exposed by the composite server
