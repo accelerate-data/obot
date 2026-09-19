@@ -252,9 +252,10 @@ func TestNormalizeSystemManifest(t *testing.T) {
 // The pre-vMCP catalog schema put per-user and deployment inputs in env,
 // remoteConfig.headers, and multiUserConfig.userDefinedHeaders. Those fields no
 // longer exist on the catalog-entry manifest, so DecodeCatalogFile must both
-// accept them (Deprecated* fields) and fold them into Config (equal to
-// flattenStoredMCPConfig's server=false conversion) or MapCatalogEntryToServer
-// would deploy an entry with no configuration.
+// accept them (Deprecated* fields) and fold them into Config or
+// MapCatalogEntryToServer would deploy an entry with no configuration.
+// multiUserConfig.userDefinedHeaders are per-user inputs, so they migrate with
+// UserAllowed set and the deployment asks each user for them.
 func TestDecodeCatalogFileMigratesDeprecatedCatalogSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(`name: Legacy
@@ -287,11 +288,11 @@ multiUserConfig:
 	require.Equal(t, []types.MCPConfig{
 		{Key: "WORKSPACE", Required: true, Usage: types.Env},
 		{Key: "AUTHORIZATION", Required: true, Sensitive: true, Usage: types.Header},
-		{Key: "X-USER", Prefix: "Bearer ", Usage: types.Header},
+		{Key: "X-USER", Prefix: "Bearer ", Usage: types.Header, UserAllowed: true},
 	}, entry.Config)
-	for _, config := range entry.Config {
-		require.False(t, config.UserAllowed, "catalog entries never carry deployment-policy UserAllowed")
-	}
+	require.False(t, entry.Config[0].UserAllowed, "env values stay server-owned")
+	require.False(t, entry.Config[1].UserAllowed, "remoteConfig headers stay server-owned")
+	require.True(t, entry.Config[2].UserAllowed, "userDefinedHeaders are per-user inputs")
 	// Existing API consumers still read the deprecated fields, so they stay populated.
 	require.Equal(t, types.ServerUserTypeMultiUser, entry.DeprecatedServerUserType) //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
 	require.Len(t, entry.DeprecatedEnv, 1)                                          //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
