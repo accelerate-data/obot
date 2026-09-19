@@ -9,6 +9,7 @@ import (
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/controller/handlers/mcpserver"
 	gclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -174,6 +175,13 @@ func reconcileOAuthCredential(req router.Request, creds credentialClient) error 
 		if err := req.Client.Status().Update(req.Ctx, entry); err != nil {
 			return fmt.Errorf("failed to update OAuth credential status: %w", err)
 		}
+		// Servers only learn this status on their own reconcile
+		// (SyncOAuthCredentialStatus), so a deployment created before the entry
+		// status settled would otherwise stay missing-OAuth. Push the new value
+		// to the entry's servers here.
+		if err := propagateOAuthCredentialStatus(req, entry.Name, configured); err != nil {
+			return err
+		}
 	}
 
 	if !recheck {
@@ -189,6 +197,36 @@ func reconcileOAuthCredential(req router.Request, creds credentialClient) error 
 	}
 	slog.Info("Cleared sync annotation for MCP catalog entry", "entry", entry.Name)
 
+	return nil
+}
+
+// propagateOAuthCredentialStatus copies a catalog entry's configured flag onto the
+// servers created from it, so a deployment's readiness does not depend on it
+// happening to reconcile after the entry status changed.
+func propagateOAuthCredentialStatus(req router.Request, entryName string, configured bool) error {
+	var mcpServers v1.MCPServerList
+	if err := req.List(&mcpServers, &kclient.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entryName),
+		Namespace:     system.DefaultNamespace,
+	}); err != nil {
+		return fmt.Errorf("failed to list MCP servers: %w", err)
+	}
+	for i := range mcpServers.Items {
+		server := &mcpServers.Items[i]
+		if server.Spec.VMCPID != "" || server.Spec.VMCPInstanceID != "" {
+			continue
+		}
+		if server.Status.OAuthCredentialConfigured == configured {
+			continue
+		}
+		// SyncOAuthCredentialStatus's own per-server reconcile can race this same
+		// write on the same server (both triggered by the same entry change), so
+		// this List()-fetched snapshot can be stale by the time we write; retry
+		// against a fresh read rather than fail the whole propagation on a conflict.
+		if err := mcpserver.UpdateOAuthCredentialConfigured(req, server.Namespace, server.Name, configured, entryName); err != nil {
+			return fmt.Errorf("failed to propagate OAuth credential status to server %s: %w", server.Name, err)
+		}
+	}
 	return nil
 }
 
