@@ -30,6 +30,7 @@ jobs:
       fork_sha: ${{ steps.resolve.outputs.fork_sha }}
       image: ${{ steps.resolve.outputs.image }}
       providers_digest: ${{ steps.check-providers.outputs.providers_digest }}
+      enterprise_providers_digest: ${{ steps.check-providers.outputs.enterprise_providers_digest }}
       encryption_bins_digest: ${{ steps.check-providers.outputs.encryption_bins_digest }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +55,7 @@ jobs:
           set -euo pipefail
           for ref in \
             "ghcr.io/accelerate-data/providers-vibedata:latest" \
+            "ghcr.io/obot-platform/enterprise-providers:latest" \
             "ghcr.io/accelerate-data/providers-vibedata/encryption-bins:latest"; do
             if ! docker buildx imagetools inspect "${ref}" >/dev/null 2>&1; then
               echo "::error::Required image not found: ${ref}"
@@ -64,10 +66,14 @@ jobs:
           PROVIDERS_DIGEST="$(docker buildx imagetools inspect \
             ghcr.io/accelerate-data/providers-vibedata:latest \
             --format '{{println .Manifest.Digest}}' | head -1 | tr -d '[:space:]')"
+          ENTERPRISE_PROVIDERS_DIGEST="$(docker buildx imagetools inspect \
+            ghcr.io/obot-platform/enterprise-providers:latest \
+            --format '{{println .Manifest.Digest}}' | head -1 | tr -d '[:space:]')"
           ENCRYPTION_BINS_DIGEST="$(docker buildx imagetools inspect \
             ghcr.io/accelerate-data/providers-vibedata/encryption-bins:latest \
             --format '{{println .Manifest.Digest}}' | head -1 | tr -d '[:space:]')"
           echo "providers_digest=${PROVIDERS_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "enterprise_providers_digest=${ENTERPRISE_PROVIDERS_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "encryption_bins_digest=${ENCRYPTION_BINS_DIGEST}" >> "$GITHUB_OUTPUT"
 
   build:
@@ -105,6 +111,7 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           build-args: |
             PROVIDERS_IMAGE=ghcr.io/accelerate-data/providers-vibedata@${{ needs.resolve.outputs.providers_digest }}
+            ENTERPRISE_PROVIDERS_IMAGE=ghcr.io/obot-platform/enterprise-providers@${{ needs.resolve.outputs.enterprise_providers_digest }}
             ENCRYPTION_BINS_IMAGE=ghcr.io/accelerate-data/providers-vibedata/encryption-bins@${{ needs.resolve.outputs.encryption_bins_digest }}
           outputs: type=image,name=${{ needs.resolve.outputs.image }},push-by-digest=true,name-canonical=true,push=true
 
@@ -186,6 +193,7 @@ jobs:
           UPSTREAM_SHA: ${{ needs.resolve.outputs.upstream_sha }}
           FORK_SHA: ${{ needs.resolve.outputs.fork_sha }}
           PROVIDERS_DIGEST: ${{ needs.resolve.outputs.providers_digest }}
+          ENTERPRISE_PROVIDERS_DIGEST: ${{ needs.resolve.outputs.enterprise_providers_digest }}
           ENCRYPTION_BINS_DIGEST: ${{ needs.resolve.outputs.encryption_bins_digest }}
         run: |
           {
@@ -197,6 +205,7 @@ jobs:
             echo "| Upstream Obot SHA | \`${UPSTREAM_SHA}\` |"
             echo "| Fork Obot SHA | \`${FORK_SHA}\` |"
             echo "| providers-vibedata digest | \`${PROVIDERS_DIGEST}\` |"
+            echo "| enterprise-providers digest | \`${ENTERPRISE_PROVIDERS_DIGEST}\` |"
             echo "| encryption-bins digest | \`${ENCRYPTION_BINS_DIGEST}\` |"
             echo "| Obot digest | \`${{ steps.manifest.outputs.digest }}\` |"
             echo "| Tags | \`${IMAGE}:${VERSIONED_TAG}\`, \`${IMAGE}:latest\` |"
