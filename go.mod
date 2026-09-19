@@ -3,10 +3,12 @@ module github.com/obot-platform/obot
 go 1.27
 
 replace (
-	// Carries the Entra offline_access fix and forced-expiry refresh proof (VD-4128)
-	// on top of the pinned nanobot commit. Keep this owned fork pinned until an
-	// equivalent upstream release is available and verified.
-	github.com/obot-platform/nanobot => github.com/accelerate-data/nanobot v0.0.0-20260809055832-58d4794821ff
+	// Carries the Entra offline_access fix and forced-expiry refresh proof
+	// (VD-4128), plus parameterized GORM query logging so decrypted MCP session
+	// credentials are never written to the container log (VD-5859), on top of
+	// the pinned nanobot commit. Keep this owned fork pinned until an equivalent
+	// upstream release is available and verified.
+	github.com/obot-platform/nanobot => github.com/accelerate-data/nanobot v0.0.0-20260919053104-951acef05499
 
 	github.com/obot-platform/obot/apiclient => ./apiclient
 	github.com/obot-platform/obot/logger => ./logger

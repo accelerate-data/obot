@@ -47,6 +47,10 @@ func New(config Config) (_ *Services, err error) {
 	}
 	log.Debugf("Database factory created successfully. dsn: %v", sanitizedDSN)
 
+	// Query logging must never write bound parameter values.
+	dbClient.DB.Logger = newParameterizedLogger(dbClient.DB.Logger)
+	parameterizeRecorder()
+
 	services := &Services{
 		DB:    dbClient,
 		Authn: authn.NewAuthenticator(config.StorageToken),
