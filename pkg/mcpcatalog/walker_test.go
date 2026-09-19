@@ -293,10 +293,10 @@ multiUserConfig:
 		require.False(t, config.UserAllowed, "catalog entries never carry deployment-policy UserAllowed")
 	}
 	// Existing API consumers still read the deprecated fields, so they stay populated.
-	require.Equal(t, types.ServerUserTypeMultiUser, entry.DeprecatedServerUserType)
-	require.Len(t, entry.DeprecatedEnv, 1)
-	require.Len(t, entry.RemoteConfig.DeprecatedHeaders, 1)
-	require.Len(t, entry.DeprecatedMultiUserConfig.UserDefinedHeaders, 1)
+	require.Equal(t, types.ServerUserTypeMultiUser, entry.DeprecatedServerUserType) //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+	require.Len(t, entry.DeprecatedEnv, 1)                                          //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+	require.Len(t, entry.RemoteConfig.DeprecatedHeaders, 1)                         //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
+	require.Len(t, entry.DeprecatedMultiUserConfig.UserDefinedHeaders, 1)           //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
 
 	require.NoError(t, entry.ValidateConfig())
 }
