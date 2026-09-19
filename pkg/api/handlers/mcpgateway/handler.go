@@ -19,6 +19,7 @@ import (
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/obot-platform/mmmcp"
 	mmmcpconfig "github.com/obot-platform/mmmcp/config"
+	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
@@ -37,6 +38,7 @@ import (
 
 const (
 	maxJSONRPCErrorRequestBody = 1 << 20
+	gatewayTokenExpiration     = 5 * time.Minute
 )
 
 var (
@@ -55,6 +57,7 @@ type Handler struct {
 	tunnelManager             *tunnel.Manager
 	secretBindingAllowedLabel string
 	serverURL                 string
+	mintToken                 func(context.Context, persistent.TokenContext) (string, error)
 }
 
 func auditLogMetadataForPrincipal(metadata map[string]string, user user.Info) map[string]string {
@@ -133,6 +136,11 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, glob
 		return nil, fmt.Errorf("failed to create composite MCP server: %w", err)
 	}
 
+	mintToken := func(ctx context.Context, tokenContext persistent.TokenContext) (string, error) {
+		_, token, err := tokenService.NewToken(ctx, tokenContext)
+		return token, err
+	}
+
 	return &Handler{
 		ctx:                       ctx,
 		cancel:                    cancel,
@@ -145,6 +153,7 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, glob
 		tunnelManager:             tunnelManager,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 		serverURL:                 serverURL,
+		mintToken:                 mintToken,
 	}, nil
 }
 
@@ -185,6 +194,12 @@ func (h *Handler) Proxy(req api.Context) error {
 		}
 		return err
 	}
+
+	gatewayToken, err := h.gatewayToken(req.Context(), req.User, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig)
+	if err != nil {
+		return fmt.Errorf("failed to mint MCP gateway token: %w", err)
+	}
+	req.Request = req.WithContext(withGatewayToken(req.Context(), req.Request, gatewayToken))
 
 	isCompositeRequest := strings.HasSuffix(req.URL.Path, "/mcp-connect-composite/"+req.PathValue("mcp_id"))
 	if isCompositeRequest {
@@ -337,6 +352,54 @@ func (h *Handler) Proxy(req api.Context) error {
 	ctx = mmmcp.ContextWithConfigID(ctx, fmt.Sprintf("%s++%s", serverConfig.MCPServerName, serverConfig.UserID))
 	h.composite.HTTPHandler().ServeHTTP(req.ResponseWriter, req.WithContext(ctx))
 	return nil
+}
+
+func (h *Handler) gatewayToken(ctx context.Context, authenticatedUser user.Info, mcpID string, server mcp.ServerConfig) (string, error) {
+	if len(server.Audiences) == 0 {
+		return "", nil
+	}
+	audience, err := gatewayAudience(server)
+	if err != nil {
+		return "", err
+	}
+	return h.mintToken(ctx, gatewayTokenContext(authenticatedUser, mcpID, audience, time.Now()))
+}
+
+func gatewayAudience(server mcp.ServerConfig) (string, error) {
+	expectedPath := "/mcp-connect/" + server.MCPServerName
+	for _, audience := range server.Audiences {
+		parsed, err := url.Parse(audience)
+		if err == nil && strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), expectedPath) {
+			return audience, nil
+		}
+	}
+	return "", fmt.Errorf("no exact audience for MCP server %s", server.MCPServerName)
+}
+
+func withGatewayToken(ctx context.Context, request *http.Request, gatewayToken string) context.Context {
+	if gatewayToken == "" {
+		request.Header.Del("Authorization")
+		return ctx
+	}
+	request.Header.Set("Authorization", "Bearer "+gatewayToken)
+	return nmcp.WithToken(ctx, gatewayToken)
+}
+
+func gatewayTokenContext(authenticatedUser user.Info, mcpID, audience string, now time.Time) persistent.TokenContext {
+	extra := authenticatedUser.GetExtra()
+	return persistent.TokenContext{
+		Audience:              audience,
+		IssuedAt:              persistent.NewTime(now),
+		ExpiresAt:             persistent.NewTime(now.Add(gatewayTokenExpiration)),
+		UserID:                authenticatedUser.GetUID(),
+		UserName:              authenticatedUser.GetName(),
+		UserEmail:             cmp.Or(extra["email"]...),
+		UserGroups:            []string{types.GroupMCP, types.GroupAuthenticated},
+		AuthProviderName:      cmp.Or(extra["auth_provider_name"]...),
+		AuthProviderNamespace: cmp.Or(extra["auth_provider_namespace"]...),
+		AuthProviderUserID:    cmp.Or(extra["auth_provider_user_id"]...),
+		MCPID:                 mcpID,
+	}
 }
 
 func rewriteProxyRequest(r *httputil.ProxyRequest, upstreamURL *url.URL) {

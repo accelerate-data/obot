@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"cmp"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -16,22 +17,27 @@ import (
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/handlers"
+	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/utils"
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
 	"github.com/obot-platform/obot/pkg/wait"
+	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
 
 const (
-	ErrInvalidClient           ErrorCode = "invalid_client"
-	ErrInvalidGrant            ErrorCode = "invalid_grant"
-	ErrInvalidRequest          ErrorCode = "invalid_request"
-	ErrAccessDenied            ErrorCode = "access_denied"
-	ErrUnsupportedResponseType ErrorCode = "unsupported_response_type"
-	ErrServerError             ErrorCode = "server_error"
-	ErrInvalidClientMetadata   ErrorCode = "invalid_client_metadata"
+	ErrInvalidClient                        ErrorCode = "invalid_client"
+	ErrInvalidGrant                         ErrorCode = "invalid_grant"
+	ErrInvalidRequest                       ErrorCode = "invalid_request"
+	ErrAccessDenied                         ErrorCode = "access_denied"
+	ErrUnsupportedResponseType              ErrorCode = "unsupported_response_type"
+	ErrServerError                          ErrorCode = "server_error"
+	ErrInvalidClientMetadata                ErrorCode = "invalid_client_metadata"
+	invalidStaticOAuthCredentialTestMessage           = "invalid or expired static OAuth credential test"
 )
 
 // ErrorCode defines the set of OAuth 2.0 error codes as per RFC 6749.
@@ -575,12 +581,18 @@ func (h *handler) ensureMCPAuthComplete(req api.Context, oauthAppAuthRequest v1.
 
 // oauthCallback handles the second-level third-party OAuth for MCP servers.
 func (h *handler) oauthCallback(req api.Context) error {
+	if handled, err := h.maybeHandleStaticOAuthTestCallback(req); err != nil || handled {
+		return err
+	}
 	if handled, err := h.maybeHandleDebuggerCallback(req); err != nil || handled {
 		return err
 	}
 
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+		}
 		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
 	}
 
@@ -635,6 +647,64 @@ func (h *handler) oauthCallback(req api.Context) error {
 	redirectWithOAuthCompletion(req, oauthAppAuthRequest.Name)
 
 	return nil
+}
+
+func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, error) {
+	state := req.URL.Query().Get("state")
+	if state == "" {
+		return false, nil
+	}
+	pending, err := h.oauthChecker.stateMgr.gatewayClient.GetMCPOAuthPendingState(req.Context(), state)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, errors.New("failed to load static OAuth credential test")
+	} else if !pending.StaticOAuthTest {
+		return false, nil
+	}
+	pending, err = h.oauthChecker.stateMgr.gatewayClient.ClaimMCPStaticOAuthTest(req.Context(), state)
+	if errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+	} else if err != nil {
+		return true, errors.New("failed to claim static OAuth credential test")
+	}
+
+	code := req.URL.Query().Get("code")
+	failure := staticOAuthCallbackInputFailure(pending, state, code, req.URL.Query().Get("error"))
+	status := types.MCPStaticOAuthTestStatusSucceeded
+	if failure != "" {
+		status = types.MCPStaticOAuthTestStatusFailed
+	} else {
+		conf := &oauth2.Config{ClientID: pending.ClientID, ClientSecret: pending.ClientSecret, Endpoint: oauth2.Endpoint{AuthURL: pending.AuthURL, TokenURL: pending.TokenURL, AuthStyle: pending.AuthStyle}, RedirectURL: pending.RedirectURL}
+		if pending.Scopes != "" {
+			conf.Scopes = strings.Fields(pending.Scopes)
+		}
+		exchangeContext := req.Context()
+		if h.staticOAuthHTTPClient != nil {
+			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.staticOAuthHTTPClient)
+		}
+		if _, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pending.Verifier, pending.ResourceURL); err != nil {
+			status = types.MCPStaticOAuthTestStatusFailed
+			failure = types.MCPStaticOAuthTestFailureTokenExchange
+		}
+	}
+	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(req.Context(), state, status, failure); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+	} else if err != nil {
+		return true, errors.New("failed to complete static OAuth credential test")
+	}
+	http.Redirect(req.ResponseWriter, req.Request, oauthCompletionURL(""), http.StatusFound)
+	return true, nil
+}
+
+func staticOAuthCallbackInputFailure(pending *gatewaytypes.MCPOAuthPendingState, state, code, errorCode string) types.MCPStaticOAuthTestFailureCategory {
+	if errorCode != "" {
+		return types.MCPStaticOAuthTestFailureAuthorizationDenied
+	}
+	if pending.State != state || code == "" {
+		return types.MCPStaticOAuthTestFailureInvalidCallback
+	}
+	return ""
 }
 
 func authenticatedOAuthUser(req api.Context, oauthAppAuthRequest v1.OAuthAuthRequest, phase string) (authProviderName, authProviderNamespace string, ok bool) {

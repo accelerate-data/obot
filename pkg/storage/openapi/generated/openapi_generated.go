@@ -66,6 +66,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/obot-platform/obot/apiclient/types.CommonProviderStatus":                      schema_obot_platform_obot_apiclient_types_CommonProviderStatus(ref),
 		"github.com/obot-platform/obot/apiclient/types.ComponentServer":                           schema_obot_platform_obot_apiclient_types_ComponentServer(ref),
 		"github.com/obot-platform/obot/apiclient/types.CompositeRuntimeConfig":                    schema_obot_platform_obot_apiclient_types_CompositeRuntimeConfig(ref),
+		"github.com/obot-platform/obot/apiclient/types.ContainerOAuthConfig":                      schema_obot_platform_obot_apiclient_types_ContainerOAuthConfig(ref),
 		"github.com/obot-platform/obot/apiclient/types.ContainerizedRuntimeConfig":                schema_obot_platform_obot_apiclient_types_ContainerizedRuntimeConfig(ref),
 		"github.com/obot-platform/obot/apiclient/types.CustomS3Config":                            schema_obot_platform_obot_apiclient_types_CustomS3Config(ref),
 		"github.com/obot-platform/obot/apiclient/types.DefaultModelAlias":                         schema_obot_platform_obot_apiclient_types_DefaultModelAlias(ref),
@@ -205,10 +206,15 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"github.com/obot-platform/obot/apiclient/types.MCPServerList":                             schema_obot_platform_obot_apiclient_types_MCPServerList(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerManifest":                         schema_obot_platform_obot_apiclient_types_MCPServerManifest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerNeedingK8sUpdate":                 schema_obot_platform_obot_apiclient_types_MCPServerNeedingK8sUpdate(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialDeleteRequest":     schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialDeleteRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialRequest":           schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialStatus":            schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialStatus(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestRequest":       schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestRequest(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestStart":         schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStart(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPServerOAuthCredentialTestStatusRequest": schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStatusRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServerTool":                             schema_obot_platform_obot_apiclient_types_MCPServerTool(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPServersNeedingK8sUpdateList":            schema_obot_platform_obot_apiclient_types_MCPServersNeedingK8sUpdateList(ref),
+		"github.com/obot-platform/obot/apiclient/types.MCPStaticOAuthTestResult":                  schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPTesterChatMessage":                      schema_obot_platform_obot_apiclient_types_MCPTesterChatMessage(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPTesterChatRequest":                      schema_obot_platform_obot_apiclient_types_MCPTesterChatRequest(ref),
 		"github.com/obot-platform/obot/apiclient/types.MCPTesterContent":                          schema_obot_platform_obot_apiclient_types_MCPTesterContent(ref),
@@ -3218,6 +3224,68 @@ func schema_obot_platform_obot_apiclient_types_CompositeRuntimeConfig(ref common
 	}
 }
 
+func schema_obot_platform_obot_apiclient_types_ContainerOAuthConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ContainerOAuthConfig describes a deployment-owned OAuth application whose values are read from the container's encrypted organization configuration. Access and refresh tokens remain user-scoped and are never added to Env.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"provider": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"authorityEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"tenantIDEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"clientIDEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"clientSecretEnv": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"scopes": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Type:   []string{"string"},
+										Format: "",
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"provider", "authorityEnv", "tenantIDEnv", "clientIDEnv", "clientSecretEnv", "scopes"},
+			},
+		},
+	}
+}
+
 func schema_obot_platform_obot_apiclient_types_ContainerizedRuntimeConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -3304,10 +3372,18 @@ func schema_obot_platform_obot_apiclient_types_ContainerizedRuntimeConfig(ref co
 							Format:      "int32",
 						},
 					},
+					"oauth": {
+						SchemaProps: spec.SchemaProps{
+							Description: "OAuth configures Obot-managed per-user OAuth for the shared container.",
+							Ref:         ref("github.com/obot-platform/obot/apiclient/types.ContainerOAuthConfig"),
+						},
+					},
 				},
 				Required: []string{"image", "port", "path"},
 			},
 		},
+		Dependencies: []string{
+			"github.com/obot-platform/obot/apiclient/types.ContainerOAuthConfig"},
 	}
 }
 
@@ -11309,6 +11385,26 @@ func schema_obot_platform_obot_apiclient_types_MCPServerNeedingK8sUpdate(ref com
 	}
 }
 
+func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialDeleteRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"expectedGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+				},
+				Required: []string{"expectedGeneration"},
+			},
+		},
+	}
+}
+
 func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -11325,12 +11421,20 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialRequest(r
 					},
 					"clientSecret": {
 						SchemaProps: spec.SchemaProps{
-							Type:   []string{"string"},
-							Format: "",
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"proof": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
 						},
 					},
 				},
-				Required: []string{"clientID"},
+				Required: []string{"clientID", "clientSecret", "proof"},
 			},
 		},
 	}
@@ -11358,8 +11462,95 @@ func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialStatus(re
 							Format:      "",
 						},
 					},
+					"generation": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"callbackURL": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
 				},
-				Required: []string{"configured"},
+				Required: []string{"configured", "callbackURL"},
+			},
+		},
+	}
+}
+
+func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"clientID": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"clientSecret": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+				},
+				Required: []string{"clientID", "clientSecret"},
+			},
+		},
+	}
+}
+
+func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStart(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"testState": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"oauthURL": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+				},
+				Required: []string{"testState", "oauthURL"},
+			},
+		},
+	}
+}
+
+func schema_obot_platform_obot_apiclient_types_MCPServerOAuthCredentialTestStatusRequest(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"testState": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+				},
+				Required: []string{"testState"},
 			},
 		},
 	}
@@ -11462,6 +11653,45 @@ func schema_obot_platform_obot_apiclient_types_MCPServersNeedingK8sUpdateList(re
 		},
 		Dependencies: []string{
 			"github.com/obot-platform/obot/apiclient/types.MCPServerNeedingK8sUpdate"},
+	}
+}
+
+func schema_obot_platform_obot_apiclient_types_MCPStaticOAuthTestResult(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"failureCategory": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"proof": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"expiresAt": {
+						SchemaProps: spec.SchemaProps{
+							Ref: ref("github.com/obot-platform/obot/apiclient/types.Time"),
+						},
+					},
+				},
+				Required: []string{"status", "expiresAt"},
+			},
+		},
+		Dependencies: []string{
+			"github.com/obot-platform/obot/apiclient/types.Time"},
 	}
 }
 

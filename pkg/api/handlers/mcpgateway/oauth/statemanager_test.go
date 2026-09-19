@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	sservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -20,6 +22,67 @@ import (
 	"k8s.io/apiserver/pkg/authentication/user"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type emptyContainerOAuthTokenStore struct{}
+
+type emptyContainerOAuthUserStore struct{}
+
+func (emptyContainerOAuthTokenStore) ForUserAndMCP(string, string, string) mcp.TokenStorage {
+	return emptyContainerOAuthUserStore{}
+}
+
+func (emptyContainerOAuthUserStore) GetTokenConfig(context.Context) (*oauth2.Config, *oauth2.Token, error) {
+	return nil, nil, nil
+}
+
+func (emptyContainerOAuthUserStore) SetTokenConfig(context.Context, *oauth2.Config, *oauth2.Token) error {
+	return nil
+}
+
+func (emptyContainerOAuthUserStore) DeleteTokenConfig(context.Context) error { return nil }
+
+func (emptyContainerOAuthUserStore) TokenSource(context.Context) (oauth2.TokenSource, error) {
+	return nil, nil
+}
+
+func TestContainerOAuthCheckStartsEntraAuthorizationWithPKCE(t *testing.T) {
+	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate())
+	gateway := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
+
+	factory := &MCPOAuthHandlerFactory{
+		baseURL:    "https://obot.example",
+		stateMgr:   newStateManager(gateway),
+		tokenStore: emptyContainerOAuthTokenStore{},
+	}
+	container := &types.ContainerizedRuntimeConfig{OAuth: &types.ContainerOAuthConfig{
+		Provider: types.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
+		ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
+	}}
+	server := v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: types.MCPServerManifest{
+		Runtime: types.RuntimeContainerized, ContainerizedConfig: container,
+	}}}
+	authURL, err := factory.CheckForMCPAuth(api.Context{Request: httptest.NewRequest(http.MethodGet, "/", nil)}, server, mcp.ServerConfig{
+		Runtime: types.RuntimeContainerized, MCPServerName: "shared-fabric", Env: []string{
+			"INSTANCE=https://login.microsoftonline.com/", "TENANT=tenant-1", "CLIENT=client-1", "SECRET=secret-1",
+		},
+	}, "user-1", "instance-1", "")
+	require.NoError(t, err)
+	parsed, err := url.Parse(authURL)
+	require.NoError(t, err)
+	require.Equal(t, "https://login.microsoftonline.com/tenant-1/oauth2/v2.0/authorize", parsed.Scheme+"://"+parsed.Host+parsed.Path)
+	require.Equal(t, "S256", parsed.Query().Get("code_challenge_method"))
+	require.NotEmpty(t, parsed.Query().Get("code_challenge"))
+	require.Contains(t, parsed.Query().Get("scope"), "offline_access")
+	pending, err := gateway.GetMCPOAuthPendingState(t.Context(), parsed.Query().Get("state"))
+	require.NoError(t, err)
+	require.Equal(t, "instance-1", pending.MCPID)
+	require.Equal(t, "urn:obot:container-oauth:shared-fabric", pending.URL)
+}
 
 func TestOAuthCallbackComponentCompletion(t *testing.T) {
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -94,7 +157,7 @@ func TestOAuthCallbackComponentCompletion(t *testing.T) {
 				require.NoError(t, storage.Create(t.Context(), connection))
 				mcpID = connection.Name
 			}
-			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", authRequest.Name, "state", "verifier", "", &oauth2.Config{
+			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", authRequest.Name, "", "state", "verifier", "", &oauth2.Config{
 				ClientID: "client", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
 			}))
 			response := httptest.NewRecorder()
@@ -150,7 +213,7 @@ func TestStateManagerExchangesAuthorizationCodeWithStoredResource(t *testing.T) 
 		},
 	}
 
-	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "request", "state", verifier, resourceURL, conf))
+	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "request", "", "state", verifier, resourceURL, conf))
 	_, _, err = stateManager.createToken(t.Context(), "state", "authorization-code", "", "")
 	require.NoError(t, err)
 
@@ -161,7 +224,7 @@ func TestStateManagerExchangesAuthorizationCodeWithStoredResource(t *testing.T) 
 	require.Equal(t, verifier, form.Get("code_verifier"))
 
 	conf.Endpoint.AuthURL = "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize"
-	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "request", "entra-state", verifier, resourceURL, conf))
+	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "request", "", "entra-state", verifier, resourceURL, conf))
 	_, _, err = stateManager.createToken(t.Context(), "entra-state", "authorization-code", "", "")
 	require.NoError(t, err)
 	require.Empty(t, (<-tokenRequest).Get("resource"))

@@ -427,8 +427,9 @@
 
 	async function getOauthURL() {
 		if (!server) return '';
-		// Multi-user server OAuth is admin-managed; per-user connect flow doesn't use it.
-		if (isMultiUserServer(server)) return '';
+		if (isMultiUserServer(server)) {
+			return instance ? UserService.getMcpServerInstanceOauthURL(instance.id) : '';
+		}
 		const oauthURL = await UserService.getMcpServerOauthURL(server.id);
 		return oauthURL || '';
 	}

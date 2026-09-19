@@ -321,9 +321,7 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 	if err != nil {
 		return server, ServerConfig{}, nil, err
 	}
-	if instance.Spec.VMCPInstanceID != "" {
-		serverConfig.MCPServerInstanceID = instance.Name
-	}
+	serverConfig.MCPServerInstanceID = instance.Name
 
 	instanceCredEnv, err := sm.serverInstanceCredEnv(ctx, instance)
 	if err != nil {
@@ -333,6 +331,11 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 	var missingInstanceConfig []string
 	serverConfig.PassthroughHeaderNames, serverConfig.PassthroughHeaderValues, missingInstanceConfig = serverInstanceHeaders(instance, instanceCredEnv)
 	missingConfig = append(missingConfig, missingInstanceConfig...)
+	if len(missingConfig) == 0 && server.Spec.Manifest.Runtime == types.RuntimeContainerized && server.Spec.Manifest.ContainerizedConfig != nil && server.Spec.Manifest.ContainerizedConfig.OAuth != nil {
+		if err := sm.addContainerOAuthAuthorization(ctx, *server.Spec.Manifest.ContainerizedConfig, instance.Name, &serverConfig); err != nil {
+			return server, ServerConfig{}, nil, err
+		}
+	}
 
 	if serverConfig.Webhooks, err = sm.webhooksForServerConfig(serverConfig); err != nil {
 		return server, ServerConfig{}, nil, err

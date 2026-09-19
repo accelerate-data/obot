@@ -20,8 +20,8 @@ func newStateManager(gatewayClient *client.Client) *stateManager {
 	}
 }
 
-func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, state, verifier, resourceURL string, conf *oauth2.Config) error {
-	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, state, verifier, resourceURL, conf)
+func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, conf *oauth2.Config) error {
+	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL, conf)
 }
 
 func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, errorDescription string) (string, string, error) {
@@ -56,13 +56,9 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 		return "", "", fmt.Errorf("failed to exchange code: %w", err)
 	}
 
-	// Save the completed token
-	if err := sm.gatewayClient.ReplaceMCPOAuthToken(ctx, ps.UserID, ps.MCPID, ps.URL, ps.OAuthAuthRequestID, conf, token); err != nil {
+	if err := sm.gatewayClient.CommitMCPOAuthPendingStateToken(ctx, ps, ps.OAuthAuthRequestID, conf, token); err != nil {
 		return "", "", err
 	}
-
-	// Delete the pending state
-	_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
 
 	return ps.OAuthAuthRequestID, ps.MCPID, nil
 }

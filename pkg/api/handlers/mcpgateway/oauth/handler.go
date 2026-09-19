@@ -24,6 +24,7 @@ type handler struct {
 	clientExpiration time.Duration
 
 	clientMetadataHTTPClient *http.Client
+	staticOAuthHTTPClient    *http.Client
 	clientMetadataCache      map[string]clientMetadataCacheEntry
 	clientMetadataCacheLock  sync.Mutex
 	clientIDNativeExceptions map[string]struct{}
@@ -40,6 +41,11 @@ func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTo
 			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
 			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
 			Timeout:        clientMetadataFetchTimeout,
+		}),
+		staticOAuthHTTPClient: safehttp.NewClient(safehttp.Options{
+			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
+			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
+			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
 		}),
 		baseURL:                  baseURL,
 		oauthChecker:             oauthChecker,

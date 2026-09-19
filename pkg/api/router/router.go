@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/handlers"
 	"github.com/obot-platform/obot/pkg/api/handlers/agentconnect"
 	"github.com/obot-platform/obot/pkg/api/handlers/agentterminal"
@@ -22,6 +23,15 @@ import (
 type Router struct {
 	http.Handler
 	mcpGateway *mcpgateway.Handler
+}
+
+type routeRegistrar interface {
+	HandleFunc(pattern string, handler api.HandlerFunc)
+}
+
+func registerServerInstanceOAuthRoutes(mux routeRegistrar, serverInstances *handlers.ServerInstancesHandler) {
+	mux.HandleFunc("GET /api/mcp-server-instances/{mcp_server_instance_id}/oauth-url", serverInstances.GetOAuthURL)
+	mux.HandleFunc("GET /api/mcp-server-instances/{mcp_server_instance_id}/oauth-redirect", serverInstances.RedirectOAuthURL)
 }
 
 func (r *Router) Close() error {
@@ -132,7 +142,7 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 	localAgentAuditLogs := mcpgateway.NewLocalAgentAuditLogHandler()
 	llmAuditLogs := handlers.NewLLMAuditLogHandler()
 	auditLogExports := handlers.NewAuditLogExportHandler(services.GatewayClient)
-	serverInstances := handlers.NewServerInstancesHandler(services.AccessControlRuleHelper, services.ServerURL)
+	serverInstances := handlers.NewServerInstancesHandler(services.AccessControlRuleHelper, oauthChecker, services.MCPSessionManager, services.ServerURL)
 	systemMCPServers := handlers.NewSystemMCPServerHandler(services.MCPSessionManager, services.MCPSecretBindingAllowedLabel)
 	userDefaultRoleSettings := handlers.NewUserDefaultRoleSettingHandler()
 	setupHandler := setup.NewHandler(services.ServerURL, services.Bootstrapper, services.ProviderDispatcher)
@@ -229,6 +239,7 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 	mux.HandleFunc("POST /api/mcp-server-instances/{mcp_server_instance_id}/deconfigure", serverInstances.DeconfigureServerInstance)
 	mux.HandleFunc("DELETE /api/mcp-server-instances/{mcp_server_instance_id}", serverInstances.DeleteServerInstance)
 	mux.HandleFunc("DELETE /api/mcp-server-instances/{mcp_server_instance_id}/oauth", serverInstances.ClearOAuthCredentials)
+	registerServerInstanceOAuthRoutes(mux, serverInstances)
 
 	// Virtual MCPs
 	mux.HandleFunc("GET /api/vmcps", vmcps.List)
@@ -290,7 +301,10 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 	// MCP Catalog Entry OAuth Credentials (admin only)
 	mux.HandleFunc("GET /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.GetOAuthCredentials)
 	mux.HandleFunc("POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.SetOAuthCredentials)
+	mux.HandleFunc("PUT /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.ReplaceOAuthCredentials)
 	mux.HandleFunc("DELETE /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.DeleteOAuthCredentials)
+	mux.HandleFunc("POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials/test", mcpCatalogs.StartOAuthCredentialTest)
+	mux.HandleFunc("POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials/test/status", mcpCatalogs.GetOAuthCredentialTest)
 
 	// MCPServers within the catalog (admin only, for multi-user MCP servers)
 	mux.HandleFunc("GET /api/mcp-catalogs/{catalog_id}/servers", mcp.ListServer)
@@ -363,7 +377,10 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 	// Workspace-scoped MCP Server Catalog Entry OAuth Credentials (PowerUser and higher only)
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.GetOAuthCredentials)
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.SetOAuthCredentials)
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.ReplaceOAuthCredentials)
 	mux.HandleFunc("DELETE /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials", mcpCatalogs.DeleteOAuthCredentials)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials/test", mcpCatalogs.StartOAuthCredentialTest)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials/test/status", mcpCatalogs.GetOAuthCredentialTest)
 
 	// Workspace-scoped MCP Servers (PowerUserPlus and higher only)
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/servers", mcp.ListServer)

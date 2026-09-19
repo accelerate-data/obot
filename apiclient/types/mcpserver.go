@@ -32,6 +32,30 @@ type Runtime string
 // ServerUserType specifies whether a catalog entry is single-user or multi-user.
 type ServerUserType string
 
+type MCPStaticOAuthTestStatus string
+
+const (
+	MCPStaticOAuthTestStatusPending   MCPStaticOAuthTestStatus = "pending"
+	MCPStaticOAuthTestStatusSucceeded MCPStaticOAuthTestStatus = "succeeded"
+	MCPStaticOAuthTestStatusFailed    MCPStaticOAuthTestStatus = "failed"
+)
+
+type MCPStaticOAuthTestFailureCategory string
+
+const (
+	MCPStaticOAuthTestFailureAuthorizationDenied MCPStaticOAuthTestFailureCategory = "authorization_denied"
+	MCPStaticOAuthTestFailureInvalidCallback     MCPStaticOAuthTestFailureCategory = "invalid_callback"
+	MCPStaticOAuthTestFailureTokenExchange       MCPStaticOAuthTestFailureCategory = "token_exchange_failed"
+	MCPStaticOAuthTestFailureExpired             MCPStaticOAuthTestFailureCategory = "expired"
+)
+
+type MCPStaticOAuthTestResult struct {
+	Status          MCPStaticOAuthTestStatus          `json:"status"`
+	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
+	Proof           string                            `json:"proof,omitempty"`
+	ExpiresAt       Time                              `json:"expiresAt"`
+}
+
 // UVXRuntimeConfig represents configuration for UVX runtime (Python packages via uvx)
 type UVXRuntimeConfig struct {
 	Package               string   `json:"package"`                         // Required: Python package name
@@ -62,6 +86,24 @@ type ContainerizedRuntimeConfig struct {
 	EgressDomains         []string `json:"egressDomains,omitempty"`         // Optional: Empty means allow all, otherwise allow only the listed domains when network policy enforcement is enabled
 	DenyAllEgress         *bool    `json:"denyAllEgress,omitempty"`         // Optional: Deny all egress when network policy enforcement is enabled
 	StartupTimeoutSeconds int      `json:"startupTimeoutSeconds,omitempty"` // Optional: Timeout to start and connect to the MCP server, in seconds. Defaults to 60s, max 600s.
+	// OAuth configures Obot-managed per-user OAuth for the shared container.
+	OAuth *ContainerOAuthConfig `json:"oauth,omitempty"`
+}
+
+type ContainerOAuthProvider string
+
+const ContainerOAuthProviderMicrosoftEntra ContainerOAuthProvider = "microsoftEntra"
+
+// ContainerOAuthConfig describes a deployment-owned OAuth application whose
+// values are read from the container's encrypted organization configuration.
+// Access and refresh tokens remain user-scoped and are never added to Env.
+type ContainerOAuthConfig struct {
+	Provider        ContainerOAuthProvider `json:"provider"`
+	AuthorityEnv    string                 `json:"authorityEnv"`
+	TenantIDEnv     string                 `json:"tenantIDEnv"`
+	ClientIDEnv     string                 `json:"clientIDEnv"`
+	ClientSecretEnv string                 `json:"clientSecretEnv"`
+	Scopes          []string               `json:"scopes"`
 }
 
 // RemoteRuntimeConfig represents configuration for remote runtime (External MCP servers)
@@ -549,7 +591,12 @@ type RuntimeValidationError struct {
 // MCPServerOAuthCredentialRequest represents a request to set OAuth credentials for an MCP server
 type MCPServerOAuthCredentialRequest struct {
 	ClientID     string `json:"clientID"`
-	ClientSecret string `json:"clientSecret,omitempty"`
+	ClientSecret string `json:"clientSecret"`
+	Proof        string `json:"proof"`
+}
+
+type MCPServerOAuthCredentialDeleteRequest struct {
+	ExpectedGeneration string `json:"expectedGeneration"`
 }
 
 // MCPServerOAuthCredentialStatus represents the status of OAuth credentials for an MCP server
@@ -557,7 +604,23 @@ type MCPServerOAuthCredentialStatus struct {
 	// Configured is true if OAuth credentials have been set
 	Configured bool `json:"configured"`
 	// ClientID is the configured client ID (never includes secret)
-	ClientID string `json:"clientID,omitempty"`
+	ClientID    string `json:"clientID,omitempty"`
+	Generation  string `json:"generation,omitempty"`
+	CallbackURL string `json:"callbackURL"`
+}
+
+type MCPServerOAuthCredentialTestRequest struct {
+	ClientID     string `json:"clientID"`
+	ClientSecret string `json:"clientSecret"`
+}
+
+type MCPServerOAuthCredentialTestStatusRequest struct {
+	TestState string `json:"testState"`
+}
+
+type MCPServerOAuthCredentialTestStart struct {
+	TestState string `json:"testState"`
+	OAuthURL  string `json:"oauthURL"`
 }
 
 // IsSingleUser returns true if the type represents a single-user server.
@@ -730,6 +793,7 @@ func MapCatalogEntryToServer(catalogEntry MCPServerCatalogEntryManifest, userURL
 			EgressDomains:         catalogEntry.ContainerizedConfig.EgressDomains,
 			DenyAllEgress:         catalogEntry.ContainerizedConfig.DenyAllEgress,
 			StartupTimeoutSeconds: catalogEntry.ContainerizedConfig.StartupTimeoutSeconds,
+			OAuth:                 catalogEntry.ContainerizedConfig.OAuth.DeepCopy(),
 		}
 
 	case RuntimeRemote:

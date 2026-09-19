@@ -95,6 +95,7 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 		server.Name,
 		serverConfig.URL,
 		OAuthDebuggerPendingStateMarker,
+		"",
 		state,
 		oauth2.GenerateVerifier(),
 		resourceURL,
@@ -174,22 +175,14 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return types.NewErrNotFound("OAuth debugger authorization state not found")
 	}
 
-	conf := oauthDebuggerConfigFromPendingState(pendingState)
-
 	httpClient, err := m.mcpSessionManager.HTTPClientForServer(serverConfig, mcp.HTTPClientOptions{Timeout: 10 * time.Second, DirectConnect: true})
 	if err != nil {
 		return err
 	}
-	exchangeContext := context.WithValue(req.Context(), oauth2.HTTPClient, httpClient)
-	token, err := mcp.ExchangeOAuthToken(exchangeContext, conf, input.Code, pendingState.Verifier, pendingState.ResourceURL)
+	token, err := exchangeAndPersistOAuthDebuggerToken(req.Context(), req.GatewayClient, pendingState, input.Code, httpClient)
 	if err != nil {
-		return fmt.Errorf("failed to exchange OAuth code: %w", err)
-	}
-
-	if err := req.GatewayClient.ReplaceMCPOAuthToken(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", conf, token); err != nil {
 		return err
 	}
-	_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
 
 	var expiresIn int
 	if !token.Expiry.IsZero() {
@@ -202,6 +195,22 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		TokenType:    token.TokenType,
 		ExpiresIn:    expiresIn,
 	})
+}
+
+func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, pendingState *gwtypes.MCPOAuthPendingState, code string, httpClients ...*http.Client) (*oauth2.Token, error) {
+	conf := oauthDebuggerConfigFromPendingState(pendingState)
+	exchangeContext := ctx
+	if len(httpClients) > 0 && httpClients[0] != nil {
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, httpClients[0])
+	}
+	token, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier, pendingState.ResourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange OAuth code: %w", err)
+	}
+	if err := gatewayClient.CommitMCPOAuthPendingStateToken(ctx, pendingState, "", conf, token); err != nil {
+		return nil, err
+	}
+	return token, nil
 }
 
 func quarterToken(token string) string {
