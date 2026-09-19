@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,9 +41,8 @@ func (s *Server) getCurrentUser(apiContext api.Context) error {
 	if name != "" && namespace != "" {
 		providerURL, err := s.dispatcher.URLForAuthProvider(apiContext.Context(), namespace, name)
 		if err != nil {
-			return fmt.Errorf("failed to get auth provider URL: %w", err)
-		}
-		if err = apiContext.GatewayClient.UpdateProfileIfNeeded(apiContext.Context(), user, name, namespace, providerURL.String()); err != nil {
+			slog.Warn("failed to get auth provider URL", "namespace", namespace, "name", name, "error", err)
+		} else if err = apiContext.GatewayClient.UpdateProfileIfNeeded(apiContext.Context(), user, name, namespace, providerURL.String()); err != nil {
 			slog.Warn("failed to update profile icon for user", "username", user.Username, "error", err)
 		}
 	}
@@ -54,10 +54,21 @@ func (s *Server) getCurrentUser(apiContext api.Context) error {
 		slog.Warn("failed to resolve effective role for user", "username", user.Username, "error", err)
 		effectiveRole = user.Role
 	}
+	effectiveRole = applyRequestTimeRoleUplift(effectiveRole, apiContext.User.GetGroups())
 
 	result := types.ConvertUserWithEffectiveRole(user, apiContext.GatewayClient.HasExplicitRole(user.Email) != types2.RoleUnknown, name, effectiveRole)
 	result.RequirePasswordChange = cmp.Or(apiContext.User.GetExtra()["password_change_required"]...) == "true"
 	return apiContext.Write(result)
+}
+
+func applyRequestTimeRoleUplift(effectiveRole types2.Role, requestGroups []string) types2.Role {
+	if slices.Contains(requestGroups, types2.GroupOwner) && !effectiveRole.HasRole(types2.RoleOwner) {
+		return effectiveRole.SwitchBaseRole(types2.RoleOwner)
+	}
+	if slices.Contains(requestGroups, types2.GroupAdmin) && !effectiveRole.HasRole(types2.RoleAdmin) {
+		return effectiveRole.SwitchBaseRole(types2.RoleAdmin)
+	}
+	return effectiveRole
 }
 
 func (s *Server) getUsers(apiContext api.Context) error {

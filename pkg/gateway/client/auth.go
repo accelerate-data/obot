@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
@@ -46,17 +47,29 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		return nil, false, nil
 	}
 
+	extra := resp.User.GetExtra()
 	var (
 		gatewayUser  *types.User
 		authGroupIDs []string
 	)
-	if authProviderNamespace, authProviderName := cmp.Or(resp.User.GetExtra()["auth_provider_namespace"]...), cmp.Or(resp.User.GetExtra()["auth_provider_name"]...); authProviderNamespace != "" && authProviderName != "" {
+	if authProviderNamespace, authProviderName := cmp.Or(extra["auth_provider_namespace"]...), cmp.Or(extra["auth_provider_name"]...); authProviderNamespace != "" && authProviderName != "" {
+		var emailVerified *bool
+		if raw := cmp.Or(extra["auth_provider_email_verified"]...); raw != "" {
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				return nil, false, fmt.Errorf("invalid auth_provider_email_verified value %q: %w", raw, err)
+			}
+			emailVerified = &parsed
+		}
+
 		identity := &types.Identity{
-			Email:                 cmp.Or(resp.User.GetExtra()["email"]...),
+			Email:                 cmp.Or(extra["email"]...),
 			AuthProviderName:      authProviderName,
 			AuthProviderNamespace: authProviderNamespace,
 			ProviderUsername:      resp.User.GetName(),
 			ProviderUserID:        resp.User.GetUID(),
+			ProviderIssuer:        cmp.Or(extra["auth_provider_issuer"]...),
+			ProviderEmailVerified: emailVerified,
 		}
 
 		userLimit, err := u.resolveUserLimit(req.Context())
@@ -74,7 +87,6 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		return nil, false, nil
 	}
 
-	extra := resp.User.GetExtra()
 	extra["auth_provider_groups"] = authGroupIDs
 
 	// Resolve effective role by merging individual + group roles

@@ -152,6 +152,12 @@ func (ap *AuthProviderHandler) Configure(req api.Context) error {
 			delete(envVars, key)
 		}
 	}
+	if err := validateGenericOAuthConfigChange(req.Context(), req.GatewayClient, authProvider.Name, []string{
+		authProvider.Name,
+		system.GenericAuthProviderCredentialContext,
+	}, envVars); err != nil {
+		return err
+	}
 
 	stagedName, err := stageProviderCredential(req, envVars)
 	if err != nil {
@@ -247,6 +253,11 @@ func (ap *AuthProviderHandler) Stage(req api.Context) error {
 		if val == "" {
 			delete(envVars, key)
 		}
+	}
+	if err := validateGenericOAuthConfigChange(req.Context(), req.GatewayClient, authProvider.Name, []string{
+		system.ReplacementAuthProviderCredentialContext,
+	}, envVars); err != nil {
+		return err
 	}
 
 	status, err := providers.AuthProviderStatus(req.Context(), authProvider, envVars, ap.license)
