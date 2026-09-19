@@ -1629,48 +1629,48 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 			return fmt.Errorf("failed to get catalog entry %s: %w", mcpServer.Spec.MCPServerCatalogEntryName, err)
 		}
 
-		var updateServer bool
-		if url := envVars[configURLKey]; url != "" {
-			validationOptions, err := ValidationOptionsWithResourceMaximums(req, m.mcpSessionManager)
-			if err != nil {
-				return err
-			}
-			if err := updateMCPServerURLFromCatalogEntry(req.Context(), req.Storage, &mcpServer, catalogEntry, url, validationOptions); err != nil {
-				return err
-			}
-
-			// The URL is part of user configuration, but it is stored on the MCPServer spec rather than in credentials.
+		// The URL is part of user configuration, but it is stored on the MCPServer spec rather than in credentials.
+		urlValue := envVars[configURLKey]
+		if urlValue != "" {
 			delete(envVars, configURLKey)
-			updateServer = true
 		}
-
-		// Check if the catalog entry has a URL template for remote runtime
-		// Templates use ${VARIABLE_NAME} syntax for variable substitution
-		// Example: "https://${DATABRICKS_WORKSPACE_URL}/api/2.0/mcp/genie/${DATABRICKS_GENIE_SPACE_ID}"
-		if catalogEntry.Spec.Manifest.Runtime == types.RuntimeRemote &&
+		// Templates use ${VARIABLE_NAME} syntax for variable substitution, for example
+		// "https://${DATABRICKS_WORKSPACE_URL}/api/2.0/mcp/genie/${DATABRICKS_GENIE_SPACE_ID}".
+		templateEntry := catalogEntry.Spec.Manifest.Runtime == types.RuntimeRemote &&
 			catalogEntry.Spec.Manifest.RemoteConfig != nil &&
-			catalogEntry.Spec.Manifest.RemoteConfig.URLTemplate != "" {
+			catalogEntry.Spec.Manifest.RemoteConfig.URLTemplate != ""
+
+		if urlValue != "" || templateEntry {
 			validationOptions, err := ValidationOptionsWithResourceMaximums(req, m.mcpSessionManager)
 			if err != nil {
 				return err
 			}
-			if err := applyRemoteURLTemplate(req.Context(), &mcpServer.Spec.Manifest, envVars, !mcpServer.Spec.IsSingleUser(), validationOptions); err != nil {
-				if configErr, ok := errors.AsType[*urlTemplateConfigurationError](err); ok {
-					return types.NewErrBadRequest("invalid configuration: %v", configErr)
+			// Controllers reconcile a freshly created server concurrently and bump
+			// its ResourceVersion, so a single read-modify-write can conflict.
+			if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+				if err := req.Get(&mcpServer, req.PathValue("mcp_server_id")); err != nil {
+					return err
 				}
-				return err
-			}
-			if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, mcpServer.Spec.Manifest); err != nil {
-				return types.NewErrBadRequest("validation failed: %v", err)
-			}
-
-			updateServer = updateServer || mcpServer.Spec.NeedsURL || mcpServer.Spec.Manifest.RemoteConfig.URL != ""
-			mcpServer.Spec.NeedsURL = false
-			mcpServer.Spec.PreviousURL = ""
-		}
-
-		if updateServer {
-			if err := req.Update(&mcpServer); err != nil {
+				if urlValue != "" {
+					if err := updateMCPServerURLFromCatalogEntry(req.Context(), req.Storage, &mcpServer, catalogEntry, urlValue, validationOptions); err != nil {
+						return err
+					}
+				}
+				if templateEntry {
+					if err := applyRemoteURLTemplate(req.Context(), &mcpServer.Spec.Manifest, envVars, !mcpServer.Spec.IsSingleUser(), validationOptions); err != nil {
+						if configErr, ok := errors.AsType[*urlTemplateConfigurationError](err); ok {
+							return types.NewErrBadRequest("invalid configuration: %v", configErr)
+						}
+						return err
+					}
+					if err := obottunnel.ValidateServerTunnelReferences(req.Context(), req.Storage, mcpServer.Spec.Manifest); err != nil {
+						return types.NewErrBadRequest("validation failed: %v", err)
+					}
+					mcpServer.Spec.NeedsURL = false
+					mcpServer.Spec.PreviousURL = ""
+				}
+				return req.Update(&mcpServer)
+			}); err != nil {
 				return fmt.Errorf("failed to update server configuration: %w", err)
 			}
 		}
