@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -619,13 +620,43 @@ func (h *Handler) SyncOAuthCredentialStatus(req router.Request, _ router.Respons
 	}
 
 	// Sync status from catalog entry
-	if server.Status.OAuthCredentialConfigured != catalogEntry.Status.OAuthCredentialConfigured {
-		server.Status.OAuthCredentialConfigured = catalogEntry.Status.OAuthCredentialConfigured
-		slog.Info("Updated MCP server OAuth credential status from catalog entry", "server", server.Name, "catalogEntry", catalogEntry.Name, "configured", server.Status.OAuthCredentialConfigured)
-		return req.Client.Status().Update(req.Ctx, server)
+	desired := catalogEntry.Status.OAuthCredentialConfigured
+	if server.Status.OAuthCredentialConfigured == desired {
+		return nil
 	}
 
-	return nil
+	return UpdateOAuthCredentialConfigured(req, server.Namespace, server.Name, desired, catalogEntry.Name)
+}
+
+// UpdateOAuthCredentialConfigured sets OAuthCredentialConfigured on the named
+// server, retrying on conflict. Deployment creation triggers several
+// controllers reconciling the same freshly-created MCPServer concurrently
+// (URL templating, OAuth propagation, this sync), each bumping
+// ResourceVersion; a single read-modify-write against the router's cached
+// req.Object can lose that race indefinitely; a bare Status().Update() call
+// logs its intent before the conflict surfaces, and the error return alone,
+// with no retry, does not guarantee the value ever lands.
+func UpdateOAuthCredentialConfigured(
+	req router.Request,
+	namespace, name string,
+	desired bool,
+	catalogEntryName string,
+) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest v1.MCPServer
+		if err := req.Get(&latest, namespace, name); err != nil {
+			return err
+		}
+		if latest.Status.OAuthCredentialConfigured == desired {
+			return nil
+		}
+		latest.Status.OAuthCredentialConfigured = desired
+		if err := req.Client.Status().Update(req.Ctx, &latest); err != nil {
+			return err
+		}
+		slog.Info("Updated MCP server OAuth credential status", "server", name, "catalogEntry", catalogEntryName, "configured", desired)
+		return nil
+	})
 }
 
 func (h *Handler) SyncOAuthMetadata(req router.Request, _ router.Response) error {
@@ -815,10 +846,8 @@ func (h *Handler) SetNonDeployServerStatus(req router.Request, _ router.Response
 
 // clearOAuthStatusIfSet clears the OAuthCredentialConfigured status if it is currently set.
 func clearOAuthStatusIfSet(req router.Request, server *v1.MCPServer) error {
-	if server.Status.OAuthCredentialConfigured {
-		server.Status.OAuthCredentialConfigured = false
-		slog.Info("Cleared MCP server OAuth credential status", "server", server.Name)
-		return req.Client.Status().Update(req.Ctx, server)
+	if !server.Status.OAuthCredentialConfigured {
+		return nil
 	}
-	return nil
+	return UpdateOAuthCredentialConfigured(req, server.Namespace, server.Name, false, "")
 }

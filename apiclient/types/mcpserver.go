@@ -214,9 +214,11 @@ type MCPServerCatalogEntryManifest struct {
 // MigrateDeprecatedCatalogFields folds the pre-vMCP catalog fields (env,
 // remoteConfig.headers, multiUserConfig.userDefinedHeaders) into the unified
 // Config list so MapCatalogEntryToServer deploys a catalog entry's
-// configuration. Catalog entries never carry UserAllowed — that is deployment
-// policy — and the deprecated fields are intentionally left populated because
-// existing API consumers still read them. It is called once per decode.
+// configuration. Fields migrated from multiUserConfig.userDefinedHeaders are
+// per-user inputs and carry UserAllowed so the deployment asks each user for
+// them; env and remoteConfig.headers stay server-owned. The deprecated fields
+// are intentionally left populated because existing API consumers still read
+// them. It is called once per decode.
 func (m *MCPServerCatalogEntryManifest) MigrateDeprecatedCatalogFields() {
 	m.Config = append(m.Config, deprecatedCatalogConfig(m.DeprecatedEnv, m.RemoteConfig, m.DeprecatedMultiUserConfig)...)
 }
@@ -233,7 +235,9 @@ func deprecatedCatalogConfig(env []MCPEnv, remote *RemoteCatalogConfig, multi *M
 	}
 	if multi != nil {
 		for _, item := range multi.UserDefinedHeaders {
-			config = append(config, ConfigFromHeader(item))
+			userConfig := ConfigFromHeader(item)
+			userConfig.UserAllowed = true
+			config = append(config, userConfig)
 		}
 	}
 	return config
@@ -353,11 +357,15 @@ const (
 	Interpolated Usage = "interpolated"
 )
 
-// ValidateConfig rejects ambiguous keys and missing or unknown usages.
+// ValidateConfig rejects ambiguous keys and missing or unknown usages. A
+// userAllowed input is only meaningful for a header on a multi-user entry, so a
+// catalog entry may carry it there (the deployment then asks each user for the
+// value); every other use is rejected.
 func (m MCPServerCatalogEntryManifest) ValidateConfig() error {
 	for _, config := range m.Config {
-		if config.UserAllowed {
-			return fmt.Errorf("config key %q: userAllowed is only supported on deployed servers", config.Key)
+		//nolint:staticcheck // DeprecatedServerUserType still carries the decoded serverUserType.
+		if config.UserAllowed && (config.Usage != Header || m.DeprecatedServerUserType != ServerUserTypeMultiUser) {
+			return fmt.Errorf("config key %q: userAllowed is only supported for multi-user headers", config.Key)
 		}
 	}
 	return (MCPServerManifest{Config: m.Config}).ValidateConfig()
@@ -487,7 +495,7 @@ type MCPServer struct {
 	Configured              bool           `json:"configured"`
 	MissingRequiredEnvVars  []string       `json:"missingRequiredEnvVars,omitempty"`
 	MissingRequiredHeaders  []string       `json:"missingRequiredHeader,omitempty"`
-	MissingOAuthCredentials bool           `json:"missingOAuthCredentials,omitempty"`
+	MissingOAuthCredentials bool           `json:"missingOAuthCredentials"`
 	CatalogEntryID          string         `json:"catalogEntryID"`
 	PowerUserWorkspaceID    string         `json:"powerUserWorkspaceID"`
 	MCPCatalogID            string         `json:"mcpCatalogID,omitempty"`
