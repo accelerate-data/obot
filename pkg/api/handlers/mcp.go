@@ -30,6 +30,7 @@ import (
 	obottunnel "github.com/obot-platform/obot/pkg/tunnel"
 	"github.com/obot-platform/obot/pkg/utils"
 	"github.com/obot-platform/obot/pkg/wait"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/util/retry"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -417,50 +418,54 @@ func (m *MCPHandler) GetServer(req api.Context) error {
 func (m *MCPHandler) DeleteServer(req api.Context) error {
 	var (
 		server      v1.MCPServer
+		slug        string
 		id          = req.PathValue("mcp_server_id")
 		catalogID   = req.PathValue("catalog_id")
 		workspaceID = req.PathValue("workspace_id")
 	)
 
-	if err := req.Get(&server, id); err != nil {
-		return err
-	}
-
-	// For servers that are in catalogs, this checks to make sure that a catalogID was provided and that it matches.
-	// For servers that are in workspaces, this checks to make sure that a workspaceID was provided and that it matches.
-	// For servers that are not in catalogs or workspaces, this checks to make sure that no catalogID or workspaceID was provided.
-	if server.Spec.MCPCatalogID != catalogID || server.Spec.PowerUserWorkspaceID != workspaceID {
-		return types.NewErrNotFound("MCP server not found")
-	}
-
-	// Add extracted env vars to the server definition
-	addExtractedEnvVars(&server)
-
-	slug, err := SlugForMCPServer(req.Context(), req.Storage, server, req.User.GetUID(), catalogID, workspaceID)
-	if err != nil {
-		return fmt.Errorf("failed to generate slug: %w", err)
-	}
-
-	// Prevent deletion of component servers that are part of a composite
-	if server.Spec.CompositeName != "" {
-		return types.NewErrForbidden(
-			"cannot delete component of composite %q; delete the composite server instead",
-			server.Spec.CompositeName,
-		)
-	}
-	// Same for vMCPs
-	if server.Spec.VMCPComponentID != "" {
-		name := server.Spec.VMCPID
-		if name == "" {
-			name = server.Spec.VMCPInstanceID
+	// Controllers can update status between the read and delete. A conflict
+	// retries with fresh state so scope and component protections still apply.
+	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var latest v1.MCPServer
+		if err := req.Get(&latest, id); err != nil {
+			return err
 		}
-		return types.NewErrForbidden(
-			"cannot delete component of vMCP %q; delete the vMCP server instead",
-			name,
-		)
-	}
 
-	if err := req.Delete(&server); err != nil {
+		// The URL's catalog or workspace must still own the fresh object.
+		if latest.Spec.MCPCatalogID != catalogID || latest.Spec.PowerUserWorkspaceID != workspaceID {
+			return types.NewErrNotFound("MCP server not found")
+		}
+		if latest.Spec.CompositeName != "" {
+			return types.NewErrForbidden(
+				"cannot delete component of composite %q; delete the composite server instead",
+				latest.Spec.CompositeName,
+			)
+		}
+		if latest.Spec.VMCPComponentID != "" {
+			name := latest.Spec.VMCPID
+			if name == "" {
+				name = latest.Spec.VMCPInstanceID
+			}
+			return types.NewErrForbidden(
+				"cannot delete component of vMCP %q; delete the vMCP server instead",
+				name,
+			)
+		}
+
+		addExtractedEnvVars(&latest)
+		currentSlug, err := SlugForMCPServer(req.Context(), req.Storage, latest, req.User.GetUID(), catalogID, workspaceID)
+		if err != nil {
+			return fmt.Errorf("failed to generate slug: %w", err)
+		}
+		uid, resourceVersion := latest.UID, latest.ResourceVersion
+		err = req.Storage.Delete(req.Context(), &latest, kclient.Preconditions{UID: &uid, ResourceVersion: &resourceVersion})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		server, slug = latest, currentSlug
+		return nil
+	}); err != nil {
 		return err
 	}
 
