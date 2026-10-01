@@ -170,6 +170,7 @@ func (sm *SessionManager) loadSession(ctx context.Context, server ServerConfig, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
+	httpClient = withSafeProtocolErrors(httpClient)
 
 	oauthHandler := sm.oauthHandlerForClient(httpClient, server.MCPServerName, clientOpts)
 

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -22,6 +23,7 @@ type fixedInstanceResolver struct {
 
 type fixedOAuthChecker struct {
 	url string
+	err error
 }
 
 // GetOAuthURL must not leak another user's instance: the ownership guard runs
@@ -87,10 +89,38 @@ func TestServerInstanceRedirectOAuthURLRedirectsOwnedInstance(t *testing.T) {
 	assert.Equal(t, "https://oauth.example.test/authorize?state=state-1", rec.Header().Get("Location"))
 }
 
+func TestServerInstanceGetOAuthURLReturnsProviderDiagnostic(t *testing.T) {
+	const diagnostic = "App is not enabled for Slack MCP server access. Please enable it here: https://api.slack.com/apps/A123/app-assistant"
+	instance := v1.MCPServerInstance{
+		Name:      "instance-1",
+		Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerInstanceSpec{
+			UserID:        "owner-uid",
+			MCPServerName: "server-1",
+		},
+	}
+	server := v1.MCPServer{Name: "server-1", Namespace: system.DefaultNamespace}
+	req := httptest.NewRequest(http.MethodGet, "/api/mcp-server-instances/instance-1/oauth-url", nil)
+	req.SetPathValue("mcp_server_instance_id", "instance-1")
+
+	err := (&ServerInstancesHandler{
+		mcpOAuthChecker:   fixedOAuthChecker{err: errors.New(diagnostic)},
+		mcpSessionManager: fixedInstanceResolver{server: server},
+	}).GetOAuthURL(api.Context{
+		ResponseWriter: httptest.NewRecorder(),
+		Request:        req,
+		Storage:        newFakeStorage(t, &instance, &server),
+		User:           &kuser.DefaultInfo{UID: "owner-uid"},
+	})
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, diagnostic)
+}
+
 func (f fixedInstanceResolver) ServerForActionWithConnectIDAllowMissingConfig(context.Context, string, string) (string, v1.MCPServer, mcp.ServerConfig, []string, error) {
 	return f.server.Name, f.server, mcp.ServerConfig{}, nil, nil
 }
 
 func (f fixedOAuthChecker) CheckForMCPAuth(api.Context, v1.MCPServer, mcp.ServerConfig, string, string, string) (string, error) {
-	return f.url, nil
+	return f.url, f.err
 }

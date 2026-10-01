@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,82 @@ func TestAuthorizationErrorSurvivesSDKWrapping(t *testing.T) {
 	if authErr.ResourceMetadata != "https://example.com/.well-known/oauth-protected-resource" {
 		t.Fatalf("ResourceMetadata = %q, want challenge resource metadata", authErr.ResourceMetadata)
 	}
+}
+
+func TestInitializeJSONRPCErrorWithNullIDKeepsProviderMessage(t *testing.T) {
+	const diagnostic = "App is not enabled for Slack MCP server access. Please enable it here: https://api.slack.com/apps/A123/app-assistant"
+	err := oauthCheckErrorForJSONRPCMessage(t, diagnostic)
+	if err == nil || !strings.Contains(err.Error(), diagnostic) {
+		t.Fatalf("Connect() error = %v, want provider diagnostic %q", err, diagnostic)
+	}
+}
+
+func TestInitializeJSONRPCErrorRedactsBearerBeforeReturning(t *testing.T) {
+	err := oauthCheckErrorForJSONRPCMessage(t, "App disabled; Bearer provider-secret-token; enable it in Slack")
+	if err == nil || !strings.Contains(err.Error(), "App disabled; Bearer [REDACTED]; enable it in Slack") {
+		t.Fatalf("Connect() error = %v, want redacted provider diagnostic", err)
+	}
+	if strings.Contains(err.Error(), "provider-secret-token") {
+		t.Fatalf("Connect() error leaked credential: %v", err)
+	}
+}
+
+func TestInitializeJSONRPCErrorRedactsOAuthCodeButKeepsRemediationURL(t *testing.T) {
+	err := oauthCheckErrorForJSONRPCMessage(t, "Grant rejected; visit https://api.slack.com/apps/A123/app-assistant?code=secret-code; access_token=secret-token")
+	if err == nil || !strings.Contains(err.Error(), "https://api.slack.com/apps/A123/app-assistant?code=[REDACTED]; access_token=[REDACTED]") {
+		t.Fatalf("Connect() error = %v, want safe remediation URL and redacted credentials", err)
+	}
+	if strings.Contains(err.Error(), "secret-code") || strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("Connect() error leaked OAuth credential: %v", err)
+	}
+}
+
+func TestInitializeJSONRPCErrorRedactsOtherHTTPStatuses(t *testing.T) {
+	err := oauthCheckErrorForJSONRPCResponse(t, "Workspace policy blocked access; Bearer provider-secret-token; ask an admin to enable MCP", http.StatusUnprocessableEntity)
+	if err == nil || !strings.Contains(err.Error(), "Workspace policy blocked access; Bearer [REDACTED]; ask an admin to enable MCP") {
+		t.Fatalf("Connect() error = %v, want redacted provider diagnostic", err)
+	}
+	if strings.Contains(err.Error(), "provider-secret-token") {
+		t.Fatalf("Connect() error leaked credential: %v", err)
+	}
+}
+
+func oauthCheckErrorForJSONRPCMessage(t *testing.T, message string) error {
+	t.Helper()
+	return oauthCheckErrorForJSONRPCResponse(t, message, http.StatusBadRequest)
+}
+
+func oauthCheckErrorForJSONRPCResponse(t *testing.T, message string, statusCode int) error {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      nil,
+			"error": map[string]any{
+				"code":    -32600,
+				"message": message,
+			},
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	sm := &SessionManager{
+		backend:                   &dockerBackend{},
+		remoteURLValidationConfig: RemoteMCPURLValidationConfig{AllowLocalhostMCP: true, AllowPrivateIPMCP: true},
+	}
+	_, err := sm.ClientForMCPServerForOAuthCheck(t.Context(), ServerConfig{
+		MCPServerName: "slack",
+		URL:           server.URL,
+		UserID:        "system",
+	}, ClientOption{ClientName: "test"})
+	return err
 }
 
 func TestOAuthHandlerForClientUsesConfiguredClientIDMetadataDocument(t *testing.T) {
