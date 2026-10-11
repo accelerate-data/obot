@@ -61,6 +61,8 @@ Typography and text-on-color settings for the active mode:
 - **Error Button Text**: Text on error buttons
 - **Font Family**: UI font stack—**Poppins** (default), **Helvetica Neue**, or **System Default**
 
+This fork does not download fonts from Google. The selected font must be available locally or supplied by the hosting application; otherwise, the font stack uses its system fallback. Studio supplies its own heading, body and code fonts.
+
 ## Logos
 
 Select **Logos** in the configuration sidebar to replace icons and full logos.
