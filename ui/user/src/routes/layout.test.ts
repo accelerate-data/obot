@@ -1,5 +1,6 @@
 import { Group } from '$lib/services';
 import { load } from './+layout';
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 
 function response(body: unknown, status = 200) {
@@ -88,5 +89,12 @@ describe('root layout product analytics consent', () => {
 	it('does not expose consent UI after another read failure', async () => {
 		const data = await loadWith(createFetch([Group.ADMIN], 500));
 		expect(data.productTelemetryConsentAvailable).toBeUndefined();
+	});
+});
+
+describe('root layout font delivery', () => {
+	it('does not initiate third-party font requests from the document head', () => {
+		const source = readFileSync(new URL('./+layout.svelte', import.meta.url), 'utf8');
+		expect(source).not.toMatch(/https:\/\/fonts\.(?:googleapis|gstatic)\.com/);
 	});
 });
