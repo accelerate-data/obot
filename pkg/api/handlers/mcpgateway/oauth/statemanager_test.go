@@ -13,6 +13,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
@@ -201,11 +202,15 @@ func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 		authRequest   string
 		tokenStatus   int
 		skipStore     bool
-		query         string
-		wantErr       bool
-		wantHTTP400   bool
-		wantLocation  string
-		wantQuery     url.Values
+		// storeMCPID overrides the stored connection id; a pointer so "" is a value.
+		storeMCPID *string
+		// breakCommit drops the token table so the token commit fails.
+		breakCommit  bool
+		query        string
+		wantErr      bool
+		wantHTTP400  bool
+		wantLocation string
+		wantQuery    url.Values
 		// wantNotContain replaces wantQuery where the exact redacted wording is
 		// not the contract: only the absence of every listed fragment is.
 		wantNotContain []string
@@ -321,6 +326,25 @@ func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 			wantNotContain: []string{"d41d8cd98f00b204e9800998ecf8427e", "alice"},
 		},
 		{
+			name:          "an error code that echoes the verifier is replaced",
+			completionURL: completionURL,
+			query:         "&error=vf-9d3e6b2a7c10",
+			wantQuery:     url.Values{"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"server_error"}},
+		},
+		{
+			name:          "an error code that echoes the client secret is replaced",
+			completionURL: completionURL,
+			query:         "&error=cs-5e8f1a3b9d27",
+			wantQuery:     url.Values{"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"server_error"}},
+		},
+		{
+			name:          "a token commit failure sends server_error",
+			completionURL: completionURL,
+			breakCommit:   true,
+			query:         "&code=code",
+			wantQuery:     url.Values{"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"server_error"}},
+		},
+		{
 			name:          "token exchange failure sends a code only",
 			completionURL: completionURL,
 			tokenStatus:   http.StatusBadRequest,
@@ -332,6 +356,13 @@ func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 			completionURL: completionURL,
 			query:         "&code=code",
 			wantLocation:  "/auth/mcp-oauth/complete?flow=instance&mcp_id=msi1&status=success",
+		},
+		{
+			name:          "success without a connection id sends no empty mcp_id",
+			completionURL: completionURL,
+			storeMCPID:    new(string),
+			query:         "&code=code",
+			wantLocation:  "/auth/mcp-oauth/complete?flow=instance&status=success",
 		},
 		{
 			name:         "success keeps Obot's page when unconfigured",
@@ -366,9 +397,18 @@ func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 			authRequest := &v1.OAuthAuthRequest{Name: "oar1request", Namespace: system.DefaultNamespace, Spec: v1.OAuthAuthRequestSpec{RedirectURI: "https://client.example/callback"}}
 			storage := clientfake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(server, connection, authRequest).Build()
 			if !tt.skipStore {
-				require.NoError(t, state.store(t.Context(), "1", connection.Name, "https://upstream.example/mcp", tt.authRequest, "", "st-4f9a2c71e8b3", "vf-9d3e6b2a7c10", "", &oauth2.Config{
+				require.NoError(t, state.store(t.Context(), "1", *cmp.Or(tt.storeMCPID, &connection.Name), "https://upstream.example/mcp", tt.authRequest, "", "st-4f9a2c71e8b3", "vf-9d3e6b2a7c10", "", &oauth2.Config{
 					ClientID: "client", ClientSecret: "cs-5e8f1a3b9d27", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
 				}))
+			}
+			if tt.breakCommit {
+				require.NoError(t, services.DB.DB.Migrator().DropTable(&gatewaytypes.MCPOAuthToken{}))
+				// A failed commit keeps the pending state, which would collide
+				// with the next case's store.
+				t.Cleanup(func() {
+					require.NoError(t, db.AutoMigrate())
+					require.NoError(t, services.DB.DB.Where("1 = 1").Delete(&gatewaytypes.MCPOAuthPendingState{}).Error)
+				})
 			}
 			h := handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: state}, completionURL: tt.completionURL}
 			response := httptest.NewRecorder()

@@ -24,7 +24,7 @@ func (e *oauthCallbackError) Unwrap() error { return e.Err }
 
 // The key list matches Studio's MCP Settings redaction
 // (src/server/modules/mcp/obot-client/error-message.ts), plus code and state.
-var completionCredentialKey = regexp.MustCompile(`(?i)(?:\\?["'])?\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token|authorization|credential|nonce|signature|code|state)\b(?:\\?["'])?\s*[:=]\s*`)
+var completionCredentialKey = regexp.MustCompile(`(?i)(?:(?:\\\\)*\\?["'])?\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token|authorization|credential|nonce|signature|code|state)\b(?:(?:\\\\)*\\?["'])?\s*[:=]\s*`)
 
 type credentialShape struct {
 	pattern *regexp.Regexp
@@ -167,9 +167,6 @@ func safeOAuthErrorCode(code string) string {
 	return code
 }
 
-// sanitizeMCPOAuthCompletionDescription keeps the provider's own words but
-// removes any authorization code, state or credential it echoed, because the result is
-// placed in a URL that lands in browser history.
 // Studio's named keys without code and state, which are ordinary words in
 // prose. The connector is "is"/"was", "value:", or bare whitespace.
 var bareCredentialKey = regexp.MustCompile(`(?i)\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token)\b(\s+(?:is|was)\s+|\s+value\s*[:=]\s*|\s+)`)
@@ -357,6 +354,9 @@ func redactKnownValues(s string, values ...string) string {
 	return b.String()
 }
 
+// sanitizeMCPOAuthCompletionDescription keeps the provider's own words but
+// removes any authorization code, state or credential it echoed, because the result is
+// placed in a URL that lands in browser history.
 func sanitizeMCPOAuthCompletionDescription(description string) string {
 	description = redactDigestParameters(description)
 	description = redactCookieHeaders(description)

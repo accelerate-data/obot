@@ -605,11 +605,14 @@ func (h *handler) oauthCallback(req api.Context) error {
 		// If there is no OAuth request object, then MCP OAuth wasn't started by OAuth; likely the UI kicked it off.
 		// Redirect to the OAuth completion page.
 		slog.Info("Completed MCP OAuth callback without first-level OAuth auth request context")
-		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, url.Values{
+		q := url.Values{
 			"flow":   {"instance"},
 			"status": {"success"},
-			"mcp_id": {mcpServerID},
-		}), http.StatusFound)
+		}
+		if mcpServerID != "" {
+			q.Set("mcp_id", mcpServerID)
+		}
+		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 		return nil
 	}
 

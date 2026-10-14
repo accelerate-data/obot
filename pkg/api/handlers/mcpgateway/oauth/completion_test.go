@@ -40,6 +40,20 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 	got = sanitizeMCPOAuthCompletionDescription(`denied {"password":"a\" b-secret"}`)
 	require.Equal(t, `denied {'password':'[REDACTED]'}`, got)
 	require.NotContains(t, got, "b-secret")
+	// A doubly JSON-escaped key is still recognised, so its value is redacted.
+	for _, tc := range []struct{ in, secret string }{
+		{`denied {\\\"client_secret\\\":\\\"a\\\\\\\" b-secret\\\"} retry`, "b-secret"},
+		{`denied {\"x\":\"{\\\"password\\\":\\\"p-secret\\\"}\"} retry`, "p-secret"},
+	} {
+		got := sanitizeMCPOAuthCompletionDescription(tc.in)
+		require.NotContains(t, got, tc.secret, tc.in)
+		require.Contains(t, got, "[REDACTED]", tc.in)
+		require.True(t, strings.HasPrefix(got, "denied "), got)
+		require.True(t, strings.HasSuffix(got, " retry"), got)
+	}
+	got = sanitizeMCPOAuthCompletionDescription(`denied {\\\"password\\\":\\\"unterminated p-secret`)
+	require.NotContains(t, got, "p-secret")
+	require.True(t, strings.HasPrefix(got, "denied "), got)
 	// Every pair of a multi-value cookie header is redacted, not only the first.
 	for _, in := range []string{
 		"denied Cookie: sid=secret-one; refresh=secret-two retry",

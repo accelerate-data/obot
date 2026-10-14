@@ -33,8 +33,14 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	if errorStr != "" {
 		// Clean up the pending state before returning the error
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
+		// A provider that echoes a secret as its error code must not carry it
+		// into the URL; such a code says nothing a fixed one does not.
+		errCode := errorStr
+		if redactKnownValues(errorStr, ps.ClientSecret, ps.Verifier, state, code) != errorStr {
+			errCode = "server_error"
+		}
 		return ps.OAuthAuthRequestID, ps.MCPID, &oauthCallbackError{
-			Code: errorStr,
+			Code: errCode,
 			// Exact values first: the pattern passes cannot recognize an unlabeled
 			// secret, and later normalization would change its bytes.
 			Description: redactKnownValues(errorDescription, ps.ClientSecret, ps.Verifier, state, code),
