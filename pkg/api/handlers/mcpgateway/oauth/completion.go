@@ -11,32 +11,17 @@ const (
 	maxCompletionDescriptionBytes = 512
 )
 
-// oauthCallbackError carries the parts of a failed callback that may reach a
-// completion page. Err keeps the full message for Obot's own HTTP error path.
-type oauthCallbackError struct {
-	Code        string
-	Description string
-	Err         error
-}
-
-func (e *oauthCallbackError) Error() string { return e.Err.Error() }
-func (e *oauthCallbackError) Unwrap() error { return e.Err }
-
-// The key list matches Studio's MCP Settings redaction
-// (src/server/modules/mcp/obot-client/error-message.ts), plus code and state.
-var completionCredentialKey = regexp.MustCompile(`(?i)(?:(?:\\\\)*\\?["'])?\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token|authorization|credential|nonce|signature|code|state)\b(?:(?:\\\\)*\\?["'])?\s*[:=]\s*`)
-
-type credentialShape struct {
-	pattern *regexp.Regexp
-	replace string
-}
-
-// Credential shapes that carry no key=value form, ported from Studio's MCP
-// Settings redaction. RE2 has no lookahead, so Studio's "not already redacted"
-// guards are dropped: redacting "[REDACTED]" again changes nothing. An
-// unquoted value also stops at a quote or backslash, so a match never
-// swallows the quote that closes a JSON value.
 var (
+	// The key list matches Studio's MCP Settings redaction
+	// (src/server/modules/mcp/obot-client/error-message.ts), plus code and state.
+	completionCredentialKey = regexp.MustCompile(`(?i)(?:(?:\\\\)*\\?["'])?\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token|authorization|credential|nonce|signature|code|state)\b(?:(?:\\\\)*\\?["'])?\s*[:=]\s*`)
+
+	// Credential shapes that carry no key=value form, ported from Studio's MCP
+	// Settings redaction. RE2 has no lookahead, so Studio's "not already redacted"
+	// guards are dropped: redacting "[REDACTED]" again changes nothing. An
+	// unquoted value also stops at a quote or backslash, so a match never
+	// swallows the quote that closes a JSON value.
+	//
 	// Run before the key scan: an authorization header value has a scheme word
 	// and a space, which the key scan would stop at.
 	credentialShapesBeforeKeys = []credentialShape{
@@ -51,7 +36,46 @@ var (
 		{regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])(?:vd_(?:iat|pat|org|svc)_[A-Za-z0-9_.-]+|ok1-\d+-\d+-[A-Za-z0-9_-]+|osa1-\d+-[A-Za-z0-9_-]+|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|sk-(?:proj-|ant-api\d+-)?[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AKIA[A-Z0-9]{16}\b|AIza[A-Za-z0-9_-]{32,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})`), "${1}[REDACTED]"},
 		{regexp.MustCompile(`(\b[a-zA-Z][a-zA-Z0-9+\-.]{0,31}://)(?:[^@\s/:]+:[^@\s/]+|[^@\s/]+)@`), "${1}[REDACTED]@"},
 	}
+
+	// Studio's named keys without code and state, which are ordinary words in
+	// prose. The connector is "is"/"was", "value:", or bare whitespace.
+	bareCredentialKey = regexp.MustCompile(`(?i)\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token)\b(\s+(?:is|was)\s+|\s+value\s*[:=]\s*|\s+)`)
+
+	// A provider saying a credential is expired or missing is the diagnostic the
+	// user needs, so those words stay.
+	safeCredentialStatus = map[string]bool{
+		"active": true, "available": true, "configured": true, "disabled": true, "enabled": true,
+		"expired": true, "invalid": true, "missing": true, "not": true, "rejected": true,
+		"required": true, "revoked": true, "unavailable": true, "unset": true, "valid": true,
+	}
+
+	cookieScheme      = regexp.MustCompile(`(?i)\b(?:set[\s_-]*)?cookie[ \t]*:[ \t]*`)
+	cookieToken       = regexp.MustCompile(`^[^\s=;,"'\\]+`)
+	cookieAssign      = regexp.MustCompile(`^[ \t]*=[ \t]*`)
+	cookieSeparator   = regexp.MustCompile(`^[ \t]*[;,][ \t]*`)
+	cookieExpiresDate = regexp.MustCompile(`(?i)^[a-z]{3},[ \t]*\d{1,2}[ -][a-z]{3}[ -]\d{2,4}[ \t]+\d{2}:\d{2}:\d{2}[ \t]*GMT`)
+
+	digestScheme         = regexp.MustCompile(`(?i)\bDigest\s+`)
+	digestParamName      = regexp.MustCompile(`^[A-Za-z0-9_-]+\s*=\s*`)
+	digestParamSeparator = regexp.MustCompile(`^\s*,\s*`)
 )
+
+// oauthCallbackError carries the parts of a failed callback that may reach a
+// completion page. Err keeps the full message for Obot's own HTTP error path.
+type oauthCallbackError struct {
+	Code        string
+	Description string
+	Err         error
+}
+
+type credentialShape struct {
+	pattern *regexp.Regexp
+	replace string
+}
+
+func (e *oauthCallbackError) Error() string { return e.Err.Error() }
+
+func (e *oauthCallbackError) Unwrap() error { return e.Err }
 
 func redactCredentialShapes(s string, shapes []credentialShape) string {
 	for _, shape := range shapes {
@@ -167,18 +191,6 @@ func safeOAuthErrorCode(code string) string {
 	return code
 }
 
-// Studio's named keys without code and state, which are ordinary words in
-// prose. The connector is "is"/"was", "value:", or bare whitespace.
-var bareCredentialKey = regexp.MustCompile(`(?i)\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token)\b(\s+(?:is|was)\s+|\s+value\s*[:=]\s*|\s+)`)
-
-// A provider saying a credential is expired or missing is the diagnostic the
-// user needs, so those words stay.
-var safeCredentialStatus = map[string]bool{
-	"active": true, "available": true, "configured": true, "disabled": true, "enabled": true,
-	"expired": true, "invalid": true, "missing": true, "not": true, "rejected": true,
-	"required": true, "revoked": true, "unavailable": true, "unset": true, "valid": true,
-}
-
 // redactBareCredentials removes values named in prose ("the password is
 // hunter2", "secret \"x\"", "token rotation-opaque-value"). After bare
 // whitespace an unquoted word is redacted only when it looks like a credential,
@@ -221,12 +233,6 @@ func bareValueIsCredential(value, delim string, plain bool) bool {
 	}
 	return true
 }
-
-var cookieScheme = regexp.MustCompile(`(?i)\b(?:set[\s_-]*)?cookie[ \t]*:[ \t]*`)
-var cookieToken = regexp.MustCompile(`^[^\s=;,"'\\]+`)
-var cookieAssign = regexp.MustCompile(`^[ \t]*=[ \t]*`)
-var cookieSeparator = regexp.MustCompile(`^[ \t]*[;,][ \t]*`)
-var cookieExpiresDate = regexp.MustCompile(`(?i)^[a-z]{3},[ \t]*\d{1,2}[ -][a-z]{3}[ -]\d{2,4}[ \t]+\d{2}:\d{2}:\d{2}[ \t]*GMT`)
 
 // redactCookieHeaders redacts every value of a Cookie or Set-Cookie header. It
 // scans pair by pair instead of matching the whole header, because a quoted value
@@ -277,10 +283,6 @@ func redactCookieHeaders(s string) string {
 	b.WriteString(s[pos:])
 	return b.String()
 }
-
-var digestScheme = regexp.MustCompile(`(?i)\bDigest\s+`)
-var digestParamName = regexp.MustCompile(`^[A-Za-z0-9_-]+\s*=\s*`)
-var digestParamSeparator = regexp.MustCompile(`^\s*,\s*`)
 
 // redactDigestParameters redacts every value of a Digest credential or challenge. The
 // authorization pass stops at the first parameter and the key scan knows neither

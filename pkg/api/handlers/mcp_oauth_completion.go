@@ -1,8 +1,12 @@
 package handlers
 
-import "net/url"
+import (
+	"net/url"
+)
 
-const defaultMCPOAuthCompletionPath = "/auth/oauth/complete"
+const (
+	defaultMCPOAuthCompletionPath = "/auth/oauth/complete"
+)
 
 // MCPOAuthCompletionRedirect keeps Obot's own completion page when the
 // deployment configures no destination, so non-Studio installs are unaffected.
