@@ -113,6 +113,7 @@ type Config struct {
 
 	MCPOAuthClientExpiration       string   `usage:"The expiration time in dynamically registered MCP OAuth clients, must be a valid duration string and may include days, hours, or minutes" default:"30d"`
 	MCPOAuthClientNativeExceptions []string `usage:"Additional Client ID Metadata Document URLs that default to the native application type when application_type is omitted"`
+	MCPOAuthCompletionURL          string   `usage:"Where downstream-only MCP OAuth flows finish (root-relative path or absolute http(s) URL); empty keeps Obot's page" env:"OBOT_SERVER_MCP_OAUTH_COMPLETION_URL"`
 	ForceDynamicClient             bool     `usage:"Force Dynamic Client Registration for MCP OAuth instead of Client ID Metadata Documents"`
 	ProductAnalyticsForceEnabled   bool     `usage:"Force-enable product analytics and disable the consent API" default:"false"`
 
@@ -238,6 +239,7 @@ type Services struct {
 
 	MCPOAuthClientSecretExpiration time.Duration
 	MCPOAuthClientNativeExceptions []string
+	MCPOAuthCompletionURL          string
 	ForceDynamicClient             bool
 	ProductTelemetryConsent        *producttelemetry.Consent
 	ProductTelemetryPublisher      *producttelemetry.Publisher
@@ -507,6 +509,10 @@ func parsePodSchedulingJSONFields(affinityJSON, tolerationsJSON, resourcesJSON, 
 }
 
 func New(ctx context.Context, config Config) (*Services, error) {
+	if err := validateMCPOAuthCompletionURL(config.MCPOAuthCompletionURL); err != nil {
+		return nil, err
+	}
+
 	modelProxyURL, err := mcptester.ParseModelProxyURL(config.ModelProxyURL, config.DevMode)
 	if err != nil {
 		return nil, err
@@ -1412,6 +1418,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		ModelInfoSourceURL:             config.ModelInfoSourceURL,
 		MCPOAuthClientSecretExpiration: oauthClientExpiration,
 		MCPOAuthClientNativeExceptions: config.MCPOAuthClientNativeExceptions,
+		MCPOAuthCompletionURL:          config.MCPOAuthCompletionURL,
 		ForceDynamicClient:             config.ForceDynamicClient,
 		ProductTelemetryConsent:        telemetryConsent,
 		ProductTelemetryPublisher:      producttelemetry.NewPublisher(ctx, telemetryConsent, gatewayClient, storageClient, licenseProvider, config.MCPRuntimeBackend),
@@ -1699,4 +1706,28 @@ func localK8sCacheByObject(mcpServerNamespace, runtimeNamespace string) map[kcli
 			Namespaces: secretNamespaces,
 		},
 	}
+}
+
+// validateMCPOAuthCompletionURL rejects values that could turn the completion
+// redirect into an open redirect or smuggle a query/fragment that would collide
+// with the parameters appended to it.
+func validateMCPOAuthCompletionURL(v string) error {
+	if v == "" {
+		return nil
+	}
+	invalid := fmt.Errorf("invalid MCP OAuth completion URL: %q", v)
+	if strings.ContainsAny(v, "?#") {
+		return invalid
+	}
+	if strings.HasPrefix(v, "/") {
+		if strings.HasPrefix(v, "//") || strings.HasPrefix(v, "/\\") {
+			return invalid
+		}
+		return nil
+	}
+	u, err := url.Parse(v)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return invalid
+	}
+	return nil
 }
