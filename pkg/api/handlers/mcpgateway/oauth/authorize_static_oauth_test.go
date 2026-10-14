@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -333,7 +334,7 @@ func TestStaticOAuthCallbackRecordsOnlySafeFailures(t *testing.T) {
 				Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+tt.query, nil),
 				ResponseWriter: recorder,
 			}
-			h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
+			h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}, completionURL: "/auth/mcp-oauth/complete"}
 			if err := h.oauthCallback(req); err != nil {
 				t.Fatalf("handle failed static OAuth callback: %v", err)
 			}
@@ -349,11 +350,68 @@ func TestStaticOAuthCallbackRecordsOnlySafeFailures(t *testing.T) {
 				t.Fatalf("failed static OAuth callback persisted a user token: %v", err)
 			}
 			for _, sensitive := range []string{"provider-secret-body", "provider body contains secret code and token", "static-secret", "discard-me"} {
-				if body := recorder.Body.String(); strings.Contains(body, sensitive) {
-					t.Fatalf("callback echoed provider detail %q: %q", sensitive, body)
+				for _, got := range []string{recorder.Body.String(), recorder.Header().Get("Location")} {
+					if strings.Contains(got, sensitive) {
+						t.Fatalf("callback echoed provider detail %q: %q", sensitive, got)
+					}
 				}
 			}
 		})
+	}
+}
+
+func TestStaticOAuthCallbackSuccessUsesConfiguredCompletion(t *testing.T) {
+	provider := newStaticOAuthCallbackProvider(t)
+	gateway := newStaticOAuthCallbackGateway(t)
+	conf := provider.config()
+	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", conf)
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+	authorizationResponse, err := http.Get(conf.AuthCodeURL(state.CallbackState, oauth2.S256ChallengeOption("exact-verifier")))
+	if err != nil {
+		t.Fatalf("authorize static OAuth test: %v", err)
+	}
+	_ = authorizationResponse.Body.Close()
+	if authorizationResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("provider rejected PKCE authorization request: %d", authorizationResponse.StatusCode)
+	}
+
+	recorder := httptest.NewRecorder()
+	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}, completionURL: "/auth/mcp-oauth/complete"}
+	if err := h.oauthCallback(api.Context{
+		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil),
+		ResponseWriter: recorder,
+	}); err != nil {
+		t.Fatalf("handle static OAuth callback: %v", err)
+	}
+	if got := recorder.Header().Get("Location"); recorder.Code != http.StatusFound || got != "/auth/mcp-oauth/complete?flow=static-test&status=success" {
+		t.Fatalf("callback response = %d Location=%q", recorder.Code, got)
+	}
+}
+
+func TestStaticOAuthCallbackFailureSendsCategoryOnly(t *testing.T) {
+	provider := newStaticOAuthCallbackProvider(t)
+	gateway := newStaticOAuthCallbackGateway(t)
+	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}, completionURL: "/auth/mcp-oauth/complete"}
+	if err := h.oauthCallback(api.Context{
+		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&error=access_denied&error_description=provider-secret-body", nil),
+		ResponseWriter: recorder,
+	}); err != nil {
+		t.Fatalf("handle static OAuth callback: %v", err)
+	}
+	location, err := url.Parse(recorder.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	want := url.Values{"flow": {"static-test"}, "status": {"failed"}, "error": {string(types.MCPStaticOAuthTestFailureAuthorizationDenied)}}
+	if location.Path != "/auth/mcp-oauth/complete" || location.Query().Encode() != want.Encode() {
+		t.Fatalf("Location = %q, want path /auth/mcp-oauth/complete with %q", location.String(), want.Encode())
 	}
 }
 

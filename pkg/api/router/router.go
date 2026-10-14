@@ -142,7 +142,7 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 	localAgentAuditLogs := mcpgateway.NewLocalAgentAuditLogHandler()
 	llmAuditLogs := handlers.NewLLMAuditLogHandler()
 	auditLogExports := handlers.NewAuditLogExportHandler(services.GatewayClient)
-	serverInstances := handlers.NewServerInstancesHandler(services.AccessControlRuleHelper, oauthChecker, services.MCPSessionManager, services.ServerURL)
+	serverInstances := handlers.NewServerInstancesHandler(services.AccessControlRuleHelper, oauthChecker, services.MCPSessionManager, services.ServerURL, services.MCPOAuthCompletionURL)
 	systemMCPServers := handlers.NewSystemMCPServerHandler(services.MCPSessionManager, services.MCPSecretBindingAllowedLabel)
 	userDefaultRoleSettings := handlers.NewUserDefaultRoleSettingHandler()
 	setupHandler := setup.NewHandler(services.ServerURL, services.Bootstrapper, services.ProviderDispatcher)
@@ -824,7 +824,7 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 	// Well-known
 	wellknown.SetupHandlers(services.ServerURL, services.OAuthServerConfig, services.RegistryNoAuth, mux)
 	// Obot OAuth
-	oauth.SetupHandlers(oauthChecker, services.MCPOAuthTokenStorage, services.PersistentTokenServer, services.OAuthServerConfig, services.MCPSessionManager, services.AccessControlRuleHelper, services.ServerURL, services.MCPOAuthClientSecretExpiration, services.MCPOAuthClientNativeExceptions, mux)
+	oauth.SetupHandlers(oauthChecker, services.MCPOAuthTokenStorage, services.PersistentTokenServer, services.OAuthServerConfig, services.MCPSessionManager, services.AccessControlRuleHelper, services.ServerURL, services.MCPOAuthClientSecretExpiration, services.MCPOAuthClientNativeExceptions, services.MCPOAuthCompletionURL, mux)
 
 	mux.HTTPHandle("/", ui.Handler(services.DevUIPort, services.UserUIPort))
 

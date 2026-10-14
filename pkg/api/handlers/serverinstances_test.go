@@ -89,6 +89,60 @@ func TestServerInstanceRedirectOAuthURLRedirectsOwnedInstance(t *testing.T) {
 	assert.Equal(t, "https://oauth.example.test/authorize?state=state-1", rec.Header().Get("Location"))
 }
 
+func TestRedirectOAuthURLNoOAuthUsesConfiguredCompletion(t *testing.T) {
+	instance := v1.MCPServerInstance{
+		Name:      "instance-1",
+		Namespace: system.DefaultNamespace,
+		Spec:      v1.MCPServerInstanceSpec{UserID: "owner-uid", MCPServerName: "server-1"},
+	}
+	server := v1.MCPServer{
+		Name:      "server-1",
+		Namespace: system.DefaultNamespace,
+		Spec:      v1.MCPServerSpec{NeedsURL: true},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/mcp-server-instances/instance-1/oauth-redirect", nil)
+	req.SetPathValue("mcp_server_instance_id", "instance-1")
+	rec := httptest.NewRecorder()
+
+	err := NewServerInstancesHandler(nil, fixedOAuthChecker{url: ""}, fixedInstanceResolver{server: server}, "", "/auth/mcp-oauth/complete").RedirectOAuthURL(api.Context{
+		ResponseWriter: rec,
+		Request:        req,
+		Storage:        newFakeStorage(t, &instance, &server),
+		User:           &kuser.DefaultInfo{UID: "owner-uid"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusFound, rec.Code)
+	assert.Equal(t, "/auth/mcp-oauth/complete?flow=instance&mcp_id=instance-1&status=success", rec.Header().Get("Location"))
+}
+
+func TestRedirectOAuthURLNoOAuthKeepsObotPageWhenUnconfigured(t *testing.T) {
+	instance := v1.MCPServerInstance{
+		Name:      "instance-1",
+		Namespace: system.DefaultNamespace,
+		Spec:      v1.MCPServerInstanceSpec{UserID: "owner-uid", MCPServerName: "server-1"},
+	}
+	server := v1.MCPServer{
+		Name:      "server-1",
+		Namespace: system.DefaultNamespace,
+		Spec:      v1.MCPServerSpec{NeedsURL: true},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/mcp-server-instances/instance-1/oauth-redirect", nil)
+	req.SetPathValue("mcp_server_instance_id", "instance-1")
+	rec := httptest.NewRecorder()
+
+	err := NewServerInstancesHandler(nil, fixedOAuthChecker{url: ""}, fixedInstanceResolver{server: server}, "", "").RedirectOAuthURL(api.Context{
+		ResponseWriter: rec,
+		Request:        req,
+		Storage:        newFakeStorage(t, &instance, &server),
+		User:           &kuser.DefaultInfo{UID: "owner-uid"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusFound, rec.Code)
+	assert.Equal(t, "/auth/oauth/complete", rec.Header().Get("Location"))
+}
+
 func TestServerInstanceGetOAuthURLReturnsProviderDiagnostic(t *testing.T) {
 	const diagnostic = "App is not enabled for Slack MCP server access. Please enable it here: https://api.slack.com/apps/A123/app-assistant"
 	instance := v1.MCPServerInstance{

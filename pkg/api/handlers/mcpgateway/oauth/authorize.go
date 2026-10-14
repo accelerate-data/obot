@@ -590,6 +590,19 @@ func (h *handler) oauthCallback(req api.Context) error {
 
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
+		var cbErr *oauthCallbackError
+		if h.completionURL != "" && errors.As(err, &cbErr) {
+			if oauthAuthRequestID == "" {
+				http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, callbackFailureQuery("instance", mcpServerID, cbErr)), http.StatusFound)
+				return nil
+			}
+			// A component tab has no first-level client to report to; a
+			// standalone server's error stays with that client.
+			if _, component, lookupErr := resolveAggregateComponent(req, mcpServerID); lookupErr == nil && component {
+				http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, callbackFailureQuery("component", mcpServerID, cbErr)), http.StatusFound)
+				return nil
+			}
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 		}
@@ -600,7 +613,14 @@ func (h *handler) oauthCallback(req api.Context) error {
 		// If there is no OAuth request object, then MCP OAuth wasn't started by OAuth; likely the UI kicked it off.
 		// Redirect to the OAuth completion page.
 		slog.Info("Completed MCP OAuth callback without first-level OAuth auth request context")
-		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		q := url.Values{
+			"flow":   {"instance"},
+			"status": {"success"},
+		}
+		if mcpServerID != "" {
+			q.Set("mcp_id", mcpServerID)
+		}
+		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 		return nil
 	}
 
@@ -619,34 +639,49 @@ func (h *handler) oauthCallback(req api.Context) error {
 	}
 
 	// Check if the MCP server is a component of an aggregate; only finalize if it's not
-	var instance v1.MCPServerInstance
-	if system.IsMCPServerInstanceID(mcpServerID) {
-		if err := req.Get(&instance, mcpServerID); err != nil {
-			redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
-			return nil
-		}
-		mcpServerID = instance.Spec.MCPServerName
-	}
-	var server v1.MCPServer
-	if err := req.Get(&server, mcpServerID); err != nil {
+	server, component, err := resolveAggregateComponent(req, mcpServerID)
+	if err != nil {
 		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
 		return nil
 	}
 
-	if instance.Spec.VMCPInstanceID != "" || instance.Spec.CompositeName != "" || server.Spec.CompositeName != "" || server.Spec.VMCPInstanceID != "" || server.Spec.VMCPID != "" {
+	if component {
 		// MCP server is a component of an aggregate.
 		// Redirect to OAuth completion page; the checkCompositeAuth handler will redirect back
 		// to the 1st level OAuth redirect URL when all pending 2nd level OAuth for the aggregate server's
 		// component servers are completed.
 		slog.Info("MCP OAuth callback completed for aggregate component server, awaiting aggregate finalization", "authRequest", oauthAppAuthRequest.Name, "mcpServer", server.Name, "composite", server.Spec.CompositeName, "vmcpInstance", server.Spec.VMCPInstanceID, "vmcp", server.Spec.VMCPID)
-		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		q := url.Values{
+			"flow":   {"component"},
+			"status": {"success"},
+			"mcp_id": {mcpServerID},
+		}
+		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 		return nil
 	}
 
-	slog.Info("Completed MCP OAuth callback and redirecting to completion screen", "authRequest", oauthAppAuthRequest.Name, "mcpServer", mcpServerID)
+	slog.Info("Completed MCP OAuth callback and redirecting to completion screen", "authRequest", oauthAppAuthRequest.Name, "mcpServer", server.Name)
 	redirectWithOAuthCompletion(req, oauthAppAuthRequest.Name)
 
 	return nil
+}
+
+// resolveAggregateComponent loads the server behind an MCP server or
+// connection id and reports whether it is a component of an aggregate.
+func resolveAggregateComponent(req api.Context, mcpServerID string) (v1.MCPServer, bool, error) {
+	var instance v1.MCPServerInstance
+	if system.IsMCPServerInstanceID(mcpServerID) {
+		if err := req.Get(&instance, mcpServerID); err != nil {
+			return v1.MCPServer{}, false, err
+		}
+		mcpServerID = instance.Spec.MCPServerName
+	}
+	var server v1.MCPServer
+	if err := req.Get(&server, mcpServerID); err != nil {
+		return v1.MCPServer{}, false, err
+	}
+	component := instance.Spec.VMCPInstanceID != "" || instance.Spec.CompositeName != "" || server.Spec.CompositeName != "" || server.Spec.VMCPInstanceID != "" || server.Spec.VMCPID != ""
+	return server, component, nil
 }
 
 func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, error) {
@@ -693,7 +728,12 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 	} else if err != nil {
 		return true, errors.New("failed to complete static OAuth credential test")
 	}
-	http.Redirect(req.ResponseWriter, req.Request, oauthCompletionURL(""), http.StatusFound)
+	q := url.Values{"flow": {"static-test"}, "status": {"success"}}
+	if status == types.MCPStaticOAuthTestStatusFailed {
+		q.Set("status", "failed")
+		q.Set("error", string(failure))
+	}
+	http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 	return true, nil
 }
 
