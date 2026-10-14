@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -169,6 +170,248 @@ func TestOAuthCallbackComponentCompletion(t *testing.T) {
 			}))
 			require.Equal(t, http.StatusFound, response.Code)
 			require.Equal(t, tt.want, response.Header().Get("Location"))
+		})
+	}
+}
+
+func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
+	const completionURL = "/auth/mcp-oauth/complete"
+	tokenStatus := http.StatusOK
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if tokenStatus != http.StatusOK {
+			http.Error(w, "provider body echoes code=leaked-code and client_secret=leaked-secret", tokenStatus)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer"}`))
+	}))
+	defer tokenServer.Close()
+	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate())
+	client := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	state := newStateManager(client)
+
+	for _, tt := range []struct {
+		name          string
+		completionURL string
+		authRequest   string
+		tokenStatus   int
+		skipStore     bool
+		query         string
+		wantErr       bool
+		wantHTTP400   bool
+		wantLocation  string
+		wantQuery     url.Values
+		// wantNotContain replaces wantQuery where the exact redacted wording is
+		// not the contract: only the absence of every listed fragment is.
+		wantNotContain []string
+		wantContain    []string
+	}{
+		{
+			name:          "denial redirects with sanitized description",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape("denied code=c-7&state=s-9 for workspace ws-42"),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {"denied code=[REDACTED]&state=[REDACTED] for workspace ws-42"},
+			},
+		},
+		{
+			name:          "denial description never carries a provider credential",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape(`denied client_secret=s3cr3t {"client_secret":"s3cr3t"} access_token: tok-123`),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {`denied client_secret=[REDACTED] {'client_secret':'[REDACTED]'} access_token: [REDACTED]`},
+			},
+		},
+		{
+			name:          "denial description with quoted values leaks no fragment",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape(`denied {"client_secret":"s3 cr,et&x"} password='p w,d&q'`),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {`denied {'client_secret':'[REDACTED]'} password='[REDACTED]'`},
+			},
+		},
+		{
+			name:          "denial description with an escaped quote inside a JSON-escaped value leaks no fragment",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape(`denied {\"client_secret\":\"head\\\" tail-secret\"}`),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {`denied {/'client_secret/':/'[REDACTED]/'}`},
+			},
+		},
+		{
+			name:          "denial description with an escaped quote inside a quoted header value leaks no fragment",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape(`denied authorization: "head\" tail-secret" retry`),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {`denied authorization: '[REDACTED]' retry`},
+			},
+		},
+		{
+			name:          "denial description never carries a password named in prose",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape("The password is hunter2"),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {"The password is [REDACTED]"},
+			},
+		},
+		{
+			name:          "denial description never carries a digit-led password named in prose",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape("denied password 7hunter retry"),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {"denied password [REDACTED] retry"},
+			},
+		},
+		{
+			name:          "denial description never carries a header credential or URL userinfo",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape("denied Authorization: Bearer opaque-credential-123 https://alice:password123@provider.example/fix"),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {"denied Authorization: [REDACTED] https://[REDACTED]@provider.example/fix"},
+			},
+		},
+		{
+			name:           "denial description never carries any pair of a cookie header",
+			completionURL:  completionURL,
+			query:          "&error=access_denied&error_description=" + url.QueryEscape("denied Cookie: sid=secret-one; refresh=secret-two retry"),
+			wantNotContain: []string{"secret-one", "secret-two"},
+		},
+		{
+			name:          "denial description never carries a cookie value after a quoted or valueless pair",
+			completionURL: completionURL,
+			query: "&error=access_denied&error_description=" + url.QueryEscape(
+				`denied Cookie: sid="head secret-one"; refresh=secret-two Set-Cookie: a=b; Secure, session=secret-three retry`),
+			wantNotContain: []string{"secret-one", "secret-two", "secret-three"},
+		},
+		{
+			name:          "denial description never carries a known secret the provider echoes unlabeled",
+			completionURL: completionURL,
+			query:         "&error=access_denied&error_description=" + url.QueryEscape("Rejected candidate cs-5e8f1a3b9d27 for ws-42 req-77 st-4f9a2c71e8b3 vf-9d3e6b2a7c10"),
+			wantQuery: url.Values{
+				"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"access_denied"},
+				"error_description": {"Rejected candidate [REDACTED] for ws-42 req-77 [REDACTED] [REDACTED]"},
+			},
+		},
+		{
+			name:          "denial description keeps the text after a cookie header",
+			completionURL: completionURL,
+			query: "&error=access_denied&error_description=" + url.QueryEscape(
+				"denied Cookie: sid=secret-one\nrequest-id=req-42 retry https://provider.example/fix"),
+			wantNotContain: []string{"secret-one"},
+			wantContain:    []string{"request-id=req-42", "retry", "https://provider.example/fix"},
+		},
+		{
+			name:          "denial description never carries a Digest credential parameter",
+			completionURL: completionURL,
+			query: "&error=access_denied&error_description=" + url.QueryEscape(
+				`denied Authorization: Digest username="alice", realm="example", response="d41d8cd98f00b204e9800998ecf8427e", retry`),
+			wantNotContain: []string{"d41d8cd98f00b204e9800998ecf8427e", "alice"},
+		},
+		{
+			name:          "token exchange failure sends a code only",
+			completionURL: completionURL,
+			tokenStatus:   http.StatusBadRequest,
+			query:         "&code=code",
+			wantQuery:     url.Values{"flow": {"instance"}, "status": {"failed"}, "mcp_id": {"msi1"}, "error": {"token_exchange_failed"}},
+		},
+		{
+			name:          "success redirects to the configured page",
+			completionURL: completionURL,
+			query:         "&code=code",
+			wantLocation:  "/auth/mcp-oauth/complete?flow=instance&mcp_id=msi1&status=success",
+		},
+		{
+			name:         "success keeps Obot's page when unconfigured",
+			query:        "&code=code",
+			wantLocation: "/auth/oauth/complete",
+		},
+		{
+			name:        "failure keeps the HTTP error when unconfigured",
+			query:       "&error=access_denied",
+			wantErr:     true,
+			wantHTTP400: true,
+		},
+		{
+			name:          "unknown state never redirects",
+			completionURL: completionURL,
+			skipStore:     true,
+			query:         "&code=code",
+			wantErr:       true,
+		},
+		{
+			name:          "third-party client failure keeps the HTTP error",
+			completionURL: completionURL,
+			authRequest:   "oar1request",
+			query:         "&error=access_denied",
+			wantErr:       true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tokenStatus = cmp.Or(tt.tokenStatus, http.StatusOK)
+			server := &v1.MCPServer{Name: "ms1component", Namespace: system.DefaultNamespace}
+			connection := &v1.MCPServerInstance{Name: "msi1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerInstanceSpec{MCPServerName: server.Name, UserID: "1"}}
+			authRequest := &v1.OAuthAuthRequest{Name: "oar1request", Namespace: system.DefaultNamespace, Spec: v1.OAuthAuthRequestSpec{RedirectURI: "https://client.example/callback"}}
+			storage := clientfake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(server, connection, authRequest).Build()
+			if !tt.skipStore {
+				require.NoError(t, state.store(t.Context(), "1", connection.Name, "https://upstream.example/mcp", tt.authRequest, "", "st-4f9a2c71e8b3", "vf-9d3e6b2a7c10", "", &oauth2.Config{
+					ClientID: "client", ClientSecret: "cs-5e8f1a3b9d27", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
+				}))
+			}
+			h := handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: state}, completionURL: tt.completionURL}
+			response := httptest.NewRecorder()
+			err := h.oauthCallback(api.Context{
+				Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state=st-4f9a2c71e8b3"+tt.query, nil),
+				ResponseWriter: response,
+				Storage:        storage,
+				User:           &user.DefaultInfo{UID: "1", Name: "user", Groups: []string{types.GroupAuthenticated}},
+			})
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Empty(t, response.Header().Get("Location"))
+				if tt.wantHTTP400 {
+					var httpErr *types.ErrHTTP
+					require.ErrorAs(t, err, &httpErr)
+					require.Equal(t, http.StatusBadRequest, httpErr.Code)
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, http.StatusFound, response.Code)
+			location := response.Header().Get("Location")
+			require.NotContains(t, location, "leaked")
+			if tt.wantNotContain != nil {
+				decoded, err := url.QueryUnescape(location)
+				require.NoError(t, err)
+				for _, fragment := range tt.wantNotContain {
+					require.NotContains(t, decoded, fragment)
+				}
+				for _, fragment := range tt.wantContain {
+					require.Contains(t, decoded, fragment)
+				}
+				require.Contains(t, location, "status=failed")
+				return
+			}
+			if tt.wantLocation != "" {
+				require.Equal(t, tt.wantLocation, location)
+				return
+			}
+			parsed, err := url.Parse(location)
+			require.NoError(t, err)
+			require.Equal(t, completionURL, parsed.Path)
+			require.Equal(t, tt.wantQuery, parsed.Query())
 		})
 	}
 }

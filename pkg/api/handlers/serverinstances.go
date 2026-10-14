@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -32,14 +33,16 @@ type ServerInstancesHandler struct {
 	mcpOAuthChecker   MCPOAuthChecker
 	mcpSessionManager MCPInstanceResolver
 	serverURL         string
+	completionURL     string
 }
 
-func NewServerInstancesHandler(acrHelper *accesscontrolrule.Helper, mcpOAuthChecker MCPOAuthChecker, mcpSessionManager MCPInstanceResolver, serverURL string) *ServerInstancesHandler {
+func NewServerInstancesHandler(acrHelper *accesscontrolrule.Helper, mcpOAuthChecker MCPOAuthChecker, mcpSessionManager MCPInstanceResolver, serverURL, completionURL string) *ServerInstancesHandler {
 	return &ServerInstancesHandler{
 		acrHelper:         acrHelper,
 		mcpOAuthChecker:   mcpOAuthChecker,
 		mcpSessionManager: mcpSessionManager,
 		serverURL:         serverURL,
+		completionURL:     completionURL,
 	}
 }
 
@@ -222,7 +225,11 @@ func (h *ServerInstancesHandler) RedirectOAuthURL(req api.Context) error {
 		return err
 	}
 	if u == "" {
-		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		http.Redirect(req.ResponseWriter, req.Request, MCPOAuthCompletionRedirect(h.completionURL, url.Values{
+			"flow":   {"instance"},
+			"status": {"success"},
+			"mcp_id": {req.PathValue("mcp_server_instance_id")},
+		}), http.StatusFound)
 		return nil
 	}
 

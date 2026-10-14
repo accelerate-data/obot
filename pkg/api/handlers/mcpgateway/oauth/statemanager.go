@@ -33,7 +33,13 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	if errorStr != "" {
 		// Clean up the pending state before returning the error
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		return "", "", fmt.Errorf("error returned from oauth server: %s, %s", errorStr, errorDescription)
+		return ps.OAuthAuthRequestID, ps.MCPID, &oauthCallbackError{
+			Code: errorStr,
+			// Exact values first: the pattern passes cannot recognize an unlabeled
+			// secret, and later normalization would change its bytes.
+			Description: redactKnownValues(errorDescription, ps.ClientSecret, ps.Verifier, state, code),
+			Err:         fmt.Errorf("error returned from oauth server: %s, %s", errorStr, errorDescription),
+		}
 	}
 
 	conf := &oauth2.Config{
@@ -53,11 +59,13 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	token, err := mcp.ExchangeOAuthToken(ctx, conf, code, ps.Verifier, ps.ResourceURL)
 	if err != nil {
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
-		return "", "", fmt.Errorf("failed to exchange code: %w", err)
+		// The exchange error can quote the provider's response body, which may
+		// echo the client secret or the code, so it never leaves this process.
+		return ps.OAuthAuthRequestID, ps.MCPID, &oauthCallbackError{Code: "token_exchange_failed", Err: fmt.Errorf("failed to exchange code: %w", err)}
 	}
 
 	if err := sm.gatewayClient.CommitMCPOAuthPendingStateToken(ctx, ps, ps.OAuthAuthRequestID, conf, token); err != nil {
-		return "", "", err
+		return ps.OAuthAuthRequestID, ps.MCPID, &oauthCallbackError{Code: "server_error", Err: err}
 	}
 
 	return ps.OAuthAuthRequestID, ps.MCPID, nil

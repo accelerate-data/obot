@@ -28,9 +28,10 @@ type handler struct {
 	clientMetadataCache      map[string]clientMetadataCacheEntry
 	clientMetadataCacheLock  sync.Mutex
 	clientIDNativeExceptions map[string]struct{}
+	completionURL            string
 }
 
-func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, oauthConfig handlers.OAuthAuthorizationServerConfig, mcpSessionManager *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, baseURL string, clientSecretExpiration time.Duration, additionalClientIDNativeExceptions []string, mux *server.Server) {
+func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, oauthConfig handlers.OAuthAuthorizationServerConfig, mcpSessionManager *mcp.SessionManager, acrHelper *accesscontrolrule.Helper, baseURL string, clientSecretExpiration time.Duration, additionalClientIDNativeExceptions []string, completionURL string, mux *server.Server) {
 	remoteURLValidationConfig := mcpSessionManager.RemoteMCPURLValidationConfig()
 	h := &handler{
 		tokenStore:   tokenStore,
@@ -53,6 +54,7 @@ func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTo
 		clientExpiration:         clientSecretExpiration,
 		clientMetadataCache:      map[string]clientMetadataCacheEntry{},
 		clientIDNativeExceptions: newClientIDNativeExceptions(additionalClientIDNativeExceptions),
+		completionURL:            completionURL,
 	}
 	// Reuse the handler's SSRF-safe client metadata resolver when forwarding a
 	// downstream client's registered name to the upstream OAuth server.

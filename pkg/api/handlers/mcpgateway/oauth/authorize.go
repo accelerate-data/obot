@@ -590,6 +590,11 @@ func (h *handler) oauthCallback(req api.Context) error {
 
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
+		var cbErr *oauthCallbackError
+		if h.completionURL != "" && oauthAuthRequestID == "" && errors.As(err, &cbErr) {
+			http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, instanceCallbackFailureQuery(mcpServerID, cbErr)), http.StatusFound)
+			return nil
+		}
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 		}
@@ -600,7 +605,11 @@ func (h *handler) oauthCallback(req api.Context) error {
 		// If there is no OAuth request object, then MCP OAuth wasn't started by OAuth; likely the UI kicked it off.
 		// Redirect to the OAuth completion page.
 		slog.Info("Completed MCP OAuth callback without first-level OAuth auth request context")
-		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, url.Values{
+			"flow":   {"instance"},
+			"status": {"success"},
+			"mcp_id": {mcpServerID},
+		}), http.StatusFound)
 		return nil
 	}
 
@@ -693,7 +702,12 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 	} else if err != nil {
 		return true, errors.New("failed to complete static OAuth credential test")
 	}
-	http.Redirect(req.ResponseWriter, req.Request, oauthCompletionURL(""), http.StatusFound)
+	q := url.Values{"flow": {"static-test"}, "status": {"success"}}
+	if status == types.MCPStaticOAuthTestStatusFailed {
+		q.Set("status", "failed")
+		q.Set("error", string(failure))
+	}
+	http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 	return true, nil
 }
 
