@@ -146,15 +146,16 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 	require.Empty(t, sanitizeMCPOAuthCompletionDescription(" \r\n "))
 }
 
-func TestInstanceCallbackFailureQuery(t *testing.T) {
-	q := instanceCallbackFailureQuery("msi1", &oauthCallbackError{Code: "access_denied", Description: "user said no", Err: errors.New("x")})
+func TestCallbackFailureQuery(t *testing.T) {
+	q := callbackFailureQuery("instance", "msi1", &oauthCallbackError{Code: "access_denied", Description: "user said no", Err: errors.New("x")})
 	require.Equal(t, "access_denied", q.Get("error"))
 	require.Equal(t, "user said no", q.Get("error_description"))
 	require.Equal(t, "instance", q.Get("flow"))
 	require.Equal(t, "failed", q.Get("status"))
 	require.Equal(t, "msi1", q.Get("mcp_id"))
 
-	q = instanceCallbackFailureQuery("", &oauthCallbackError{Code: "token_exchange_failed", Err: errors.New("x")})
+	q = callbackFailureQuery("component", "", &oauthCallbackError{Code: "token_exchange_failed", Err: errors.New("x")})
+	require.Equal(t, "component", q.Get("flow"))
 	require.False(t, q.Has("error_description"))
 	require.False(t, q.Has("mcp_id"))
 }

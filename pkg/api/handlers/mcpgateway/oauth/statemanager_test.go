@@ -175,6 +175,107 @@ func TestOAuthCallbackComponentCompletion(t *testing.T) {
 	}
 }
 
+func TestOAuthCallbackComponentCompletionRedirect(t *testing.T) {
+	const completionURL = "/auth/mcp-oauth/complete"
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"token","token_type":"Bearer"}`))
+	}))
+	defer tokenServer.Close()
+	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate())
+	client := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	state := newStateManager(client)
+	h := handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: state}, completionURL: completionURL}
+	for _, tt := range []struct {
+		name         string
+		spec         v1.MCPServerSpec
+		instanceSpec *v1.MCPServerInstanceSpec
+		query        string
+		wantLocation string
+		wantQuery    url.Values
+		wantHTTP400  bool
+	}{
+		{
+			name:      "shared vmcp success",
+			spec:      v1.MCPServerSpec{VMCPID: "vmcp1shared"},
+			query:     "state=state&code=code",
+			wantQuery: url.Values{"flow": {"component"}, "status": {"success"}, "mcp_id": {"ms1component"}},
+		},
+		{
+			name:         "legacy composite connection success",
+			instanceSpec: &v1.MCPServerInstanceSpec{CompositeName: "ms1composite"},
+			query:        "state=state&code=code",
+			wantQuery:    url.Values{"flow": {"component"}, "status": {"success"}, "mcp_id": {"msi1connection"}},
+		},
+		{
+			name:      "dedicated vmcp denied",
+			spec:      v1.MCPServerSpec{VMCPInstanceID: "vmcpi1dedicated"},
+			query:     "state=state&error=access_denied&error_description=User+denied+access",
+			wantQuery: url.Values{"flow": {"component"}, "status": {"failed"}, "error": {"access_denied"}, "error_description": {"User denied access"}, "mcp_id": {"ms1component"}},
+		},
+		{
+			name:         "standalone success stays with the client",
+			query:        "state=state&code=code",
+			wantLocation: oauthCompletionURL("oar1request"),
+		},
+		{
+			name:        "standalone denied stays an error",
+			query:       "state=state&error=access_denied",
+			wantHTTP400: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &v1.MCPServer{Name: "ms1component", Namespace: system.DefaultNamespace, Spec: tt.spec}
+			authRequest := &v1.OAuthAuthRequest{Name: "oar1request", Namespace: system.DefaultNamespace, Spec: v1.OAuthAuthRequestSpec{RedirectURI: "https://client.example/callback"}}
+			storage := clientfake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(server, authRequest).Build()
+			mcpID := server.Name
+			if tt.instanceSpec != nil {
+				connection := &v1.MCPServerInstance{
+					Name:      "msi1connection",
+					Namespace: system.DefaultNamespace,
+					Spec:      *tt.instanceSpec,
+				}
+				connection.Spec.MCPServerName = server.Name
+				connection.Spec.UserID = "1"
+				require.NoError(t, storage.Create(t.Context(), connection))
+				mcpID = connection.Name
+			}
+			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", authRequest.Name, "", "state", "verifier", "", &oauth2.Config{
+				ClientID: "client", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
+			}))
+			response := httptest.NewRecorder()
+			err := h.oauthCallback(api.Context{
+				Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?"+tt.query, nil),
+				ResponseWriter: response,
+				Storage:        storage,
+				User:           &user.DefaultInfo{UID: "1", Name: "user", Groups: []string{types.GroupAuthenticated}},
+			})
+			if tt.wantHTTP400 {
+				var httpErr *types.ErrHTTP
+				require.ErrorAs(t, err, &httpErr)
+				require.Equal(t, http.StatusBadRequest, httpErr.Code)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, http.StatusFound, response.Code)
+			location := response.Header().Get("Location")
+			if tt.wantLocation != "" {
+				require.Equal(t, tt.wantLocation, location)
+				return
+			}
+			parsed, err := url.Parse(location)
+			require.NoError(t, err)
+			require.Equal(t, completionURL, parsed.Path)
+			require.Equal(t, tt.wantQuery, parsed.Query())
+		})
+	}
+}
+
 func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 	const completionURL = "/auth/mcp-oauth/complete"
 	tokenStatus := http.StatusOK

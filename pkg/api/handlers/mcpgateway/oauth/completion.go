@@ -371,9 +371,12 @@ func sanitizeMCPOAuthCompletionDescription(description string) string {
 	return description
 }
 
-func instanceCallbackFailureQuery(mcpID string, cbErr *oauthCallbackError) url.Values {
+// callbackFailureQuery describes a failed callback for the completion page;
+// flow is "instance" for a UI-started connection or "component" for one
+// component of an aggregate.
+func callbackFailureQuery(flow, mcpID string, cbErr *oauthCallbackError) url.Values {
 	q := url.Values{
-		"flow":   {"instance"},
+		"flow":   {flow},
 		"status": {"failed"},
 		"error":  {safeOAuthErrorCode(cbErr.Code)},
 	}
