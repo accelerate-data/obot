@@ -22,7 +22,10 @@ import (
 )
 
 const (
-	obotOAuthClientName = "Obot MCP OAuth"
+	// vibedataOAuthClientName is the client_name a provider shows when it asks the
+	// user to approve Vibedata's access to an MCP server, both for dynamically
+	// registered clients and in the hosted Client ID Metadata Document.
+	vibedataOAuthClientName = "Vibedata"
 )
 
 type MCPOAuthHandlerFactory struct {
@@ -213,14 +216,8 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 	go func() {
 		defer close(errChan)
 
-		_, err := f.mcpSessionManager.ClientForMCPServerForOAuthCheck(req.Context(), mcpServerConfig, mcp.ClientOption{
-			OAuthClientName:               oauthClientName,
-			OAuthClientIDMetadataDocument: f.cimdDocumentURL,
-			ClientName:                    obotOAuthClientName,
-			TokenStorage:                  f.tokenStore.ForUserAndMCP(userID, mcpID, mcpServerConfig.URL),
-			CallbackHandler:               oauthHandler,
-			ClientLookup:                  oauthHandler,
-		})
+		_, err := f.mcpSessionManager.ClientForMCPServerForOAuthCheck(req.Context(), mcpServerConfig,
+			f.oauthCheckClientOption(oauthClientName, f.tokenStore.ForUserAndMCP(userID, mcpID, mcpServerConfig.URL), oauthHandler))
 		if err != nil {
 			errChan <- fmt.Errorf("failed to get client for server %s: %v", mcpServer.Name, err)
 		} else {
@@ -383,6 +380,20 @@ func staticOAuthMetadata(metadata mcp.OAuthMetadata, redirectURL string) (mcp.Au
 
 	return authorizationServer, mcp.AuthServerMetadataToClientRegistration(authorizationServer,
 		"Obot MCP Gateway", redirectURL, registration.Scope), nil
+}
+
+// oauthCheckClientOption takes an oauthClientName that is empty unless a
+// downstream client initiated the flow; when it is empty, the MCP client
+// registers with the provider under ClientName instead.
+func (f *MCPOAuthHandlerFactory) oauthCheckClientOption(oauthClientName string, tokenStorage mcp.TokenStorage, oauthHandler *mcpOAuthHandler) mcp.ClientOption {
+	return mcp.ClientOption{
+		OAuthClientName:               oauthClientName,
+		OAuthClientIDMetadataDocument: f.cimdDocumentURL,
+		ClientName:                    vibedataOAuthClientName,
+		TokenStorage:                  tokenStorage,
+		CallbackHandler:               oauthHandler,
+		ClientLookup:                  oauthHandler,
+	}
 }
 
 func (f *MCPOAuthHandlerFactory) newMCPOAuthHandler(gatewayClient *client.Client, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName string) *mcpOAuthHandler {

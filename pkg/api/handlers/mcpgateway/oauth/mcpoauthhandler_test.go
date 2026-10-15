@@ -178,3 +178,18 @@ func TestStaticOAuthMetadataReportsMissingAuthorizationServer(t *testing.T) {
 	_, _, err := staticOAuthMetadata(mcp.OAuthMetadata{}, "https://obot.example.com/oauth/mcp/callback")
 	require.EqualError(t, err, "static OAuth is required but authorization server metadata was not found")
 }
+
+func TestOAuthCheckClientOptionNamesTheClientVibedata(t *testing.T) {
+	factory := &MCPOAuthHandlerFactory{cimdDocumentURL: "https://obot.example/oauth/client-metadata.json"}
+	handler := &mcpOAuthHandler{}
+
+	opt := factory.oauthCheckClientOption("", &staticOAuthTokenStorage{}, handler)
+	require.Equal(t, "Vibedata", opt.ClientName)
+	require.Empty(t, opt.OAuthClientName, "an empty downstream name must fall back to ClientName at registration")
+	require.Equal(t, factory.cimdDocumentURL, opt.OAuthClientIDMetadataDocument)
+	require.Same(t, handler, opt.CallbackHandler)
+
+	opt = factory.oauthCheckClientOption("Downstream Client", &staticOAuthTokenStorage{}, handler)
+	require.Equal(t, "Downstream Client", opt.OAuthClientName)
+	require.Equal(t, "Vibedata", opt.ClientName)
+}

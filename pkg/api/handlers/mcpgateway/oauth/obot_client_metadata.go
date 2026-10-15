@@ -12,7 +12,7 @@ func (h *handler) obotClientIDMetadata(req api.Context) error {
 		TokenEndpointAuthMethod: "none",
 		GrantTypes:              []string{"authorization_code", "refresh_token"},
 		ResponseTypes:           []string{"code"},
-		ClientName:              "Obot MCP Gateway",
+		ClientName:              vibedataOAuthClientName,
 		ClientURI:               h.baseURL,
 		SoftwareID:              "obot",
 	})
