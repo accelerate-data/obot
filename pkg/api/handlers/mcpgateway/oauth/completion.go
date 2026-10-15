@@ -55,7 +55,12 @@ var (
 	cookieSeparator   = regexp.MustCompile(`^[ \t]*[;,][ \t]*`)
 	cookieExpiresDate = regexp.MustCompile(`(?i)^[a-z]{3},[ \t]*\d{1,2}[ -][a-z]{3}[ -]\d{2,4}[ \t]+\d{2}:\d{2}:\d{2}[ \t]*GMT`)
 
-	digestScheme         = regexp.MustCompile(`(?i)\bDigest\s+`)
+	quotedSchemeAuthorizationKey = regexp.MustCompile(`(?i)\bauthorization\b(?:(?:\\\\)*\\?["'])?\s*[:=]\s*`)
+	// RE2's \s omits the vertical tab and Unicode spaces that Studio's JavaScript \s matches.
+	quotedSchemeWord = regexp.MustCompile(`^((?:\\\\)*\\?)["'][A-Za-z][A-Za-z0-9_-]{0,31}((?:\\\\)*\\?)["'][\s\v\p{Z}\x{FEFF}]+`)
+
+	// The scheme word may be quoted (Authorization = "Digest" username=...).
+	digestScheme         = regexp.MustCompile(`(?i)\bDigest(?:(?:\\\\)*\\?["'])?\s+`)
 	digestParamName      = regexp.MustCompile(`^[A-Za-z0-9_-]+\s*=\s*`)
 	digestParamSeparator = regexp.MustCompile(`^\s*,\s*`)
 )
@@ -284,6 +289,40 @@ func redactCookieHeaders(s string) string {
 	return b.String()
 }
 
+// redactQuotedSchemeAuthorization redacts an authorization value whose scheme word is
+// quoted, as in Authorization = "Bearer" token. The unquoted authorization shape stops
+// at the quote, and the key scan takes the quoted scheme as the whole value, so the token
+// after it would otherwise survive. The quoted scheme and the token are redacted
+// together, as Studio's redactQuotedSchemeAuthorization does. The closing quote character
+// need not match the opening one, so a mismatched pair cannot leak the token, but the
+// escape run before each quote must: "head\" is a quoted value holding an escaped quote.
+// RE2 has no backreference, so the escapes are compared here.
+func redactQuotedSchemeAuthorization(s string) string {
+	var b strings.Builder
+	pos := 0
+	for pos < len(s) {
+		loc := quotedSchemeAuthorizationKey.FindStringIndex(s[pos:])
+		if loc == nil {
+			break
+		}
+		keyEnd := pos + loc[1]
+		b.WriteString(s[pos:keyEnd])
+		pos = keyEnd
+		m := quotedSchemeWord.FindStringSubmatch(s[keyEnd:])
+		if m == nil || m[1] != m[2] {
+			continue
+		}
+		valueStart := keyEnd + len(m[0])
+		if valueStart >= len(s) || strings.ContainsRune(",;&}", rune(s[valueStart])) {
+			continue
+		}
+		b.WriteString("[REDACTED]")
+		_, pos = credentialValueEnd(s, valueStart)
+	}
+	b.WriteString(s[pos:])
+	return b.String()
+}
+
 // redactDigestParameters redacts every value of a Digest credential or challenge. The
 // authorization pass stops at the first parameter and the key scan knows neither
 // "response" nor "cnonce", so later parameters would otherwise survive.
@@ -362,6 +401,7 @@ func redactKnownValues(s string, values ...string) string {
 func sanitizeMCPOAuthCompletionDescription(description string) string {
 	description = redactDigestParameters(description)
 	description = redactCookieHeaders(description)
+	description = redactQuotedSchemeAuthorization(description)
 	description = redactCredentialShapes(description, credentialShapesBeforeKeys)
 	description = redactCompletionCredentials(description)
 	description = redactBareCredentials(description)
