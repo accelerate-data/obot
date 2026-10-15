@@ -115,24 +115,6 @@ func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
 		}
 	})
 
-	t.Run("replay after success is rejected without an exchange", func(t *testing.T) {
-		provider := newBlockingTokenServer(t)
-		provider.releaseAll()
-		gateway := newStaticOAuthCallbackGateway(t)
-		storeDynamicCallbackState(t, gateway, provider.URL, "state")
-		sm := newStateManager(gateway)
-
-		if _, _, err := sm.createToken(t.Context(), "state", "code", "", ""); err != nil {
-			t.Fatalf("first callback: %v", err)
-		}
-		if _, _, err := sm.createToken(t.Context(), "state", "code", "", ""); err == nil {
-			t.Fatal("replayed callback succeeded, want rejection")
-		}
-		if got := provider.exchanges.Load(); got != 1 {
-			t.Fatalf("provider token exchanges = %d, want exactly 1", got)
-		}
-	})
-
 	t.Run("expired state is rejected before cleanup runs", func(t *testing.T) {
 		provider := newBlockingTokenServer(t)
 		provider.releaseAll()

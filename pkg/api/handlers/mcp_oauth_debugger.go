@@ -174,15 +174,12 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 	if pendingState.UserID != req.User.GetUID() || pendingState.MCPID != server.Name || pendingState.URL != serverConfig.URL || pendingState.OAuthAuthRequestID != OAuthDebuggerPendingStateMarker {
 		return types.NewErrNotFound("OAuth debugger authorization state not found")
 	}
-	if pendingState, err = claimOAuthDebuggerPendingState(req.Context(), req.GatewayClient, input.State); err != nil {
-		return err
-	}
 
 	httpClient, err := m.mcpSessionManager.HTTPClientForServer(serverConfig, mcp.HTTPClientOptions{Timeout: 10 * time.Second, DirectConnect: true})
 	if err != nil {
 		return err
 	}
-	token, err := exchangeAndPersistOAuthDebuggerToken(req.Context(), req.GatewayClient, pendingState, input.Code, httpClient)
+	token, err := claimAndExchangeOAuthDebuggerToken(req.Context(), req.GatewayClient, input.State, input.Code, httpClient)
 	if err != nil {
 		return err
 	}
@@ -200,15 +197,18 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 	})
 }
 
-// claimOAuthDebuggerPendingState makes the debugger's code exchange one-use and
-// enforces the state's expiry, so a replayed or concurrent request never reaches
-// the provider. Callers check ownership first, so a foreign state is never claimed.
-func claimOAuthDebuggerPendingState(ctx context.Context, gatewayClient *gateway.Client, state string) (*gwtypes.MCPOAuthPendingState, error) {
+// claimAndExchangeOAuthDebuggerToken claims the pending state as the last step
+// before the code exchange, which makes the exchange one-use and enforces the
+// state's expiry: a replayed or concurrent request never reaches the provider.
+// Callers check ownership first, so a foreign state is never claimed.
+func claimAndExchangeOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, state, code string, httpClient *http.Client) (*oauth2.Token, error) {
 	pendingState, err := gatewayClient.ClaimMCPOAuthPendingState(ctx, state)
 	if errors.Is(err, gateway.ErrMCPOAuthPendingStateInvalid) {
 		return nil, types.NewErrNotFound("OAuth debugger authorization state not found")
+	} else if err != nil {
+		return nil, err
 	}
-	return pendingState, err
+	return exchangeAndPersistOAuthDebuggerToken(ctx, gatewayClient, pendingState, code, httpClient)
 }
 
 func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, pendingState *gwtypes.MCPOAuthPendingState, code string, httpClients ...*http.Client) (*oauth2.Token, error) {

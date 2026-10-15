@@ -15,6 +15,9 @@ import (
 
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"golang.org/x/oauth2"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
+	"k8s.io/apiserver/pkg/storage/value"
 )
 
 func createDynamicOAuthPendingState(t *testing.T, c *Client, mcpURL, state string) *oauth2.Config {
@@ -122,4 +125,25 @@ func TestClaimMCPOAuthPendingStateEnforcesTTLAndExactlyOnce(t *testing.T) {
 			})
 		})
 	}
+
+	// A static-OAuth test callback has its own claim lifecycle; the dynamic claim
+	// must not consume it, or a test callback could be exchanged as a connection.
+	t.Run("static OAuth test state is not claimable", func(t *testing.T) {
+		c := newTestClient(t)
+		c.encryptionConfig = &encryptionconfig.EncryptionConfiguration{
+			Transformers: map[schema.GroupResource]value.Transformer{mcpOAuthPendingStateGroupResource: testTransformer{}},
+		}
+		conf := &oauth2.Config{
+			ClientID:    "static-client-id",
+			Endpoint:    oauth2.Endpoint{AuthURL: "https://provider.example/authorize", TokenURL: "https://provider.example/token"},
+			RedirectURL: "https://obot.example/oauth/mcp/callback",
+		}
+		start, err := c.CreateMCPStaticOAuthTest(t.Context(), "user-1", "mcp-instance-1", "https://mcp.example/api", "pkce-verifier", conf)
+		if err != nil {
+			t.Fatalf("create static OAuth test: %v", err)
+		}
+		if _, err := c.ClaimMCPOAuthPendingState(t.Context(), start.CallbackState); !errors.Is(err, ErrMCPOAuthPendingStateInvalid) {
+			t.Fatalf("claim static OAuth test state returned %v, want invalid state", err)
+		}
+	})
 }
