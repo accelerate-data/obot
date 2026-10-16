@@ -318,10 +318,18 @@ func redactQuotedSchemeAuthorization(s string) string {
 		if valueStart >= len(s) || strings.ContainsRune(",;&}", rune(s[valueStart])) {
 			continue
 		}
+		proseWords := 0
 		for at := valueStart; ; {
 			delim, end := credentialValueEnd(s, at)
 			word := s[at:end]
-			if word != "" && quotedSchemeWordIsToken(word, delim) {
+			if word == "" {
+				break
+			}
+			isToken := quotedSchemeProseWordIsToken(word, delim)
+			if proseWords == 0 {
+				isToken = quotedSchemeWordIsToken(word, delim)
+			}
+			if isToken {
 				if at > valueStart {
 					b.WriteString(s[keyEnd:at])
 				}
@@ -330,12 +338,15 @@ func redactQuotedSchemeAuthorization(s string) string {
 				break
 			}
 			if !quotedSchemeWordIsStatus(word) {
+				proseWords++
+			}
+			if proseWords > quotedSchemeMaxProseWords || strings.ContainsAny(word[len(word)-1:], ".!?") {
 				break
 			}
 			next := end
 			for next < len(s) {
 				r, size := utf8.DecodeRuneInString(s[next:])
-				if !unicode.IsSpace(r) {
+				if r == '\r' || r == '\n' || !unicode.IsSpace(r) {
 					break
 				}
 				next += size
@@ -352,14 +363,34 @@ func redactQuotedSchemeAuthorization(s string) string {
 
 // quotedSchemeWordIsToken reports whether a word after a quoted scheme is a token: quoted,
 // or shaped like one, the rule bareValueIsCredential applies after a bare credential key.
-// Any other word ("unsupported", "is required") is the provider's diagnostic, and the later
-// passes redact the scheme alone, as Studio's quotedSchemeWordIsToken does.
+// Any other word ("unsupported", "is required") is the provider's diagnostic: the walk
+// steps over it and the later passes redact the scheme, as Studio's quotedSchemeWordIsToken
+// does.
 func quotedSchemeWordIsToken(value, delim string) bool {
 	if delim != "" {
 		return true
 	}
 	word := strings.TrimRight(value, ".!?")
 	return len(word) >= 20 || strings.ContainsAny(word, "-_.0123456789")
+}
+
+// quotedSchemeMaxProseWords bounds the walk after a quoted scheme. The walk also ends at a
+// separator, a line break or the end of a sentence, so it stays within the clause.
+const quotedSchemeMaxProseWords = 8
+
+// quotedSchemeProseWordIsToken reports whether a word past a diagnostic word is a token.
+// That part of the clause is the provider's prose, which names identifiers the user needs
+// (tenant t-42, request-id=req-42, a URL), so a word there is a token only on a stronger
+// shape: long, or mixing letters and digits, as Studio's quotedSchemeProseWordIsToken does.
+func quotedSchemeProseWordIsToken(value, delim string) bool {
+	if delim != "" {
+		return true
+	}
+	word := strings.TrimRight(value, ".!?")
+	if strings.ContainsAny(word, "=@") || strings.Contains(word, "://") {
+		return false
+	}
+	return len(word) >= 20 || (len(word) >= 8 && strings.ContainsAny(word, "0123456789") && strings.IndexFunc(word, unicode.IsLetter) >= 0)
 }
 
 // quotedSchemeWordIsStatus reports whether a word is a status word or linking verb, which

@@ -141,6 +141,10 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 		// A token after the status words of a quoted scheme is still redacted.
 		{`invalid_request: Authorization = "Bearer" expired s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' expired [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" was revoked s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' was revoked [REDACTED] retry`},
+		{`invalid_request: Authorization = "Bearer" unsupported s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' unsupported [REDACTED] retry`},
+		{`invalid_request: Authorization = "Bearer" token exchange failed s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' token exchange failed [REDACTED] retry`},
+		{`invalid_request: Authorization = "Bearer" unsupported for tenant t-42 request-id=req-42 retry`, `invalid_request: Authorization = '[REDACTED]' unsupported for tenant t-42 request-id=req-42 retry`},
+		{`invalid_request: Authorization = "Bearer" unsupported, client app42client retry`, `invalid_request: Authorization = '[REDACTED]' unsupported, client app42client retry`},
 		// Values named in prose.
 		{"The password is hunter2", "The password is [REDACTED]"},
 		{"denied password opaque-value for request-id=req-42", "denied password [REDACTED] for request-id=req-42"},
