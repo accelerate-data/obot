@@ -1,8 +1,9 @@
 name: Verify Sync Metadata
 
 # Guards .accelerate/upstream-sync.json (which drives the vibedata image tag)
-# against drift. Runs on every PR to main so it also catches syncs done as
-# manual merges, not just those produced by the Upstream Sync workflow.
+# against drift, and fork-only Go tests against removal by a sync. Runs on every
+# PR to main so it also catches syncs done as manual merges, not just those
+# produced by the Upstream Sync workflow.
 
 permissions:
   contents: read
@@ -41,3 +42,11 @@ jobs:
 
       - name: Verify upstream-sync metadata
         run: bash scripts/verify-sync-metadata.sh
+
+      # A sync that takes upstream's side of a shared test file deletes the fork's
+      # tests in it without failing anything else (VD-6903).
+      - name: Verify fork-only tests survive
+        if: github.event_name == 'pull_request' || github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/check-fork-test-survival.sh "$BASE_SHA"

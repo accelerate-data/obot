@@ -1,0 +1,4 @@
+# Deliberate removals of fork-only Go tests, read by scripts/check-fork-test-survival.sh.
+# One per line: <package dir> <TestName> <reason, naming the issue and any upstream test that supersedes it>
+# Example:
+#   pkg/mcp TestSomethingRemoved VD-1234 superseded upstream by pkg/mcp/foo_test.go TestFoo
