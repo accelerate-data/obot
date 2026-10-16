@@ -17,20 +17,21 @@ const (
 	quotedSchemeMaxProseWords = 8
 )
 
-var oauthErrorCodes = map[string]bool{
-	"invalid_request": true, "invalid_client": true, "invalid_grant": true,
-	"unauthorized_client": true, "unsupported_grant_type": true, "unsupported_response_type": true,
-	"invalid_scope": true, "access_denied": true, "server_error": true,
-	"temporarily_unavailable": true, "invalid_token": true, "insufficient_scope": true,
-	"interaction_required": true, "login_required": true, "consent_required": true,
-	"account_selection_required": true, "invalid_request_uri": true, "invalid_request_object": true,
-	"request_not_supported": true, "request_uri_not_supported": true, "registration_not_supported": true,
-	"invalid_redirect_uri": true, "invalid_client_metadata": true, "invalid_target": true,
-	"invalid_dpop_proof": true, "use_dpop_nonce": true, "authorization_pending": true,
-	"slow_down": true, "expired_token": true,
-}
-
 var (
+	// OAuth and OpenID Connect error codes (RFC 6749, RFC 6750, OIDC Core).
+	oauthErrorCodes = map[string]bool{
+		"invalid_request": true, "invalid_client": true, "invalid_grant": true,
+		"unauthorized_client": true, "unsupported_grant_type": true, "unsupported_response_type": true,
+		"invalid_scope": true, "access_denied": true, "server_error": true,
+		"temporarily_unavailable": true, "invalid_token": true, "insufficient_scope": true,
+		"interaction_required": true, "login_required": true, "consent_required": true,
+		"account_selection_required": true, "invalid_request_uri": true, "invalid_request_object": true,
+		"request_not_supported": true, "request_uri_not_supported": true, "registration_not_supported": true,
+		"invalid_redirect_uri": true, "invalid_client_metadata": true, "invalid_target": true,
+		"invalid_dpop_proof": true, "use_dpop_nonce": true, "authorization_pending": true,
+		"slow_down": true, "expired_token": true,
+	}
+
 	// The key list matches Studio's MCP Settings redaction
 	// (src/server/modules/mcp/obot-client/error-message.ts), plus code and state.
 	completionCredentialKey = regexp.MustCompile(`(?i)(?:(?:\\\\)*\\?["'])?\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token|authorization|credential|nonce|signature|code|state)\b(?:(?:\\\\)*\\?["'])?\s*[:=]\s*`)
