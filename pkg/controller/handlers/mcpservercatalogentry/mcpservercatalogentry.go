@@ -23,7 +23,9 @@ import (
 
 type credentialClient interface {
 	RevealCredential(ctx context.Context, contexts []string, name string) (gatewaytypes.Credential, error)
-	DeleteCredential(ctx context.Context, credentialContext, name string) (bool, error)
+	AcquireCredentialLock(ctx context.Context, key string) (func(), error)
+	DeleteMCPStaticOAuthCredential(ctx context.Context, mcpID string, reconcileMCPIDs ...string) (bool, error)
+	DeleteMCPStaticOAuthStateForDeletedCatalogEntry(ctx context.Context, mcpID string, deploymentMCPIDs ...string) (bool, error)
 }
 
 // Handler handles operations for MCP server catalog entries
@@ -163,7 +165,7 @@ func reconcileOAuthCredential(req router.Request, creds credentialClient) error 
 	}
 	if !retained {
 		var err error
-		configured, err = syncOAuthCredential(req.Ctx, creds, entry, recheck)
+		configured, err = syncOAuthCredential(req, creds, entry, recheck)
 		if err != nil {
 			return err
 		}
@@ -231,18 +233,16 @@ func propagateOAuthCredentialStatus(req router.Request, entryName string, config
 }
 
 // syncOAuthCredential brings the credential store in line with entry and reports whether a
-// credential exists for it afterwards.
-func syncOAuthCredential(ctx context.Context, creds credentialClient, entry *v1.MCPServerCatalogEntry, recheck bool) (bool, error) {
-	credName := system.MCPOAuthCredentialName(entry.Name)
-
+// usable credential exists for it afterwards.
+func syncOAuthCredential(req router.Request, creds credentialClient, entry *v1.MCPServerCatalogEntry, recheck bool) (bool, error) {
 	if requiresStaticOAuth(entry) {
-		if entry.Status.OAuthCredentialConfigured && !recheck {
-			return true, nil
-		}
-
-		_, err := creds.RevealCredential(ctx, []string{credName}, system.StaticOAuthCredentialName)
+		// The store is read even when the status already says configured: a manifest edit such
+		// as a new FixedURL does not set the sync annotation, yet it leaves the stored credential
+		// bound to the old URL. Reporting only a credential that is complete for the current
+		// manifest keeps deployments failing closed instead of starting OAuth with it.
+		credential, err := creds.RevealCredential(req.Ctx, []string{system.MCPOAuthCredentialName(entry.Name)}, system.StaticOAuthCredentialName)
 		if err == nil {
-			return true, nil
+			return gclient.MCPStaticOAuthCredentialReady(credential.Secrets, entry.Spec.Manifest.RemoteConfig.FixedURL), nil
 		}
 		if !errors.As(err, &gclient.CredentialNotFoundError{}) {
 			return false, fmt.Errorf("failed to check OAuth credential status: %w", err)
@@ -258,9 +258,14 @@ func syncOAuthCredential(ctx context.Context, creds credentialClient, entry *v1.
 		return false, nil
 	}
 
-	deleted, err := creds.DeleteCredential(ctx, credName, system.StaticOAuthCredentialName)
+	deleted, restored, err := deleteStaticOAuthCredential(req, creds, entry, false)
 	if err != nil {
-		return false, fmt.Errorf("failed to delete OAuth credential: %w", err)
+		return false, err
+	}
+	if restored {
+		// This pass saw a stale entry. Its status is left for the reconcile the
+		// restoring update queues, which reads the restored credential.
+		return entry.Status.OAuthCredentialConfigured, nil
 	}
 	if deleted {
 		slog.Info("Deleted unused static OAuth credential for MCP catalog entry", "entry", entry.Name)
@@ -284,17 +289,15 @@ func removeOAuthCredentials(req router.Request, creds credentialClient) error {
 		return nil
 	}
 
-	// Build the credential name for this entry
-	credName := system.MCPOAuthCredentialName(entry.Name)
 	if retained, err := oauthCredentialReferencedByVMCP(req, entry); err != nil {
 		return err
 	} else if retained {
 		return nil
 	}
 
-	deleted, err := creds.DeleteCredential(req.Ctx, credName, system.StaticOAuthCredentialName)
+	deleted, _, err := deleteStaticOAuthCredential(req, creds, entry, true)
 	if err != nil {
-		return fmt.Errorf("failed to delete OAuth credential: %w", err)
+		return err
 	}
 	if deleted {
 		slog.Info("Removed static OAuth credential for deleted MCP catalog entry", "entry", entry.Name)
