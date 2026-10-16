@@ -41,7 +41,7 @@ func TestObotClientIDMetadata(t *testing.T) {
 	if got.ClientID != system.OAuthClientIDMetadataURL(baseURL) {
 		t.Fatalf("expected client_id %q, got %q", system.OAuthClientIDMetadataURL(baseURL), got.ClientID)
 	}
-	if got.ClientName != "Obot MCP Gateway" {
+	if got.ClientName != "Vibedata" {
 		t.Fatalf("unexpected client_name: %s", got.ClientName)
 	}
 	if got.TokenEndpointAuthMethod != "none" {

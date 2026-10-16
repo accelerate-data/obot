@@ -153,6 +153,62 @@ func TestOAuthHandlerForClientUsesConfiguredClientIDMetadataDocument(t *testing.
 	}
 }
 
+func TestOAuthHandlerForClientRegistersUnderTheClientNameProvidersShow(t *testing.T) {
+	tests := []struct {
+		name            string
+		oauthClientName string
+		want            string
+	}{
+		{
+			name: "no downstream client name",
+			want: "client-name",
+		},
+		{
+			name:            "downstream client name",
+			oauthClientName: "downstream-client",
+			want:            "downstream-client",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var registered ClientRegistrationMetadata
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if err := json.NewDecoder(req.Body).Decode(&registered); err != nil {
+					t.Errorf("decode registration request: %v", err)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"client_id":"registered-client"}`))
+			}))
+			defer server.Close()
+
+			sm := &SessionManager{baseURL: "https://obot.example.com"}
+			handler := sm.oauthHandlerForClient(server.Client(), "test-server", ClientOption{
+				OAuthClientName: tt.oauthClientName,
+				ClientName:      "client-name",
+				TokenStorage:    &recordingTokenStorage{},
+			})
+			oauthHandler, ok := handler.(*oauth)
+			if !ok {
+				t.Fatalf("expected *oauth handler, got %T", handler)
+			}
+
+			authServer := AuthorizationServerMetadata{RegistrationEndpoint: server.URL}
+			_, _, err := oauthHandler.resolveClientInfo(t.Context(), "test-server", oauthMetadataDiscovery{
+				ProtectedResourceMetadata:   protectedResourceMetadata{AuthorizationServers: []string{server.URL}},
+				AuthorizationServerMetadata: authServer,
+				ClientRegistration:          AuthServerMetadataToClientRegistration(authServer, oauthHandler.clientName, oauthHandler.redirectURL, ""),
+			})
+			if err != nil {
+				t.Fatalf("resolve client info: %v", err)
+			}
+			if registered.ClientName != tt.want {
+				t.Fatalf("expected registration client_name %q, got %q", tt.want, registered.ClientName)
+			}
+		})
+	}
+}
+
 func TestServerIDSharesDeploymentButNotUserSession(t *testing.T) {
 	first := ServerConfig{
 		Runtime:       "containerized",
