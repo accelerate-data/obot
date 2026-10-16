@@ -29,6 +29,12 @@ const (
 	pendingStateTTL                                                   = 30 * time.Minute
 	ContainerOAuthResourcePrefix                                      = "urn:obot:container-oauth:"
 	mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
+
+	// staticOAuthTestClaimLease bounds how long an admitted provider callback may hold a
+	// credential test. A callback fires once per state, so a lapsed claim is never re-admitted:
+	// the test is reported as an interrupted failure and the user retries with a fresh test.
+	// Keep this above the handler's provider-exchange timeout and far below pendingStateTTL.
+	staticOAuthTestClaimLease = 90 * time.Second
 )
 
 var (
@@ -287,21 +293,21 @@ func (c *Client) CopyMCPOAuthTokens(ctx context.Context, userID, sourceID, targe
 }
 
 func (c *Client) DeleteMCPOAuthTokenForURL(ctx context.Context, userID, mcpID, mcpURL string) error {
-	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthToken{}, "user_id = ? AND mcp_id = ? AND (url = ? OR url = ?)", userID, mcpID, mcpURL, "").Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthToken{}, "user_id = ? AND mcp_id = ? AND (url = ? OR url = ?)", userID, mcpID, mcpURL, "").Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
 	return c.triggerMCPOAuthTokenChange(ctx, mcpID)
 }
 
 func (c *Client) DeleteMCPOAuthTokens(ctx context.Context, userID, mcpID string) error {
-	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthToken{}, "user_id = ? AND mcp_id = ?", userID, mcpID).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthToken{}, "user_id = ? AND mcp_id = ?", userID, mcpID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
 	return c.triggerMCPOAuthTokenChange(ctx, mcpID)
 }
 
 func (c *Client) DeleteMCPOAuthTokenForAllUsers(ctx context.Context, mcpID string) error {
-	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthToken{}, "mcp_id = ?", mcpID).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthToken{}, "mcp_id = ?", mcpID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
 	return c.triggerMCPOAuthTokenChange(ctx, mcpID)
@@ -369,16 +375,27 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, testState, use
 		return apitypes.MCPStaticOAuthTestResult{Status: apitypes.MCPStaticOAuthTestStatusFailed, FailureCategory: apitypes.MCPStaticOAuthTestFailureExpired, ExpiresAt: apitypes.Time{Time: expiresAt}}, nil
 	}
 	status := ps.StaticOAuthTestStatus
+	failureCategory := ps.StaticOAuthTestFailureCategory
 	if status == mcpStaticOAuthTestStatusClaimed {
-		status = apitypes.MCPStaticOAuthTestStatusPending
+		// A missing claim time belongs to a row claimed before this column existed, so
+		// the attempt is abandoned rather than in flight.
+		if claimedAt := ps.StaticOAuthTestClaimedAt; claimedAt != nil && time.Since(*claimedAt) < staticOAuthTestClaimLease {
+			status = apitypes.MCPStaticOAuthTestStatusPending
+		} else {
+			status = apitypes.MCPStaticOAuthTestStatusFailed
+			failureCategory = apitypes.MCPStaticOAuthTestFailureInterrupted
+		}
 	}
-	return apitypes.MCPStaticOAuthTestResult{Status: status, FailureCategory: ps.StaticOAuthTestFailureCategory, Proof: ps.StaticOAuthSaveProof, ExpiresAt: apitypes.Time{Time: expiresAt}}, nil
+	return apitypes.MCPStaticOAuthTestResult{Status: status, FailureCategory: failureCategory, Proof: ps.StaticOAuthSaveProof, ExpiresAt: apitypes.Time{Time: expiresAt}}, nil
 }
 
 func (c *Client) ClaimMCPStaticOAuthTest(ctx context.Context, state string) (*types.MCPOAuthPendingState, error) {
 	result := c.db.WithContext(ctx).Model(&types.MCPOAuthPendingState{}).
 		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?", hashMCPStaticOAuthValue(state), true, apitypes.MCPStaticOAuthTestStatusPending, time.Now().Add(-pendingStateTTL)).
-		Update("static_o_auth_test_status", mcpStaticOAuthTestStatusClaimed)
+		Updates(map[string]any{
+			"static_o_auth_test_status":     mcpStaticOAuthTestStatusClaimed,
+			"static_o_auth_test_claimed_at": time.Now(),
+		})
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -397,6 +414,9 @@ func (c *Client) CompleteMCPStaticOAuthTest(ctx context.Context, state string, s
 		var pending types.MCPOAuthPendingState
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status IN ? AND created_at >= ?", hashMCPStaticOAuthValue(state), true, []apitypes.MCPStaticOAuthTestStatus{apitypes.MCPStaticOAuthTestStatusPending, mcpStaticOAuthTestStatusClaimed}, completedAt.Add(-pendingStateTTL)).
+			// A claim whose lease lapsed has already been reported as interrupted; a very
+			// late callback must not resurrect it.
+			Where("(static_o_auth_test_status <> ? OR static_o_auth_test_claimed_at > ?)", mcpStaticOAuthTestStatusClaimed, completedAt.Add(-staticOAuthTestClaimLease)).
 			First(&pending).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrMCPStaticOAuthTestInvalid
@@ -467,7 +487,11 @@ func (c *Client) ClaimMCPStaticOAuthCredentialProof(ctx context.Context, proofVa
 	return &MCPStaticOAuthCredentialClaim{mcpID: mcpID, mcpURL: mcpURL, clientID: clientID, clientSecret: clientSecret, generation: hashMCPStaticOAuthValue(proofValue)}, nil
 }
 
-func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, claim *MCPStaticOAuthCredentialClaim, replace bool, cleanupMCPIDs ...string) error {
+// CommitClaimedMCPStaticOAuthCredential stores the claimed application. A replacement
+// revokes only the grants the previous application issued; reconcileMCPIDs are
+// notified after commit but never broaden the deletion, so a user's own dynamic
+// grant on the same deployment survives.
+func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, claim *MCPStaticOAuthCredentialClaim, replace bool, reconcileMCPIDs ...string) error {
 	if claim == nil {
 		return ErrMCPStaticOAuthTestInvalid
 	}
@@ -490,6 +514,12 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 				}
 				return err
 			}
+			// Refuse to overwrite an application this server cannot read: an
+			// undecryptable row means a lost or rotated key, and replacing it would
+			// also revoke grants the operator has no way to inspect first.
+			if err := c.decryptCredential(ctx, &existing); err != nil {
+				return fmt.Errorf("failed to decrypt existing static OAuth credential: %w", err)
+			}
 		}
 		conflict := clause.OnConflict{Columns: []clause.Column{{Name: "context"}, {Name: "name"}}, DoUpdates: clause.AssignmentColumns([]string{"secrets", "encrypted"})}
 		if !replace {
@@ -504,7 +534,7 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 		}
 		if replace {
 			var err error
-			changed, err = deleteMCPStaticOAuthTokens(tx, claim.mcpID, cleanupMCPIDs)
+			changed, err = deleteOwnedMCPStaticOAuthTokens(tx, claim.mcpID, reconcileMCPIDs)
 			if err != nil {
 				return err
 			}
@@ -517,25 +547,55 @@ func (c *Client) CommitClaimedMCPStaticOAuthCredential(ctx context.Context, clai
 	return c.triggerMCPOAuthTokenChanges(ctx, changed)
 }
 
-func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, mcpID, expectedGeneration string, cleanupMCPIDs ...string) (bool, error) {
+// DeleteMCPStaticOAuthCredential removes the shared application, every pending
+// static OAuth test for the entry, and the grants that application issued, in
+// one transaction. reconcileMCPIDs are notified after commit but never widen the
+// deletion, so a user's own dynamic grant on the same deployment survives. It
+// returns whether an application row existed. The caller must hold the entry's
+// credential lock throughout.
+func (c *Client) DeleteMCPStaticOAuthCredential(ctx context.Context, mcpID string, reconcileMCPIDs ...string) (bool, error) {
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, "", nil, reconcileMCPIDs)
+}
+
+// DeleteMCPStaticOAuthCredentialGeneration clears the application only when it is
+// still the generation the caller reviewed, with the same ownership-scoped grant
+// cleanup as a replacement.
+func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, mcpID, expectedGeneration string, reconcileMCPIDs ...string) (bool, error) {
 	if expectedGeneration == "" {
 		return false, ErrMCPOAuthCatalogCredentialChanged
 	}
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, expectedGeneration, nil, reconcileMCPIDs)
+}
+
+// DeleteMCPStaticOAuthStateForDeletedCatalogEntry removes the entry's static
+// OAuth state and, unlike DeleteMCPStaticOAuthCredential, every grant held on
+// the entry's deployments whoever issued it, because those deployments are going
+// away with the entry. Callers must use it only while deleting the catalog entry
+// itself.
+func (c *Client) DeleteMCPStaticOAuthStateForDeletedCatalogEntry(ctx context.Context, mcpID string, deploymentMCPIDs ...string) (bool, error) {
+	return c.deleteMCPStaticOAuthCredential(ctx, mcpID, "", deploymentMCPIDs, deploymentMCPIDs)
+}
+
+// deleteMCPStaticOAuthCredential checks expectedGeneration only when it is set;
+// purgeMCPIDs widens grant deletion beyond the entry-owned grants.
+func (c *Client) deleteMCPStaticOAuthCredential(ctx context.Context, mcpID, expectedGeneration string, purgeMCPIDs, reconcileMCPIDs []string) (bool, error) {
 	credentialContext := system.MCPOAuthCredentialName(mcpID)
 	var deleted bool
 	var changed []string
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var current types.Credential
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("context = ? AND name = ?", credentialContext, system.StaticOAuthCredentialName).First(&current).Error
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		if err == nil {
-			if err := c.decryptCredential(ctx, &current); err != nil {
-				return fmt.Errorf("failed to decrypt static OAuth credential: %w", err)
+		if expectedGeneration != "" {
+			var current types.Credential
+			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("context = ? AND name = ?", credentialContext, system.StaticOAuthCredentialName).First(&current).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
 			}
-			if !secureStringEqual(current.Secrets["GENERATION"], expectedGeneration) {
-				return ErrMCPOAuthCatalogCredentialChanged
+			if err == nil {
+				if err := c.decryptCredential(ctx, &current); err != nil {
+					return fmt.Errorf("failed to decrypt static OAuth credential: %w", err)
+				}
+				if !secureStringEqual(current.Secrets["GENERATION"], expectedGeneration) {
+					return ErrMCPOAuthCatalogCredentialChanged
+				}
 			}
 		}
 		result := tx.Where("context = ? AND name = ?", credentialContext, system.StaticOAuthCredentialName).Delete(&types.Credential{})
@@ -543,7 +603,12 @@ func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, m
 			return result.Error
 		}
 		deleted = result.RowsAffected > 0
-		changed, err = deleteMCPStaticOAuthTokens(tx, mcpID, cleanupMCPIDs)
+		var err error
+		if len(purgeMCPIDs) == 0 {
+			changed, err = deleteOwnedMCPStaticOAuthTokens(tx, mcpID, reconcileMCPIDs)
+		} else {
+			changed, err = deleteMCPStaticOAuthTokensForDeletedCatalogEntry(tx, mcpID, purgeMCPIDs, reconcileMCPIDs)
+		}
 		if err != nil {
 			return err
 		}
@@ -555,19 +620,27 @@ func (c *Client) DeleteMCPStaticOAuthCredentialGeneration(ctx context.Context, m
 	return deleted, c.triggerMCPOAuthTokenChanges(ctx, changed)
 }
 
-func deleteMCPStaticOAuthTokens(tx *gorm.DB, catalogEntryName string, cleanupMCPIDs []string) ([]string, error) {
-	scope := tx.Model(&types.MCPOAuthToken{}).Where("catalog_entry_name = ?", catalogEntryName)
-	if len(cleanupMCPIDs) > 0 {
-		scope = scope.Or("mcp_id IN ?", cleanupMCPIDs)
-	}
+func deleteOwnedMCPStaticOAuthTokens(tx *gorm.DB, catalogEntryName string, reconcileMCPIDs []string) ([]string, error) {
+	return deleteMCPOAuthTokensInScope(tx.Model(&types.MCPOAuthToken{}).Where("catalog_entry_name = ?", catalogEntryName), reconcileMCPIDs)
+}
+
+func deleteMCPStaticOAuthTokensForDeletedCatalogEntry(tx *gorm.DB, catalogEntryName string, deploymentMCPIDs, reconcileMCPIDs []string) ([]string, error) {
+	scope := tx.Model(&types.MCPOAuthToken{}).Where("catalog_entry_name = ? OR mcp_id IN ?", catalogEntryName, deploymentMCPIDs)
+	return deleteMCPOAuthTokensInScope(scope, reconcileMCPIDs)
+}
+
+// deleteMCPOAuthTokensInScope returns every deployment that lost a grant plus
+// reconcileMCPIDs, so a retry after a failed notification still reaches the
+// deployments whose rows the first attempt already removed.
+func deleteMCPOAuthTokensInScope(scope *gorm.DB, reconcileMCPIDs []string) ([]string, error) {
 	var mcpIDs []string
-	if err := scope.Distinct("mcp_id").Pluck("mcp_id", &mcpIDs).Error; err != nil {
+	if err := scope.Session(&gorm.Session{}).Distinct("mcp_id").Pluck("mcp_id", &mcpIDs).Error; err != nil {
 		return nil, err
 	}
-	if err := scope.Delete(&types.MCPOAuthToken{}).Error; err != nil {
+	if err := scope.Session(&gorm.Session{}).Delete(&types.MCPOAuthToken{}).Error; err != nil {
 		return nil, err
 	}
-	return append(mcpIDs, cleanupMCPIDs...), nil
+	return append(mcpIDs, reconcileMCPIDs...), nil
 }
 
 func (c *Client) triggerMCPOAuthTokenChanges(ctx context.Context, mcpIDs []string) error {
@@ -582,7 +655,9 @@ func (c *Client) triggerMCPOAuthTokenChanges(ctx context.Context, mcpIDs []strin
 		}
 		seen[id] = struct{}{}
 		if err := c.triggerMCPOAuthTokenChange(ctx, id); err != nil {
-			errs = append(errs, err)
+			// Name the server so the operator can tell whose grant cleanup still
+			// needs a retry; the rows are already gone and nothing else records it.
+			errs = append(errs, fmt.Errorf("failed to trigger OAuth token change for %s: %w", id, err))
 		}
 	}
 	return errors.Join(errs...)
@@ -590,15 +665,28 @@ func (c *Client) triggerMCPOAuthTokenChanges(ctx context.Context, mcpIDs []strin
 
 func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pending *types.MCPOAuthPendingState, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	entryName := pending.CatalogEntryName
-	if entryName != "" && pending.CatalogCredentialGeneration == "" {
-		entryName = ""
-	} else if entryName == "" && !IsContainerOAuthResource(pending.URL) {
-		var err error
-		entryName, err = c.CatalogEntryForCurrentOAuthCredential(ctx, pending.UserID, pending.MCPID, pending.URL, oauthConf)
+	if entryName == "" && !IsContainerOAuthResource(pending.URL) && c.storageClient != nil {
+		// A row written before entry identity was persisted carries no entry name;
+		// recover it from the server so the static-OAuth-only check below still
+		// applies. This needs no existing grant, so a first-time dynamic
+		// authorization started before the upgrade still completes.
+		recovered, err := c.mcpCatalogEntryName(ctx, pending.MCPID)
 		if err != nil {
+			c.deleteChangedMCPOAuthPendingState(ctx, pending.HashedState, ErrMCPOAuthCatalogCredentialChanged)
+			return ErrMCPOAuthCatalogCredentialChanged
+		}
+		entryName = recovered
+	}
+	if entryName != "" && pending.CatalogCredentialGeneration == "" {
+		// The pending state was started as a dynamic grant. If the entry has since
+		// been made static-OAuth-only, committing it would store an untagged grant
+		// that no credential change can revoke.
+		if err := c.replaceDynamicCatalogOAuthToken(ctx, pending, entryName, oauthAuthRequestID, oauthConf, token); err != nil {
 			c.deleteChangedMCPOAuthPendingState(ctx, pending.HashedState, err)
 			return err
 		}
+		_ = c.DeleteMCPOAuthPendingState(ctx, pending.HashedState)
+		return nil
 	}
 	if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, pending.UserID, pending.MCPID, pending.URL, oauthAuthRequestID, entryName, pending.CatalogCredentialGeneration, oauthConf, token); err != nil {
 		c.deleteChangedMCPOAuthPendingState(ctx, pending.HashedState, err)
@@ -606,6 +694,31 @@ func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pending *t
 	}
 	_ = c.DeleteMCPOAuthPendingState(ctx, pending.HashedState)
 	return nil
+}
+
+// replaceDynamicCatalogOAuthToken stores a dynamic grant for a catalog-backed MCP.
+// The static-OAuth-only check and the write share the catalog mutation lock, so an
+// entry cannot be made static-only between them; a static-only entry accepts only
+// grants fenced to its current credential generation.
+func (c *Client) replaceDynamicCatalogOAuthToken(ctx context.Context, pending *types.MCPOAuthPendingState, entryName, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	if c.storageClient == nil {
+		return fmt.Errorf("storage client is unavailable")
+	}
+	releaseCatalog, err := c.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate dynamic catalog OAuth token write with catalog mutation: %w", err)
+	}
+	defer releaseCatalog()
+	releaseCredential, err := c.AcquireCredentialLock(ctx, system.MCPOAuthCredentialName(entryName))
+	if err != nil {
+		return fmt.Errorf("failed to coordinate dynamic catalog OAuth token write: %w", err)
+	}
+	defer releaseCredential()
+	entry, err := c.mcpCatalogEntry(ctx, entryName)
+	if err != nil || (entry.Spec.Manifest.RemoteConfig != nil && entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired) {
+		return ErrMCPOAuthCatalogCredentialChanged
+	}
+	return c.ReplaceMCPOAuthToken(ctx, pending.UserID, pending.MCPID, pending.URL, oauthAuthRequestID, oauthConf, token)
 }
 
 func (c *Client) deleteChangedMCPOAuthPendingState(ctx context.Context, hashedState string, err error) {

@@ -126,6 +126,10 @@ func (db *DB) AutoMigrate() (err error) {
 		return fmt.Errorf("failed to migrate system MCP server configuration: %w", err)
 	}
 
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, pendingMCPStaticTestIndexMigrationName, dropSingleColumnPendingMCPStaticTestIndex); err != nil {
+		return fmt.Errorf("failed to drop single-column pending MCP static test index: %w", err)
+	}
+
 	if err := tx.AutoMigrate(
 		types.AuthToken{},
 		types.TokenRequest{},

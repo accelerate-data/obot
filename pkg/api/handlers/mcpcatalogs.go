@@ -433,6 +433,16 @@ func (h *MCPCatalogHandler) UpdateEntry(req api.Context) error {
 	// Update the manifest
 	entry.Spec.Manifest = manifest
 
+	// A static OAuth Save claims its proof against the entry's provider URL and
+	// re-reads the entry inside this fence; without it, an update could swap the
+	// provider between that re-read and the commit, binding the credential to a
+	// provider it was never tested against.
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog entry update with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
+
 	if err := req.Update(&entry); err != nil {
 		return fmt.Errorf("failed to update entry: %w", err)
 	}
@@ -505,6 +515,14 @@ func (h *MCPCatalogHandler) DeleteEntry(req api.Context) error {
 	if !entry.Spec.Editable {
 		return types.NewErrBadRequest("entry is not editable and cannot be manually deleted")
 	}
+
+	// Deleting the entry under the same fence as a static OAuth Save keeps a
+	// Save from committing a credential for an entry that is being removed.
+	releaseCatalogMutationLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog entry deletion with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 
 	if err := req.Delete(&entry); err != nil {
 		return fmt.Errorf("failed to delete entry: %w", err)
@@ -1474,26 +1492,28 @@ func (h *MCPCatalogHandler) saveOAuthCredentials(req api.Context, replace bool) 
 		return err
 	}
 
-	if !replace {
-		existing, revealErr := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, system.StaticOAuthCredentialName)
-		if revealErr == nil {
-			if gclient.MCPStaticOAuthCredentialReady(existing.Secrets, testedURL) {
-				return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
-			}
-			replace = true
-		} else if !errors.As(revealErr, &gclient.CredentialNotFoundError{}) {
-			return fmt.Errorf("failed to read existing OAuth credential: %w", revealErr)
+	// Both Save and Replace read the stored application first: an unreadable
+	// credential (a decryption or database failure) must fail closed rather
+	// than be overwritten by a blind upsert that hides the fault.
+	existing, revealErr := req.GatewayClient.RevealCredential(req.Context(), []string{credName}, system.StaticOAuthCredentialName)
+	if revealErr != nil && !errors.As(revealErr, &gclient.CredentialNotFoundError{}) {
+		return fmt.Errorf("failed to read existing OAuth credential: %w", revealErr)
+	}
+	if !replace && revealErr == nil {
+		if gclient.MCPStaticOAuthCredentialReady(existing.Secrets, testedURL) {
+			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
 		}
+		replace = true
 	}
 
-	var cleanup []string
+	var reconcile []string
 	if replace {
-		cleanup, err = resolveOAuthTokenCleanupTargets(req, entry.Name)
+		reconcile, err = resolveOAuthTokenReconciliationTargets(req, entry.Name)
 		if err != nil {
 			return err
 		}
 	}
-	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, replace, cleanup...); err != nil {
+	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, replace, reconcile...); err != nil {
 		switch {
 		case errors.Is(err, gclient.ErrMCPStaticOAuthCredentialExists):
 			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
@@ -1558,11 +1578,11 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredential()
 
-	cleanup, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
+	reconcile, err := resolveOAuthTokenReconciliationTargets(req, entry.Name)
 	if err != nil {
 		return err
 	}
-	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredentialGeneration(req.Context(), entry.Name, clearRequest.ExpectedGeneration, cleanup...)
+	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredentialGeneration(req.Context(), entry.Name, clearRequest.ExpectedGeneration, reconcile...)
 	if errors.Is(err, gclient.ErrMCPOAuthCatalogCredentialChanged) {
 		return types.NewErrHTTP(http.StatusConflict, "OAuth application changed; reload its status before clearing")
 	} else if err != nil {
@@ -1580,7 +1600,7 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	return req.Write(map[string]bool{"deleted": deleted})
 }
 
-func resolveOAuthTokenCleanupTargets(req api.Context, entryName string) ([]string, error) {
+func resolveOAuthTokenReconciliationTargets(req api.Context, entryName string) ([]string, error) {
 	var servers v1.MCPServerList
 	if err := req.List(&servers, kclient.MatchingFields{"spec.mcpServerCatalogEntryName": entryName}); err != nil {
 		return nil, fmt.Errorf("failed to list MCP servers for OAuth token cleanup: %w", err)

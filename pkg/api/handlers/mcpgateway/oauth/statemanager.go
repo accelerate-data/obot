@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/obot-platform/obot/pkg/gateway/client"
@@ -12,12 +13,19 @@ import (
 
 type stateManager struct {
 	gatewayClient *client.Client
+	// exchangeHTTPClient carries the operator's remote-network policy and rejects
+	// redirects. Every OAuth code exchange runs through it.
+	exchangeHTTPClient *http.Client
 }
 
-func newStateManager(gatewayClient *client.Client) *stateManager {
-	return &stateManager{
+func newStateManager(gatewayClient *client.Client, exchangeHTTPClient ...*http.Client) *stateManager {
+	manager := &stateManager{
 		gatewayClient: gatewayClient,
 	}
+	if len(exchangeHTTPClient) > 0 {
+		manager.exchangeHTTPClient = exchangeHTTPClient[0]
+	}
+	return manager
 }
 
 func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, conf *oauth2.Config) error {
@@ -66,7 +74,7 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 		conf.Scopes = strings.Split(ps.Scopes, " ")
 	}
 
-	token, err := mcp.ExchangeOAuthToken(ctx, conf, code, ps.Verifier, ps.ResourceURL)
+	token, err := mcp.ExchangeOAuthToken(mcp.WithOAuthHTTPClient(ctx, sm.exchangeHTTPClient), conf, code, ps.Verifier, ps.ResourceURL)
 	if err != nil {
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
 		// The exchange error can quote the provider's response body, which may

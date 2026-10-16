@@ -79,6 +79,13 @@ func newFakeClient(objects ...kclient.Object) kclient.WithWatch {
 			}
 			return []string{server.Spec.MCPServerCatalogEntryName}
 		}).
+		WithIndex(&v1.MCPServerInstance{}, "spec.mcpServerCatalogEntryName", func(obj kclient.Object) []string {
+			instance := obj.(*v1.MCPServerInstance)
+			if instance.Spec.MCPServerCatalogEntryName == "" {
+				return nil
+			}
+			return []string{instance.Spec.MCPServerCatalogEntryName}
+		}).
 		WithObjects(objects...).
 		Build()
 }
@@ -250,10 +257,27 @@ func (f *fakeCredentialClient) RevealCredential(_ context.Context, contexts []st
 	if !f.exists {
 		return gatewaytypes.Credential{}, gclient.CredentialNotFoundError{Contexts: contexts, Name: name}
 	}
-	return gatewaytypes.Credential{Context: contexts[0], Name: name}, nil
+	return gatewaytypes.Credential{Context: contexts[0], Name: name, Secrets: map[string]string{
+		"MCP_URL":       "https://example.com/mcp",
+		"GENERATION":    "generation-1",
+		"CLIENT_ID":     "client",
+		"CLIENT_SECRET": "secret",
+	}}, nil
 }
 
-func (f *fakeCredentialClient) DeleteCredential(_ context.Context, _, _ string) (bool, error) {
+func (f *fakeCredentialClient) AcquireCredentialLock(context.Context, string) (func(), error) {
+	return func() {}, nil
+}
+
+func (f *fakeCredentialClient) DeleteMCPStaticOAuthCredential(context.Context, string, ...string) (bool, error) {
+	return f.deleteCredential()
+}
+
+func (f *fakeCredentialClient) DeleteMCPStaticOAuthStateForDeletedCatalogEntry(context.Context, string, ...string) (bool, error) {
+	return f.deleteCredential()
+}
+
+func (f *fakeCredentialClient) deleteCredential() (bool, error) {
 	f.deletes++
 	if f.deleteErr != nil {
 		return false, f.deleteErr
@@ -312,14 +336,16 @@ func TestReconcileOAuthCredential(t *testing.T) {
 		},
 		{
 			// The other steady state: a configured entry that still requires static OAuth. The
-			// status already answers the question, so the store is not read.
-			name: "configured entry that still requires static OAuth is left alone",
+			// store is read anyway, because a manifest edit can leave the credential incomplete
+			// without setting the sync annotation (fork #37, VD-6903).
+			name: "configured entry that still requires static OAuth stays configured",
 			entry: func() *v1.MCPServerCatalogEntry {
 				e := remoteEntry(true)
 				e.Status.OAuthCredentialConfigured = true
 				return e
 			},
 			exists:         true,
+			wantReveals:    1,
 			wantConfigured: true,
 		},
 		{

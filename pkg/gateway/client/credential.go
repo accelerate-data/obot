@@ -267,13 +267,23 @@ func (c *Client) encryptCredential(ctx context.Context, credential *types.Creden
 }
 
 func (c *Client) decryptCredential(ctx context.Context, credential *types.Credential) error {
-	if !credential.Encrypted || len(credential.Secrets) != 1 || c.encryptionConfig == nil {
+	if !credential.Encrypted {
 		return nil
+	}
+	// An encrypted row read without its transformer must fail rather than hand the
+	// ciphertext envelope back as the credential's secrets: callers compare those
+	// secrets against client IDs and generations, and an empty match is not "no
+	// credential".
+	if c.encryptionConfig == nil {
+		return fmt.Errorf("credential is encrypted but encryption is not configured")
+	}
+	if len(credential.Secrets) != 1 {
+		return fmt.Errorf("credential is encrypted but its encrypted secrets are malformed")
 	}
 
 	transformer := c.encryptionConfig.Transformers[credentialGroupResource]
 	if transformer == nil {
-		return nil
+		return fmt.Errorf("credential is encrypted but no credential transformer is configured")
 	}
 
 	encryptedSecrets := credential.Secrets[credentialEncryptedSecretsKey]

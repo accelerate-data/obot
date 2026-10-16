@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -24,11 +25,13 @@ type TokenStorage interface {
 }
 
 type globalTokenStore struct {
-	gatewayClient *gateway.Client
+	gatewayClient     *gateway.Client
+	refreshHTTPClient *http.Client
 }
 
 type tokenStore struct {
 	gatewayClient         *gateway.Client
+	refreshHTTPClient     *http.Client
 	userID, mcpID, mcpURL string
 	mu                    sync.Mutex
 	catalogEntry          catalogCredentialFence
@@ -46,20 +49,26 @@ type storageBackedTokenSource struct {
 	tokenStorage TokenStorage
 	conf         *oauth2.Config
 	tok          *oauth2.Token
+	httpClient   *http.Client
 }
 
-func NewGlobalTokenStore(gatewayClient *gateway.Client) GlobalTokenStore {
-	return &globalTokenStore{
+func NewGlobalTokenStore(gatewayClient *gateway.Client, opts ...GlobalTokenStoreOption) GlobalTokenStore {
+	g := &globalTokenStore{
 		gatewayClient: gatewayClient,
 	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 func (g *globalTokenStore) ForUserAndMCP(userID, mcpID, mcpURL string) TokenStorage {
 	return &tokenStore{
-		gatewayClient: g.gatewayClient,
-		mcpID:         mcpID,
-		userID:        userID,
-		mcpURL:        mcpURL,
+		gatewayClient:     g.gatewayClient,
+		refreshHTTPClient: g.refreshHTTPClient,
+		mcpID:             mcpID,
+		userID:            userID,
+		mcpURL:            mcpURL,
 	}
 }
 
@@ -141,19 +150,27 @@ func (t *tokenStore) TokenSource(ctx context.Context) (oauth2.TokenSource, error
 	if config == nil || token == nil {
 		return nil, nil
 	}
-	return newStorageBackedTokenSource(t, config, token), nil
+	return newStorageBackedTokenSourceWithClient(t, config, token, t.refreshHTTPClient), nil
 }
 
 func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token) oauth2.TokenSource {
+	return newStorageBackedTokenSourceWithClient(tokenStorage, conf, tok, nil)
+}
+
+// newStorageBackedTokenSourceWithClient builds a token source that persists
+// refreshed tokens. httpClient carries the operator's remote-network policy and
+// rejects redirects; without it a refresh runs on http.DefaultClient.
+func newStorageBackedTokenSourceWithClient(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, httpClient *http.Client) oauth2.TokenSource {
 	return oauth2.ReuseTokenSource(tok, &storageBackedTokenSource{
 		tokenStorage: tokenStorage,
 		conf:         conf,
 		tok:          tok,
+		httpClient:   httpClient,
 	})
 }
 
 func (ts *storageBackedTokenSource) Token() (*oauth2.Token, error) {
-	ctx := context.Background()
+	ctx := WithOAuthHTTPClient(context.Background(), ts.httpClient)
 	tok, err := ts.conf.TokenSource(ctx, ts.tok).Token()
 	if err != nil {
 		return nil, err

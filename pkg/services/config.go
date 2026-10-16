@@ -672,9 +672,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		gatewayDB,
 		storageClient,
 		encryptionConfig,
-		func(ctx context.Context, mcpID string) error {
-			return r.Backend().Trigger(ctx, v1.SchemeGroupVersion.WithKind("MCPServer"), mcpID, 0)
-		},
+		r.Backend(),
 		config.AuthOwnerEmails,
 		config.AuthAdminEmails,
 		time.Duration(config.MCPAuditLogPersistIntervalSeconds)*time.Second,
@@ -878,7 +876,9 @@ func New(ctx context.Context, config Config) (*Services, error) {
 
 	webhookHelper := mcp.NewWebhookHelper(mcpWebhookValidationInformer.GetIndexer(), config.Hostname)
 
-	mcpOAuthTokenStorage := mcp.NewGlobalTokenStore(gatewayClient)
+	mcpOAuthTokenStorage := mcp.NewGlobalTokenStore(gatewayClient, mcp.WithTokenRefreshHTTPClient(
+		mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfigFromOptions(mcp.Options(config.MCPConfig))),
+	))
 	mcpSessionManager, err := mcp.NewSessionManager(ctx, config.EnableAuthentication, mcpOAuthTokenStorage, persistentTokenServer, config.Hostname, config.HTTPListenPort, mcp.Options(config.MCPConfig), webhookHelper, localK8sConfig, apiLocalK8sClient, localCacheClient, storageClient, gatewayClient, config.ServiceNamespace, tunnelManager)
 	if err != nil {
 		return nil, err

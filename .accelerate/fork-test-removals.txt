@@ -1,0 +1,83 @@
+# Deliberate removals of fork-only Go tests, read by scripts/check-fork-test-survival.sh.
+# One per line: <package dir> <TestName> <reason, naming the issue and any upstream test that supersedes it>
+# Example:
+#   pkg/mcp TestSomethingRemoved VD-1234 superseded upstream by pkg/mcp/foo_test.go TestFoo
+pkg/oidcjwt TestIntegration_AdminAndOwnerRolesReachCatalogOAuthEndpoint VD-6903 asserted the sync's admin-access regression; replaced by TestIntegration_OwnerRoleReachesOwnerOnlyCatalogOAuthEndpoint in integration_owner_only_oauth_claim_test.go
+
+# VD-6903 replay of the v0.26.0 sync (base 623377d59). Every entry below names the
+# HEAD test that replaces it; none is a bare deletion.
+
+# #56 token-endpoint egress: re-architected upstream onto NewOAuthExchangeClient and safehttp.NoRedirects.
+pkg/api/handlers/mcpgateway/oauth TestNewOAuthExchangeClientBlocksLoopbackUnlessOperatorAllowsIt VD-6903 superseded by pkg/mcp TestExchangeOAuthTokenOnExchangeClientEnforcesNetworkPolicy and TestRemoteMCPURLValidationConfigFromOptions
+pkg/api/handlers/mcpgateway/oauth TestNewOAuthExchangeClientRejectsTokenEndpointRedirect VD-6903 superseded by pkg/mcp TestExchangeOAuthTokenOnExchangeClientRefusesRedirect
+pkg/api/handlers/mcpgateway/oauth TestRefreshOAuthTokenUsesRestrictedHTTPClient VD-6903 superseded by pkg/mcp TestStorageBackedRefreshOnExchangeClientEnforcesNetworkPolicy
+pkg/api/handlers/mcpgateway/oauth TestStateManagerBlocksDynamicTokenExchangeToPrivateAddress VD-6903 superseded by statemanager_egress_test.go TestStateManagerCreateTokenEnforcesRemoteNetworkPolicy
+pkg/api/handlers/mcpgateway/oauth TestStateManagerBlocksStaticCatalogTokenExchangeToPrivateAddress VD-6903 superseded by TestStaticOAuthCallbackBlocksPrivateTokenEndpoint and TestStateManagerCreateTokenEnforcesRemoteNetworkPolicy
+pkg/api/handlers/mcpgateway/oauth TestStateManagerRejectsTokenEndpointRedirect VD-6903 superseded by TestStateManagerCreateTokenRefusesTokenEndpointRedirect
+pkg/mcp TestNoRedirectClientRejectsRedirect VD-6903 NoRedirectClient replaced by safehttp.NoRedirects; superseded by pkg/safehttp TestNoRedirectsRefusesRedirectWithoutContactingTarget and pkg/mcp TestStorageBackedRefreshOnExchangeClientRefusesRedirect
+pkg/mcp TestStorageBackedTokenSourceUsesSuppliedHTTPClient VD-6903 superseded by TestStorageBackedRefreshOnExchangeClientEnforcesNetworkPolicy and TestStorageBackedRefreshOnExchangeClientRefusesRedirect
+pkg/mcp TestDiscoveredInternalTokenEndpointIsRejectedAtExchange VD-6903 superseded by TestExchangeOAuthTokenOnExchangeClientEnforcesNetworkPolicy
+pkg/mcp TestContainerOAuthRefreshRunsOnTheNetworkPolicyClient VD-6903 NoRedirectClient removed; refresh builds a per-call HTTPClientForServer client (TestContainerOAuthAuthorizationIsInjectedPerUser) and its token endpoint is limited to trusted Entra authorities (TestResolveMicrosoftEntraContainerOAuthRejectsUntrustedAuthority)
+pkg/safehttp TestNewClientFollowsRedirectsByDefault VD-6903 BlockRedirects option removed upstream; redirect policy covered by TestClientPreservesOAuthTokenOnlyForSameOriginRedirects
+pkg/safehttp TestNewClientRejectsRedirectsWhenBlocked VD-6903 BlockRedirects option removed upstream; superseded by TestNoRedirectsRefusesRedirectWithoutContactingTarget
+
+# #56 error text: superseded by #70/#72 redaction (ADR-0126).
+pkg/mcp TestSanitizeTokenExchangeErrorPreservesCancellation VD-6903 sanitizer removed by #70/#72; error text handled by pkg/api/handlers/mcpgateway/oauth TestSafeOAuthErrorCode and TestSanitizeMCPOAuthCompletionDescription
+pkg/mcp TestSafeOAuthErrorCode VD-6903 moved to pkg/api/handlers/mcpgateway/oauth TestSafeOAuthErrorCode (completion_test.go)
+pkg/api/handlers/mcpgateway/oauth TestStateManagerSanitizesProviderCallbackError VD-6903 superseded by #70/#72 TestSafeOAuthErrorCode and TestSanitizeMCPOAuthCompletionDescription
+pkg/api/handlers/mcpgateway/oauth TestStateManagerSanitizesUpstreamExchangeError VD-6903 superseded by #70/#72 TestSafeOAuthErrorCode and TestSanitizeMCPOAuthCompletionDescription
+pkg/api/handlers/mcpgateway/oauth TestOAuthCallbackDoesNotReflectUpstreamErrorResponse VD-6903 superseded by #70/#72 TestOAuthErrorDescriptionQueryIsRFC6749Safe and TestSanitizeMCPOAuthCompletionDescription
+pkg/api/handlers/mcpgateway/oauth TestDebuggerCallbackDoesNotForwardProviderErrorDescription VD-6903 superseded by #70/#72 TestOAuthErrorDescriptionQueryIsRFC6749Safe and TestSanitizeMCPOAuthCompletionDescription
+pkg/api/handlers TestExchangeAndPersistOAuthDebuggerTokenRejectsRedirectAndSanitizesError VD-6903 egress half superseded by TestExchangeOAuthDebuggerTokenBlocksStaticCatalogPrivateTokenEndpoint and pkg/safehttp TestNoRedirectsRefusesRedirectWithoutContactingTarget; error text by #70/#72
+
+# Upstream-authored changes (ancestry marks them fork-only): renamed or removed upstream.
+pkg/mcp TestK8sObjects_NanobotAgentExcludesAuditLogConfig VD-6903 renamed upstream (#7660) to TestK8sObjects_AgentExcludesAuditLogConfig
+pkg/mcp TestK8sObjects_UVXAndNPXPassNanobotHealthEnv VD-6903 upstream #7124 limits the health env to containerized runtimes; UVX/NPX readiness covered by TestEnsureServerReadyUsesHealthzPath
+pkg/gateway/server/dispatcher TestModelProviderLogLevelEnv VD-6903 renamed upstream to TestProviderLogLevelEnv
+pkg/mcp TestCompositeServerToServerConfig_AllDisabledToolOverridesSetNoTools VD-6903 CompositeConfig removed upstream (ccd461902); composite entries rejected by mcpcatalogs.go
+pkg/mcp TestCompositeServerToServerConfig_TokenExchangeConfig VD-6903 CompositeConfig removed upstream (ccd461902)
+pkg/mcp TestConstructMCPServerNanobotYAMLForCompositeIncludesOnlyEnabledTools VD-6903 CompositeConfig removed upstream (ccd461902)
+pkg/mcp TestConstructMCPServerNanobotYAMLForCompositeOmitsToolConfigWhenOverridesOmitted VD-6903 CompositeConfig removed upstream (ccd461902)
+pkg/mcp TestConstructMCPServerNanobotYAMLForCompositeOmitsWebhooks VD-6903 CompositeConfig removed upstream (ccd461902)
+pkg/mcp TestConstructMCPServerNanobotYAMLForCompositePreservesComponentsWithNoEnabledTools VD-6903 CompositeConfig removed upstream (ccd461902)
+pkg/mcp TestValidateCatalogEntryManifestCompositeConfigurationOptions VD-6903 CompositeConfig removed upstream (ccd461902); non-composite options covered by TestValidateServerManifestConfigurationOptions
+pkg/mcp TestSessionManagerClientIDMetadataDocument VD-6903 #53 CIMD superseded by pkg/api/handlers/mcpgateway/oauth TestNewMCPOAuthHandlerFactoryConfiguresCIMD
+
+# #21 remote headers and static credentials: folded into Manifest.Config upstream.
+apiclient/types TestMapCatalogEntryToServer_RemoteFixedURLCopiesMultiUserHeadersSeparately VD-6903 headers fold into Config at catalog load; pinned by pkg/mcpcatalog TestDecodeCatalogFileMigratesDeprecatedCatalogSchema and pkg/mcp TestServerToServerConfig_RemoteHeadersAreDeploymentConfigAndMultiUserHeadersArePassthrough
+apiclient/types TestMapCatalogEntryToServer_RemoteFixedURLKeepsRemoteHeadersAsServerConfig VD-6903 headers fold into Config at catalog load; pinned by pkg/mcpcatalog TestDecodeCatalogFileMigratesDeprecatedCatalogSchema and pkg/mcp TestServerToServerConfig_RemoteHeadersAreDeploymentConfigAndMultiUserHeadersArePassthrough
+pkg/mcp TestServerToServerConfig_StaticOAuthCredentials VD-6903 ServerConfig no longer carries static OAuth client credentials (upstream #7510); the handler resolves them from the gateway, tested by TestStaticOAuthLookupUsesCurrentReferencedCredential
+pkg/api/authz TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoutes VD-6903 superseded by TestAPIGroupAllowsOwnedMCPServerInstanceOAuthReadRoutes
+
+# #27 gateway bearer handling: re-architected upstream onto rewriteProxyRequest; nanobot scoped-token path removed.
+pkg/api/handlers/mcpgateway TestProxyRemovesInboundStudioBearerForNanobotAgentWhenAuthenticationIsDisabled VD-6903 superseded by TestProxyStripsInboundGatewayCredentials and TestWithGatewayTokenRemovesInboundBearerWhenAuthenticationIsDisabled
+pkg/api/handlers/mcpgateway TestProxyRemovesInboundStudioBearerWhenAuthenticationIsDisabled VD-6903 superseded by TestProxyStripsInboundGatewayCredentials and TestWithGatewayTokenRemovesInboundBearerWhenAuthenticationIsDisabled
+pkg/api/handlers/mcpgateway TestProxyReplacesInboundStudioBearerForEmbeddedNanobot VD-6903 superseded by TestProxyStripsInboundGatewayCredentials and TestWithGatewayTokenReplacesInboundBearer
+pkg/api/handlers/mcpgateway TestProxyReplacesInboundStudioBearerForNanobotAgent VD-6903 superseded by TestProxyStripsInboundGatewayCredentials and TestWithGatewayTokenReplacesInboundBearer
+
+# #34 token exchange grant removed upstream; cross-user access denied in authz.
+pkg/api/handlers/mcpgateway/oauth TestTokenExchangeUsesUserSpecificOAuthForMCPServerInstance VD-6903 token-exchange grant removed upstream; cross-user instance access covered by pkg/api/authz TestCheckMCPIDChecksMCPServerInstanceOwner
+
+# #35 restored under a new name.
+pkg/controller/handlers/mcpcatalog TestReadMCPCatalogAcceptsOrgConfiguredRemoteShapes VD-6903 restored as TestReadMCPCatalogAcceptsOrgConfiguredLegacyRemoteShapes
+
+# #58 static OAuth claim lease: restored under new names.
+pkg/gateway/client TestCompleteMCPStaticOAuthTestFencesClaimByLease VD-6903 restored as TestStaticOAuthTestClaimLeaseFencesStatusAndCompletion
+pkg/gateway/client TestGetMCPStaticOAuthTestStatusReportsAbandonedClaimAsInterrupted VD-6903 restored as TestStaticOAuthTestClaimLeaseFencesStatusAndCompletion
+pkg/api/handlers/mcpgateway/oauth TestStaticOAuthCallbackReportsCompletionPersistenceFailureSafely VD-6903 restored as TestStaticOAuthCallbackHidesCompletionPersistenceFailure and TestStaticOAuthCallbackRejectsCompletionAfterClaimLeaseLapsed
+
+# #37 / #53 / #57 gateway OAuth state: restored, merged into table tests.
+pkg/gateway/client TestCreateMCPOAuthPendingStateRejectsCredentialBoundToAnotherCatalogURL VD-6903 restored in table test TestCreateMCPOAuthPendingStateRejectsIncompleteStaticCredential
+pkg/gateway/client TestCreateMCPOAuthPendingStateRejectsCredentialWithoutCatalogURL VD-6903 restored in table test TestCreateMCPOAuthPendingStateRejectsIncompleteStaticCredential
+pkg/gateway/client TestCreateMCPOAuthPendingStateRejectsCredentialWithoutGeneration VD-6903 restored in table test TestCreateMCPOAuthPendingStateRejectsIncompleteStaticCredential
+pkg/gateway/client TestDeleteMCPOAuthTokenForAllUsersTriggersServerReconciliation VD-6903 restored in TestMCPOAuthTokenChangeTriggersOwningServerNamespacedKey (delete for all users)
+pkg/gateway/client TestMCPOAuthTokenChangeForInstanceTriggersOwningServerReconciliation VD-6903 restored in TestMCPOAuthTokenChangeTriggersOwningServerNamespacedKey (instance)
+pkg/gateway/client TestDeleteMCPStaticOAuthCredentialGenerationPreservesDynamicGrant VD-6903 restored in TestStaticOAuthCredentialChangeRevokesOnlyOwnedGrants (clear)
+pkg/gateway/client TestReplaceMCPStaticOAuthCredentialPreservesDynamicGrant VD-6903 restored in TestStaticOAuthCredentialChangeRevokesOnlyOwnedGrants (replace)
+pkg/gateway/client TestStaticOAuthMutationOverlappingDynamicGrantPreservesGrant VD-6903 restored in TestStaticOAuthCredentialChangeRevokesOnlyOwnedGrants (replace, clear)
+pkg/gateway/client TestDeleteMCPStaticOAuthCredentialPreservesDynamicGrantWithStaticCredential VD-6903 restored as TestDeleteMCPStaticOAuthCredentialRevokesOnlyOwnedState
+pkg/gateway/client TestDeleteMCPStaticOAuthCredentialPreservesDynamicGrantWithoutStaticCredential VD-6903 restored as TestDeleteMCPStaticOAuthCredentialRevokesOnlyOwnedState
+
+# ConfigureServer spec writes: superseded by upstream's retry.RetryOnConflict re-read, which re-applies only URL and template changes to the latest server.
+pkg/api/handlers TestConfigureServerRejectsConcurrentSpecChange VD-6903 superseded: ConfigureServer re-reads the latest server and applies only URL/template edits, so a concurrent spec change is not clobbered and the fork's 409 digest check no longer applies
+pkg/api/handlers TestConfigureServerRetriesControllerUpdateConflict VD-6903 superseded by ConfigureServer's retry.RetryOnConflict loop (upstream, no upstream test)

@@ -78,7 +78,7 @@ type MCPOAuthPendingState struct {
 	State                          string
 	Verifier                       string
 	UserID                         string `gorm:"index:idx_pending_user_mcp"`
-	MCPID                          string `gorm:"index:idx_pending_user_mcp"`
+	MCPID                          string `gorm:"index:idx_pending_user_mcp;index:idx_pending_mcp_static_test,priority:1"`
 	URL                            string
 	ResourceURL                    string
 	CatalogEntryName               string
@@ -96,10 +96,14 @@ type MCPOAuthPendingState struct {
 	StaticOAuthTestStatus          apitypes.MCPStaticOAuthTestStatus
 	StaticOAuthTestFailureCategory apitypes.MCPStaticOAuthTestFailureCategory
 	StaticOAuthTestCompletedAt     time.Time
-	StaticOAuthSaveProofHash       string `gorm:"index"`
-	StaticOAuthSaveProof           string
-	Encrypted                      bool
-	CreatedAt                      time.Time
+	// StaticOAuthTestClaimedAt bounds how long an admitted callback may hold the
+	// test. Nil only on a row claimed before this column existed, which is treated
+	// as abandoned; claiming stamps the status and this column in one statement.
+	StaticOAuthTestClaimedAt *time.Time
+	StaticOAuthSaveProofHash string `gorm:"index"`
+	StaticOAuthSaveProof     string
+	Encrypted                bool
+	CreatedAt                time.Time
 	// ClaimedAt is nil until a callback claims the row for exchange. A claim is
 	// terminal: the row can never be claimed again, whatever the outcome.
 	ClaimedAt *time.Time

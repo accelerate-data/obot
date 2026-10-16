@@ -24,6 +24,7 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/mcptrigger"
 	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
@@ -1309,11 +1310,13 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 
 	var gitManagedEntry bool
 	var sourceCatalogEntryManifest *types.MCPServerCatalogEntryManifest
+	var catalogEntrySnapshot *v1.MCPServerCatalogEntry
 	if input.CatalogEntryID != "" {
 		var catalogEntry v1.MCPServerCatalogEntry
 		if err := req.Get(&catalogEntry, input.CatalogEntryID); err != nil {
 			return err
 		}
+		catalogEntrySnapshot = catalogEntry.DeepCopy()
 		sourceCatalogEntryManifest = catalogEntry.Spec.Manifest.DeepCopy()
 
 		// Validate that the catalog entry type is compatible with the route used.
@@ -1351,10 +1354,9 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 			}
 		}
 
-		// Block server creation if OAuth is required but not configured
-		if entryRequiresStaticOAuthCreds(catalogEntry) {
-			return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
-		}
+		// Static OAuth readiness is checked against the credential store inside
+		// the catalog mutation fence just before creation, not against the
+		// entry's cached status here.
 
 		// Catalog entries no longer declare a sharing mode. They are mapped to the
 		// legacy server manifest and administrators may still override that result.
@@ -1406,7 +1408,34 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 	if err := mcp.ValidateTemplateReferences(server.Spec.Manifest); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
-	if err := req.Create(&server); err != nil {
+	if catalogEntrySnapshot != nil {
+		// The closure scopes the fence to the readiness check and Create, so it
+		// is released before the response is written to a possibly slow client.
+		if err := func() error {
+			releaseOAuthCredential, currentEntry, oauthCredentialReady, err := lockStaticOAuthCredentialForCreate(
+				req.Context(),
+				req.GatewayClient,
+				req.Storage,
+				kclient.ObjectKey{Namespace: req.Namespace(), Name: catalogEntrySnapshot.Name},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to check static OAuth credential: %w", err)
+			}
+			defer releaseOAuthCredential()
+			if !oauthCredentialReady {
+				return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
+			}
+			// The server manifest was derived from the snapshot; an entry edited
+			// since then could carry a different provider than the credential
+			// that was just checked.
+			if utils.Digest(currentEntry.Spec) != utils.Digest(catalogEntrySnapshot.Spec) {
+				return types.NewErrBadRequest("catalog entry changed while the server was being prepared; retry creation")
+			}
+			return req.Create(&server)
+		}(); err != nil {
+			return err
+		}
+	} else if err := req.Create(&server); err != nil {
 		return err
 	}
 
@@ -1625,6 +1654,17 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 		return types.NewErrBadRequest("invalid configuration: %v", err)
 	}
 
+	credCtx := mcpServer.CredentialContext(req.User.GetUID())
+
+	// Replacing the credential is a delete followed by a create, so two concurrent
+	// configurations could interleave and leave the server with neither value, or
+	// with the first request's value after the second one returned.
+	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credCtx+"\x00"+mcpServer.Name)
+	if err != nil {
+		return fmt.Errorf("failed to acquire server configuration lock: %w", err)
+	}
+	defer releaseCredentialLock()
+
 	// Check if this server is from a catalog and has a URL template that needs to be processed.
 	// URL templates may only reference user-supplied env vars. References to secret-bound env
 	// vars are rejected to avoid resolving Secret-backed values during template expansion.
@@ -1681,8 +1721,6 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 		}
 	}
 
-	credCtx := mcpServer.CredentialContext(req.User.GetUID())
-
 	// Allow for updating credentials. The only way to update a credential is to delete the existing one and recreate it.
 	if err := m.removeMCPServerAndCred(req.Context(), req.GatewayClient, mcpServer, []string{credCtx}); err != nil {
 		return err
@@ -1715,10 +1753,7 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 }
 
 func (m *MCPHandler) triggerMCPServerControllers(ctx context.Context, serverName string) error {
-	if m.controllerBackend == nil {
-		return fmt.Errorf("MCP server controller backend is not configured")
-	}
-	return m.controllerBackend.Trigger(ctx, v1.SchemeGroupVersion.WithKind("MCPServer"), serverName, 0)
+	return mcptrigger.Server(ctx, m.controllerBackend, serverName)
 }
 
 func sanitizeConfig(config map[string]string, manifest types.MCPServerManifest) {

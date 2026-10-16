@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
@@ -502,7 +503,7 @@ func newOAuthCredentialTestGatewayClient(t *testing.T) *gatewayclient.Client {
 	return newOAuthCredentialTestGatewayClientWithOptions(t, staticOAuthTestEncryptionConfig(), nil)
 }
 
-func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) *gatewayclient.Client {
+func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, controllerBackend nahbackend.Trigger) *gatewayclient.Client {
 	t.Helper()
 	if encryptionConfig == nil {
 		encryptionConfig = staticOAuthTestEncryptionConfig()
@@ -519,7 +520,7 @@ func newOAuthCredentialTestGatewayClientWithOptions(t *testing.T, encryptionConf
 			encryptionConfig.Transformers[credentialResource] = &toggleCredentialWriteErrorTransformer{}
 		}
 	}
-	client, _ := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, encryptionConfig, trigger)
+	client, _ := newOAuthCredentialTestGatewayClientWithOptionsAndDB(t, encryptionConfig, controllerBackend)
 	return client
 }
 
@@ -531,7 +532,7 @@ func staticOAuthTestEncryptionConfig() *encryptionconfig.EncryptionConfiguration
 	}}
 }
 
-func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, trigger func(context.Context, string) error) (*gatewayclient.Client, *gorm.DB) {
+func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptionConfig *encryptionconfig.EncryptionConfiguration, controllerBackend nahbackend.Trigger) (*gatewayclient.Client, *gorm.DB) {
 	t.Helper()
 	if encryptionConfig == nil {
 		encryptionConfig = staticOAuthTestEncryptionConfig()
@@ -547,7 +548,7 @@ func newOAuthCredentialTestGatewayClientWithOptionsAndDB(t *testing.T, encryptio
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, trigger, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
+	return gatewayclient.New(t.Context(), database, nil, encryptionConfig, controllerBackend, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
 }
 
 func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
@@ -641,12 +642,12 @@ func pendingStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Clie
 	return proof
 }
 
-func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.Client, proof, userID, entryName, fixedURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
+func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.Client, proof, userID, entryName, fixedURL, clientID, clientSecret string, replace bool, reconcileMCPIDs ...string) error {
 	claim, err := gateway.ClaimMCPStaticOAuthCredentialProof(ctx, proof, userID, entryName, fixedURL, clientID, clientSecret)
 	if err != nil {
 		return err
 	}
-	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
+	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, reconcileMCPIDs...)
 }
 
 func (t *toggleCredentialWriteErrorTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
