@@ -316,11 +316,26 @@ func redactQuotedSchemeAuthorization(s string) string {
 		if valueStart >= len(s) || strings.ContainsRune(",;&}", rune(s[valueStart])) {
 			continue
 		}
+		delim, valueEnd := credentialValueEnd(s, valueStart)
+		if followsQuotedSchemeAsProse(s[valueStart:valueEnd], delim) {
+			continue
+		}
 		b.WriteString("[REDACTED]")
-		_, pos = credentialValueEnd(s, valueStart)
+		pos = valueEnd
 	}
 	b.WriteString(s[pos:])
 	return b.String()
+}
+
+// followsQuotedSchemeAsProse reports whether the word after a quoted scheme is the
+// provider's diagnostic ("expired", "is required") rather than a token; the later passes
+// then redact the scheme alone, as Studio's followsQuotedSchemeAsProse does.
+func followsQuotedSchemeAsProse(value, delim string) bool {
+	if delim != "" {
+		return false
+	}
+	word := strings.ToLower(strings.TrimRight(value, ".!?"))
+	return word == "is" || word == "was" || safeCredentialStatus[word]
 }
 
 // redactDigestParameters redacts every value of a Digest credential or challenge. The

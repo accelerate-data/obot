@@ -129,6 +129,11 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 		{`invalid_request: Authorization = 'Bearer" s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] retry`},
 		{"invalid_request: Authorization = \"Bearer\"\u00a0s3cr3tvalue123 retry", `invalid_request: Authorization = [REDACTED] retry`},
 		{"invalid_request: Authorization = \"Bearer\"\vs3cr3tvalue123 retry", `invalid_request: Authorization = [REDACTED] retry`},
+		// A status word after a quoted scheme is the diagnostic, not a token.
+		{`invalid_request: Authorization = "Bearer" expired retry`, `invalid_request: Authorization = '[REDACTED]' expired retry`},
+		{`invalid_request: Authorization = 'Basic' is required retry`, `invalid_request: Authorization = '[REDACTED]' is required retry`},
+		{`invalid_request: Authorization = "Bearer" invalid.`, `invalid_request: Authorization = '[REDACTED]' invalid.`},
+		{`invalid_request: Authorization = "Bearer" was revoked retry`, `invalid_request: Authorization = '[REDACTED]' was revoked retry`},
 		// Values named in prose.
 		{"The password is hunter2", "The password is [REDACTED]"},
 		{"denied password opaque-value for request-id=req-42", "denied password [REDACTED] for request-id=req-42"},
