@@ -54,7 +54,7 @@ list_tests "$UPSTREAM" > "$WORK/upstream"
 
 touch "$WORK/allowed"
 if [ -f "$ALLOW" ]; then
-  while read -r dir name reason; do
+  while read -r dir name reason || [ -n "$dir" ]; do
     case "$dir" in '' | '#'*) continue ;; esac
     [ -n "$name" ] && [ -n "$reason" ] \
       || fail "${ALLOW}: entry '${dir} ${name}' needs a package dir, a test name and a reason"
