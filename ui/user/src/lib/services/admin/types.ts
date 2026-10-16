@@ -905,7 +905,8 @@ export interface MCPServerOAuthCredentialTestResult {
 		| 'authorization_denied'
 		| 'invalid_callback'
 		| 'token_exchange_failed'
-		| 'expired';
+		| 'expired'
+		| 'interrupted';
 }
 export interface MCPServerOAuthCredentialStatus {
 	configured: boolean;

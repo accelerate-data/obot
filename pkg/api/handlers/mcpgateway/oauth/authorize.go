@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
@@ -38,6 +39,18 @@ const (
 	ErrServerError                          ErrorCode = "server_error"
 	ErrInvalidClientMetadata                ErrorCode = "invalid_client_metadata"
 	invalidStaticOAuthCredentialTestMessage           = "invalid or expired static OAuth credential test"
+
+	// staticOAuthTestCompletionTimeout bounds persisting the outcome once the exchange
+	// settles, which runs detached from the request so a disconnect still records a
+	// terminal result.
+	staticOAuthTestCompletionTimeout = 10 * time.Second
+)
+
+var (
+	// staticOAuthTokenExchangeTimeout bounds one provider token exchange during a
+	// credential test. It is a var so tests can shorten it; keep it below the gateway's
+	// claim lease.
+	staticOAuthTokenExchangeTimeout = 30 * time.Second
 )
 
 // ErrorCode defines the set of OAuth 2.0 error codes as per RFC 6749.
@@ -714,7 +727,9 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 		if pending.Scopes != "" {
 			conf.Scopes = strings.Fields(pending.Scopes)
 		}
-		exchangeContext := req.Context()
+		// Bound the provider exchange so a stalled provider cannot hold the claim past its lease.
+		exchangeContext, cancelExchange := context.WithTimeout(req.Context(), staticOAuthTokenExchangeTimeout)
+		defer cancelExchange()
 		if h.staticOAuthHTTPClient != nil {
 			exchangeContext = context.WithValue(exchangeContext, oauth2.HTTPClient, h.staticOAuthHTTPClient)
 		}
@@ -723,7 +738,11 @@ func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, err
 			failure = types.MCPStaticOAuthTestFailureTokenExchange
 		}
 	}
-	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(req.Context(), state, status, failure); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+	// Record the outcome even when the browser has already gone away, so an abandoned
+	// popup leaves a terminal result rather than a claim the user has to wait out.
+	completionContext, cancelCompletion := context.WithTimeout(context.WithoutCancel(req.Context()), staticOAuthTestCompletionTimeout)
+	defer cancelCompletion()
+	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(completionContext, state, status, failure); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
 		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 	} else if err != nil {
 		return true, errors.New("failed to complete static OAuth credential test")

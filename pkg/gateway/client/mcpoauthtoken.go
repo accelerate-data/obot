@@ -29,6 +29,12 @@ const (
 	pendingStateTTL                                                   = 30 * time.Minute
 	ContainerOAuthResourcePrefix                                      = "urn:obot:container-oauth:"
 	mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
+
+	// staticOAuthTestClaimLease bounds how long an admitted provider callback may hold a
+	// credential test. A callback fires once per state, so a lapsed claim is never re-admitted:
+	// the test is reported as an interrupted failure and the user retries with a fresh test.
+	// Keep this above the handler's provider-exchange timeout and far below pendingStateTTL.
+	staticOAuthTestClaimLease = 90 * time.Second
 )
 
 var (
@@ -369,16 +375,27 @@ func (c *Client) GetMCPStaticOAuthTestStatus(ctx context.Context, testState, use
 		return apitypes.MCPStaticOAuthTestResult{Status: apitypes.MCPStaticOAuthTestStatusFailed, FailureCategory: apitypes.MCPStaticOAuthTestFailureExpired, ExpiresAt: apitypes.Time{Time: expiresAt}}, nil
 	}
 	status := ps.StaticOAuthTestStatus
+	failureCategory := ps.StaticOAuthTestFailureCategory
 	if status == mcpStaticOAuthTestStatusClaimed {
-		status = apitypes.MCPStaticOAuthTestStatusPending
+		// A missing claim time belongs to a row claimed before this column existed, so
+		// the attempt is abandoned rather than in flight.
+		if claimedAt := ps.StaticOAuthTestClaimedAt; claimedAt != nil && time.Since(*claimedAt) < staticOAuthTestClaimLease {
+			status = apitypes.MCPStaticOAuthTestStatusPending
+		} else {
+			status = apitypes.MCPStaticOAuthTestStatusFailed
+			failureCategory = apitypes.MCPStaticOAuthTestFailureInterrupted
+		}
 	}
-	return apitypes.MCPStaticOAuthTestResult{Status: status, FailureCategory: ps.StaticOAuthTestFailureCategory, Proof: ps.StaticOAuthSaveProof, ExpiresAt: apitypes.Time{Time: expiresAt}}, nil
+	return apitypes.MCPStaticOAuthTestResult{Status: status, FailureCategory: failureCategory, Proof: ps.StaticOAuthSaveProof, ExpiresAt: apitypes.Time{Time: expiresAt}}, nil
 }
 
 func (c *Client) ClaimMCPStaticOAuthTest(ctx context.Context, state string) (*types.MCPOAuthPendingState, error) {
 	result := c.db.WithContext(ctx).Model(&types.MCPOAuthPendingState{}).
 		Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status = ? AND created_at >= ?", hashMCPStaticOAuthValue(state), true, apitypes.MCPStaticOAuthTestStatusPending, time.Now().Add(-pendingStateTTL)).
-		Update("static_o_auth_test_status", mcpStaticOAuthTestStatusClaimed)
+		Updates(map[string]any{
+			"static_o_auth_test_status":     mcpStaticOAuthTestStatusClaimed,
+			"static_o_auth_test_claimed_at": time.Now(),
+		})
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -397,6 +414,9 @@ func (c *Client) CompleteMCPStaticOAuthTest(ctx context.Context, state string, s
 		var pending types.MCPOAuthPendingState
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("hashed_state = ? AND static_o_auth_test = ? AND static_o_auth_test_status IN ? AND created_at >= ?", hashMCPStaticOAuthValue(state), true, []apitypes.MCPStaticOAuthTestStatus{apitypes.MCPStaticOAuthTestStatusPending, mcpStaticOAuthTestStatusClaimed}, completedAt.Add(-pendingStateTTL)).
+			// A claim whose lease lapsed has already been reported as interrupted; a very
+			// late callback must not resurrect it.
+			Where("(static_o_auth_test_status <> ? OR static_o_auth_test_claimed_at > ?)", mcpStaticOAuthTestStatusClaimed, completedAt.Add(-staticOAuthTestClaimLease)).
 			First(&pending).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrMCPStaticOAuthTestInvalid
