@@ -24,6 +24,7 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/mcptrigger"
 	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
@@ -1715,10 +1716,7 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 }
 
 func (m *MCPHandler) triggerMCPServerControllers(ctx context.Context, serverName string) error {
-	if m.controllerBackend == nil {
-		return fmt.Errorf("MCP server controller backend is not configured")
-	}
-	return m.controllerBackend.Trigger(ctx, v1.SchemeGroupVersion.WithKind("MCPServer"), serverName, 0)
+	return mcptrigger.Server(ctx, m.controllerBackend, serverName)
 }
 
 func sanitizeConfig(config map[string]string, manifest types.MCPServerManifest) {

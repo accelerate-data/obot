@@ -150,7 +150,8 @@ func TestClearOAuthCredentialsVMCPUsesDeclaredRemoteComponents(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
-	assert.Equal(t, []string{component.Name}, trigger.keys)
+	// MCPServer is namespace-scoped; a bare name resolves to no object (VD-4889).
+	assert.Equal(t, []string{system.DefaultNamespace + "/" + component.Name}, trigger.keys)
 }
 
 func TestAggregateComponentServersForActionVMCPUsesServerConfigComponents(t *testing.T) {
