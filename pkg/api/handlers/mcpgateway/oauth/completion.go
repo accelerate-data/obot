@@ -11,6 +11,10 @@ import (
 const (
 	maxCompletionErrorCodeBytes   = 64
 	maxCompletionDescriptionBytes = 512
+
+	// quotedSchemeMaxProseWords bounds the walk after a quoted scheme. The walk also ends
+	// at a separator, a line break or the end of a sentence, so it stays within the clause.
+	quotedSchemeMaxProseWords = 8
 )
 
 var (
@@ -373,10 +377,6 @@ func quotedSchemeWordIsToken(value, delim string) bool {
 	word := strings.TrimRight(value, ".!?")
 	return len(word) >= 20 || strings.ContainsAny(word, "-_.0123456789")
 }
-
-// quotedSchemeMaxProseWords bounds the walk after a quoted scheme. The walk also ends at a
-// separator, a line break or the end of a sentence, so it stays within the clause.
-const quotedSchemeMaxProseWords = 8
 
 // quotedSchemeProseWordIsToken reports whether a word past a diagnostic word is a token.
 // That part of the clause is the provider's prose, which names identifiers the user needs
