@@ -91,6 +91,7 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 	for _, in := range []string{
 		`denied Authorization: Digest username="alice", realm="example", response="d41d8cd98f00b204e9800998ecf8427e", retry`,
 		`denied Digest username=alice, cnonce=c0ffee, response=d41d8cd98f00b204e9800998ecf8427e retry`,
+		`denied Authorization = "Digest" username="alice", realm="example", response="d41d8cd98f00b204e9800998ecf8427e", retry`,
 		`denied {\"auth\":\"Digest username=\\\"alice\\\", response=\\\"d41d8cd98f00b204e9800998ecf8427e\\\"\"} retry`,
 	} {
 		got := sanitizeMCPOAuthCompletionDescription(in)
@@ -117,6 +118,17 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 		// A quoted header value goes through the escape-aware scan.
 		{`denied authorization: "head\" tail-secret" retry`, `denied authorization: '[REDACTED]' retry`},
 		{`denied authorization: "cut off tail-secret`, `denied authorization: '[REDACTED]'`},
+		// A quoted scheme word is redacted with the token after it, not taken as the whole value.
+		{`invalid_request: Authorization = "Bearer" s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] retry`},
+		{`invalid_request: Authorization = 'Bearer' s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] retry`},
+		{`invalid_request: Authorization="Bearer" s3cr3tvalue123 retry`, `invalid_request: Authorization=[REDACTED] retry`},
+		{`invalid_request: Authorization: "Bearer" s3cr3tvalue123 retry`, `invalid_request: Authorization: [REDACTED] retry`},
+		{`invalid_request: Authorization = "Bearer" "s3cr3t value123" retry`, `invalid_request: Authorization = [REDACTED] retry`},
+		{`invalid_request: {\"authorization\": \"Bearer\" s3cr3tvalue123} retry`, `invalid_request: {/'authorization/': [REDACTED]} retry`},
+		{`invalid_request: Authorization = "Bearer' s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] retry`},
+		{`invalid_request: Authorization = 'Bearer" s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] retry`},
+		{"invalid_request: Authorization = \"Bearer\"\u00a0s3cr3tvalue123 retry", `invalid_request: Authorization = [REDACTED] retry`},
+		{"invalid_request: Authorization = \"Bearer\"\vs3cr3tvalue123 retry", `invalid_request: Authorization = [REDACTED] retry`},
 		// Values named in prose.
 		{"The password is hunter2", "The password is [REDACTED]"},
 		{"denied password opaque-value for request-id=req-42", "denied password [REDACTED] for request-id=req-42"},
@@ -130,7 +142,7 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 	} {
 		got := sanitizeMCPOAuthCompletionDescription(tc.in)
 		require.Equal(t, tc.want, got, tc.in)
-		for _, fragment := range []string{"opaque-credential-123", "alice", "password123", "YWxpY2U6cHc9", "ghp_", "MIIEvQ", "b-secret", "s3cr3t", "n-1", "tail-secret", "hunter2", "opaque-value", "documentation", "7hunter"} {
+		for _, fragment := range []string{"opaque-credential-123", "alice", "password123", "YWxpY2U6cHc9", "ghp_", "MIIEvQ", "b-secret", "s3cr3t", "n-1", "tail-secret", "s3cr3tvalue123", "value123", "hunter2", "opaque-value", "documentation", "7hunter"} {
 			require.NotContains(t, got, fragment, tc.in)
 		}
 	}
