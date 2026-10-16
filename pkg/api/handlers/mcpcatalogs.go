@@ -1486,14 +1486,14 @@ func (h *MCPCatalogHandler) saveOAuthCredentials(req api.Context, replace bool) 
 		}
 	}
 
-	var cleanup []string
+	var reconcile []string
 	if replace {
-		cleanup, err = resolveOAuthTokenCleanupTargets(req, entry.Name)
+		reconcile, err = resolveOAuthTokenReconciliationTargets(req, entry.Name)
 		if err != nil {
 			return err
 		}
 	}
-	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, replace, cleanup...); err != nil {
+	if err := h.gatewayClient.CommitClaimedMCPStaticOAuthCredential(req.Context(), claim, replace, reconcile...); err != nil {
 		switch {
 		case errors.Is(err, gclient.ErrMCPStaticOAuthCredentialExists):
 			return types.NewErrBadRequest("credentials already exist; test replacement credentials and use PUT to replace them")
@@ -1558,11 +1558,11 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	}
 	defer releaseCredential()
 
-	cleanup, err := resolveOAuthTokenCleanupTargets(req, entry.Name)
+	reconcile, err := resolveOAuthTokenReconciliationTargets(req, entry.Name)
 	if err != nil {
 		return err
 	}
-	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredentialGeneration(req.Context(), entry.Name, clearRequest.ExpectedGeneration, cleanup...)
+	deleted, err := req.GatewayClient.DeleteMCPStaticOAuthCredentialGeneration(req.Context(), entry.Name, clearRequest.ExpectedGeneration, reconcile...)
 	if errors.Is(err, gclient.ErrMCPOAuthCatalogCredentialChanged) {
 		return types.NewErrHTTP(http.StatusConflict, "OAuth application changed; reload its status before clearing")
 	} else if err != nil {
@@ -1580,7 +1580,7 @@ func (h *MCPCatalogHandler) DeleteOAuthCredentials(req api.Context) error {
 	return req.Write(map[string]bool{"deleted": deleted})
 }
 
-func resolveOAuthTokenCleanupTargets(req api.Context, entryName string) ([]string, error) {
+func resolveOAuthTokenReconciliationTargets(req api.Context, entryName string) ([]string, error) {
 	var servers v1.MCPServerList
 	if err := req.List(&servers, kclient.MatchingFields{"spec.mcpServerCatalogEntryName": entryName}); err != nil {
 		return nil, fmt.Errorf("failed to list MCP servers for OAuth token cleanup: %w", err)

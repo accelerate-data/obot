@@ -642,12 +642,12 @@ func pendingStaticOAuthCredentialProof(t *testing.T, gateway *gatewayclient.Clie
 	return proof
 }
 
-func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.Client, proof, userID, entryName, fixedURL, clientID, clientSecret string, replace bool, cleanupMCPIDs ...string) error {
+func commitMCPStaticOAuthCredential(ctx context.Context, gateway *gatewayclient.Client, proof, userID, entryName, fixedURL, clientID, clientSecret string, replace bool, reconcileMCPIDs ...string) error {
 	claim, err := gateway.ClaimMCPStaticOAuthCredentialProof(ctx, proof, userID, entryName, fixedURL, clientID, clientSecret)
 	if err != nil {
 		return err
 	}
-	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, cleanupMCPIDs...)
+	return gateway.CommitClaimedMCPStaticOAuthCredential(ctx, claim, replace, reconcileMCPIDs...)
 }
 
 func (t *toggleCredentialWriteErrorTransformer) TransformToStorage(_ context.Context, data []byte, _ value.Context) ([]byte, error) {
