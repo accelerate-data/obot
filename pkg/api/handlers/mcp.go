@@ -1310,11 +1310,13 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 
 	var gitManagedEntry bool
 	var sourceCatalogEntryManifest *types.MCPServerCatalogEntryManifest
+	var catalogEntrySnapshot *v1.MCPServerCatalogEntry
 	if input.CatalogEntryID != "" {
 		var catalogEntry v1.MCPServerCatalogEntry
 		if err := req.Get(&catalogEntry, input.CatalogEntryID); err != nil {
 			return err
 		}
+		catalogEntrySnapshot = catalogEntry.DeepCopy()
 		sourceCatalogEntryManifest = catalogEntry.Spec.Manifest.DeepCopy()
 
 		// Validate that the catalog entry type is compatible with the route used.
@@ -1352,10 +1354,9 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 			}
 		}
 
-		// Block server creation if OAuth is required but not configured
-		if entryRequiresStaticOAuthCreds(catalogEntry) {
-			return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
-		}
+		// Static OAuth readiness is checked against the credential store inside
+		// the catalog mutation fence just before creation, not against the
+		// entry's cached status here.
 
 		// Catalog entries no longer declare a sharing mode. They are mapped to the
 		// legacy server manifest and administrators may still override that result.
@@ -1407,7 +1408,34 @@ func (m *MCPHandler) CreateServer(req api.Context) error {
 	if err := mcp.ValidateTemplateReferences(server.Spec.Manifest); err != nil {
 		return types.NewErrBadRequest("validation failed: %v", err)
 	}
-	if err := req.Create(&server); err != nil {
+	if catalogEntrySnapshot != nil {
+		// The closure scopes the fence to the readiness check and Create, so it
+		// is released before the response is written to a possibly slow client.
+		if err := func() error {
+			releaseOAuthCredential, currentEntry, oauthCredentialReady, err := lockStaticOAuthCredentialForCreate(
+				req.Context(),
+				req.GatewayClient,
+				req.Storage,
+				kclient.ObjectKey{Namespace: req.Namespace(), Name: catalogEntrySnapshot.Name},
+			)
+			if err != nil {
+				return fmt.Errorf("failed to check static OAuth credential: %w", err)
+			}
+			defer releaseOAuthCredential()
+			if !oauthCredentialReady {
+				return types.NewErrBadRequest("catalog entry requires OAuth configuration by an administrator before it can be used")
+			}
+			// The server manifest was derived from the snapshot; an entry edited
+			// since then could carry a different provider than the credential
+			// that was just checked.
+			if utils.Digest(currentEntry.Spec) != utils.Digest(catalogEntrySnapshot.Spec) {
+				return types.NewErrBadRequest("catalog entry changed while the server was being prepared; retry creation")
+			}
+			return req.Create(&server)
+		}(); err != nil {
+			return err
+		}
+	} else if err := req.Create(&server); err != nil {
 		return err
 	}
 
