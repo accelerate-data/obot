@@ -1654,6 +1654,17 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 		return types.NewErrBadRequest("invalid configuration: %v", err)
 	}
 
+	credCtx := mcpServer.CredentialContext(req.User.GetUID())
+
+	// Replacing the credential is a delete followed by a create, so two concurrent
+	// configurations could interleave and leave the server with neither value, or
+	// with the first request's value after the second one returned.
+	releaseCredentialLock, err := req.GatewayClient.AcquireCredentialLock(req.Context(), credCtx+"\x00"+mcpServer.Name)
+	if err != nil {
+		return fmt.Errorf("failed to acquire server configuration lock: %w", err)
+	}
+	defer releaseCredentialLock()
+
 	// Check if this server is from a catalog and has a URL template that needs to be processed.
 	// URL templates may only reference user-supplied env vars. References to secret-bound env
 	// vars are rejected to avoid resolving Secret-backed values during template expansion.
@@ -1709,8 +1720,6 @@ func (m *MCPHandler) ConfigureServer(req api.Context) error {
 			}
 		}
 	}
-
-	credCtx := mcpServer.CredentialContext(req.User.GetUID())
 
 	// Allow for updating credentials. The only way to update a credential is to delete the existing one and recreate it.
 	if err := m.removeMCPServerAndCred(req.Context(), req.GatewayClient, mcpServer, []string{credCtx}); err != nil {
