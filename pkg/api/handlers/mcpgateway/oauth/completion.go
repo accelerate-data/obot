@@ -4,6 +4,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -316,24 +318,53 @@ func redactQuotedSchemeAuthorization(s string) string {
 		if valueStart >= len(s) || strings.ContainsRune(",;&}", rune(s[valueStart])) {
 			continue
 		}
-		delim, valueEnd := credentialValueEnd(s, valueStart)
-		if followsQuotedSchemeAsProse(s[valueStart:valueEnd], delim) {
-			continue
+		for at := valueStart; ; {
+			delim, end := credentialValueEnd(s, at)
+			word := s[at:end]
+			if word != "" && quotedSchemeWordIsToken(word, delim) {
+				if at > valueStart {
+					b.WriteString(s[keyEnd:at])
+				}
+				b.WriteString("[REDACTED]")
+				pos = end
+				break
+			}
+			if !quotedSchemeWordIsStatus(word) {
+				break
+			}
+			next := end
+			for next < len(s) {
+				r, size := utf8.DecodeRuneInString(s[next:])
+				if !unicode.IsSpace(r) {
+					break
+				}
+				next += size
+			}
+			if next == end || next >= len(s) {
+				break
+			}
+			at = next
 		}
-		b.WriteString("[REDACTED]")
-		pos = valueEnd
 	}
 	b.WriteString(s[pos:])
 	return b.String()
 }
 
-// followsQuotedSchemeAsProse reports whether the word after a quoted scheme is the
-// provider's diagnostic ("expired", "is required") rather than a token; the later passes
-// then redact the scheme alone, as Studio's followsQuotedSchemeAsProse does.
-func followsQuotedSchemeAsProse(value, delim string) bool {
+// quotedSchemeWordIsToken reports whether a word after a quoted scheme is a token: quoted,
+// or shaped like one, the rule bareValueIsCredential applies after a bare credential key.
+// Any other word ("unsupported", "is required") is the provider's diagnostic, and the later
+// passes redact the scheme alone, as Studio's quotedSchemeWordIsToken does.
+func quotedSchemeWordIsToken(value, delim string) bool {
 	if delim != "" {
-		return false
+		return true
 	}
+	word := strings.TrimRight(value, ".!?")
+	return len(word) >= 20 || strings.ContainsAny(word, "-_.0123456789")
+}
+
+// quotedSchemeWordIsStatus reports whether a word is a status word or linking verb, which
+// is stepped over so a token after it ("expired <token>") is still redacted.
+func quotedSchemeWordIsStatus(value string) bool {
 	word := strings.ToLower(strings.TrimRight(value, ".!?"))
 	return word == "is" || word == "was" || safeCredentialStatus[word]
 }
