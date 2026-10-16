@@ -24,10 +24,14 @@ func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthA
 	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL, conf)
 }
 
+// createToken claims the callback state before anything else, so a replayed or
+// concurrent callback is rejected without reaching the provider. The claim is
+// terminal: a denial, a failed exchange, a cancellation, or a persistence failure
+// all leave the state unusable, and the user starts a new sign-in.
 func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, errorDescription string) (string, string, error) {
-	ps, err := sm.gatewayClient.GetMCPOAuthPendingState(ctx, state)
+	ps, err := sm.gatewayClient.ClaimMCPOAuthPendingState(ctx, state)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get oauth state: %w", err)
+		return "", "", fmt.Errorf("failed to claim oauth state: %w", err)
 	}
 
 	if errorStr != "" {

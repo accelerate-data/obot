@@ -47,6 +47,7 @@ var (
 	ErrMCPStaticOAuthCredentialNotFound = errors.New("static OAuth credential does not exist")
 	ErrMCPStaticOAuthEncryptionRequired = errors.New("static OAuth credential encryption is required")
 	ErrMCPOAuthCatalogCredentialChanged = errors.New("catalog OAuth credential changed")
+	ErrMCPOAuthPendingStateInvalid      = errors.New("invalid, expired, or already claimed OAuth state")
 )
 
 type MCPStaticOAuthTestStart struct {
@@ -683,6 +684,26 @@ func (c *Client) GetMCPOAuthPendingState(ctx context.Context, state string) (*ty
 	}
 
 	return ps, nil
+}
+
+// ClaimMCPOAuthPendingState atomically marks an unclaimed, unexpired callback
+// state as claimed and returns it, so its authorization code is exchanged at most
+// once. The TTL is part of the claim predicate rather than left to background
+// cleanup, which may not have run yet. Static OAuth credential tests have their
+// own claim (ClaimMCPStaticOAuthTest) and are never matched here.
+func (c *Client) ClaimMCPOAuthPendingState(ctx context.Context, state string) (*types.MCPOAuthPendingState, error) {
+	hashedState := fmt.Sprintf("%x", sha256.Sum256([]byte(state)))
+	now := time.Now()
+	result := c.db.WithContext(ctx).Model(&types.MCPOAuthPendingState{}).
+		Where("hashed_state = ? AND static_o_auth_test = ? AND claimed_at IS NULL AND created_at >= ?", hashedState, false, now.Add(-pendingStateTTL)).
+		Update("claimed_at", now)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return nil, ErrMCPOAuthPendingStateInvalid
+	}
+	return c.GetMCPOAuthPendingState(ctx, state)
 }
 
 func (c *Client) DeleteMCPOAuthPendingState(ctx context.Context, hashedState string) error {

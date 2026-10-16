@@ -603,7 +603,7 @@ func (h *handler) oauthCallback(req api.Context) error {
 				return nil
 			}
 		}
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
 			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 		}
 		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
