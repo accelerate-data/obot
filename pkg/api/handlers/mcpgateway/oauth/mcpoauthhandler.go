@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -26,6 +27,9 @@ const (
 	// user to approve Vibedata's access to an MCP server, both for dynamically
 	// registered clients and in the hosted Client ID Metadata Document.
 	vibedataOAuthClientName = "Vibedata"
+	// obotOAuthCheckMCPClientName identifies the OAuth check to the MCP server
+	// itself, in the initialize request's clientInfo. Providers never see it.
+	obotOAuthCheckMCPClientName = "Obot MCP OAuth"
 )
 
 type MCPOAuthHandlerFactory struct {
@@ -383,13 +387,13 @@ func staticOAuthMetadata(metadata mcp.OAuthMetadata, redirectURL string) (mcp.Au
 }
 
 // oauthCheckClientOption takes an oauthClientName that is empty unless a
-// downstream client initiated the flow; when it is empty, the MCP client
-// registers with the provider under ClientName instead.
+// downstream client initiated the flow. The provider is shown that name, or
+// Vibedata when there is none; ClientName only reaches the MCP server.
 func (f *MCPOAuthHandlerFactory) oauthCheckClientOption(oauthClientName string, tokenStorage mcp.TokenStorage, oauthHandler *mcpOAuthHandler) mcp.ClientOption {
 	return mcp.ClientOption{
-		OAuthClientName:               oauthClientName,
+		OAuthClientName:               cmp.Or(oauthClientName, vibedataOAuthClientName),
 		OAuthClientIDMetadataDocument: f.cimdDocumentURL,
-		ClientName:                    vibedataOAuthClientName,
+		ClientName:                    obotOAuthCheckMCPClientName,
 		TokenStorage:                  tokenStorage,
 		CallbackHandler:               oauthHandler,
 		ClientLookup:                  oauthHandler,
