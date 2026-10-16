@@ -149,7 +149,12 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 		{`invalid_request: Authorization = "Bearer" expired, s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' expired, [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" abc-def s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" unsupported for tenant t-42 request-id=req-42 retry`, `invalid_request: Authorization = '[REDACTED]' unsupported for tenant t-42 request-id=req-42 retry`},
-		{`invalid_request: Authorization = "Bearer" unsupported; client app42client retry`, `invalid_request: Authorization = '[REDACTED]' unsupported; client app42client retry`},
+		{`invalid_request: Authorization = "Bearer" unsupported; client acme retry`, `invalid_request: Authorization = '[REDACTED]' unsupported; client acme retry`},
+		// A quoted identifier in the clause is the provider's detail; a quoted token is not.
+		{`invalid_request: Authorization = "Bearer" expired for tenant "acme" retry`, `invalid_request: Authorization = '[REDACTED]' expired for tenant 'acme' retry`},
+		{`invalid_request: Authorization = "Bearer" unsupported scope "read:data" retry`, `invalid_request: Authorization = '[REDACTED]' unsupported scope 'read:data' retry`},
+		{`invalid_request: Authorization = "Bearer" denied resource "reports" retry`, `invalid_request: Authorization = '[REDACTED]' denied resource 'reports' retry`},
+		{`invalid_request: Authorization = "Bearer" misconfigured "s3cr3tvalue123" retry`, `invalid_request: Authorization = '[REDACTED]' misconfigured [REDACTED] retry`},
 		// Values named in prose.
 		{"The password is hunter2", "The password is [REDACTED]"},
 		{"denied password opaque-value for request-id=req-42", "denied password [REDACTED] for request-id=req-42"},
