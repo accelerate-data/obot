@@ -17,6 +17,19 @@ const (
 	quotedSchemeMaxProseWords = 8
 )
 
+var oauthErrorCodes = map[string]bool{
+	"invalid_request": true, "invalid_client": true, "invalid_grant": true,
+	"unauthorized_client": true, "unsupported_grant_type": true, "unsupported_response_type": true,
+	"invalid_scope": true, "access_denied": true, "server_error": true,
+	"temporarily_unavailable": true, "invalid_token": true, "insufficient_scope": true,
+	"interaction_required": true, "login_required": true, "consent_required": true,
+	"account_selection_required": true, "invalid_request_uri": true, "invalid_request_object": true,
+	"request_not_supported": true, "request_uri_not_supported": true, "registration_not_supported": true,
+	"invalid_redirect_uri": true, "invalid_client_metadata": true, "invalid_target": true,
+	"invalid_dpop_proof": true, "use_dpop_nonce": true, "authorization_pending": true,
+	"slow_down": true, "expired_token": true,
+}
+
 var (
 	// The key list matches Studio's MCP Settings redaction
 	// (src/server/modules/mcp/obot-client/error-message.ts), plus code and state.
@@ -323,6 +336,7 @@ func redactQuotedSchemeAuthorization(s string) string {
 			continue
 		}
 		proseWords := 0
+		redacted := false
 		for at := valueStart; ; {
 			delim, end := credentialValueEnd(s, at)
 			word := s[at:end]
@@ -330,18 +344,21 @@ func redactQuotedSchemeAuthorization(s string) string {
 				break
 			}
 			isToken := quotedSchemeProseWordIsToken(word, delim)
-			if proseWords == 0 {
+			if proseWords == 0 && !redacted {
 				isToken = quotedSchemeWordIsToken(word, delim)
 			}
-			if isToken {
+			switch {
+			case quotedSchemeWordIsErrorCode(word):
+				proseWords++
+			case isToken:
+				// A token right after the scheme is redacted together with it.
 				if at > valueStart {
-					b.WriteString(s[keyEnd:at])
+					b.WriteString(s[pos:at])
 				}
 				b.WriteString("[REDACTED]")
 				pos = end
-				break
-			}
-			if !quotedSchemeWordIsStatus(word) {
+				redacted = true
+			case !quotedSchemeWordIsStatus(word):
 				proseWords++
 			}
 			if proseWords > quotedSchemeMaxProseWords || strings.ContainsAny(word[len(word)-1:], ".!?") {
@@ -376,6 +393,14 @@ func quotedSchemeWordIsToken(value, delim string) bool {
 	}
 	word := strings.TrimRight(value, ".!?")
 	return len(word) >= 20 || strings.ContainsAny(word, "-_.0123456789")
+}
+
+// quotedSchemeWordIsErrorCode reports whether a word is an OAuth or OpenID Connect error
+// code (RFC 6749, RFC 6750, OIDC Core). The codes are snake_case, so the token shape alone
+// would take one for the credential and stop before the real token, as Studio's
+// OAUTH_ERROR_CODES guards against.
+func quotedSchemeWordIsErrorCode(value string) bool {
+	return oauthErrorCodes[strings.ToLower(strings.TrimRight(value, ".!?:"))]
 }
 
 // quotedSchemeProseWordIsToken reports whether a word past a diagnostic word is a token.
