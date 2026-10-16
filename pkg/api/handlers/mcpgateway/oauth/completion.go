@@ -4,14 +4,34 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
 	maxCompletionErrorCodeBytes   = 64
 	maxCompletionDescriptionBytes = 512
+
+	// quotedSchemeMaxProseWords bounds the walk after a quoted scheme. The walk also ends
+	// at a separator, a line break or the end of a sentence, so it stays within the clause.
+	quotedSchemeMaxProseWords = 8
 )
 
 var (
+	// OAuth and OpenID Connect error codes (RFC 6749, RFC 6750, OIDC Core).
+	oauthErrorCodes = map[string]bool{
+		"invalid_request": true, "invalid_client": true, "invalid_grant": true,
+		"unauthorized_client": true, "unsupported_grant_type": true, "unsupported_response_type": true,
+		"invalid_scope": true, "access_denied": true, "server_error": true,
+		"temporarily_unavailable": true, "invalid_token": true, "insufficient_scope": true,
+		"interaction_required": true, "login_required": true, "consent_required": true,
+		"account_selection_required": true, "invalid_request_uri": true, "invalid_request_object": true,
+		"request_not_supported": true, "request_uri_not_supported": true, "registration_not_supported": true,
+		"invalid_redirect_uri": true, "invalid_client_metadata": true, "invalid_target": true,
+		"invalid_dpop_proof": true, "use_dpop_nonce": true, "authorization_pending": true,
+		"slow_down": true, "expired_token": true,
+	}
+
 	// The key list matches Studio's MCP Settings redaction
 	// (src/server/modules/mcp/obot-client/error-message.ts), plus code and state.
 	completionCredentialKey = regexp.MustCompile(`(?i)(?:(?:\\\\)*\\?["'])?\b(?:aws[\s_-]*secret[\s_-]*access[\s_-]*key|client[\s_-]*secret|client[\s_-]*assertion|api[\s_-]*key|authorization[\s_-]*code|oauth[\s_-]*code|access[\s_-]*token|refresh[\s_-]*token|id[\s_-]*token|test[\s_-]*state|code[\s_-]*(?:verifier|challenge)|private[\s_-]*key|proof|set[\s_-]*cookie|cookie|password|secret|token|authorization|credential|nonce|signature|code|state)\b(?:(?:\\\\)*\\?["'])?\s*[:=]\s*`)
@@ -316,11 +336,94 @@ func redactQuotedSchemeAuthorization(s string) string {
 		if valueStart >= len(s) || strings.ContainsRune(",;&}", rune(s[valueStart])) {
 			continue
 		}
-		b.WriteString("[REDACTED]")
-		_, pos = credentialValueEnd(s, valueStart)
+		proseWords := 0
+		redacted := false
+		for at := valueStart; ; {
+			delim, end := credentialValueEnd(s, at)
+			word := s[at:end]
+			if word == "" {
+				break
+			}
+			isToken := quotedSchemeProseWordIsToken(word, delim)
+			if proseWords == 0 && !redacted {
+				isToken = quotedSchemeWordIsToken(word, delim)
+			}
+			switch {
+			case quotedSchemeWordIsErrorCode(word):
+				proseWords++
+			case isToken:
+				// A token right after the scheme is redacted together with it.
+				if at > valueStart {
+					b.WriteString(s[pos:at])
+				}
+				b.WriteString("[REDACTED]")
+				pos = end
+				redacted = true
+			case !quotedSchemeWordIsStatus(word):
+				proseWords++
+			}
+			if proseWords > quotedSchemeMaxProseWords || strings.ContainsAny(word[len(word)-1:], ".!?") {
+				break
+			}
+			next := end
+			for next < len(s) {
+				r, size := utf8.DecodeRuneInString(s[next:])
+				if r == '\r' || r == '\n' || !unicode.IsSpace(r) {
+					break
+				}
+				next += size
+			}
+			if next == end || next >= len(s) {
+				break
+			}
+			at = next
+		}
 	}
 	b.WriteString(s[pos:])
 	return b.String()
+}
+
+// quotedSchemeWordIsToken reports whether a word after a quoted scheme is a token: quoted,
+// or shaped like one, the rule bareValueIsCredential applies after a bare credential key.
+// Any other word ("unsupported", "is required") is the provider's diagnostic: the walk
+// steps over it and the later passes redact the scheme, as Studio's quotedSchemeWordIsToken
+// does.
+func quotedSchemeWordIsToken(value, delim string) bool {
+	if delim != "" {
+		return true
+	}
+	word := strings.TrimRight(value, ".!?")
+	return len(word) >= 20 || strings.ContainsAny(word, "-_.0123456789")
+}
+
+// quotedSchemeWordIsErrorCode reports whether a word is an OAuth or OpenID Connect error
+// code (RFC 6749, RFC 6750, OIDC Core). The codes are snake_case, so the token shape alone
+// would take one for the credential and stop before the real token, as Studio's
+// OAUTH_ERROR_CODES guards against.
+func quotedSchemeWordIsErrorCode(value string) bool {
+	return oauthErrorCodes[strings.ToLower(strings.TrimRight(value, ".!?:"))]
+}
+
+// quotedSchemeProseWordIsToken reports whether a word past a diagnostic word is a token.
+// That part of the clause is the provider's prose, which names identifiers the user needs
+// (tenant t-42, request-id=req-42, a URL), so a word there is a token only on a stronger
+// shape: long, or mixing letters and digits, as Studio's quotedSchemeProseWordIsToken does.
+func quotedSchemeProseWordIsToken(value, delim string) bool {
+	if delim != "" {
+		return true
+	}
+	word := strings.TrimRight(value, ".!?")
+	if strings.ContainsAny(word, "=@") || strings.Contains(word, "://") {
+		return false
+	}
+	return len(word) >= 20 || (len(word) >= 8 && strings.ContainsAny(word, "0123456789") && strings.IndexFunc(word, unicode.IsLetter) >= 0)
+}
+
+// quotedSchemeWordIsStatus reports whether a word is a status word or linking verb, which
+// is stepped over so a token after it ("expired <token>") is still redacted.
+func quotedSchemeWordIsStatus(value string) bool {
+	word := strings.ToLower(strings.TrimRight(value, ".!?"))
+	return word == "is" || word == "was" || safeCredentialStatus[word]
 }
 
 // redactDigestParameters redacts every value of a Digest credential or challenge. The
