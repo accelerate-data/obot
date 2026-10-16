@@ -145,3 +145,48 @@ func TestStaticOAuthCallbackRejectsCompletionAfterClaimLeaseLapsed(t *testing.T)
 	}
 	requireLeaseClaimCallbackResult(t, gateway, provider, state, types.MCPStaticOAuthTestFailureInterrupted)
 }
+
+// A failed completion write must not tell the browser about the database: the
+// callback answers generically, and the unwritten row stays a claim that later
+// reads as interrupted instead of being resurrected.
+func TestStaticOAuthCallbackHidesCompletionPersistenceFailure(t *testing.T) {
+	provider, tokenExchangeStarted, releaseTokenExchange := newBlockingStaticOAuthCallbackProvider(t)
+	defer releaseTokenExchange()
+	gateway, db := newStaticOAuthCallbackGatewayWithDB(t)
+	state, err := gateway.CreateMCPStaticOAuthTest(t.Context(), "user-1", "entry-1", provider.URL+"/mcp", "exact-verifier", provider.config())
+	if err != nil {
+		t.Fatalf("create static OAuth test: %v", err)
+	}
+	handled := startLeaseClaimCallback(t, gateway, newLeaseClaimCallbackRequest(t.Context(), state.CallbackState), tokenExchangeStarted)
+
+	// Fail only the completion write: the claim has already been recorded, so the
+	// trigger installed here cannot affect anything but the outcome persistence.
+	stmt := &gorm.Statement{DB: db}
+	if err := stmt.Parse(&gatewaytypes.MCPOAuthPendingState{}); err != nil {
+		t.Fatalf("resolve pending state table: %v", err)
+	}
+	table := stmt.Schema.Table
+	if err := db.WithContext(t.Context()).Exec(`CREATE TRIGGER fail_static_completion BEFORE UPDATE ON ` + table + ` BEGIN SELECT RAISE(FAIL, 'injected completion write failure'); END`).Error; err != nil {
+		t.Fatalf("install completion write failure: %v", err)
+	}
+	releaseTokenExchange()
+
+	err = awaitLeaseClaimCallback(t, handled)
+	if err == nil {
+		t.Fatal("callback with a failing completion write returned no error")
+	}
+	for _, leaked := range []string{"injected", "RAISE", table, state.CallbackState} {
+		if strings.Contains(err.Error(), leaked) {
+			t.Fatalf("callback error exposed %q: %v", leaked, err)
+		}
+	}
+	if err := db.WithContext(t.Context()).Exec(`DROP TRIGGER fail_static_completion`).Error; err != nil {
+		t.Fatalf("remove completion write failure: %v", err)
+	}
+	if err := db.WithContext(t.Context()).Model(&gatewaytypes.MCPOAuthPendingState{}).
+		Where("static_o_auth_test = ?", true).
+		Update("static_o_auth_test_claimed_at", time.Now().Add(-24*time.Hour)).Error; err != nil {
+		t.Fatalf("age claim: %v", err)
+	}
+	requireLeaseClaimCallbackResult(t, gateway, provider, state, types.MCPStaticOAuthTestFailureInterrupted)
+}
