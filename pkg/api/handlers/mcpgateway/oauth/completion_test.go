@@ -145,9 +145,11 @@ func TestSanitizeMCPOAuthCompletionDescription(t *testing.T) {
 		{`invalid_request: Authorization = "Bearer" token exchange failed s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' token exchange failed [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" invalid_request s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' invalid_request [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" access_denied: s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' access_denied: [REDACTED] retry`},
+		{`invalid_request: Authorization = "Bearer" invalid_grant, s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' invalid_grant, [REDACTED] retry`},
+		{`invalid_request: Authorization = "Bearer" expired, s3cr3tvalue123 retry`, `invalid_request: Authorization = '[REDACTED]' expired, [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" abc-def s3cr3tvalue123 retry`, `invalid_request: Authorization = [REDACTED] [REDACTED] retry`},
 		{`invalid_request: Authorization = "Bearer" unsupported for tenant t-42 request-id=req-42 retry`, `invalid_request: Authorization = '[REDACTED]' unsupported for tenant t-42 request-id=req-42 retry`},
-		{`invalid_request: Authorization = "Bearer" unsupported, client app42client retry`, `invalid_request: Authorization = '[REDACTED]' unsupported, client app42client retry`},
+		{`invalid_request: Authorization = "Bearer" unsupported; client app42client retry`, `invalid_request: Authorization = '[REDACTED]' unsupported; client app42client retry`},
 		// Values named in prose.
 		{"The password is hunter2", "The password is [REDACTED]"},
 		{"denied password opaque-value for request-id=req-42", "denied password [REDACTED] for request-id=req-42"},

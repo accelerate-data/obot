@@ -14,6 +14,8 @@ const (
 
 	// quotedSchemeMaxProseWords bounds the walk after a quoted scheme. The walk also ends
 	// at a separator, a line break or the end of a sentence, so it stays within the clause.
+	// A comma followed by a space is prose punctuation ("invalid_grant, <token>"), not a
+	// separator, so the walk steps over it.
 	quotedSchemeMaxProseWords = 8
 )
 
@@ -365,13 +367,11 @@ func redactQuotedSchemeAuthorization(s string) string {
 			if proseWords > quotedSchemeMaxProseWords || strings.ContainsAny(word[len(word)-1:], ".!?") {
 				break
 			}
-			next := end
-			for next < len(s) {
-				r, size := utf8.DecodeRuneInString(s[next:])
-				if r == '\r' || r == '\n' || !unicode.IsSpace(r) {
-					break
+			next := skipQuotedSchemeGap(s, end)
+			if next < len(s) && s[next] == ',' {
+				if after := skipQuotedSchemeGap(s, next+1); after > next+1 {
+					next = after
 				}
-				next += size
 			}
 			if next == end || next >= len(s) {
 				break
@@ -381,6 +381,18 @@ func redactQuotedSchemeAuthorization(s string) string {
 	}
 	b.WriteString(s[pos:])
 	return b.String()
+}
+
+// skipQuotedSchemeGap steps over horizontal whitespace; a line break ends the clause.
+func skipQuotedSchemeGap(s string, i int) int {
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == '\r' || r == '\n' || !unicode.IsSpace(r) {
+			break
+		}
+		i += size
+	}
+	return i
 }
 
 // quotedSchemeWordIsToken reports whether a word after a quoted scheme is a token: quoted,
