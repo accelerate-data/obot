@@ -420,11 +420,16 @@ func quotedSchemeWordIsErrorCode(value string) bool {
 // That part of the clause is the provider's prose, which names identifiers the user needs
 // (tenant t-42, request-id=req-42, a URL), so a word there is a token only on a stronger
 // shape: long, or mixing letters and digits, as Studio's quotedSchemeProseWordIsToken does.
+// A quoted word is judged by what it holds, so a quoted identifier (tenant "acme", scope
+// "read:data") is relayed as well.
 func quotedSchemeProseWordIsToken(value, delim string) bool {
-	if delim != "" {
-		return true
-	}
 	word := strings.TrimRight(value, ".!?")
+	if delim != "" {
+		word = strings.TrimPrefix(word, delim)
+		if strings.HasSuffix(word, `"`) || strings.HasSuffix(word, "'") {
+			word = strings.TrimRight(word[:len(word)-1], `\`)
+		}
+	}
 	if strings.ContainsAny(word, "=@") || strings.Contains(word, "://") {
 		return false
 	}
