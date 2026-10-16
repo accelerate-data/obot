@@ -271,3 +271,49 @@ func TestReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(t *testing.T) 
 		}
 	})
 }
+
+// A dynamic grant's static-OAuth-only check and its write share both the catalog
+// mutation lock and the entry's credential lock. Without either, an entry made
+// static-only between the check and the write would keep an untagged grant that
+// no later credential change can revoke.
+func TestCommitDynamicCatalogGrantWaitsForCatalogAndEntryLocks(t *testing.T) {
+	for _, lockName := range []string{system.MCPStaticOAuthCatalogMutationLock, system.MCPOAuthCredentialName(fenceTestEntry)} {
+		t.Run(lockName, func(t *testing.T) {
+			c := newFenceTestClient(t, false)
+			release, err := c.AcquireCredentialLock(t.Context(), lockName)
+			if err != nil {
+				t.Fatalf("acquire %s: %v", lockName, err)
+			}
+			pending := &gwtypes.MCPOAuthPendingState{
+				HashedState: "dynamic-pending", UserID: fenceTestUser, MCPID: fenceTestMCPID,
+				URL: fenceTestURL, CatalogEntryName: fenceTestEntry,
+			}
+			committed := make(chan error, 1)
+			go func() {
+				committed <- c.CommitMCPOAuthPendingStateToken(t.Context(), pending, "",
+					&oauth2.Config{ClientID: "dynamic-client"}, &oauth2.Token{AccessToken: "dynamic-access"})
+			}()
+			select {
+			case err := <-committed:
+				release()
+				t.Fatalf("dynamic grant committed while %s was held: %v", lockName, err)
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			var entry v1.MCPServerCatalogEntry
+			if err := c.storageClient.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: fenceTestEntry}, &entry); err != nil {
+				t.Fatalf("get catalog entry: %v", err)
+			}
+			entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired = true
+			if err := c.storageClient.Update(t.Context(), &entry); err != nil {
+				t.Fatalf("make entry static-OAuth-only: %v", err)
+			}
+			release()
+
+			if err := <-committed; !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
+				t.Fatalf("commit after entry became static-only = %v, want catalog credential changed", err)
+			}
+			requireNoFenceTestGrant(t, c)
+		})
+	}
+}

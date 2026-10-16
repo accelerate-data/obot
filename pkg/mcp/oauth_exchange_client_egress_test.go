@@ -141,6 +141,29 @@ func TestExchangeOAuthTokenOnExchangeClientEnforcesNetworkPolicy(t *testing.T) {
 	require.Zero(t, endpoint.hits.Load())
 }
 
+// Each class of the operator's policy is enforced on its own; a loopback-only
+// assertion would pass with the private and link-local blocks switched off.
+func TestExchangeOAuthTokenOnExchangeClientBlocksEachDisallowedAddressClass(t *testing.T) {
+	for _, tc := range []struct {
+		name, tokenURL, reason string
+	}{
+		{name: "private", tokenURL: "http://10.255.255.1:9/token", reason: "blocked private IP"},
+		{name: "link-local", tokenURL: "http://169.254.169.254:9/token", reason: "blocked link-local IP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A short deadline keeps an unblocked dial from hanging the test;
+			// the assertion is on the policy refusal, not on the dial failing.
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			ctx = WithOAuthHTTPClient(ctx, NewOAuthExchangeClient(RemoteMCPURLValidationConfig{}))
+
+			_, err := ExchangeOAuthToken(ctx, exchangeTestConfig(tc.tokenURL), "auth-code", "pkce-verifier", "")
+
+			require.ErrorContains(t, err, tc.reason)
+		})
+	}
+}
+
 func TestStorageBackedRefreshOnExchangeClientRefusesRedirect(t *testing.T) {
 	endpoint, target := newRedirectingTokenEndpoint(t)
 	storage := &recordingTokenStorage{}
@@ -171,6 +194,28 @@ func TestGlobalTokenStoreCarriesRefreshClientToEveryTokenStore(t *testing.T) {
 	tokenStorage, ok := storage.(*tokenStore)
 	require.True(t, ok, "ForUserAndMCP returned %T, want *tokenStore", storage)
 	require.Same(t, refreshClient, tokenStorage.refreshHTTPClient)
+}
+
+// The token store a request handler actually uses must refresh on the configured
+// client; carrying it on the struct is not enough if TokenSource drops it.
+func TestGlobalTokenStoreRefreshRunsOnConfiguredClient(t *testing.T) {
+	const (
+		entryName = "catalog-entry-1"
+		mcpID     = "mcp-instance-1"
+		mcpURL    = "https://mcp.example/api"
+	)
+	endpoint, target := newRedirectingTokenEndpoint(t)
+	client := newCatalogTokenStoreTestClient(t, entryName, mcpID, false)
+	require.NoError(t, client.ReplaceMCPOAuthToken(t.Context(), "user-1", mcpID, mcpURL, "", exchangeTestConfig(endpoint.URL), expiredTestToken()))
+	store := NewGlobalTokenStore(client, WithTokenRefreshHTTPClient(NewOAuthExchangeClient(allowAllRemoteMCP))).ForUserAndMCP("user-1", mcpID, mcpURL)
+
+	source, err := store.TokenSource(t.Context())
+	require.NoError(t, err)
+	require.NotNil(t, source)
+	_, err = source.Token()
+
+	require.ErrorContains(t, err, "refusing to follow redirect")
+	require.Zero(t, target.hits.Load(), "refresh token and client secret were replayed to the redirect target")
 }
 
 func TestOAuthAuthorizeExchangeRefusesRedirect(t *testing.T) {
