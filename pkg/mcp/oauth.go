@@ -502,7 +502,9 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 		}
 	}
 
-	tok, err := ExchangeOAuthToken(ctx, conf, cb.Code, verifier, resourceURL)
+	// The exchange replays the code, verifier, and client secret, so it runs on
+	// the remote-network policy and never follows a redirect.
+	tok, err := ExchangeOAuthToken(WithOAuthHTTPClient(ctx, safehttp.NoRedirects(o.metadataClient)), conf, cb.Code, verifier, resourceURL)
 	if err != nil {
 		slog.Warn("oauth code exchange failed",
 			"server", o.serverName,

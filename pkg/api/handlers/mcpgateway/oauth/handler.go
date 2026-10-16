@@ -43,11 +43,7 @@ func SetupHandlers(oauthChecker *MCPOAuthHandlerFactory, tokenStore mcp.GlobalTo
 			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
 			Timeout:        clientMetadataFetchTimeout,
 		}),
-		staticOAuthHTTPClient: safehttp.NewClient(safehttp.Options{
-			BlockLoopback:  !remoteURLValidationConfig.AllowLocalhostMCP,
-			BlockPrivateIP: !remoteURLValidationConfig.AllowPrivateIPMCP,
-			BlockLinkLocal: !remoteURLValidationConfig.AllowLinkLocalMCP,
-		}),
+		staticOAuthHTTPClient:    mcp.NewOAuthExchangeClient(remoteURLValidationConfig),
 		baseURL:                  baseURL,
 		oauthChecker:             oauthChecker,
 		acrHelper:                acrHelper,

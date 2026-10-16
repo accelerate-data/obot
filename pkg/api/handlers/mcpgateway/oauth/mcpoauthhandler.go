@@ -62,7 +62,7 @@ func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManage
 		baseURL:                   baseURL,
 		mcpSessionManager:         sessionManager,
 		client:                    client,
-		stateMgr:                  newStateManager(gatewayClient),
+		stateMgr:                  newStateManager(gatewayClient, mcp.NewOAuthExchangeClient(sessionManager.RemoteMCPURLValidationConfig())),
 		tokenStore:                globalTokenStore,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 	}

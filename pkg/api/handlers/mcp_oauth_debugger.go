@@ -17,6 +17,7 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gwtypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
@@ -215,7 +216,9 @@ func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *ga
 	conf := oauthDebuggerConfigFromPendingState(pendingState)
 	exchangeContext := ctx
 	if len(httpClients) > 0 && httpClients[0] != nil {
-		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, httpClients[0])
+		// The exchange replays the authorization code, PKCE verifier, and client
+		// secret, so it must not follow a redirect to another origin.
+		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, safehttp.NoRedirects(httpClients[0]))
 	}
 	token, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier, pendingState.ResourceURL)
 	if err != nil {

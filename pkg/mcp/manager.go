@@ -199,11 +199,7 @@ func NewSessionManager(ctx context.Context, authEnabled bool, globalTokenStore G
 		obotNamespace:             obotNamespace,
 		secretBindingAllowedLabel: strings.TrimSpace(opts.MCPSecretBindingAllowedLabel),
 		tunnelManager:             tunnelManager,
-		remoteURLValidationConfig: RemoteMCPURLValidationConfig{
-			AllowLocalhostMCP: !opts.DisallowLocalhostMCP,
-			AllowPrivateIPMCP: !opts.DisallowPrivateIPMCP,
-			AllowLinkLocalMCP: !opts.DisallowLinkLocalMCP,
-		},
+		remoteURLValidationConfig: RemoteMCPURLValidationConfigFromOptions(opts),
 	}, nil
 }
 
@@ -212,6 +208,10 @@ func (sm *SessionManager) MCPRuntimeBackend() string {
 }
 
 func (sm *SessionManager) RemoteMCPURLValidationConfig() RemoteMCPURLValidationConfig {
+	if sm == nil {
+		// The zero value allows no local, private, or link-local destination.
+		return RemoteMCPURLValidationConfig{}
+	}
 	return sm.remoteURLValidationConfig
 }
 
