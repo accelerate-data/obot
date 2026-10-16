@@ -32,6 +32,19 @@ var (
 	)
 	tunnelPeerResources = newPathMatcher("GET /tunnel/peer")
 
+	// Default-catalog static OAuth credentials are shared by every user of the
+	// entry, so reading, testing or replacing them is reserved for owners.
+	// Admins manage catalog entries but must not be able to swap the OAuth
+	// application every user signs in through.
+	ownerOnlyCatalogOAuthResources = newPathMatcher(
+		"POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials/test",
+		"POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials/test/status",
+		"GET /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+		"POST /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+		"PUT /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+		"DELETE /api/mcp-catalogs/{catalog_id}/entries/{entry_id}/oauth-credentials",
+	)
+
 	adminAndOwnerRules = []string{
 		"/api/model-proxy",
 		"/api/model-proxy/",
@@ -473,6 +486,11 @@ func NewAuthorizer(gatewayClient *client.Client, cache, uncached kclient.Client,
 }
 
 func (a *Authorizer) Authorize(req *http.Request, userInfo user.Info) bool {
+	// The owner-only boundary runs before every other rule because the broad
+	// admin "/api/mcp-catalogs/" prefix would otherwise grant these routes.
+	if _, restricted := ownerOnlyCatalogOAuthResources.Match(req); restricted && !slices.Contains(userInfo.GetGroups(), types.GroupOwner) {
+		return false
+	}
 	// Tunnel credentials are deliberately non-user principals. Keep this check
 	// ahead of anyGroup and UI authorization so the credential cannot inherit
 	// baseline routes intended for ordinary users.

@@ -2,3 +2,4 @@
 # One per line: <package dir> <TestName> <reason, naming the issue and any upstream test that supersedes it>
 # Example:
 #   pkg/mcp TestSomethingRemoved VD-1234 superseded upstream by pkg/mcp/foo_test.go TestFoo
+pkg/oidcjwt TestIntegration_AdminAndOwnerRolesReachCatalogOAuthEndpoint VD-6903 asserted the sync's admin-access regression; replaced by TestIntegration_OwnerRoleReachesOwnerOnlyCatalogOAuthEndpoint in integration_owner_only_oauth_claim_test.go

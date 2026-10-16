@@ -62,14 +62,6 @@ func buildIntegrationStack(t *testing.T) (http.Handler, *testutil.TestIssuer, fu
 	return mux, issuer, cleanup, priv
 }
 
-func TestIntegration_AdminAndOwnerRolesReachCatalogOAuthEndpoint(t *testing.T) {
-	path := "/api/mcp-catalogs/default/entries/slack/oauth-credentials"
-	code, _ := runPathWithRoles(t, path, []string{"owner"})
-	require.Equal(t, http.StatusOK, code)
-	code, _ = runPathWithRoles(t, path, []string{"admin"})
-	require.Equal(t, http.StatusOK, code)
-}
-
 func (g integrationAuthzGate) serveJSON(body map[string]any) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		info, err := g.authn.Authenticate(r)
