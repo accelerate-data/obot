@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { tooltip, type TooltipOptions } from '$lib/actions/tooltip.svelte';
+	import { m } from '$lib/i18n';
 	import type { Placement } from '@floating-ui/dom';
 	import { CircleHelpIcon, CircleQuestionMark } from '@lucide/svelte';
 	import type { Component, Snippet } from 'svelte';
@@ -17,6 +18,11 @@
 		icon?: Component | typeof CircleQuestionMark;
 		interactive?: boolean;
 		ariaLabel?: string;
+		onClick?: () => void;
+		disablePortal?: boolean;
+		variant?: 'default' | 'hint';
+		anchor?: HTMLElement;
+		offset?: { x?: number; y?: number };
 	}
 
 	let {
@@ -28,7 +34,12 @@
 		popoverWidth = 'md',
 		icon: Icon = CircleHelpIcon,
 		interactive = false,
-		ariaLabel
+		ariaLabel,
+		onClick,
+		disablePortal = true,
+		variant = 'default',
+		anchor,
+		offset: positionOffset
 	}: Props = $props();
 
 	function getPopoverWidth() {
@@ -47,8 +58,16 @@
 	}
 
 	const tooltipOpts: TooltipOptions | undefined = $derived.by(() => {
-		const layout = [getPopoverWidth(), 'break-normal'] as string[];
-		const base = { disablePortal: true, classes: layout, placement, interactive } as const;
+		const layout = [variant === 'hint' ? 'tooltip-hint' : getPopoverWidth(), 'break-normal'];
+		const base = {
+			disablePortal,
+			classes: layout,
+			placement,
+			interactive,
+			anchor,
+			offset: variant === 'hint' ? 10 : undefined,
+			positionOffset
+		};
 		if (children) {
 			return { ...base, snippet: children };
 		}
@@ -57,7 +76,7 @@
 		return { ...base, text: t };
 	});
 
-	const accessibleName = $derived(ariaLabel?.trim() || text?.trim() || 'More information');
+	const accessibleName = $derived(ariaLabel?.trim() || text?.trim() || m.core_more_information());
 </script>
 
 {#if tooltipOpts}
@@ -70,6 +89,7 @@
 		)}
 		aria-label={accessibleName}
 		use:tooltip={tooltipOpts}
+		onclick={onClick}
 	>
 		<Icon class={twMerge('text-gray size-3', classes?.icon)} aria-hidden="true" />
 	</button>

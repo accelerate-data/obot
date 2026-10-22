@@ -1,15 +1,32 @@
-import { COMMUNITY_ENTITLEMENT, SETUP_COMMUNITY_SIGNUP_BANNER_COPY } from '$lib/constants';
+import { page as appPage } from '$app/state';
+import { COMMUNITY_ENTITLEMENT } from '$lib/constants';
 import { type VMCP, type VMCPInstance } from '$lib/services';
 import { vmcpInstances } from '$lib/stores';
+import { goto, replaceState } from '$lib/url';
 import { createVMCP } from '../../../tests/helpers/mcp';
 import { preparePageData } from '../../../tests/helpers/pageData';
 import { getProfileResponse, getLicenseResponse } from '../../../tests/mocks/data';
 import { worker } from '../../../tests/mocks/worker';
 import VMcpTester from './VMcpTester.svelte';
+import { EditorView } from '@codemirror/view';
 import { http, HttpResponse } from 'msw';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page } from 'vitest/browser';
+
+vi.mock('$lib/url', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/url')>()),
+	goto: vi.fn().mockResolvedValue(undefined),
+	replaceState: vi.fn()
+}));
+
+function expectedOAuthPath(entryID: string, vmcpID: string) {
+	const params = new URLSearchParams({ 'configure-oauth': 'true' });
+	const returnURL = new URL(appPage.url);
+	returnURL.searchParams.set('inspector', vmcpID);
+	params.set('oauth-redirect', `${returnURL.pathname}${returnURL.search}${returnURL.hash}`);
+	return `/mcp-servers/c/${encodeURIComponent(entryID)}?${params.toString()}`;
+}
 
 const vmcp = createVMCP({ id: 'vmcp-1', displayName: 'Issue Tracker vMCP' });
 
@@ -99,15 +116,26 @@ async function renderVMcpTester(
 		onLaunch?: () => void;
 		openEditInstanceConfiguration?: (target: VMCP, instance: VMCPInstance) => void;
 		connectFailureStatus?: number;
+		instancesLoading?: boolean;
+		tab?: string;
 	}
 ) {
 	await preparePageData(overrides);
+
+	if (options?.tab) {
+		appPage.url.searchParams.set('tab', options.tab);
+	} else {
+		appPage.url.searchParams.delete('tab');
+	}
 
 	const target = options?.vmcp ?? vmcp;
 	const instance =
 		options && 'instance' in options ? options.instance : createInstance({ configured: true });
 
-	vmcpInstances.current = { items: instance ? [instance] : [], loading: false };
+	vmcpInstances.current = {
+		items: instance ? [instance] : [],
+		loading: options?.instancesLoading ?? false
+	};
 	if (instance) {
 		if (options?.connectFailureStatus !== undefined) {
 			mockMCPInitializationFailure(instance.id, options.connectFailureStatus);
@@ -128,50 +156,146 @@ afterEach(() => {
 });
 
 describe('VMcpTester', () => {
+	it.each([
+		{
+			status: 403,
+			description: 'Your permission to connect to this server is no longer available.'
+		},
+		{ status: 401, description: 'Reconnect this server before using the tester.' }
+	])(
+		'keeps translated authentication guidance inline and HTTP details in the dialog (%s)',
+		async ({ status, description }) => {
+			await renderVMcpTester({}, { connectFailureStatus: status });
+			await expect.element(page.getByText(description, { exact: true })).toBeVisible();
+			await expect.element(page.getByText(/Streamable HTTP error/)).not.toBeInTheDocument();
+			await page.getByRole('button', { name: 'View full error' }).click();
+			await expect.element(page.getByLabelText('Full error')).toBeVisible();
+			const text = EditorView.findFromDOM(
+				page.getByLabelText('Full error').element() as HTMLElement
+			)?.state.doc.toString();
+			expect(text).toContain(String(status));
+		}
+	);
+
+	it('shows administrator OAuth setup before connecting to a vMCP with missing static credentials', async () => {
+		const target = createVMCP({ id: vmcp.id, displayName: vmcp.displayName });
+		target.components![0].name = 'Salesforce';
+		target.components![0].mcpServerCatalogEntryID = 'salesforce';
+		target.components![0].catalogEntry.manifest.runtime = 'remote';
+		target.components![0].catalogEntry.manifest.remoteConfig = {
+			fixedURL: 'https://api.salesforce.com/platform/mcp/v1/platform/sobject-all',
+			staticOAuthRequired: true
+		};
+		target.status = {
+			ready: false,
+			components: [{ name: 'Salesforce', error: 'static OAuth credentials are not configured' }]
+		};
+		await renderVMcpTester({}, { vmcp: target });
+		await expect
+			.element(
+				page.getByText('Salesforce requires administrator OAuth setup before this vMCP can start.')
+			)
+			.toBeVisible();
+		const configureOAuth = page.getByRole('link', { name: 'Configure Salesforce OAuth' });
+		await expect
+			.element(configureOAuth)
+			.toHaveAttribute('href', expectedOAuthPath('salesforce', target.id));
+
+		await configureOAuth.click();
+
+		const url = vi.mocked(replaceState).mock.calls[0]?.[0] as URL;
+		expect(url.searchParams.get('inspector')).toBe(target.id);
+		expect(vi.mocked(goto)).toHaveBeenCalledWith(expectedOAuthPath('salesforce', target.id));
+		await expect
+			.element(page.getByRole('button', { name: 'Start Session' }))
+			.not.toBeInTheDocument();
+	});
+
 	it('offers Chat through the model service when no model provider is configured', async () => {
-		await renderVMcpTester({
-			models: [],
-			defaultModelAliases: [],
-			version: {
-				hasModelProvider: false,
-				hasValidLicense: true,
-				mcpTesterModelProxyAvailable: true
-			}
-		});
+		await renderVMcpTester(
+			{
+				models: [],
+				defaultModelAliases: [],
+				version: {
+					hasModelProvider: false,
+					hasValidLicense: true,
+					mcpTesterModelProxyAvailable: true
+				}
+			},
+			{ tab: 'chat' }
+		);
 
 		await expect.element(page.getByRole('region', { name: 'Chat composer' })).toBeVisible();
 	});
 
 	it('requires a valid license when no model provider is configured', async () => {
-		await renderVMcpTester({
-			models: [],
-			defaultModelAliases: [],
-			version: { hasModelProvider: false, hasValidLicense: false }
-		});
+		await renderVMcpTester(
+			{
+				models: [],
+				defaultModelAliases: [],
+				version: { hasModelProvider: false, hasValidLicense: false }
+			},
+			{ tab: 'chat' }
+		);
 
 		await expect
-			.element(page.getByRole('heading', { name: 'Unlock Chat & More!', exact: true }))
+			.element(page.getByRole('heading', { name: 'Unlock MCP Inspector Chat', exact: true }))
 			.toBeVisible();
-		await expect.element(page.getByText(SETUP_COMMUNITY_SIGNUP_BANNER_COPY)).toBeVisible();
+		await expect
+			.element(
+				page.getByText(
+					/Register to get free access to the MCP Inspector Chat, powered by Obot’s model service/
+				)
+			)
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'configuring your own model provider' }))
+			.toHaveAttribute('href', '/models?view=model-providers');
 		await expect.element(page.getByRole('button', { name: 'Register' })).toBeVisible();
 	});
 
 	it('keeps the default model alias message when a model provider is configured', async () => {
-		await renderVMcpTester({
-			models: [],
-			defaultModelAliases: [],
-			license: {
-				...getLicenseResponse,
-				licenseKey: 'community-license-key',
-				enterprise: true,
-				entitlements: [COMMUNITY_ENTITLEMENT]
+		await renderVMcpTester(
+			{
+				models: [],
+				defaultModelAliases: [],
+				license: {
+					...getLicenseResponse,
+					licenseKey: 'community-license-key',
+					enterprise: true,
+					entitlements: [COMMUNITY_ENTITLEMENT]
+				},
+				version: { hasModelProvider: true, hasValidLicense: true }
 			},
-			version: { hasModelProvider: true, hasValidLicense: true }
-		});
+			{ tab: 'chat' }
+		);
 
 		await expect.element(page.getByText('Chat unavailable', { exact: true })).toBeVisible();
 		await expect
 			.element(page.getByText('No default llm model is configured. Configure one to use Chat.'))
+			.toBeVisible();
+	});
+
+	it('keeps starting session while an unconfigured instance is still loading', async () => {
+		const instance = createInstance({
+			configured: false,
+			configurationCheckHash: 'checked'
+		});
+		await renderVMcpTester({}, { instance, instancesLoading: true });
+
+		await expect.element(page.getByText('Starting session...')).toBeVisible();
+		await expect
+			.element(
+				page.getByText('Before you can continue inspecting this vMCP, an update is required.')
+			)
+			.not.toBeInTheDocument();
+
+		vmcpInstances.current = { items: [instance], loading: false };
+
+		await expect
+			.element(
+				page.getByText('Before you can continue inspecting this vMCP, an update is required.')
+			)
 			.toBeVisible();
 	});
 
@@ -274,4 +398,33 @@ describe('VMcpTester', () => {
 			expect(openEditInstanceConfiguration).toHaveBeenCalledWith(target, instance);
 		}
 	);
+});
+
+it('shows CLI login and retries the inspector for localhost OAuth', async () => {
+	const target = createConfigurableVMcp();
+	const attemptURL = `${window.location.origin}/oauth/mcp/login/component-attempt`;
+	worker.use(
+		http.get('*/oauth/mcp/login/:state', () => HttpResponse.json({})),
+		http.get('/api/oauth/vmcp/vmcpi-1', () =>
+			HttpResponse.json([{ mcpServerID: 'temp-component', authURL: attemptURL }])
+		),
+		http.get('/api/oauth/vmcp/vmcpi-1/components/temp-component', () =>
+			HttpResponse.json({ authURL: '' })
+		)
+	);
+	target.localhostCallbackPaths = ['/custom/callback'];
+	await renderVMcpTester(
+		{},
+		{ vmcp: target, instance: createInstance({ configured: true }), connectFailureStatus: 401 }
+	);
+	await page.getByRole('button', { name: 'Authenticate', exact: true }).click();
+	await expect
+		.element(page.getByLabelText('Authentication command'))
+		.toHaveTextContent(`obot mcp login "${attemptURL}"`);
+	mockMCPInitialization('vmcpi-1');
+	worker.use(http.get('*/oauth/mcp/login/:state', () => new HttpResponse(null, { status: 400 })));
+	document.dispatchEvent(new Event('visibilitychange'));
+	await expect
+		.element(page.getByRole('heading', { name: 'Reauthentication required' }))
+		.not.toBeInTheDocument();
 });

@@ -2,7 +2,7 @@ import { Group, type VMCPInstance, type VMCPManifest } from '$lib/services';
 import { mcpServersAndEntries, vmcpInstances } from '$lib/stores';
 import { createMCPCatalogEntry, createVMCP, createVMCPComponent } from '../../../tests/helpers/mcp';
 import { createMockProfile, preparePageData } from '../../../tests/helpers/pageData';
-import { getProfileResponse } from '../../../tests/mocks/data';
+import { getProfileResponse, getVersionResponse } from '../../../tests/mocks/data';
 import { worker } from '../../../tests/mocks/worker';
 import VMcpCardHost from './VMcpCard.svelte.spec.host.svelte';
 import { http, HttpResponse } from 'msw';
@@ -65,6 +65,7 @@ async function renderCard(options: {
 	provideDiff?: boolean;
 	provideUpdateConfirm?: boolean;
 	owner?: string;
+	kubernetes?: boolean;
 }) {
 	const vmcp = options.vmcp
 		? options.userID !== undefined
@@ -77,7 +78,8 @@ async function renderCard(options: {
 			});
 	const instances = options.instances ?? [];
 	await preparePageData({
-		profile: createMockProfile(options.groups)
+		profile: createMockProfile(options.groups),
+		version: options.kubernetes ? { ...getVersionResponse, engine: 'kubernetes' } : undefined
 	});
 	worker.use(http.get('/api/vmcp-instances', () => HttpResponse.json({ items: instances })));
 	vmcpInstances.current = {
@@ -155,6 +157,43 @@ describe('VMcpCard.svelte', () => {
 		};
 		vmcpInstances.current = { items: [], loading: false };
 	});
+
+	it('shows missing administrator configuration ahead of connected and update states', async () => {
+		const entry = createMCPCatalogEntry({
+			id: 'salesforce',
+			name: 'Salesforce',
+			runtime: 'remote'
+		});
+		entry.manifest.remoteConfig = {
+			fixedURL: 'https://api.salesforce.com/platform/mcp/v1/platform/sobject-all',
+			staticOAuthRequired: true
+		};
+		const vmcp = createVMCP(
+			{
+				id: 'vmcp-1',
+				status: {
+					ready: false,
+					components: [
+						{
+							name: 'Salesforce',
+							needsUpdate: true,
+							error: 'static OAuth credentials are not configured'
+						}
+					]
+				}
+			},
+			[entry]
+		);
+		await renderCard({
+			groups: [Group.ADMIN],
+			vmcp,
+			instances: [createInstance('vmcpi-1')]
+		});
+		await expect.element(page.getByText('Configuration Required')).toBeVisible();
+		await expect.element(page.getByText('Connected')).not.toBeInTheDocument();
+		await expect.element(page.getByText('Update Available')).not.toBeInTheDocument();
+	});
+
 	it.each([
 		{
 			name: 'lets the creator delete and connect',
@@ -324,6 +363,9 @@ describe('VMcpCard.svelte', () => {
 			status: { components: [{ name: 'GitHub', needsUpdate: false }] }
 		};
 		worker.use(
+			http.get('/api/mcp-server-binding-secrets', () =>
+				HttpResponse.json({ items: [{ name: 'token-secret', keys: ['token'] }] })
+			),
 			http.get('/api/vmcps/vmcp-1', () => HttpResponse.json(refreshed)),
 			http.post('/api/vmcps/vmcp-1/reveal', () => HttpResponse.json({ components: {} })),
 			http.put('/api/vmcps/vmcp-1', async ({ request }) => {
@@ -338,7 +380,8 @@ describe('VMcpCard.svelte', () => {
 
 		await renderCard({
 			groups: [Group.ADMIN],
-			userID: getProfileResponse.id,
+			userID: '',
+			kubernetes: true,
 			vmcp,
 			onUpdate
 		});
@@ -348,6 +391,7 @@ describe('VMcpCard.svelte', () => {
 		await page.getByRole('button', { name: "Yes, I'm sure", exact: true }).click();
 
 		await expect.element(page.getByRole('heading', { name: /Configure GitHub/ })).toBeVisible();
+		await expect.element(page.getByCSS('#secret-binding-source-API_TOKEN')).toBeVisible();
 		expect(triggered).not.toHaveBeenCalled();
 		expect(onUpdate).not.toHaveBeenCalled();
 		await expect.element(page.getByRole('combobox', { name: 'API token policy' })).toBeVisible();
@@ -392,6 +436,47 @@ describe('VMcpCard.svelte', () => {
 		await actionsButton().click();
 		await page.getByRole('button', { name: 'View Diff', exact: true }).click();
 		await expect.element(page.getByText('Issue Tracker vMCP | vmcp-1')).toBeVisible();
+	});
+
+	it('hides delete but keeps update for an admin on a catalog-synced vMCP', async () => {
+		await renderCard({
+			groups: [Group.ADMIN],
+			userID: undefined,
+			vmcp: { ...createNeedsUpdateVmcp(), sourceURL: 'https://github.com/example/catalog' },
+			provideDiff: true,
+			provideUpdateConfirm: true
+		});
+
+		await actionsButton().click();
+		await expect
+			.element(page.getByRole('button', { name: 'View Diff', exact: true }))
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Update vMCP', exact: true }))
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Delete', exact: true }))
+			.not.toBeInTheDocument();
+	});
+
+	it('marks a catalog-synced vMCP', async () => {
+		await renderCard({
+			groups: [Group.ADMIN],
+			vmcp: {
+				...createVMCP({ id: 'vmcp-1', displayName: 'Issue Tracker vMCP' }),
+				sourceURL: 'https://github.com/example/catalog'
+			}
+		});
+
+		await expect.element(page.getByRole('button', { name: 'Synced from catalog' })).toBeVisible();
+	});
+
+	it('does not mark a vMCP created in Obot as catalog-synced', async () => {
+		await renderCard({ groups: [Group.ADMIN] });
+
+		await expect
+			.element(page.getByRole('button', { name: 'Synced from catalog' }))
+			.not.toBeInTheDocument();
 	});
 
 	it('hides update action for non-owners without admin access', async () => {
@@ -519,11 +604,9 @@ describe('VMcpCard.svelte', () => {
 			http.get('/api/vmcp-instances/vmcpi-1', () =>
 				HttpResponse.json({
 					...stale,
-					status: { configured: true }
+					status: { configured: true, configurationCheckHash: 'checked' }
 				})
-			),
-			http.post('/api/vmcps/vmcp-1/launch', () => HttpResponse.json({})),
-			http.get('/api/vmcps/vmcp-1/oauth-url', () => HttpResponse.json({ oauthURL: '' }))
+			)
 		);
 
 		await renderCard({
@@ -648,4 +731,20 @@ describe('VMcpCard.svelte', () => {
 		await page.getByRole('button', { name: 'Edit Configuration', exact: true }).click();
 		await expect.element(page.getByCSS('input[name="API token"]')).toBeVisible();
 	});
+});
+
+it('keeps the HTTP copy shortcut for a ready vMCP with localhost OAuth', async () => {
+	const vmcp = createVMCP({
+		id: 'vmcp-localhost',
+		userID: getProfileResponse.id,
+		localhostCallbackPaths: ['/oauth/callback'],
+		status: { ready: true }
+	});
+	await renderCard({ groups: [Group.USER], vmcp });
+	await expect
+		.element(page.getByRole('button', { name: 'Copy Connect URL', exact: true }))
+		.toBeVisible();
+	await expect
+		.element(page.getByRole('button', { name: 'Copy Connect URL', exact: true }))
+		.toBeEnabled();
 });

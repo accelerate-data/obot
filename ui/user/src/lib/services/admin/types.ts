@@ -1,3 +1,4 @@
+import { m } from '$lib/i18n';
 import {
 	type MCPServerTool,
 	type MCPSecretBinding,
@@ -8,6 +9,7 @@ import {
 	type UVXRuntimeConfig,
 	type NPXRuntimeConfig,
 	type ContainerizedRuntimeConfig,
+	type OpenAPIRuntimeConfig,
 	type Schedule,
 	ModelAlias,
 	type AccessControlRuleSubject,
@@ -266,6 +268,25 @@ export interface AuthProvider extends BaseProvider {
 	verifiedEmail?: string;
 	// A provisioned initial owner has not opened their setup link yet, so nobody can sign in.
 	requiresActivation?: boolean;
+	// The state of the provider's SCIM connection, absent when it has none. Deconfiguring the
+	// provider deletes the connection. Only administrators see it.
+	scimState?: SCIMConnectionState;
+	// When the bearer token of the provider's SCIM connection stops being accepted. Absent while the
+	// connection has no token, and for non-administrators.
+	scimTokenExpiresAt?: string;
+	// How the provider supports SCIM. Absent for providers that do not, and for non-administrators.
+	scim?: AuthProviderSCIM;
+}
+
+export interface AuthProviderSCIM {
+	// While the provider is configured or staged without a SCIM connection, providing these
+	// parameters sets up directory synchronization, and leaving them empty sets up SCIM.
+	directoryParameters: string[];
+	// The parameter that holds the identity provider's issuer, such as the Okta Org URL.
+	issuerParameter: string;
+	// The issuer recorded when the provider's SCIM connection was created. SCIM bindings belong to
+	// that organization.
+	connectionIssuer?: string;
 }
 
 // A user of the built-in local auth provider. Passwords are never returned by the API.
@@ -419,6 +440,46 @@ export interface DeviceScanStats {
 	scanTimestamps: string[] | null;
 }
 
+// Egress audit logs
+
+export interface EgressAuditLog {
+	actor: string;
+	claudeAccount: string;
+	claudeSession: string;
+	createdAt: string;
+	durationMs: number;
+	environmentID: string;
+	host: string;
+	id: string;
+	method: string;
+	outcome: string;
+	path: string;
+	requestBody?: string;
+	requestBytes: number;
+	requestHeaders?: Record<string, string[]>;
+	requestTruncated: boolean;
+	responseBody?: string;
+	responseBytes: number;
+	responseHeaders?: Record<string, string[]>;
+	responseStatus: number;
+	responseTruncated: boolean;
+	scheme: string;
+	updatedAt: string;
+	userID: string;
+}
+export type EgressAuditLogURLFilters = {
+	claudeAccount?: string;
+	claudeSession?: string;
+	endTime?: string;
+	environmentId?: string;
+	host?: string;
+	limit?: number;
+	offset?: number;
+	outcome?: string;
+	startTime?: string;
+	userId?: string;
+};
+
 // Group role assignments
 
 export type GroupRoleAssignment = {
@@ -438,8 +499,7 @@ export const Group = {
 	POWERUSER_PLUS: 'power-user-plus',
 	POWERUSER: 'power-user',
 	USER: 'user',
-	AUDITOR: 'auditor',
-	USER_IMPERSONATION: 'user-impersonation'
+	AUDITOR: 'auditor'
 };
 export const Role = {
 	BASIC: 4,
@@ -447,8 +507,7 @@ export const Role = {
 	ADMIN: 16,
 	AUDITOR: 32,
 	POWERUSER_PLUS: 64,
-	POWERUSER: 128,
-	USER_IMPERSONATION: 256
+	POWERUSER: 128
 };
 
 // Image pull secrets
@@ -559,8 +618,6 @@ export interface K8sSettings {
 	tolerations?: string;
 	resources?: string;
 	runtimeClassName?: string;
-	storageClassName?: string;
-	nanobotWorkspaceSize?: string;
 	setViaHelm?: boolean;
 }
 
@@ -573,8 +630,6 @@ export interface K8sSettingsManifest {
 	tolerations?: string;
 	resources?: string;
 	runtimeClassName?: string;
-	storageClassName?: string;
-	nanobotWorkspaceSize?: string;
 }
 export interface ServerK8sSettings {
 	needsK8sUpdate: boolean;
@@ -695,6 +750,8 @@ export interface MCPCatalogEntryFieldManifest {
 	required: boolean;
 	sensitive: boolean;
 	value: string;
+	/** The value is stored by Obot and omitted from the manifest; reveal it to edit it. */
+	static?: boolean;
 	file?: boolean;
 	dynamicFile?: boolean;
 	interpolated?: boolean;
@@ -702,11 +759,15 @@ export interface MCPCatalogEntryFieldManifest {
 	secretBinding?: MCPSecretBinding;
 }
 export interface RemoteRuntimeConfigAdmin {
+	localhostCallbackEnabled?: boolean;
+	localhostCallbackPath?: string;
 	headers?: MCPCatalogEntryFieldManifest[];
 	tunnelName?: string;
 	url: string;
 }
 export interface RemoteCatalogConfigAdmin {
+	localhostCallbackEnabled?: boolean;
+	localhostCallbackPath?: string;
 	fixedURL?: string;
 	hostname?: string;
 	staticOAuthRequired?: boolean;
@@ -724,6 +785,8 @@ export type MCPConfig = Omit<
 export interface MCPCatalogEntryServerManifest {
 	entryKey?: string;
 	upgradeNote?: string;
+	minObotVersion?: string;
+	maxObotVersion?: string;
 	icon?: string;
 	config?: MCPConfig[];
 	repoURL?: string;
@@ -741,8 +804,10 @@ export interface MCPCatalogEntryServerManifest {
 	uvxConfig?: UVXRuntimeConfig;
 	npxConfig?: NPXRuntimeConfig;
 	containerizedConfig?: ContainerizedRuntimeConfig;
+	openAPIConfig?: OpenAPIRuntimeConfig;
 	remoteConfig?: RemoteCatalogConfigAdmin;
 	resources?: MCPResourceRequirements;
+	staticConfigurationRevision?: string;
 }
 export interface MCPCatalogEntry {
 	id: string;
@@ -762,7 +827,6 @@ export interface MCPCatalogEntry {
 	canConnect?: boolean;
 	needsK8sUpdate?: boolean;
 	oauthCredentialConfigured?: boolean;
-	connectURL?: string;
 	userID?: string;
 }
 
@@ -791,6 +855,7 @@ export interface RuntimeFormData {
 	npxConfig?: NPXRuntimeConfig;
 	uvxConfig?: UVXRuntimeConfig;
 	containerizedConfig?: ContainerizedRuntimeConfig;
+	openAPIConfig?: OpenAPIRuntimeConfig;
 	remoteConfig?: LegacyRemoteCatalogConfigAdmin; // Form state; flattened when saving catalog entries
 	remoteServerConfig?: RemoteRuntimeConfigAdmin; // For servers
 	multiUserConfig?: MultiUserConfig; // Form state; flattened into config when saving servers
@@ -822,11 +887,14 @@ export type CompositeServerToolRow = {
 	description?: string;
 	overrideDescription?: string;
 	enabled: boolean;
+	removed?: boolean;
 };
 
 // MCP filters
 
 export interface MCPFilterRemoteRuntimeConfig {
+	localhostCallbackEnabled?: boolean;
+	localhostCallbackPath?: string;
 	url: string;
 	isTemplate?: boolean;
 	urlTemplate?: string;
@@ -974,9 +1042,9 @@ export interface TunnelConnection {
 
 export type PolicyDirection = 'user-message' | 'tool-calls' | 'both';
 export const PolicyDirectionLabels: Record<PolicyDirection, string> = {
-	'user-message': 'User Messages',
-	'tool-calls': 'Tool Calls',
-	both: 'Both'
+	'user-message': m.core_policy_direction_user_messages(),
+	'tool-calls': m.core_policy_direction_tool_calls(),
+	both: m.core_policy_direction_both()
 };
 export interface MessagePolicyManifest {
 	id?: string;
@@ -1067,6 +1135,28 @@ export interface ModelAccessPolicy extends Omit<ModelAccessPolicyManifest, 'id'>
 	metadata?: Record<string, string>;
 }
 
+// Model proxy
+
+export interface ModelProxySettings {
+	enabled: boolean;
+	url: string;
+}
+
+export interface ModelProxySettingsUpdateManifest {
+	enabled: boolean;
+}
+
+export interface ModelProxyTokenUsage {
+	max: number;
+	used: number;
+}
+
+export interface ModelProxyUsage {
+	input: ModelProxyTokenUsage;
+	output: ModelProxyTokenUsage;
+	resetAt: string;
+}
+
 // Models
 
 export const ModelUsage = {
@@ -1079,23 +1169,23 @@ export const ModelUsage = {
 } as const;
 export type ModelUsage = (typeof ModelUsage)[keyof typeof ModelUsage];
 export const ModelUsageLabels = {
-	[ModelUsage.LLM]: 'Language Model (Chat)',
-	[ModelUsage.TextEmbedding]: 'Text Embedding (Knowledge)',
-	[ModelUsage.ImageGeneration]: 'Image Generation',
-	[ModelUsage.Vision]: 'Vision',
-	[ModelUsage.Other]: 'Other',
-	[ModelUsage.Unknown]: 'Unknown'
+	[ModelUsage.LLM]: m.core_model_usage_llm(),
+	[ModelUsage.TextEmbedding]: m.core_model_usage_text_embedding(),
+	[ModelUsage.ImageGeneration]: m.core_model_usage_image_generation(),
+	[ModelUsage.Vision]: m.core_model_usage_vision(),
+	[ModelUsage.Other]: m.core_model_usage_other(),
+	[ModelUsage.Unknown]: m.core_unknown()
 } as const;
-export const NanobotModelAlias = {
+export const ConfigurableModelAlias = {
 	Llm: 'llm',
 	LlmMini: 'llm-mini'
 } as const;
 export const ModelAliasLabels = {
-	[ModelAlias.Llm]: 'Language Model (Chat)',
-	[ModelAlias.LlmMini]: 'Language Model (Chat - Fast)',
-	[ModelAlias.TextEmbedding]: 'Text Embedding (Knowledge)',
-	[ModelAlias.ImageGeneration]: 'Image Generation',
-	[ModelAlias.Vision]: 'Vision'
+	[ModelAlias.Llm]: m.core_model_usage_llm(),
+	[ModelAlias.LlmMini]: m.core_model_usage_llm_fast(),
+	[ModelAlias.TextEmbedding]: m.core_model_usage_text_embedding(),
+	[ModelAlias.ImageGeneration]: m.core_model_usage_image_generation(),
+	[ModelAlias.Vision]: m.core_model_usage_vision()
 } as const;
 export const ModelAliasToUsageMap = {
 	[ModelAlias.Llm]: ModelUsage.LLM,
@@ -1165,254 +1255,6 @@ export interface SkillAccessPolicyManifest {
 	displayName: string;
 	subjects: AccessControlRuleSubject[];
 	resources: SkillAccessPolicyResource[];
-}
-
-// Agent sources
-
-export interface AgentCatalogManifest {
-	displayName: string;
-	repoURL: string;
-	ref?: string;
-}
-
-export interface AgentCatalog extends AgentCatalogManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-	lastSyncTime?: string;
-	isSyncing?: boolean;
-	syncError?: string;
-	resolvedCommitSHA?: string;
-	discoveredAgentCount: number;
-	discoveredHarnessCount: number;
-}
-
-// Harnesses — the runtimes hosted agents are built on (e.g. "Claude Code",
-// "Codex", "Custom Python"). The harness supplies the docker image; the agent
-// supplies configuration.
-
-export interface HarnessManifest {
-	name: string;
-	description?: string;
-	icon?: string;
-	iconDark?: string;
-	image: string;
-}
-
-export interface Harness extends HarnessManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-}
-
-// Hosted agents
-
-export type HostedAgentState = 'pending' | 'ready' | 'error' | 'removing';
-
-// Agents are templates and carry no status; only instances run.
-export interface HostedAgentInstanceStatus {
-	state?: HostedAgentState;
-	url?: string;
-	error?: string;
-	reason?: string;
-	message?: string;
-	observedRevision?: string;
-	lastObservedTime?: string;
-	backendID?: string;
-	backendGeneration?: string;
-}
-
-export interface HostedAgentEnv {
-	name?: string;
-	description?: string;
-	key: string;
-	value?: string;
-	sensitive?: boolean;
-	required?: boolean;
-}
-
-export type HostedAgentQuestionType = 'string' | 'number' | 'boolean' | 'select' | 'schedule';
-
-export interface HostedAgentQuestion {
-	key: string;
-	name?: string;
-	description?: string;
-	type?: HostedAgentQuestionType;
-	required?: boolean;
-	sensitive?: boolean;
-	default?: string;
-	// Only valid for type 'select'.
-	options?: string[];
-}
-
-export interface HostedAgentManifest {
-	name: string;
-	description?: string;
-	icon?: string;
-	iconDark?: string;
-	// The Harness this agent runs on; the harness supplies the docker image.
-	harnessID: string;
-	// Optional git repository made available to the agent.
-	gitRepo?: string;
-	// Branch, tag or commit SHA. Blank checks out the default branch.
-	gitRef?: string;
-	modelProviders?: string[];
-	// Model IDs, obot://<alias> references, or wildcard prefixes.
-	models?: string[];
-	// MCP gateway IDs — the same handles used by /mcp-connect/{mcp_id}.
-	mcpServers?: string[];
-	skills?: string[];
-	env?: HostedAgentEnv[];
-	questions?: HostedAgentQuestion[];
-	allowUserMCPServers?: boolean;
-	allowUserSkills?: boolean;
-	allowUserModels?: boolean;
-	// Lets a user set their own git repository on an instance, overriding the
-	// agent's gitRepo if one is configured.
-	allowUserGitRepo?: boolean;
-	maxInstancesPerUser?: number;
-	// The HTTP port the agent serves on inside its sandbox. When set, instances
-	// are reachable at /agent-connect/{instance id}.
-	port?: number;
-	// Offers an interactive shell attached to the sandbox. Requires an
-	// interactive harness, since without a TTY there is no session to attach to.
-	terminal?: boolean;
-}
-
-export interface HostedAgent extends HostedAgentManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-	// Why this agent cannot be launched on this installation — a model its
-	// harness can use is not configured, or an MCP server it names is missing.
-	// Empty or absent means it can be launched.
-	unavailableReasons?: string[];
-}
-
-export interface HostedAgentInstanceManifest {
-	name: string;
-	description?: string;
-	icon?: string;
-	// Answers to the agent's questions, keyed by question key. Values are strings
-	// regardless of the question's type.
-	answers?: Record<string, string>;
-	// Git repository the user supplied; only accepted when the agent sets
-	// allowUserGitRepo.
-	gitRepo?: string;
-	// Branch, tag or commit for gitRepo. It belongs to the repository beside it:
-	// the agent's ref is not applied to a repository the user supplied.
-	gitRef?: string;
-	// Resources the user attached themselves; only accepted when the agent's
-	// corresponding allowUser* flag is set.
-	mcpServers?: string[];
-	skills?: string[];
-	models?: string[];
-}
-
-export interface HostedAgentInstance extends HostedAgentInstanceManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-	hostedAgentID: string;
-	userID?: string;
-	poolID?: string;
-	// The icon to show, already resolved by the server through instance ->
-	// agent -> harness, so a client renders a row from this payload alone.
-	resolvedIcon?: string;
-	resolvedIconDark?: string;
-	status?: HostedAgentInstanceStatus;
-}
-
-export interface HostedAgentResourceQuantity {
-	cpuVcpus: number;
-	memoryBytes: number;
-	storageBytes: number;
-}
-
-export interface HostedAgentPoolManifest {
-	// How many sandboxes share this pool. Each reserves capacity/maxSandboxes
-	// and may burst to the whole pool, so raising it shrinks everyone's share.
-	maxSandboxes?: number;
-	capacity: HostedAgentResourceQuantity;
-	suspended?: boolean;
-}
-
-export interface HostedAgentPoolStatus {
-	backendProjectID?: string;
-	backendPoolID?: string;
-	ready?: boolean;
-	schedulable?: boolean;
-	degraded?: boolean;
-	capacity?: HostedAgentResourceQuantity;
-	observedRevision?: string;
-	reason?: string;
-	message?: string;
-}
-
-export interface HostedAgentPool extends HostedAgentPoolManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-	status?: HostedAgentPoolStatus;
-}
-
-export interface HostedAgentPoolDefaults extends HostedAgentPoolManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-}
-
-export interface HostedAgentPoolAssignmentManifest {
-	userID: string;
-	poolID: string;
-	default?: boolean;
-}
-
-export interface HostedAgentPoolAssignment extends HostedAgentPoolAssignmentManifest {
-	id: string;
-	created: string;
-	deleted?: string;
-}
-
-export interface HostedAgentInstanceUtilization {
-	instanceID: string;
-	state?: string;
-	usage: HostedAgentResourceQuantity;
-}
-
-export interface HostedAgentPoolUtilization {
-	timestamp: string;
-	pool: HostedAgentResourceQuantity;
-	instances: HostedAgentInstanceUtilization[];
-	pressure: {
-		cpu?: boolean;
-		memory?: boolean;
-		storage?: boolean;
-	};
-	// Distinguishes a pool using no disk from one whose disk cannot be measured.
-	// Sandboxes share one volume, so disk is only ever reported for the pool —
-	// never per instance.
-	storageMeasured?: boolean;
-}
-
-// The UI calls these "Access Policies"; the API resource is
-// hosted-agent-access-rules. See operations.ts for the rename shim.
-export interface HostedAgentAccessPolicyResource {
-	type: 'hostedAgent' | 'selector';
-	id: string;
-}
-export interface HostedAgentAccessPolicy {
-	id: string;
-	created: string;
-	deleted?: string;
-	displayName: string;
-	subjects: AccessControlRuleSubject[];
-	resources: HostedAgentAccessPolicyResource[];
-}
-export interface HostedAgentAccessPolicyManifest {
-	displayName: string;
-	subjects: AccessControlRuleSubject[];
-	resources: HostedAgentAccessPolicyResource[];
 }
 
 // Storage credentials
@@ -1536,19 +1378,6 @@ export interface SystemMCPServer {
 	deploymentReadyReplicas?: number;
 	deploymentReplicas?: number;
 	k8sSettingsHash?: string;
-}
-export interface RestartNanobotAgentDeploymentsFailure {
-	serverID: string;
-	error: string;
-}
-export interface RestartNanobotAgentDeploymentsResult {
-	dryRun: boolean;
-	totalNanobotAgentServers: number;
-	targetedServerIDs: string[];
-	restartedCount: number;
-	restartedServerIDs: string[];
-	failedCount: number;
-	failed: RestartNanobotAgentDeploymentsFailure[];
 }
 
 // Token usage
@@ -1801,3 +1630,161 @@ export type EnforcementDecisionURLFilters = {
 	start_time?: string | null;
 	tool?: string | null;
 };
+
+// SCIM provisioning
+
+export type SCIMConnectionState = 'connected' | 'enforced';
+
+export interface SCIMConnection {
+	id: string;
+	adapterType: string;
+	// 'scim_first' when the provider was configured without directory credentials, 'migrated' when
+	// the connection replaced login-time directory synchronization.
+	origin: 'scim_first' | 'migrated';
+	authProviderNamespace: string;
+	authProviderName: string;
+	authProviderDisplayName: string;
+	state: SCIMConnectionState;
+	// The SCIM base URL to configure in the identity provider.
+	baseURL: string;
+	issuer?: string;
+	enabledAt: string;
+	enforcedAt?: string;
+	// False until the first bearer token is issued.
+	hasToken: boolean;
+	tokenIssuedAt?: string;
+	// When the token stops being accepted, a year after it was issued.
+	tokenExpiresAt?: string;
+	// True while the token replaced by the last rotation is still accepted.
+	previousTokenAccepted: boolean;
+	previousTokenExpiresAt?: string;
+	// False while the connection's auth provider does not serve sign-ins, and SCIM requests fail.
+	authProviderConfigured: boolean;
+	// The bearer token. Only set in the response that issued it.
+	token?: string;
+}
+
+export interface GroupReference {
+	kind:
+		| 'accessControlRule'
+		| 'modelAccessPolicy'
+		| 'skillAccessRule'
+		| 'messagePolicy'
+		| 'hostedAgentAccessRule'
+		| 'groupRoleAssignment'
+		| 'vmcpProfile';
+	id: string;
+	displayName?: string;
+	detail?: string;
+}
+
+export interface SCIMSetupGroup {
+	id: string;
+	// Empty for a referenced group ID that no group has.
+	name: string;
+	nativeID?: string;
+	// Link to the group in the identity provider's admin console.
+	consoleURL?: string;
+	// Empty while the group is unbound.
+	scimID?: string;
+	references?: GroupReference[];
+}
+
+export interface SCIMSetupWarning {
+	// 'duplicateName' and 'unreferencedNamesake' name groups whose name a pushed group cannot bind by.
+	type: 'everyoneGroup' | 'missingGroup' | 'duplicateName' | 'unreferencedNamesake';
+	message: string;
+	groupID: string;
+	groupName?: string;
+	references?: GroupReference[];
+}
+
+export interface SCIMSetupUser {
+	id: string;
+	username?: string;
+	email?: string;
+	displayName?: string;
+	status: 'active' | 'disabled';
+	disabledReason?: string;
+	// Empty while the user is unprovisioned.
+	scimID?: string;
+	active?: boolean;
+	// True once the user has signed in through the auth provider.
+	signedIn?: boolean;
+}
+
+export interface SCIMRequestFailure {
+	time: string;
+	method: string;
+	resource: string;
+	status: number;
+	scimType?: string;
+	detail?: string;
+}
+
+export interface SCIMPage<T> {
+	items: T[];
+	total: number;
+}
+
+export type SCIMGroupList = 'bound' | 'unboundReferenced' | 'unreferenced';
+
+export interface SCIMConnectionReview {
+	connection: SCIMConnection;
+	provisionedUsers: SCIMPage<SCIMSetupUser>;
+	unprovisionedUsers: SCIMPage<SCIMSetupUser>;
+	boundGroups: SCIMPage<SCIMSetupGroup>;
+	unboundReferencedGroups: SCIMPage<SCIMSetupGroup>;
+	unreferencedGroups: SCIMPage<SCIMSetupGroup>;
+	warnings: SCIMSetupWarning[];
+	// Why the requesting user cannot enforce SCIM now, besides unboundReferencedGroups, which also
+	// block it. Empty once SCIM is enforced.
+	enforceBlockers: string[];
+	activity: {
+		lastRequestAt?: string;
+		lastSuccessAt?: string;
+		recentFailures: SCIMPage<SCIMRequestFailure>;
+	};
+}
+
+export interface SCIMEnforceResult {
+	connection: SCIMConnection;
+	disabledUserCount: number;
+	deletedGroupCount: number;
+}
+
+// A name that more than one referenced group has. A group pushed under it could bind to neither.
+export interface SCIMDuplicateGroupName {
+	name: string;
+	groups: SCIMSetupGroup[];
+}
+
+// The configured auth provider that SCIM can be enabled for, which synchronizes its directory at
+// sign-in, and what blocks enabling it.
+export interface SCIMEnablePreview {
+	// Absent when no auth provider is configured, or the configured one does not support SCIM.
+	authProviderNamespace?: string;
+	authProviderName?: string;
+	authProviderDisplayName?: string;
+	blockers: string[];
+	duplicateGroupNames: SCIMDuplicateGroupName[];
+}
+
+export interface SCIMEnableResult {
+	// Carries the token, which is shown only once.
+	connection: SCIMConnection;
+	deletedGroupCount: number;
+	// Set when the unreferenced groups could not be deleted. SCIM is enabled regardless.
+	deletionError?: string;
+}
+
+export interface SCIMGroupDeletionResult {
+	deletedGroupCount: number;
+}
+
+// Group data left from an earlier configuration of an auth provider. It blocks configuring the
+// provider without directory credentials until the provider's auth provider cleanup removes it.
+export interface ResidualGroupData {
+	groups: SCIMSetupGroup[];
+	membershipCount: number;
+}

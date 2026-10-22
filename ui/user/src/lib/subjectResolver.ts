@@ -1,15 +1,46 @@
+import { m } from '$lib/i18n';
 import {
+	Group,
 	UserService,
 	type AccessControlRuleSubject,
 	type OrgGroup,
-	type OrgUser
+	type OrgUser,
+	type Profile
 } from '$lib/services';
-import { getUserDisplayName } from '$lib/utils';
+import { getUserDisplayName, isDisabledUser } from '$lib/utils';
+
+const EVERYONE_SUBJECT_ID = '*';
+export const OBOT_ADMIN_PICKER_ID = 'obot-admin';
+
+export function resolveSubjectFromGroup(group: OrgGroup): AccessControlRuleSubject {
+	if (group.id === EVERYONE_SUBJECT_ID) {
+		return { type: 'selector', id: group.id };
+	}
+	if (group.id === OBOT_ADMIN_PICKER_ID) {
+		return { type: 'obotGroup', id: Group.ADMIN };
+	}
+	return { type: 'group', id: group.id };
+}
+
+export function resolveSubjectPickerById(
+	subject: Pick<AccessControlRuleSubject, 'type' | 'id'>
+): string {
+	if (subject.type === 'obotGroup' && subject.id === Group.ADMIN) {
+		return OBOT_ADMIN_PICKER_ID;
+	}
+	return subject.id;
+}
+
+export function obotGroupDisplayName(id: string): string {
+	return `Obot ${id.charAt(0).toUpperCase()}${id.slice(1)}`;
+}
 
 export interface SubjectTableRow {
 	id: string;
 	displayName: string;
-	type: 'User' | 'Group' | 'Selector';
+	type: string;
+	/** Set for a user who is disabled. */
+	disabled?: boolean;
 }
 
 export interface ResolvedSubjects {
@@ -51,7 +82,7 @@ export async function resolveSubjects(
 				.filter((subject) => subject.type === 'group')
 				.map((subject) => subject.id)
 				// The "all users" pseudo-group is client-side only and has no directory entry.
-				.filter((id) => id !== '*' && !known.has(id))
+				.filter((id) => id !== EVERYONE_SUBJECT_ID && !known.has(id))
 		)
 	];
 
@@ -87,7 +118,8 @@ export function convertSubjectsToTableData(
 					return {
 						id: subject.id,
 						displayName: getUserDisplayName(userMap, subject.id),
-						type: 'User'
+						type: m.core_col_user(),
+						disabled: isDisabledUser(userMap.get(subject.id))
 					};
 				}
 
@@ -97,16 +129,56 @@ export function convertSubjectsToTableData(
 					return {
 						id: subject.id,
 						displayName: group?.name ?? subject.id,
-						type: 'Group'
+						type: m.core_col_group()
+					};
+				}
+
+				if (subject.type === 'obotGroup') {
+					return {
+						id: resolveSubjectPickerById(subject),
+						displayName: obotGroupDisplayName(subject.id),
+						type: m.core_col_group()
 					};
 				}
 
 				return {
 					id: subject.id,
-					displayName: subject.id === '*' ? 'All Obot Users' : subject.id,
-					type: 'Selector'
+					displayName: subject.id === EVERYONE_SUBJECT_ID ? m.core_all_obot_users() : subject.id,
+					type: m.identity_access_users_selector()
 				};
 			})
 			.filter((subject): subject is SubjectTableRow => subject !== undefined) ?? []
 	);
+}
+
+export function hasAccessWithinSubjects(
+	subjects: AccessControlRuleSubject[],
+	profile: Profile
+): boolean {
+	for (const subject of subjects) {
+		if (subject.type === 'selector' && subject.id === EVERYONE_SUBJECT_ID) {
+			return true;
+		}
+
+		if (subject.type === 'user' && subject.id === profile.id) {
+			return true;
+		}
+
+		if (
+			subject.type === 'group' &&
+			profile.authProviderGroups &&
+			profile.authProviderGroups.some((group) => group === subject.id)
+		) {
+			return true;
+		}
+
+		if (
+			subject.type === 'obotGroup' &&
+			profile.groups &&
+			profile.groups.some((group) => group === subject.id)
+		) {
+			return true;
+		}
+	}
+	return false;
 }

@@ -47,7 +47,7 @@ func buildIntegrationStack(t *testing.T) (http.Handler, *testutil.TestIssuer, fu
 	jwtAuth := oidcjwt.NewAuthenticator(cfg, v)
 	uplifted := oidcjwt.NewRoleUplift(jwtAuth, cfg)
 	wrapped := apioauthn.NewAuthenticator(union.NewFailOnError(uplifted, apioauthn.Anonymous{}))
-	az := authz.NewAuthorizer(nil, nil, nil, false, nil, nil, nil, false)
+	az := authz.NewAuthorizer(nil, nil, nil, false, nil, nil, false)
 
 	mux := http.NewServeMux()
 	gate := integrationAuthzGate{

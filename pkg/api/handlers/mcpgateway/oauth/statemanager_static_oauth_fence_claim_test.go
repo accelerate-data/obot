@@ -147,7 +147,7 @@ func TestStateManagerFencesCallbackWriteAfterProviderExchange(t *testing.T) {
 				defer release()
 				tc.changeApp(t, client)
 			})
-			manager := newStateManager(client)
+			manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
 			require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "request-1", fenceClaimEntryName, "state-1", "verifier-1", "", fenceClaimConfig(provider, "client-1", "secret-1")))
 
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -171,7 +171,7 @@ func TestStateManagerRejectsLegacyStaticPendingState(t *testing.T) {
 	client := newFenceClaimGateway(t, true)
 	upsertFenceClaimCredential(t, client, "client-1", "secret-1", "generation-1")
 	provider := newFenceClaimProvider(t, "legacy-access", nil)
-	manager := newStateManager(client)
+	manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
 	// An empty catalog entry models a pending row created before the fence columns
 	// existed; it carries no generation, so a static-only entry must refuse it.
 	require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "request-1", "", "legacy-state", "verifier-1", "", fenceClaimConfig(provider, "client-1", "secret-1")))
@@ -183,7 +183,7 @@ func TestStateManagerRejectsLegacyStaticPendingState(t *testing.T) {
 func TestStateManagerPreservesLegacyDynamicPendingState(t *testing.T) {
 	client := newFenceClaimGateway(t, false)
 	provider := newFenceClaimProvider(t, "dynamic-access", nil)
-	manager := newStateManager(client)
+	manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
 	require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "request-1", "", "legacy-dynamic", "verifier-1", "", fenceClaimConfig(provider, "dynamic-client", "dynamic-secret")))
 
 	_, _, err := manager.createToken(t.Context(), "legacy-dynamic", "code-1", "", "")
@@ -214,7 +214,7 @@ func TestStateManagerPersistsDirectDynamicAndCIMDCallbacks(t *testing.T) {
 			client := newFenceClaimGatewayWithObjects(t, &v1.MCPServer{Namespace: system.DefaultNamespace, Name: mcpID})
 			provider := newFenceClaimProvider(t, "direct-access", nil)
 			config := fenceClaimConfig(provider, tc.clientID, tc.clientSecret)
-			manager := newStateManager(client)
+			manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
 			state := "legacy-direct-state"
 			if tc.legacy {
 				require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", state, "verifier-1", "", config))
@@ -244,7 +244,7 @@ func TestMCPOAuthHandlerCapturesCatalogEntryOnlyForSelectedStaticApp(t *testing.
 	// cannot rest on the handler; the pending state must still pin static grants
 	// to the application's generation and refuse any other application.
 	handler := &mcpOAuthHandler{
-		gatewayClient: client, stateMgr: newStateManager(client),
+		gatewayClient: client, stateMgr: newStateManager(client, fixedTokenClient(http.DefaultClient)),
 		userID: "user-1", mcpID: fenceClaimMCPID, mcpURL: fenceClaimMCPURL,
 		catalogEntryName: fenceClaimEntryName, urlChan: make(chan string, 1),
 	}

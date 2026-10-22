@@ -1,4 +1,5 @@
 ---
+displayed_sidebar: sidebar
 title: MCP Server Egress Control
 ---
 
@@ -59,8 +60,8 @@ With the default set to deny all, admins can still allow unrestricted egress for
 
 ## Configure allowed domains
 
-Configure egress domains on the MCP server runtime configuration. This is supported for `npx`, `uvx`, and `containerized` MCP servers.
-This can be configured in the UI when creating or editing an MCP server.
+Configure egress domains on the MCP server runtime configuration. This is supported for `npx`, `uvx`, `containerized`, and `openapi` MCP servers.
+This can be configured in the UI when creating or editing an MCP server, or through the API.
 See the YAML configuration examples if you manage MCP servers through Git.
 
 ### YAML configuration examples
@@ -70,10 +71,10 @@ Example `npx` catalog entry:
 ```yaml
 runtime: npx
 npxConfig:
-  package: "@modelcontextprotocol/server-github"
+  package: "<your-npm-package>" # placeholder: replace with your package name
   egressDomains:
-    - api.github.com
-    - "*.githubusercontent.com"
+    - api.example.com
+    - "*.example-cdn.com"
 ```
 
 Example `uvx` configuration:
@@ -81,7 +82,7 @@ Example `uvx` configuration:
 ```yaml
 runtime: uvx
 uvxConfig:
-  package: "example-mcp-server"
+  package: "<your-pypi-package>" # placeholder: replace with your package name
   egressDomains:
     - api.example.com
 ```
@@ -99,12 +100,38 @@ containerizedConfig:
     - "*.example-cdn.com"
 ```
 
+Example OpenAPI configuration:
+
+```yaml
+runtime: openapi
+openAPIConfig:
+  source:
+    # Inline schema (1 MiB maximum); Obot imports it and stores a snapshot for running servers.
+    content: |
+      openapi: "3.0.3"
+      info:
+        title: Example API
+        version: "1.0.0"
+      servers:
+        - url: "https://api.example.com"
+        - url: "https://staging-api.example.com"
+      paths: {}
+  egressDomains:
+    - api.example.com
+```
+
+OpenAPI uses `baseURL` when set, otherwise the first absolute HTTP(S) URL in the schema's `servers`. This example uses only `api.example.com`, so staging needs no egress allowance.
+
+For restricted egress, include the selected destination's hostname in `egressDomains`. Setting `baseURL` does not grant access. If you use `source.url` instead of inline content, Obot fetches the schema separately, so the schema host needs no allowance in the pod's egress policy.
+
+Obot and the wrapper independently validate destinations; wrapper restrictions can cause startup or tool errors even if Obot accepts a destination. Obot requires HTTPS for API destinations and credential forwarding unless development mode is enabled.
+
 To block all external egress for a server, set `denyAllEgress: true` and leave `egressDomains` empty:
 
 ```yaml
 runtime: npx
 npxConfig:
-  package: "example-mcp-server"
+  package: "<your-npm-package>" # placeholder: replace with your package name
   denyAllEgress: true
 ```
 

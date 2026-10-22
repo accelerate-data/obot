@@ -2,6 +2,7 @@
 	import { CATALOG_SERVER_FIELD_IDS } from '$lib/constants';
 	import { HttpError } from '$lib/errors';
 	import { highlightFirstAvailableField } from '$lib/form';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import {
 		AdminService,
@@ -17,6 +18,14 @@
 		type Runtime,
 		Group
 	} from '$lib/services';
+	import type { OpenAPIRuntimeConfig } from '$lib/services';
+	import type {
+		OpenAPIDestinationValidation,
+		OpenAPIImportDraft,
+		OpenAPIImportResult,
+		OpenAPIMetadata
+	} from '$lib/services/openapi';
+	import { normalizeOpenAPIConfig, validateOpenAPIDestination } from '$lib/services/openapi';
 	import { MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH } from '$lib/services/user/constants';
 	import { getManifestConfiguration } from '$lib/services/user/mcp';
 	import {
@@ -35,13 +44,14 @@
 	import CustomConfigurationForm from '../mcp/CustomConfigurationForm.svelte';
 	import MultiUserHeadersForm from '../mcp/MultiUserHeadersForm.svelte';
 	import NpxRuntimeForm from '../mcp/NpxRuntimeForm.svelte';
+	import OpenAPIConfiguration from '../mcp/OpenAPIConfiguration.svelte';
 	import RemoteRuntimeForm from '../mcp/RemoteRuntimeForm.svelte';
 	import ResourceRuntimeForm from '../mcp/ResourceRuntimeForm.svelte';
 	import RuntimeSelector from '../mcp/RuntimeSelector.svelte';
 	import UvxRuntimeForm from '../mcp/UvxRuntimeForm.svelte';
 	import SelectMcpAccessControlRules from './SelectMcpAccessControlRules.svelte';
 	import { Info } from '@lucide/svelte';
-	import { onMount, untrack, type Snippet } from 'svelte';
+	import { onDestroy, onMount, untrack, type Snippet } from 'svelte';
 	import { twMerge } from 'tailwind-merge';
 
 	interface Props {
@@ -49,6 +59,7 @@
 		entity?: 'workspace' | 'catalog';
 		entry?: MCPCatalogEntry | MCPCatalogServer;
 		type?: LaunchServerType;
+		initialOpenAPIImport?: OpenAPIImportDraft;
 		readonly?: boolean;
 		onCancel?: () => void;
 		onSubmit?: (data: MCPCatalogEntry | MCPCatalogServer, message?: string) => void;
@@ -64,6 +75,7 @@
 		entry,
 		readonly,
 		type: newType = 'hosted',
+		initialOpenAPIImport,
 		onCancel,
 		onSubmit,
 		readonlyMessage,
@@ -77,7 +89,8 @@
 		} else {
 			// For catalog entries, determine type based on runtime
 			const catalogEntry = entry as MCPCatalogEntry;
-			return catalogEntry.manifest.runtime === 'remote' ? 'remote' : 'hosted';
+			const runtime = catalogEntry.manifest.runtime;
+			return runtime === 'remote' || runtime === 'openapi' ? runtime : 'hosted';
 		}
 	}
 
@@ -87,11 +100,53 @@
 	let showRequired = $state<Record<string, boolean>>({});
 	let showInvalid = $state<Record<string, boolean>>({});
 	let loading = $state(false);
+	let disposed = false;
+	let destinationValidationController: AbortController | undefined;
+	onDestroy(() => {
+		disposed = true;
+		destinationValidationController?.abort();
+	});
+
+	function handleCancel() {
+		destinationValidationController?.abort();
+		onCancel?.();
+	}
+
+	let openAPIImporting = $state(false);
 	let mcpResourceDefaults = $state<MCPResourceRequirements>();
 	let mcpTunnels = $state<MCPTunnel[]>();
 	let secretBindingTargets = $state<MCPAllowedSecretBindingTarget[]>();
 
 	let formData = $state<RuntimeFormData>(untrack(() => convertToFormData(entry)));
+	let openAPIImported = $state(untrack(() => Boolean(entry || initialOpenAPIImport)));
+	let importedBaseURL = $state(untrack(() => initialOpenAPIImport?.result.baseURL ?? ''));
+	let destinationValidation = $state<OpenAPIDestinationValidation | undefined>(
+		untrack(() => initialOpenAPIImport?.result.destinationValidation)
+	);
+	let overrideValidation = $state<OpenAPIDestinationValidation>();
+
+	function completeOpenAPIImport(
+		config: OpenAPIRuntimeConfig,
+		result: OpenAPIImportResult,
+		metadata: OpenAPIMetadata
+	) {
+		formData.openAPIConfig = config;
+		openAPIImported = true;
+		importedBaseURL = result.baseURL;
+		destinationValidation = result.destinationValidation;
+		overrideValidation = undefined;
+		formData.config ??= [];
+		for (const header of result.suggestedHeaders) {
+			if (
+				!formData.config.some((existing) => existing.key.toLowerCase() === header.key.toLowerCase())
+			) {
+				formData.config.push(header);
+			}
+		}
+		for (const key of ['name', 'description', 'shortDescription', 'icon'] as const) {
+			if (metadata[key] !== undefined) formData[key] = metadata[key];
+		}
+	}
 
 	const isAtLeastPowerUserPlus = $derived(profile.current?.groups.includes(Group.POWERUSER_PLUS));
 	const canConfigureTunnels = $derived(
@@ -118,8 +173,10 @@
 	const defaultDenyAllEgress = $derived(!!version.current.mcpDefaultDenyAllEgress);
 	const shortDescriptionError = $derived(
 		showRequired.shortDescription
-			? 'Short description is required'
-			: `Must be less than or equal to ${MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH} characters`
+			? m.mcps_catalog_form_short_description_required()
+			: m.mcps_catalog_form_short_description_max({
+					max: MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH
+				})
 	);
 	const hasShortDescriptionError = $derived(
 		showRequired.shortDescription ?? showInvalid.shortDescription
@@ -174,7 +231,7 @@
 	function convertToFormData(item?: MCPCatalogEntry | MCPCatalogServer): RuntimeFormData {
 		if (!item) {
 			// Default initialization for new servers
-			const isHostedType = type === 'hosted';
+			const isHostedType = type === 'hosted' || type === 'openapi';
 			return {
 				categories: [''],
 				metadata: undefined,
@@ -184,15 +241,25 @@
 				env: [],
 				icon: '',
 				serverUserType: isHostedType && entity === 'catalog' ? 'multiUser' : 'singleUser',
-				runtime: 'npx' as Runtime,
-				config: type !== 'multi' ? [] : undefined,
+				runtime: type === 'openapi' ? 'openapi' : ('npx' as Runtime),
+				config:
+					type !== 'multi'
+						? structuredClone($state.snapshot(initialOpenAPIImport?.result.suggestedHeaders ?? []))
+						: undefined,
+				openAPIConfig:
+					type === 'openapi'
+						? structuredClone(
+								$state.snapshot(initialOpenAPIImport?.config ?? { source: { url: '' } })
+							)
+						: undefined,
 				resources: type !== 'remote' ? defaultResourceRuntimeConfig() : undefined,
 				npxConfig: defaultNpxConfig(),
 				uvxConfig: undefined,
 				containerizedConfig: undefined,
 				remoteConfig: undefined,
 				remoteServerConfig: undefined,
-				multiUserConfig: isHostedType ? { userDefinedHeaders: [] } : undefined
+				multiUserConfig: isHostedType ? { userDefinedHeaders: [] } : undefined,
+				...initialOpenAPIImport?.result.suggestedMetadata
 			};
 		}
 
@@ -245,6 +312,8 @@
 								headers:
 									getManifestConfiguration(manifest).headers.map((h) => ({ ...h, value: '' })) ??
 									[],
+								localhostCallbackEnabled: manifest.remoteConfig.localhostCallbackEnabled,
+								localhostCallbackPath: manifest.remoteConfig.localhostCallbackPath,
 								tunnelName: manifest.remoteConfig.tunnelName
 							}
 						: { url: '', headers: [] };
@@ -265,6 +334,9 @@
 				shortDescription: manifest.shortDescription ?? '',
 				env: [],
 				config: manifest.config?.map((config) => ({ ...config, value: config.value ?? '' })) ?? [],
+				openAPIConfig: manifest.openAPIConfig
+					? structuredClone($state.snapshot(manifest.openAPIConfig))
+					: undefined,
 				description: manifest.description ?? '',
 				serverUserType: 'multiUser',
 				runtime: manifest.runtime,
@@ -343,14 +415,38 @@
 		}
 	}
 
+	// Static configuration values are stored by Obot and omitted from the entry manifest, so they
+	// are revealed separately to edit them.
+	async function revealCatalogEntry(id: string, entryId: string, entity: 'workspace' | 'catalog') {
+		if (!formData.config?.some((field) => field.static)) return;
+		try {
+			const revealFn =
+				entity === 'workspace'
+					? UserService.revealWorkspaceMCPCatalogEntry
+					: AdminService.revealMCPCatalogEntry;
+			const response = await revealFn(id, entryId, { dontLogErrors: true });
+			formData.config = formData.config?.map((field) =>
+				field.static && !field.value ? { ...field, value: response[field.key] ?? '' } : field
+			);
+		} catch (error) {
+			// Static fields submitted without a value keep their stored values, so the form remains usable.
+			console.error('Failed to reveal static configuration:', error);
+		}
+	}
+
 	// Runtime change handler
 	function handleRuntimeChange(newRuntime: Runtime) {
 		formData.runtime = newRuntime;
+		openAPIImported = false;
+		importedBaseURL = '';
+		destinationValidation = undefined;
+		overrideValidation = undefined;
 
 		// Clear all runtime configs first
 		formData.npxConfig = undefined;
 		formData.uvxConfig = undefined;
 		formData.containerizedConfig = undefined;
+		formData.openAPIConfig = undefined;
 		formData.remoteConfig = undefined;
 		formData.remoteServerConfig = undefined;
 
@@ -362,6 +458,9 @@
 
 		// Initialize the appropriate config based on the new runtime
 		switch (newRuntime) {
+			case 'openapi':
+				formData.openAPIConfig = { source: {} };
+				break;
 			case 'npx':
 				formData.npxConfig = defaultNpxConfig();
 				break;
@@ -388,7 +487,7 @@
 			})
 			.catch((err) => {
 				secretBindingTargets = [];
-				errors.append(`Failed to load Kubernetes Secrets for binding: ${err}`);
+				errors.append(m.mcps_catalog_form_load_secrets_failed({ error: String(err) }));
 			});
 	}
 
@@ -403,13 +502,20 @@
 	}
 
 	function hasDuplicateConfigKeys() {
-		const keys = (formData.config ?? []).map(({ key }) => key.trim()).filter(Boolean);
+		const keys = (formData.config ?? [])
+			.map(({ key }) => {
+				const trimmed = key.trim();
+				return formData.runtime === 'openapi' ? trimmed.toLowerCase() : trimmed;
+			})
+			.filter(Boolean);
 		return new Set(keys).size !== keys.length;
 	}
 
 	onMount(() => {
 		if (entry?.type === 'mcpserver' && id) {
 			revealCatalogServer(id, entry.id, entity);
+		} else if (entry && id) {
+			revealCatalogEntry(id, entry.id, entity);
 		}
 		if (version.current.engine === 'kubernetes') {
 			UserService.getK8sResourceDefaults()
@@ -456,7 +562,11 @@
 				? { shortDescription: baseData.shortDescription }
 				: {}),
 			icon: baseData.icon,
-			config: baseData.config?.map(stripSecretBindingSource),
+			config: baseData.config?.map((field) => {
+				const config = stripSecretBindingSource(field);
+				// Secret-bound values are never stored as static configuration.
+				return config.secretBinding ? { ...config, static: false } : config;
+			}),
 			runtime: baseData.runtime,
 			...(resources ? { resources } : {}),
 			...convertCategoriesToMetadata(categories, metadata)
@@ -464,6 +574,16 @@
 
 		// Add runtime-specific config based on the runtime type
 		switch (baseData.runtime) {
+			case 'openapi':
+				if (baseData.openAPIConfig) {
+					manifest.openAPIConfig = {
+						source: baseData.openAPIConfig.source,
+						baseURL: baseData.openAPIConfig.baseURL,
+						egressDomains: sanitizeEgressDomains(baseData.openAPIConfig.egressDomains),
+						denyAllEgress: baseData.openAPIConfig.denyAllEgress
+					};
+				}
+				break;
 			case 'npx':
 				if (baseData.npxConfig) {
 					manifest.npxConfig = {
@@ -509,6 +629,8 @@
 						hostname: baseData.remoteConfig.hostname?.trim() || undefined,
 						urlTemplate: baseData.remoteConfig.urlTemplate?.trim() || undefined,
 						staticOAuthRequired: baseData.remoteConfig.staticOAuthRequired,
+						localhostCallbackEnabled: baseData.remoteConfig.localhostCallbackEnabled,
+						localhostCallbackPath: baseData.remoteConfig.localhostCallbackPath?.trim() || undefined,
 						tunnelName: baseData.remoteConfig.tunnelName?.trim() || undefined
 					};
 				}
@@ -593,7 +715,10 @@
 	}
 
 	async function handleSubmit() {
-		if (!id) return;
+		if (!id || disposed || loading || (formData.runtime === 'openapi' && openAPIImporting)) return;
+		if (formData.runtime === 'openapi' && formData.openAPIConfig) {
+			formData.openAPIConfig = normalizeOpenAPIConfig(formData.openAPIConfig);
+		}
 
 		// reset
 		showRequired = {};
@@ -601,7 +726,14 @@
 
 		const validationData =
 			type !== 'multi' ? { ...formData, env: formData.config ?? [] } : formData;
-		const { required, invalid } = validateRuntimeForm(validationData, type);
+		const { required, invalid } = validateRuntimeForm(validationData, type, false, openAPIImported);
+		if (
+			formData.runtime === 'openapi' &&
+			destinationValidation?.valid === false &&
+			!formData.openAPIConfig?.baseURL?.trim()
+		) {
+			required.openAPIBaseURL = true;
+		}
 		if (type !== 'multi' && hasDuplicateConfigKeys()) {
 			invalid.env = true;
 		}
@@ -614,8 +746,45 @@
 
 		loading = true;
 		try {
+			if (formData.runtime === 'openapi' && formData.openAPIConfig?.baseURL?.trim()) {
+				const previewConfig = $state.snapshot(formData.openAPIConfig);
+				const controller = new AbortController();
+				destinationValidationController = controller;
+				let validation: OpenAPIDestinationValidation;
+				try {
+					validation = await validateOpenAPIDestination(previewConfig, controller.signal);
+				} catch (error) {
+					if (!disposed && !controller.signal.aborted) errors.append(error);
+					loading = false;
+					return;
+				} finally {
+					if (destinationValidationController === controller) {
+						destinationValidationController = undefined;
+					}
+				}
+
+				if (
+					disposed ||
+					controller.signal.aborted ||
+					openAPIImporting ||
+					formData.openAPIConfig?.baseURL !== previewConfig.baseURL ||
+					formData.openAPIConfig?.source.url !== previewConfig.source.url ||
+					formData.openAPIConfig?.source.content !== previewConfig.source.content
+				) {
+					loading = false;
+					return;
+				}
+				overrideValidation = validation;
+				if (!overrideValidation.valid) {
+					showInvalid.openAPIBaseURL = true;
+					highlightFirstAvailableField({ openAPIBaseURL: true }, CATALOG_SERVER_FIELD_IDS);
+					loading = false;
+					return;
+				}
+			}
 			const handleFns = {
 				hosted: handleEntrySubmit,
+				openapi: handleEntrySubmit,
 				multi: handleServerSubmit,
 				remote: handleEntrySubmit
 			};
@@ -646,7 +815,10 @@
 			}
 			loading = false;
 			formData = convertToFormData(entryResponse);
-			onSubmit?.(entryResponse, 'Catalog entry updated successfully!');
+			if (entryResponse.type !== 'mcpserver') {
+				await revealCatalogEntry(id, entryResponse.id, entity);
+			}
+			onSubmit?.(entryResponse, m.mcps_catalog_form_entry_updated());
 		} catch (error) {
 			loading = false;
 			throw error;
@@ -699,10 +871,10 @@
 					for={CATALOG_SERVER_FIELD_IDS.name}
 					class={twMerge('text-sm font-light capitalize', showRequired.name && 'error')}
 				>
-					Name
+					{m.core_name()}
 					{#if !readonly}
 						<span class={showRequired.name ? 'text-error' : ''} aria-hidden="true">*</span>
-						<span class="sr-only">(required)</span>
+						<span class="sr-only">{m.mcps_catalog_required_sr()}</span>
 					{/if}
 				</label>
 				<input
@@ -721,22 +893,22 @@
 				/>
 				{#if showRequired.name}
 					<p id={CATALOG_SERVER_FIELD_IDS.nameError} class="text-xs text-error" role="alert">
-						Name is required
+						{m.mcps_name_required()}
 					</p>
 				{/if}
 			</div>
 
 			<div class="flex flex-col gap-1" id={`${CATALOG_SERVER_FIELD_IDS.description}-container`}>
 				<span id={CATALOG_SERVER_FIELD_IDS.description} class="text-sm font-light capitalize">
-					Description
+					{m.core_description()}
 					<span id={CATALOG_SERVER_FIELD_IDS.descriptionHint} class="text-muted-content text-xs">
-						(Markdown syntax supported)
+						{m.mcps_catalog_markdown_supported()}
 					</span>
 				</span>
 				<MarkdownInput
 					bind:value={formData.description}
 					disabled={readonly}
-					placeholder="Provide details about the MCP server."
+					placeholder={m.mcps_catalog_form_description_placeholder()}
 					labelledBy={CATALOG_SERVER_FIELD_IDS.description}
 					describedBy={CATALOG_SERVER_FIELD_IDS.descriptionHint}
 				/>
@@ -750,16 +922,18 @@
 					for={CATALOG_SERVER_FIELD_IDS.shortDescription}
 					class={twMerge('text-sm font-light capitalize', hasShortDescriptionError && 'error')}
 				>
-					Short Description
+					{m.mcps_catalog_form_short_description()}
 					{#if !readonly}
 						<span class={hasShortDescriptionError ? 'text-error' : ''} aria-hidden="true">*</span>
-						<span class="sr-only">(required)</span>
+						<span class="sr-only">{m.mcps_catalog_required_sr()}</span>
 					{/if}
 					<span
 						id={CATALOG_SERVER_FIELD_IDS.shortDescriptionHint}
 						class="text-muted-content text-xs"
 					>
-						(max {MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH} characters)
+						{m.mcps_catalog_form_max_characters({
+							max: MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH
+						})}
 					</span>
 				</label>
 				<input
@@ -769,7 +943,7 @@
 					bind:value={formData.shortDescription}
 					class={twMerge('text-input-filled dark:bg-base-100', hasShortDescriptionError && 'error')}
 					disabled={readonly}
-					placeholder="Provide a brief summary that will be shown in catalog listings."
+					placeholder={m.mcps_catalog_form_short_description_placeholder()}
 					maxlength={MAX_CATALOG_ENTRY_SHORT_DESCRIPTION_LENGTH}
 					aria-required={!readonly ? 'true' : undefined}
 					aria-describedby={`${CATALOG_SERVER_FIELD_IDS.shortDescriptionHint} ${CATALOG_SERVER_FIELD_IDS.shortDescriptionCount}`}
@@ -809,7 +983,7 @@
 
 			<div class="flex flex-col gap-1" id={`${CATALOG_SERVER_FIELD_IDS.icon}-container`}>
 				<label for={CATALOG_SERVER_FIELD_IDS.icon} class="text-sm font-light capitalize"
-					>Icon URL</label
+					>{m.mcps_catalog_form_icon_url()}</label
 				>
 				<input
 					type="text"
@@ -826,12 +1000,14 @@
 	</section>
 
 	<!-- Runtime Selection -->
-	<RuntimeSelector
-		bind:runtime={formData.runtime}
-		serverType={type}
-		{readonly}
-		onRuntimeChange={handleRuntimeChange}
-	/>
+	{#if type !== 'openapi'}
+		<RuntimeSelector
+			bind:runtime={formData.runtime}
+			serverType={type}
+			{readonly}
+			onRuntimeChange={handleRuntimeChange}
+		/>
+	{/if}
 
 	<!-- Runtime-specific Forms -->
 	<div class="flex flex-col gap-8" id={`${CATALOG_SERVER_FIELD_IDS.runtimeConfiguration}`}>
@@ -864,6 +1040,31 @@
 				{readonly}
 				{showRequired}
 				onFieldChange={updateRequired}
+			/>
+		{:else if formData.runtime === 'openapi' && formData.openAPIConfig && id}
+			<OpenAPIConfiguration
+				bind:config={formData.openAPIConfig}
+				onEditingChange={(editing) => (openAPIImporting = editing)}
+				{showEgressDomains}
+				{defaultDenyAllEgress}
+				imported={openAPIImported}
+				{importedBaseURL}
+				{destinationValidation}
+				{overrideValidation}
+				{readonly}
+				current={{
+					name: formData.name,
+					description: formData.description,
+					shortDescription: formData.shortDescription,
+					icon: formData.icon
+				}}
+				onComplete={completeOpenAPIImport}
+				onBaseURLChange={() => {
+					overrideValidation = undefined;
+					updateRequired('openAPIBaseURL');
+					updateInvalid('openAPIBaseURL');
+				}}
+				showBaseURLError={showRequired.openAPIBaseURL || showInvalid.openAPIBaseURL}
 			/>
 		{:else if formData.runtime === 'remote' && type === 'multi' && formData.remoteServerConfig}
 			<RemoteRuntimeForm
@@ -919,6 +1120,8 @@
 	{#if type !== 'multi'}
 		<CatalogConfigurationForm
 			bind:config={formData.config}
+			headersOnly={formData.runtime === 'openapi'}
+			hasDuplicateKeys={formData.runtime === 'openapi' && hasDuplicateConfigKeys()}
 			{readonly}
 			secretBindingTargets={editableSecretBindingTargets}
 			showRequired={showRequired.env}
@@ -951,22 +1154,23 @@
 					role="alert"
 					tabindex="-1"
 				>
-					Fill out all required fields
+					{m.mcps_catalog_fill_required_fields()}
 				</span>
 			{/if}
 			<button
 				type="button"
 				class="btn btn-secondary flex items-center gap-1"
-				onclick={() => onCancel?.()}
+				onclick={handleCancel}
 				id={CATALOG_SERVER_FIELD_IDS.cancelBtn}
 			>
-				Cancel
+				{m.common_cancel()}
 			</button>
 			<button
 				type="submit"
 				data-form-action="save"
 				class="btn btn-primary flex items-center gap-1"
-				disabled={loading}
+				disabled={loading ||
+					(formData.runtime === 'openapi' && (!openAPIImported || openAPIImporting))}
 				aria-busy={loading}
 				id={CATALOG_SERVER_FIELD_IDS.submitBtn}
 			>
@@ -974,9 +1178,9 @@
 					<span aria-hidden="true">
 						<Loading class="size-4" />
 					</span>
-					<span class="sr-only">Saving</span>
+					<span class="sr-only">{m.mcps_catalog_saving()}</span>
 				{:else}
-					{entry ? 'Update' : 'Save'}
+					{entry ? m.core_update() : m.core_save()}
 				{/if}
 			</button>
 		</div>

@@ -14,10 +14,10 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
-	"github.com/obot-platform/obot/pkg/utils"
 	vmcpaccess "github.com/obot-platform/obot/pkg/vmcp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -29,49 +29,21 @@ var (
 	actionEnvVarRegex = regexp.MustCompile(`\${([^}]+)}`)
 )
 
-type missingCatalogEntryAdminConfig struct {
-	SecretBoundFields []string
-	StaticOAuth       bool
-}
-
-// IDAndAudienceFromConnectURL returns the MCP server or instance name and audience based on the provided connect URL.
-// The connect URL could have a vMCP ID, MCP server ID, server instance ID, or MCP catalog entry ID.
-func (sm *SessionManager) IDAndAudienceFromConnectURL(ctx context.Context, id, userID string) (string, string, error) {
-	if vmcp, _, err := vmcpaccess.ResolveConnectID(ctx, sm.storageClient, id, userID); err != nil {
-		return "", "", err
-	} else if vmcp != nil {
-		return id, id, nil
-	}
-
-	server, instance, err := sm.serverOrInstanceFromConnectURL(ctx, id, userID)
-	if err != nil {
-		return "", "", err
-	}
-
-	switch {
-	case instance.Name != "":
-		return instance.Name, instance.Spec.MCPServerName, nil
-	case server.Name != "":
-		return server.Name, id, nil
-	default:
-		return "", "", fmt.Errorf("unknown MCP server ID %s", id)
-	}
-}
-
-func (sm *SessionManager) ServerForActionWithConnectID(ctx context.Context, id, userID string) (string, v1.MCPServer, ServerConfig, error) {
-	id, server, config, _, err := sm.serverForActionWithConnectID(ctx, id, userID, false)
+func (sm *SessionManager) ServerForActionWithConnectID(ctx context.Context, id string, user kuser.Info) (string, v1.MCPServer, ServerConfig, error) {
+	id, server, config, _, err := sm.serverForActionWithConnectID(ctx, id, user, false)
 	return id, server, config, err
 }
 
-func (sm *SessionManager) ServerForActionWithConnectIDAllowMissingConfig(ctx context.Context, id, userID string) (string, v1.MCPServer, ServerConfig, []string, error) {
-	return sm.serverForActionWithConnectID(ctx, id, userID, true)
+func (sm *SessionManager) ServerForActionWithConnectIDAllowMissingConfig(ctx context.Context, id string, user kuser.Info) (string, v1.MCPServer, ServerConfig, []string, error) {
+	return sm.serverForActionWithConnectID(ctx, id, user, true)
 }
 
-func (sm *SessionManager) serverForActionWithConnectID(ctx context.Context, id, userID string, allowMissingConfig bool) (string, v1.MCPServer, ServerConfig, []string, error) {
+func (sm *SessionManager) serverForActionWithConnectID(ctx context.Context, id string, user kuser.Info, allowMissingConfig bool) (string, v1.MCPServer, ServerConfig, []string, error) {
+	userID := user.GetUID()
 	if vmcp, instance, err := vmcpaccess.ResolveConnectID(ctx, sm.storageClient, id, userID); err != nil {
 		return "", v1.MCPServer{}, ServerConfig{}, nil, err
 	} else if vmcp != nil {
-		server, config, err := sm.serverForVMCPAction(ctx, id, userID, vmcp, instance)
+		server, config, err := sm.serverForVMCPAction(ctx, id, user, vmcp, instance)
 		if err != nil {
 			return "", v1.MCPServer{}, ServerConfig{}, nil, err
 		}
@@ -95,15 +67,16 @@ func (sm *SessionManager) serverForActionWithConnectID(ctx context.Context, id, 
 	}
 }
 
-func (sm *SessionManager) ServerForAction(ctx context.Context, id, userID string) (v1.MCPServer, ServerConfig, error) {
+func (sm *SessionManager) ServerForAction(ctx context.Context, id string, user kuser.Info) (v1.MCPServer, ServerConfig, error) {
+	userID := user.GetUID()
 	if system.IsMCPServerInstanceID(id) {
-		_, server, config, _, err := sm.serverForActionWithConnectID(ctx, id, userID, false)
+		_, server, config, _, err := sm.serverForActionWithConnectID(ctx, id, user, false)
 		return server, config, err
 	}
 	if vmcp, instance, err := vmcpaccess.ResolveConnectID(ctx, sm.storageClient, id, userID); err != nil {
 		return v1.MCPServer{}, ServerConfig{}, err
 	} else if vmcp != nil {
-		return sm.serverForVMCPAction(ctx, id, userID, vmcp, instance)
+		return sm.serverForVMCPAction(ctx, id, user, vmcp, instance)
 	}
 
 	var server v1.MCPServer
@@ -111,12 +84,42 @@ func (sm *SessionManager) ServerForAction(ctx context.Context, id, userID string
 		return server, ServerConfig{}, err
 	}
 
+	if server.Spec.VMCPID != "" {
+		// The gateway only reaches shared vMCP components through the caller's connection to them.
+		connectionID, err := sm.sharedVMCPComponentConnection(ctx, server, userID)
+		if err != nil {
+			return server, ServerConfig{}, err
+		}
+		_, componentServer, serverConfig, _, err := sm.serverForActionWithConnectID(ctx, connectionID, user, false)
+		return componentServer, serverConfig, err
+	}
+
 	serverConfig, _, err := sm.serverConfigForAction(ctx, server, userID, false)
 	return server, serverConfig, err
 }
 
-func (sm *SessionManager) serverForVMCPAction(ctx context.Context, id, userID string, vmcp *v1.VMCP, instance *v1.VMCPInstance) (v1.MCPServer, ServerConfig, error) {
-	config, err := sm.serverConfigForVMCP(ctx, vmcp, instance, userID)
+// sharedVMCPComponentConnection returns the name of the user's connection to a shared vMCP component server.
+func (sm *SessionManager) sharedVMCPComponentConnection(ctx context.Context, server v1.MCPServer, userID string) (string, error) {
+	var connections v1.MCPServerInstanceList
+	if err := sm.storageClient.List(ctx, &connections,
+		kclient.InNamespace(server.Namespace),
+		kclient.MatchingFields{
+			"spec.mcpServerName": server.Name,
+			"spec.userID":        userID,
+		},
+	); err != nil {
+		return "", err
+	}
+	for _, connection := range connections.Items {
+		if connection.Spec.VMCPInstanceID != "" && connection.Spec.VMCPComponentID == server.Spec.VMCPComponentID && connection.DeletionTimestamp.IsZero() {
+			return connection.Name, nil
+		}
+	}
+	return "", types.NewErrBadRequest("connect to vMCP %s to use its shared component %s", server.Spec.VMCPID, server.Name)
+}
+
+func (sm *SessionManager) serverForVMCPAction(ctx context.Context, id string, user kuser.Info, vmcp *v1.VMCP, instance *v1.VMCPInstance) (v1.MCPServer, ServerConfig, error) {
+	config, err := sm.serverConfigForVMCP(ctx, vmcp, instance, user)
 	if err != nil {
 		return v1.MCPServer{}, ServerConfig{}, err
 	}
@@ -159,23 +162,7 @@ func (sm *SessionManager) serverOrInstanceFromConnectURL(ctx context.Context, id
 				return v1.MCPServer{}, v1.MCPServerInstance{}, err
 			}
 			if len(instances.Items) == 0 {
-				instance := v1.MCPServerInstance{
-					GenerateName: system.MCPServerInstancePrefix,
-					Namespace:    server.Namespace,
-					Spec: v1.MCPServerInstanceSpec{
-						MCPServerName:             id,
-						MCPCatalogName:            server.Spec.MCPCatalogID,
-						MCPServerCatalogEntryName: server.Spec.MCPServerCatalogEntryName,
-						PowerUserWorkspaceID:      server.Spec.PowerUserWorkspaceID,
-						UserID:                    userID,
-						Config:                    server.Spec.Manifest.UserConfig(),
-					},
-				}
-				if err := sm.storageClient.Create(ctx, &instance); err != nil {
-					return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an instance of MCP server %s", id)
-				}
-
-				instances.Items = append(instances.Items, instance)
+				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an instance of MCP server %s", id)
 			}
 
 			slices.SortFunc(instances.Items, func(a, b v1.MCPServerInstance) int {
@@ -187,83 +174,7 @@ func (sm *SessionManager) serverOrInstanceFromConnectURL(ctx context.Context, id
 
 		return server, v1.MCPServerInstance{}, nil
 	default:
-		var entry v1.MCPServerCatalogEntry
-		if err := sm.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: id}, &entry); err != nil {
-			return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("catalog entry %s not found", id)
-		}
-		addExtractedEnvVarsToCatalogEntry(&entry)
-
-		var servers v1.MCPServerList
-		if err := sm.storageClient.List(ctx, &servers,
-			kclient.InNamespace(system.DefaultNamespace),
-			kclient.MatchingFields{
-				"spec.mcpServerCatalogEntryName": id,
-				"spec.userID":                    userID,
-				"spec.template":                  "false",
-				"spec.compositeName":             "",
-			},
-		); err != nil {
-			return v1.MCPServer{}, v1.MCPServerInstance{}, err
-		}
-		servers.Items = slices.DeleteFunc(servers.Items, func(server v1.MCPServer) bool {
-			return server.Spec.VMCPID != "" || server.Spec.VMCPInstanceID != ""
-		})
-		if len(servers.Items) == 0 {
-			missingAdminConfig, err := sm.entryMissingAdminConfig(ctx, entry)
-			if err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, fmt.Errorf("failed to determine required admin configuration for catalog entry %s: %w", id, err)
-			}
-			if err := missingAdminConfig.err(id); err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, err
-			}
-
-			allowMissingURL := catalogEntryRequiresUserURL(entry.Spec.Manifest)
-			manifest, err := serverManifestFromCatalogEntryManifest(false, allowMissingURL, entry.Spec.Manifest, types.MCPServerManifest{})
-			if err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrBadRequest("catalog entry %s cannot be connected because it could not be converted to an MCP server: %v", id, err)
-			}
-			resourceMaximums, err := sm.EffectiveKubernetesResourceMaximums(ctx, sm.storageClient)
-			if err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, err
-			}
-			if err := ValidateServerManifest(ctx, manifest, false, ValidationOptions{
-				AllowMissingURL:              allowMissingURL,
-				RemoteMCPURLValidationConfig: sm.remoteURLValidationConfig,
-				ResourceMaximums:             resourceMaximums,
-			}); err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrBadRequest("catalog entry %s cannot be connected because its MCP server manifest is invalid: %v", id, err)
-			}
-
-			server := v1.MCPServer{
-				GenerateName: system.MCPServerPrefix,
-				Namespace:    system.DefaultNamespace,
-				Spec: v1.MCPServerSpec{
-					Manifest:                  manifest,
-					UnsupportedTools:          entry.Spec.UnsupportedTools,
-					MCPServerCatalogEntryName: id,
-					UserID:                    userID,
-					NeedsURL:                  allowMissingURL && (manifest.RemoteConfig == nil || manifest.RemoteConfig.URL == ""),
-				},
-			}
-			if err := sm.storageClient.Create(ctx, &server); err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, fmt.Errorf("failed to create MCP server for catalog entry %s: %w", id, err)
-			}
-
-			servers.Items = append(servers.Items, server)
-		}
-
-		slices.SortFunc(servers.Items, func(a, b v1.MCPServer) int {
-			return a.CreationTimestamp.Compare(b.CreationTimestamp.Time)
-		})
-
-		server := servers.Items[0]
-		if syncConnectServerRemoteConfigFromCatalogEntry(&server, entry) {
-			if err := sm.storageClient.Update(ctx, &server); err != nil {
-				return v1.MCPServer{}, v1.MCPServerInstance{}, fmt.Errorf("failed to update MCP server configuration from catalog entry %s: %w", id, err)
-			}
-		}
-
-		return server, v1.MCPServerInstance{}, nil
+		return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrBadRequest("invalid MCP connection ID %s", id)
 	}
 }
 
@@ -292,6 +203,7 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 			return server, ServerConfig{}, nil, err
 		}
 		server.Spec.Manifest.Config = vmcpaccess.ComponentConfig(component)
+		server.Spec.Manifest.StaticConfigurationRevision = component.CatalogEntry.Manifest.StaticConfigurationRevision
 		instance.Spec.Config = server.Spec.Manifest.UserConfig()
 		scope = server.Spec.VMCPID
 	} else if server.Spec.MCPCatalogID != "" {
@@ -312,12 +224,17 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 		return server, ServerConfig{}, nil, err
 	}
 
-	mergedEnv, err := MergeBoundCreds(ctx, sm.localK8sClient, sm.obotNamespace, server.Spec.Manifest.Config, cred.Secrets, sm.secretBindingAllowedLabel)
+	mergedEnv, err := MergeBoundCreds(ctx, sm.localCachedClient, sm.obotNamespace, server.Spec.Manifest.Config, cred.Secrets, sm.secretBindingAllowedLabel)
 	if err != nil {
 		return server, ServerConfig{}, nil, fmt.Errorf("failed to resolve secret bindings: %w", err)
 	}
 
-	serverConfig, missingConfig, err := ServerToServerConfig(server, instance.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv)
+	resolvedServer, err := ResolveServerStaticConfiguration(ctx, sm.gatewayClient, server)
+	if err != nil {
+		return server, ServerConfig{}, nil, err
+	}
+
+	serverConfig, missingConfig, err := ServerToServerConfig(resolvedServer, instance.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv, sm.devMode)
 	if err != nil {
 		return server, ServerConfig{}, nil, err
 	}
@@ -378,7 +295,7 @@ func (sm *SessionManager) serverConfigForAction(ctx context.Context, server v1.M
 		return ServerConfig{}, nil, fmt.Errorf("failed to find credential: %w", err)
 	}
 
-	mergedEnv, err := MergeBoundCreds(ctx, sm.localK8sClient, sm.obotNamespace, server.Spec.Manifest.Config, cred.Secrets, sm.secretBindingAllowedLabel)
+	mergedEnv, err := MergeBoundCreds(ctx, sm.localCachedClient, sm.obotNamespace, server.Spec.Manifest.Config, cred.Secrets, sm.secretBindingAllowedLabel)
 	if err != nil {
 		return ServerConfig{}, nil, fmt.Errorf("failed to resolve secret bindings: %w", err)
 	}
@@ -388,7 +305,12 @@ func (sm *SessionManager) serverConfigForAction(ctx context.Context, server v1.M
 		return ServerConfig{}, nil, err
 	}
 
-	serverConfig, missingConfig, err := ServerToServerConfig(server, server.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv)
+	resolvedServer, err := ResolveServerStaticConfiguration(ctx, sm.gatewayClient, server)
+	if err != nil {
+		return ServerConfig{}, nil, err
+	}
+
+	serverConfig, missingConfig, err := ServerToServerConfig(resolvedServer, server.ValidConnectURLs(sm.baseURL), userID, scope, catalogName, mergedEnv, sm.devMode)
 	if err != nil {
 		return ServerConfig{}, nil, err
 	}
@@ -414,7 +336,7 @@ func (sm *SessionManager) serverConfigForAction(ctx context.Context, server v1.M
 }
 
 func (sm *SessionManager) webhooksForServerConfig(serverConfig ServerConfig) ([]Webhook, error) {
-	if serverConfig.ComponentMCPServer || serverConfig.SystemMCPServer || serverConfig.IsAgentServer() || sm.webhookHelper == nil {
+	if serverConfig.ComponentMCPServer || serverConfig.SystemMCPServer || sm.webhookHelper == nil {
 		return nil, nil
 	}
 
@@ -526,183 +448,6 @@ func applyMCPServerInstanceHeaderPrefix(value, prefix string) string {
 	return prefix + value
 }
 
-func (m missingCatalogEntryAdminConfig) err(entryID string) error {
-	var parts []string
-	if len(m.SecretBoundFields) > 0 {
-		parts = append(parts, fmt.Sprintf("required Kubernetes Secret bindings are missing or empty for %s", strings.Join(m.SecretBoundFields, ", ")))
-	}
-	if m.StaticOAuth {
-		parts = append(parts, "required static OAuth credentials have not been configured")
-	}
-	if len(parts) == 0 {
-		return nil
-	}
-	return types.NewErrBadRequest("catalog entry %s cannot be connected because %s", entryID, strings.Join(parts, "; "))
-}
-
-func (sm *SessionManager) entryMissingAdminConfig(ctx context.Context, entry v1.MCPServerCatalogEntry) (missingCatalogEntryAdminConfig, error) {
-	missing := missingCatalogEntryAdminConfig{
-		StaticOAuth: entryRequiresStaticOAuthCreds(entry),
-	}
-
-	manifest := entry.Spec.Manifest
-	resolved, err := MergeBoundCreds(ctx, sm.localK8sClient, sm.obotNamespace, manifest.Config, nil, sm.secretBindingAllowedLabel)
-	if err != nil {
-		return missing, err
-	}
-	for _, config := range manifest.Config {
-		if config.Required && config.SecretBinding != nil {
-			if _, ok := resolved[config.Key]; !ok {
-				kind := "env"
-				if config.Usage == types.Header {
-					kind = "header"
-				}
-				missing.SecretBoundFields = append(missing.SecretBoundFields, secretBoundFieldLabel("", kind, config.ToHeader()))
-			}
-		}
-	}
-
-	return missing, nil
-}
-
-func entryRequiresStaticOAuthCreds(entry v1.MCPServerCatalogEntry) bool {
-	if entry.Spec.Manifest.RemoteConfig == nil || !entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired {
-		return false
-	}
-	return !entry.Status.OAuthCredentialConfigured
-}
-
-func secretBoundFieldLabel(prefix, kind string, h types.MCPHeader) string {
-	key := h.Key
-	if key == "" {
-		key = h.Name
-	}
-	if key == "" {
-		key = "<unknown>"
-	}
-	if prefix != "" {
-		return fmt.Sprintf("component %s %s %s", prefix, kind, key)
-	}
-	return fmt.Sprintf("%s %s", kind, key)
-}
-
-func catalogEntryRequiresUserURL(manifest types.MCPServerCatalogEntryManifest) bool {
-	if manifest.Runtime == types.RuntimeRemote &&
-		manifest.RemoteConfig != nil &&
-		(manifest.RemoteConfig.Hostname != "" || manifest.RemoteConfig.URLTemplate != "") {
-		return true
-	}
-	return false
-}
-
-func syncConnectServerRemoteConfigFromCatalogEntry(server *v1.MCPServer, entry v1.MCPServerCatalogEntry) bool {
-	if server.Spec.Manifest.Runtime != types.RuntimeRemote || entry.Spec.Manifest.Runtime != types.RuntimeRemote || entry.Spec.Manifest.RemoteConfig == nil {
-		return false
-	}
-
-	before := utils.Digest(server.Spec)
-	entryRemote := entry.Spec.Manifest.RemoteConfig
-	if server.Spec.Manifest.RemoteConfig == nil {
-		server.Spec.Manifest.RemoteConfig = new(types.RemoteRuntimeConfig)
-	}
-	serverRemote := server.Spec.Manifest.RemoteConfig
-
-	server.Spec.Manifest.Config = entry.Spec.Manifest.Config
-	serverRemote.StaticOAuthRequired = entryRemote.StaticOAuthRequired
-	serverRemote.TunnelName = entryRemote.TunnelName
-	switch {
-	case entryRemote.Hostname != "":
-		serverRemote.Hostname = entryRemote.Hostname
-		serverRemote.IsTemplate = false
-		serverRemote.URLTemplate = ""
-		if serverRemote.URL == "" {
-			server.Spec.NeedsURL = true
-		} else if err := types.ValidateURLHostname(serverRemote.URL, entryRemote.Hostname); err != nil {
-			server.Spec.NeedsURL = true
-			server.Spec.PreviousURL = serverRemote.URL
-			serverRemote.URL = ""
-		} else {
-			server.Spec.NeedsURL = false
-			server.Spec.PreviousURL = ""
-		}
-	case entryRemote.URLTemplate != "":
-		serverRemote.IsTemplate = true
-		serverRemote.URLTemplate = entryRemote.URLTemplate
-		serverRemote.Hostname = ""
-		server.Spec.NeedsURL = serverRemote.URL == ""
-		if !server.Spec.NeedsURL {
-			server.Spec.PreviousURL = ""
-		}
-	}
-
-	return before != utils.Digest(server.Spec)
-}
-
-func serverManifestFromCatalogEntryManifest(isAdmin, disableHostnameValidation bool, entry types.MCPServerCatalogEntryManifest, input types.MCPServerManifest) (types.MCPServerManifest, error) {
-	var userURL string
-	if entry.Runtime == types.RuntimeRemote &&
-		entry.RemoteConfig != nil &&
-		entry.RemoteConfig.Hostname != "" &&
-		input.RemoteConfig != nil {
-		userURL = input.RemoteConfig.URL
-	}
-
-	result, err := types.MapCatalogEntryToServer(entry, userURL, disableHostnameValidation)
-	if err != nil {
-		return types.MCPServerManifest{}, err
-	}
-
-	if isAdmin {
-		result = mergeMCPServerManifests(result, input)
-	}
-
-	return *result.DeepCopy(), nil
-}
-
-func mergeMCPServerManifests(existing, override types.MCPServerManifest) types.MCPServerManifest {
-	if override.Name != "" {
-		existing.Name = override.Name
-	}
-	if override.ShortDescription != "" {
-		existing.ShortDescription = override.ShortDescription
-	}
-	if override.Description != "" {
-		existing.Description = override.Description
-	}
-	if override.Icon != "" {
-		existing.Icon = override.Icon
-	}
-	if len(override.Config) > 0 {
-		existing.Config = override.Config
-	}
-	if override.Resources != nil {
-		existing.Resources = override.Resources
-	}
-	if override.Runtime != "" {
-		existing.Runtime = override.Runtime
-	}
-	if override.UVXConfig != nil {
-		existing.UVXConfig = override.UVXConfig
-	}
-	if override.NPXConfig != nil {
-		existing.NPXConfig = override.NPXConfig
-	}
-	if override.ContainerizedConfig != nil {
-		existing.ContainerizedConfig = override.ContainerizedConfig
-	}
-	if override.RemoteConfig != nil {
-		if existing.RemoteConfig == nil {
-			existing.RemoteConfig = override.RemoteConfig
-		} else {
-			if override.RemoteConfig.URL != "" {
-				existing.RemoteConfig.URL = override.RemoteConfig.URL
-			}
-		}
-	}
-
-	return existing
-}
-
 func extractEnvVars(text string) []string {
 	if text == "" {
 		return nil
@@ -762,69 +507,6 @@ func addExtractedEnvVars(server *v1.MCPServer) {
 					Sensitive:   true,
 					Required:    true,
 				})
-			}
-		}
-	}
-}
-
-func addExtractedEnvVarsToCatalogEntry(entry *v1.MCPServerCatalogEntry) {
-	addExtractedEnvVarsToCatalogEntryManifest(&entry.Spec.Manifest)
-}
-
-func addExtractedEnvVarsToCatalogEntryManifest(manifest *types.MCPServerCatalogEntryManifest) {
-	if manifest == nil {
-		return
-	}
-
-	existing := make(map[string]struct{})
-	for _, config := range manifest.Config {
-		existing[config.Key] = struct{}{}
-	}
-
-	var toExtract []string
-	switch manifest.Runtime {
-	case types.RuntimeUVX:
-		if manifest.UVXConfig != nil {
-			toExtract = append(toExtract, manifest.UVXConfig.Command)
-			if len(manifest.UVXConfig.Args) > 0 {
-				toExtract = append(toExtract, manifest.UVXConfig.Args...)
-			}
-		}
-	case types.RuntimeNPX:
-		if manifest.NPXConfig != nil && len(manifest.NPXConfig.Args) > 0 {
-			toExtract = append(toExtract, manifest.NPXConfig.Args...)
-		}
-	case types.RuntimeContainerized:
-		if manifest.ContainerizedConfig != nil {
-			toExtract = append(toExtract, manifest.ContainerizedConfig.Command)
-			if len(manifest.ContainerizedConfig.Args) > 0 {
-				toExtract = append(toExtract, manifest.ContainerizedConfig.Args...)
-			}
-		}
-	case types.RuntimeRemote:
-		if manifest.RemoteConfig != nil {
-			toExtract = append(toExtract, manifest.RemoteConfig.URLTemplate)
-		}
-	}
-
-	for _, v := range toExtract {
-		for _, env := range extractEnvVars(v) {
-			if _, exists := existing[env]; !exists {
-				usage := types.Env
-				sensitive := true
-				if manifest.Runtime == types.RuntimeRemote {
-					usage = types.Header
-					sensitive = false
-				}
-				manifest.Config = append(manifest.Config, types.MCPConfig{
-					Name:        env,
-					Key:         env,
-					Description: "Automatically detected variable",
-					Sensitive:   sensitive,
-					Required:    true,
-					Usage:       usage,
-				})
-				existing[env] = struct{}{}
 			}
 		}
 	}

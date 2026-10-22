@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { m } from '$lib/i18n';
+	import type { LocalizedString } from '$lib/paraglide/messages';
 	import {
 		UserService,
 		type MCPCatalogEntry,
@@ -27,9 +29,10 @@
 			configuration: VMCPConfigurationPolicy[],
 			forceSingleUser: boolean
 		) => void | Promise<void>;
+		onConfigurationDismiss?: () => void;
 	}
 
-	let { onConfigurationNext }: Props = $props();
+	let { onConfigurationNext, onConfigurationDismiss }: Props = $props();
 
 	let selectInstanceDialog = $state<ReturnType<typeof VMcpSelectInstance>>();
 	let diffDialog = $state<ReturnType<typeof VMcpDiffDialog>>();
@@ -39,7 +42,7 @@
 	let updateName = $state('');
 	let updating = $state(false);
 	let onSelectInstance = $state<(instance: VMCPInstance) => void>();
-	let selectInstanceTitle = $state('Select Your Connection');
+	let selectInstanceTitle = $state<string>(m.vmcps_select_your_connection());
 	let pendingUpdate = $state<() => Promise<void>>();
 	let pendingUpdateVMcp = $state<VMCP>();
 	let continueUpdateAfterClose = false;
@@ -59,7 +62,7 @@
 	export function openSelectInstance(
 		instances: VMCPInstance[],
 		onSelect: (instance: VMCPInstance) => void,
-		title = 'Select Your Connection'
+		title: string = m.vmcps_select_your_connection()
 	) {
 		onSelectInstance = onSelect;
 		selectInstanceTitle = title;
@@ -82,6 +85,38 @@
 		connectVMcpDialog?.open(vmcp, targetInstance, options);
 	}
 
+	export function openReauthenticate(vmcp: VMCP, componentIDs: string[]) {
+		const instance = vmcpInstances.current.items.find(
+			(candidate) =>
+				candidate.vmcpID === vmcp.id &&
+				candidate.userID === profile.current.id &&
+				!candidate.deleted
+		);
+		connectVMcpDialog?.openReauthenticate(vmcp, componentIDs, instance, { connectReturn: 'list' });
+	}
+
+	// Resolves once the user finishes or dismisses the component's OAuth prompt.
+	export async function reauthenticateComponent(vmcp: VMCP, componentID: string) {
+		const instance = vmcpInstances.current.items.find(
+			(candidate) =>
+				candidate.vmcpID === vmcp.id &&
+				candidate.userID === profile.current.id &&
+				!candidate.deleted
+		);
+		await new Promise<void>((resolve, reject) => {
+			if (!connectVMcpDialog) {
+				resolve();
+				return;
+			}
+			connectVMcpDialog
+				.reauthenticateComponent(vmcp, instance, componentID, {
+					onConnected: resolve,
+					onDismissed: resolve
+				})
+				.catch(reject);
+		});
+	}
+
 	export function openEditInstanceConfiguration(
 		vmcp: VMCP,
 		instance: VMCPInstance,
@@ -95,8 +130,9 @@
 		options?: {
 			configuration?: VMCPConfigurationPolicy[];
 			forceSingleUser?: boolean;
-			submitLabel?: string;
-			errorMessage?: string;
+			isShared?: boolean;
+			submitLabel?: LocalizedString;
+			errorMessage?: LocalizedString;
 		}
 	) {
 		pendingConfigUpdate = undefined;
@@ -105,7 +141,7 @@
 	}
 
 	export function openUpdateConfirm(vmcp: VMCP, onConfirm: () => Promise<void>) {
-		updateName = vmcp.displayName || 'Untitled vMCP';
+		updateName = vmcp.displayName || m.vmcps_untitled_vmcp();
 		pendingUpdateVMcp = vmcp;
 		pendingUpdate = onConfirm;
 		showUpdateConfirm = true;
@@ -130,9 +166,10 @@
 
 		configurationDialog?.open(current.entry, {
 			configuration,
+			isShared: !pending.vmcp.userID,
 			forceSingleUser: current.component.forceSingleUser,
-			submitLabel: pending.index === pending.queue.length - 1 ? 'Update' : 'Next',
-			errorMessage: 'Failed to update vMCP.'
+			submitLabel: pending.index === pending.queue.length - 1 ? m.core_update() : m.core_next(),
+			errorMessage: m.vmcps_failed_to_update()
 		});
 	}
 
@@ -184,8 +221,8 @@
 			pendingConfigUpdate = undefined;
 			await onConfirm();
 		} catch {
-			errors.append('Failed to update vMCP.');
-			throw new Error('Failed to update vMCP.');
+			errors.append(m.vmcps_failed_to_update());
+			throw new Error(m.vmcps_failed_to_update());
 		}
 	}
 
@@ -196,6 +233,7 @@
 			return;
 		}
 		pendingConfigUpdate = undefined;
+		onConfigurationDismiss?.();
 	}
 
 	async function confirmUpdate() {
@@ -250,15 +288,17 @@
 	oncancel={() => (showUpdateConfirm = false)}
 	loading={updating}
 	type="info"
-	title="Confirm Update"
+	title={m.vmcps_confirm_update()}
 >
 	{#snippet msgContent()}
 		<h4 class="flex items-center justify-center gap-2 text-lg font-semibold">
 			<CircleAlert class="size-5" />
-			{`Update ${updateName}?`}
+			{m.vmcps_continue_with_update()}
 		</h4>
 	{/snippet}
 	{#snippet note()}
-		<p class="text-sm font-light">The vMCP and its components will be updated to latest version.</p>
+		<p class="text-sm font-light">
+			{m.vmcps_update_confirm_note({ name: updateName })}
+		</p>
 	{/snippet}
 </Confirm>

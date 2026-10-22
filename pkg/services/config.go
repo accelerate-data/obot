@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/mail"
 	"net/url"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/adrg/xdg"
 	"github.com/glebarez/sqlite"
 	kinmdb "github.com/obot-platform/kinm/pkg/db"
 	"github.com/obot-platform/nah"
@@ -23,13 +23,9 @@ import (
 	"github.com/obot-platform/nah/pkg/router"
 	apiclienttypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/accesscontrolrule"
-	"github.com/obot-platform/obot/pkg/agentbackend"
-	agentbackendfake "github.com/obot-platform/obot/pkg/agentbackend/fake"
-	agentbackendkubernetes "github.com/obot-platform/obot/pkg/agentbackend/kubernetes"
 	"github.com/obot-platform/obot/pkg/api/authn"
 	"github.com/obot-platform/obot/pkg/api/authz"
 	"github.com/obot-platform/obot/pkg/api/handlers"
-	"github.com/obot-platform/obot/pkg/api/handlers/agentconnect"
 	"github.com/obot-platform/obot/pkg/api/server"
 	"github.com/obot-platform/obot/pkg/api/server/audit"
 	"github.com/obot-platform/obot/pkg/api/server/ratelimiter"
@@ -42,7 +38,6 @@ import (
 	otime "github.com/obot-platform/obot/pkg/gateway/time"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/hash"
-	"github.com/obot-platform/obot/pkg/hostedagentaccessrule"
 	"github.com/obot-platform/obot/pkg/imagepullsecrets"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/license"
@@ -56,14 +51,16 @@ import (
 	"github.com/obot-platform/obot/pkg/otel"
 	"github.com/obot-platform/obot/pkg/producttelemetry"
 	"github.com/obot-platform/obot/pkg/proxy"
+	"github.com/obot-platform/obot/pkg/scim"
+	scimsetup "github.com/obot-platform/obot/pkg/scim/setup"
 	"github.com/obot-platform/obot/pkg/serviceaccounts"
 	"github.com/obot-platform/obot/pkg/skillaccessrule"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storageauthn "github.com/obot-platform/obot/pkg/storage/authn"
-	"github.com/obot-platform/obot/pkg/storage/blob"
 	"github.com/obot-platform/obot/pkg/storage/scheme"
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
+	"github.com/obot-platform/obot/pkg/substrate"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/tunnel"
 	"github.com/obot-platform/obot/pkg/upgrade"
@@ -71,7 +68,6 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apiserver/pkg/authentication/request/union"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
@@ -98,6 +94,7 @@ type (
 )
 
 type Config struct {
+	GitMaxRepoSizeMB                               int      `usage:"Maximum git repository size in MB" default:"100" name:"git-max-repo-size-mb"`
 	ModelProxyURL                                  string   `usage:"MCP Tester model proxy base URL; empty disables the model proxy" default:"https://model-service.obot.ai"`
 	HTTPListenPort                                 int      `usage:"HTTP port to listen on" default:"8080" name:"http-listen-port"`
 	AllowedOrigin                                  string   `usage:"Allowed origin for CORS"`
@@ -111,11 +108,11 @@ type Config struct {
 	TunnelPeerID                                   string   `usage:"Unique Pod UID of this Obot replica for tunnel peering"`
 	TunnelPeerToken                                string   `usage:"Shared internal credential for tunnel peering"`
 
-	MCPOAuthClientExpiration       string   `usage:"The expiration time in dynamically registered MCP OAuth clients, must be a valid duration string and may include days, hours, or minutes" default:"30d"`
-	MCPOAuthClientNativeExceptions []string `usage:"Additional Client ID Metadata Document URLs that default to the native application type when application_type is omitted"`
-	MCPOAuthCompletionURL          string   `usage:"Where downstream-only MCP OAuth flows finish (root-relative path or absolute http(s) URL); empty keeps Obot's page" env:"OBOT_SERVER_MCP_OAUTH_COMPLETION_URL"`
-	ForceDynamicClient             bool     `usage:"Force Dynamic Client Registration for MCP OAuth instead of Client ID Metadata Documents"`
-	ProductAnalyticsForceEnabled   bool     `usage:"Force-enable product analytics and disable the consent API" default:"false"`
+	MCPOAuthClientExpiration       string                `usage:"The expiration time in dynamically registered MCP OAuth clients, must be a valid duration string and may include days, hours, or minutes" default:"30d"`
+	MCPOAuthClientNativeExceptions []string              `usage:"Additional Client ID Metadata Document URLs that default to the native application type when application_type is omitted"`
+	ForceDynamicClient             bool                  `usage:"Force Dynamic Client Registration for MCP OAuth instead of Client ID Metadata Documents"`
+	ProductAnalyticsMode           producttelemetry.Mode `usage:"Product analytics mode: consent, on, or off" default:"consent" env:"OBOT_SERVER_PRODUCT_ANALYTICS_MODE"`
+	MCPOAuthCompletionURL          string                `usage:"Where downstream-only MCP OAuth flows finish (root-relative path or absolute http(s) URL); empty keeps Obot's page" env:"OBOT_SERVER_MCP_OAUTH_COMPLETION_URL"`
 
 	DevMode              bool   `usage:"Enable development mode" default:"false" name:"dev-mode" env:"OBOT_DEV_MODE"`
 	DevUIPort            int    `usage:"The port on localhost running the dev instance of the UI" default:"5174"`
@@ -124,34 +121,29 @@ type Config struct {
 	ForceEnableBootstrap bool   `usage:"Enables the bootstrap user even if other admin users have been created" default:"false"`
 	MetricsBearerToken   string `usage:"Bearer token for metrics endpoint authentication" name:"metrics-bearer-token"`
 
-	DefaultMCPCatalogPath                string `usage:"The path to the default MCP catalog (accessible to all users)" default:""`
-	DefaultSystemMCPCatalogPath          string `usage:"The path to the default System MCP catalog" default:""`
-	MDMAssetSource                       string `usage:"The source for MDM assets (a local directory, a tar archive path, or an HTTP(S) tarball URL)" default:"https://github.com/obot-platform/obot-sentry/releases/download/v0.1.7/mdm-assets.tar.gz" env:"OBOT_SERVER_MDM_ASSET_SOURCE"`
-	DefaultSkillRepoURL                  string `usage:"The default skill repository URL (must be HTTPS GitHub URL)" default:"https://github.com/obot-platform/skills" env:"OBOT_DEFAULT_SKILL_REPO_URL"`
-	DefaultSkillRepoRef                  string `usage:"The ref (branch/tag) for the default skill repository" default:"" env:"OBOT_DEFAULT_SKILL_REPO_REF"`
-	DefaultHostedAgentsCatalogURL        string `usage:"The default hosted agent catalog repository URL (must be HTTPS)" default:"https://github.com/obot-platform/hosted-agents-catalog" env:"OBOT_DEFAULT_HOSTED_AGENTS_CATALOG_URL"`
-	DefaultHostedAgentsCatalogRef        string `usage:"The ref (branch/tag) for the default hosted agent catalog repository" default:"" env:"OBOT_DEFAULT_HOSTED_AGENTS_CATALOG_REF"`
-	ModelInfoSourceURL                   string `usage:"Authoritative URL for the model info (pricing) source synced into model costs; changes take effect on restart, empty disables it" default:"https://models.dev/api.json"`
-	DisableUpdateCheck                   bool   `usage:"Disable Obot server update checks"`
-	HideK8sDetails                       bool   `usage:"Hide Kubernetes configuration details such as the Server Scheduling page from the UI" default:"false"`
-	EnableRegistryAuth                   bool   `usage:"Enable authentication for the MCP registry API" default:"false" env:"OBOT_SERVER_ENABLE_REGISTRY_AUTH"`
-	EnableMessagePolicies                bool   `usage:"Enable message policies for LLM proxy content enforcement" default:"false"`
-	LLMAuditLogRetentionDays             int    `usage:"Number of days to retain LLM audit logs (0 to disable cleanup)." default:"90"`
-	DisableLLMAuditLog                   bool   `usage:"Disable LLM gateway audit logging" default:"false"`
-	DeviceScanRetentionDays              int    `usage:"Number of days to retain submitted device scans (0 to disable cleanup)." default:"90"`
-	EnableAgents                         *bool  `usage:"Enable Obot Agent features. When unset, agents are disabled for new deployments but grandfathered in for deployments that already have agents. Explicitly set to true to force-enable, or false to force-disable, regardless of grandfathering." env:"OBOT_ENABLE_AGENTS"`
-	EnableHostedAgents                   bool   `usage:"Enable Hosted Agents features" default:"false"`
-	HostedAgentsBackend                  string `usage:"Hosted agent runtime backend (disabled, fake, or kubernetes). Defaults to the MCP runtime backend: kubernetes when MCP servers run on Kubernetes, and otherwise fake, since there is no docker agent backend." name:"hosted-agents-backend" env:"OBOT_HOSTED_AGENTS_BACKEND"`
-	HostedAgentsStorageClassName         string `usage:"StorageClass for hosted agent pool volumes. It should use volumeBindingMode WaitForFirstConsumer, which is what keeps a pool on one node." name:"hosted-agents-storage-class-name"`
-	HostedAgentsPodSecurityLevel         string `usage:"Pod Security Admission level enforced on the namespace hosted agent sandboxes run in (privileged, baseline, or restricted). Must match the namespace's own label or sandboxes are refused at admission. Empty means restricted." name:"hosted-agents-pod-security-level" env:"OBOT_HOSTED_AGENTS_POD_SECURITY_LEVEL"`
-	HostedAgentsImagePullPolicy          string `usage:"Pull policy for hosted agent sandbox images (Always, IfNotPresent, Never)" default:"" name:"hosted-agents-image-pull-policy" env:"OBOT_HOSTED_AGENTS_IMAGE_PULL_POLICY"`
-	HostedAgentsCleanupImage             string `usage:"Image used to erase a deleted sandbox's directory from its pool volume. Needs a shell and coreutils." name:"hosted-agents-cleanup-image" default:"busybox:1.36"`
-	HostedAgentsRuntimeClassName         string `usage:"RuntimeClass for hosted agent deployments" name:"hosted-agents-runtime-class-name"`
-	HostedAgentsAffinity                 string `usage:"Affinity rules for hosted agent pods (JSON)" name:"hosted-agents-affinity"`
-	HostedAgentsTolerations              string `usage:"Tolerations for hosted agent pods (JSON)" name:"hosted-agents-tolerations"`
-	HostedAgentsNodeSelector             string `usage:"Node selector for hosted agent pods (JSON)" name:"hosted-agents-node-selector"`
-	MCPServerSearchImage                 string `usage:"Container image for the obot MCP server" default:"ghcr.io/obot-platform/obot-mcp-server:v0.2.0"`
-	NanobotAgentImage                    string `usage:"Container image for the Nanobot agent MCP server" default:"ghcr.io/obot-platform/nanobot-agent:v0.0.92"`
+	DefaultMCPCatalogPath       string `usage:"The path to the default MCP catalog (accessible to all users)" default:""`
+	DefaultSystemMCPCatalogPath string `usage:"The path to the default System MCP catalog" default:""`
+	MDMAssetSource              string `usage:"The source for MDM assets (a local directory, a tar archive path, or an HTTP(S) tarball URL)" default:"https://github.com/obot-platform/obot-sentry/releases/download/v0.1.8/mdm-assets.tar.gz" env:"OBOT_SERVER_MDM_ASSET_SOURCE"`
+	DefaultSkillRepoURL         string `usage:"The default skill repository URL (must be HTTPS GitHub URL)" default:"https://github.com/obot-platform/skills" env:"OBOT_DEFAULT_SKILL_REPO_URL"`
+	DefaultSkillRepoRef         string `usage:"The ref (branch/tag) for the default skill repository" default:"" env:"OBOT_DEFAULT_SKILL_REPO_REF"`
+	ModelInfoSourceURL          string `usage:"Authoritative URL for the model info (pricing) source synced into model costs; changes take effect on restart, empty disables it" default:"https://models.dev/api.json"`
+	DisableUpdateCheck          bool   `usage:"Disable Obot server update checks"`
+	HideK8sDetails              bool   `usage:"Hide Kubernetes configuration details such as the Server Scheduling page from the UI" default:"false"`
+	EnableRegistryAuth          bool   `usage:"Enable authentication for the MCP registry API" default:"false" env:"OBOT_SERVER_ENABLE_REGISTRY_AUTH"`
+	EnableMessagePolicies       bool   `usage:"Enable message policies for LLM proxy content enforcement" default:"false"`
+	EgressAuditLogRetentionDays int    `usage:"Days to retain egress audit logs (0 disables cleanup)." default:"90"`
+	LLMAuditLogRetentionDays    int    `usage:"Number of days to retain LLM audit logs (0 to disable cleanup)." default:"90"`
+	DisableLLMAuditLog          bool   `usage:"Disable LLM gateway audit logging" default:"false"`
+	DeviceScanRetentionDays     int    `usage:"Number of days to retain submitted device scans (0 to disable cleanup)." default:"90"`
+	SubstrateRunnerImage        string `usage:"Default digest-pinned Claude runner image for new environments" default:"ghcr.io/obot-platform/obot-claude-runner@sha256:c6bef775ba97a3af60c7cad2c623598c583a6e33b7a1b1c3daec49e4f493cc8a"`
+	SubstrateWorkerImage        string `usage:"Default Substrate worker image for new environments"`
+	SubstrateWorkerNodeSelector string `usage:"JSON node selector applied to all Substrate workers" default:"{\"kubernetes.io/os\":\"linux\"}"`
+	SubstrateWorkerTolerations  string `usage:"JSON tolerations applied to all Substrate workers, e.g. [{\"key\":\"workload\",\"operator\":\"Equal\",\"value\":\"agents\",\"effect\":\"NoSchedule\"}]" default:"[]"`
+	SubstrateNamespace          string `usage:"Namespace for Claude environment worker pools" default:"obot-agents"`
+	SubstrateAddress            string `usage:"Substrate gRPC address; empty disables Claude environments"`
+	SubstrateSnapshotLocation   string `usage:"Substrate snapshot bucket URI"`
+	SubstrateObotURL            string `usage:"Obot URL reachable from actors; defaults to server URL"`
+
 	MCPNetworkPolicyProviderChartRepo    string `usage:"Helm repository URL for the network policy provider chart"`
 	MCPNetworkPolicyProviderChartName    string `usage:"Helm chart name for the network policy provider chart"`
 	MCPNetworkPolicyProviderChartVersion string `usage:"Helm chart version for the network policy provider chart"`
@@ -160,17 +152,6 @@ type Config struct {
 	MCPDefaultDenyAllEgress              bool   `usage:"Default new MCP servers to deny all egress when network policy enforcement is enabled" default:"false"`
 
 	// Published artifact storage
-	ArtifactStorageProvider       string `usage:"Storage provider for published artifacts (s3, gcs, azure, custom)" name:"artifact-storage-provider" env:"OBOT_ARTIFACT_STORAGE_PROVIDER"`
-	ArtifactStorageBucket         string `usage:"Bucket for published artifacts" name:"artifact-storage-bucket" env:"OBOT_ARTIFACT_STORAGE_BUCKET"`
-	ArtifactS3Region              string `usage:"S3 region for artifact storage" name:"artifact-s3-region" env:"OBOT_ARTIFACT_S3_REGION"`
-	ArtifactS3AccessKeyID         string `usage:"S3 access key ID for artifact storage" name:"artifact-s3-access-key-id" env:"OBOT_ARTIFACT_S3_ACCESS_KEY_ID"`
-	ArtifactS3SecretAccessKey     string `usage:"S3 secret access key for artifact storage" name:"artifact-s3-secret-access-key" env:"OBOT_ARTIFACT_S3_SECRET_ACCESS_KEY"`
-	ArtifactS3Endpoint            string `usage:"Custom S3 endpoint for artifact storage" name:"artifact-s3-endpoint" env:"OBOT_ARTIFACT_S3_ENDPOINT"`
-	ArtifactGCSServiceAccountJSON string `usage:"GCS service account JSON for artifact storage (omit to use Application Default Credentials)" name:"artifact-gcs-service-account-json" env:"OBOT_ARTIFACT_GCS_SERVICE_ACCOUNT_JSON"`
-	ArtifactAzureStorageAccount   string `usage:"Azure storage account name for artifact storage" name:"artifact-azure-storage-account" env:"OBOT_ARTIFACT_AZURE_STORAGE_ACCOUNT"`
-	ArtifactAzureTenantID         string `usage:"Azure tenant ID for artifact storage" name:"artifact-azure-tenant-id" env:"OBOT_ARTIFACT_AZURE_TENANT_ID"`
-	ArtifactAzureClientID         string `usage:"Azure client ID for artifact storage" name:"artifact-azure-client-id" env:"OBOT_ARTIFACT_AZURE_CLIENT_ID"`
-	ArtifactAzureClientSecret     string `usage:"Azure client secret for artifact storage" name:"artifact-azure-client-secret" env:"OBOT_ARTIFACT_AZURE_CLIENT_SECRET"`
 
 	GatewayConfig
 	EncryptionConfig
@@ -182,6 +163,7 @@ type Config struct {
 }
 
 type Services struct {
+	GitMaxRepoSizeMB      int
 	EncryptionConfig      *encryptionconfig.EncryptionConfiguration
 	StorageClient         storage.Client
 	StorageDB             *kinmdb.Factory
@@ -195,9 +177,9 @@ type Services struct {
 	AuditLogger           audit.Logger
 	DSN                   string
 	ServerURL             string
-	// AgentServerURL is Obot's address as a sandbox can reach it, which differs
-	// from ServerURL when Obot runs outside the cluster its sandboxes run in.
-	AgentServerURL    string
+	// LocalServerURL is Obot's address as Obot itself can reach it, which differs
+	// from ServerURL when the public port is mapped by a Service or ingress.
+	LocalServerURL    string
 	MCPSessionManager *mcp.SessionManager
 	TunnelManager     *tunnel.Manager
 	OAuthServerConfig handlers.OAuthAuthorizationServerConfig
@@ -207,23 +189,21 @@ type Services struct {
 	MCPSecretBindingAllowedLabel string
 	RegistryNoAuth               bool
 
-	PostgresDSN                   string
-	ProviderRegistryPaths         []string
-	DevUIPort                     int
-	DevMode                       bool
-	UserUIPort                    int
-	GatewayServer                 *gserver.Server
-	Bootstrapper                  *bootstrap.Bootstrap
-	LocalAuthProvider             *localauth.Provider
-	AuthEnabled                   bool
-	DefaultMCPCatalogPath         string
-	DefaultSystemMCPCatalogPath   string
-	MDMAssetSource                string
-	DefaultSkillRepoURL           string
-	DefaultSkillRepoRef           string
-	DefaultHostedAgentsCatalogURL string
-	DefaultHostedAgentsCatalogRef string
-	ModelInfoSourceURL            string
+	PostgresDSN                 string
+	ProviderRegistryPaths       []string
+	DevUIPort                   int
+	DevMode                     bool
+	UserUIPort                  int
+	GatewayServer               *gserver.Server
+	Bootstrapper                *bootstrap.Bootstrap
+	LocalAuthProvider           *localauth.Provider
+	AuthEnabled                 bool
+	DefaultMCPCatalogPath       string
+	DefaultSystemMCPCatalogPath string
+	MDMAssetSource              string
+	DefaultSkillRepoURL         string
+	DefaultSkillRepoRef         string
+	ModelInfoSourceURL          string
 
 	// Used for indexed lookups of access control rules.
 	AccessControlRuleHelper *accesscontrolrule.Helper
@@ -233,9 +213,6 @@ type Services struct {
 
 	// Used for indexed lookups of skill access rules.
 	SkillAccessRuleHelper *skillaccessrule.Helper
-
-	// Used for indexed lookups of hosted agent access rules.
-	HostedAgentAccessRuleHelper *hostedagentaccessrule.Helper
 
 	MCPOAuthClientSecretExpiration time.Duration
 	MCPOAuthClientNativeExceptions []string
@@ -272,23 +249,14 @@ type Services struct {
 	// environment/Helm config and not modifiable via UI.
 	PSASettingsFromHelm *v1.PodSecurityAdmissionSettings
 
-	HideK8sDetails          bool
-	MCPRuntimeBackend       string
-	MCPImagePullSecrets     []string
-	MCPHTTPWebhookBaseImage string
-	MessagePoliciesEnabled  bool
-	EnableAgents            *bool
-	HostedAgentsEnabled     bool
-	AgentBackend            agentbackend.Backend
-	AgentBackendKind        string
-	// AgentDevRouter reaches sandboxes from outside the cluster. It is set only
-	// in development; in production Obot runs in-cluster and the sandbox address
-	// resolves directly.
-	AgentDevRouter                       agentconnect.DevRouter
+	HideK8sDetails                       bool
+	MCPRuntimeBackend                    string
+	MCPImagePullSecrets                  []string
+	MCPHTTPWebhookBaseImage              string
+	MessagePoliciesEnabled               bool
 	MCPNetworkPolicyEnabled              bool
 	MCPDefaultDenyAllEgress              bool
-	MCPServerSearchImage                 string
-	NanobotAgentImage                    string
+	Substrate                            *substrate.Client
 	MCPNetworkPolicyProviderChartRepo    string
 	MCPNetworkPolicyProviderChartName    string
 	MCPNetworkPolicyProviderChartVersion string
@@ -296,11 +264,8 @@ type Services struct {
 	MCPNetworkPolicyProviderValues       string
 	SingleUserIdleServerShutdownInterval time.Duration
 	MultiUserIdleServerShutdownInterval  time.Duration
-	AgentIdleServerShutdownInterval      time.Duration
 
 	// Published artifact blob storage
-	ArtifactBlobStore  blob.BlobStore
-	ArtifactBlobBucket string
 
 	// License provider
 	LicenseProvider *license.Provider
@@ -308,12 +273,6 @@ type Services struct {
 
 	ModelProxyConfiguredURL string
 	ModelProxyURL           *url.URL
-}
-
-type hostedAgentPodSchedulingSettings struct {
-	Affinity     *corev1.Affinity
-	Tolerations  []corev1.Toleration
-	NodeSelector map[string]string
 }
 
 // BuildLocalK8sConfig creates a Kubernetes config for local cluster access
@@ -334,32 +293,6 @@ func unmarshalJSONStrict(data []byte, v any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(v)
-}
-
-func parseHostedAgentPodSchedulingSettings(config Config) (hostedAgentPodSchedulingSettings, error) {
-	var settings hostedAgentPodSchedulingSettings
-
-	if config.HostedAgentsAffinity != "" && config.HostedAgentsAffinity != "{}" {
-		var affinity corev1.Affinity
-		if err := unmarshalJSONStrict([]byte(config.HostedAgentsAffinity), &affinity); err != nil {
-			return settings, fmt.Errorf("failed to parse hosted agent affinity: %w", err)
-		}
-		settings.Affinity = &affinity
-	}
-
-	if config.HostedAgentsTolerations != "" && config.HostedAgentsTolerations != "[]" {
-		if err := unmarshalJSONStrict([]byte(config.HostedAgentsTolerations), &settings.Tolerations); err != nil {
-			return settings, fmt.Errorf("failed to parse hosted agent tolerations: %w", err)
-		}
-	}
-
-	if config.HostedAgentsNodeSelector != "" && config.HostedAgentsNodeSelector != "{}" {
-		if err := unmarshalJSONStrict([]byte(config.HostedAgentsNodeSelector), &settings.NodeSelector); err != nil {
-			return settings, fmt.Errorf("failed to parse hosted agent node selector: %w", err)
-		}
-	}
-
-	return settings, nil
 }
 
 // parsePSASettingsFromHelm parses Pod Security Admission settings from environment/Helm options.
@@ -404,10 +337,7 @@ func parsePodSchedulingSettingsFromHelm(opts mcp.Options) (*v1.K8sSettingsSpec, 
 	hasPodSettings := (opts.MCPK8sSettingsAffinity != "" && opts.MCPK8sSettingsAffinity != "{}") ||
 		(opts.MCPK8sSettingsTolerations != "" && opts.MCPK8sSettingsTolerations != "[]") ||
 		(opts.MCPK8sSettingsResources != "" && opts.MCPK8sSettingsResources != "{}") ||
-		(opts.MCPK8sSettingsNanobotAgentResources != "" && opts.MCPK8sSettingsNanobotAgentResources != "{}") ||
-		opts.MCPK8sSettingsRuntimeClassName != "" ||
-		opts.MCPK8sSettingsStorageClassName != "" ||
-		opts.MCPK8sSettingsNanobotWorkspaceSize != ""
+		opts.MCPK8sSettingsRuntimeClassName != ""
 	hasMaximums := opts.MCPK8sMaxCPURequest != "" ||
 		opts.MCPK8sMaxCPULimit != "" ||
 		opts.MCPK8sMaxMemoryRequest != "" ||
@@ -443,26 +373,6 @@ func parsePodSchedulingSettingsFromHelm(opts mcp.Options) (*v1.K8sSettingsSpec, 
 	spec.MaxCPULimit = maximums.CPULimit
 	spec.MaxMemoryRequest = maximums.MemoryRequest
 	spec.MaxMemoryLimit = maximums.MemoryLimit
-
-	if opts.MCPK8sSettingsNanobotAgentResources != "" && opts.MCPK8sSettingsNanobotAgentResources != "{}" {
-		var nanobotAgentResources corev1.ResourceRequirements
-		if err := unmarshalJSONStrict([]byte(opts.MCPK8sSettingsNanobotAgentResources), &nanobotAgentResources); err != nil {
-			return nil, fmt.Errorf("failed to parse nanobot agent resources from Helm: %w", err)
-		}
-		spec.NanobotAgentResources = &nanobotAgentResources
-	}
-
-	if opts.MCPK8sSettingsStorageClassName != "" {
-		storageClassName := opts.MCPK8sSettingsStorageClassName
-		spec.StorageClassName = &storageClassName
-	}
-
-	if opts.MCPK8sSettingsNanobotWorkspaceSize != "" {
-		if _, err := resource.ParseQuantity(opts.MCPK8sSettingsNanobotWorkspaceSize); err != nil {
-			return nil, fmt.Errorf("invalid nanobot workspace size from Helm: %w", err)
-		}
-		spec.NanobotWorkspaceSize = opts.MCPK8sSettingsNanobotWorkspaceSize
-	}
 
 	return spec, nil
 }
@@ -509,6 +419,12 @@ func parsePodSchedulingJSONFields(affinityJSON, tolerationsJSON, resourcesJSON, 
 }
 
 func New(ctx context.Context, config Config) (*Services, error) {
+	if config.GitMaxRepoSizeMB <= 0 || int64(config.GitMaxRepoSizeMB) > math.MaxInt64/(1024*1024) {
+		return nil, fmt.Errorf("git-max-repo-size-mb must be positive and no greater than %d", int64(math.MaxInt64)/(1024*1024))
+	}
+	if err := config.ProductAnalyticsMode.Validate(); err != nil {
+		return nil, err
+	}
 	if err := validateMCPOAuthCompletionURL(config.MCPOAuthCompletionURL); err != nil {
 		return nil, err
 	}
@@ -682,6 +598,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		config.DeviceScanRetentionDays,
 		!config.DisableLLMAuditLog,
 	)
+	go scimsetup.RunGroupSubjectCleanups(ctx, gatewayClient, storageClient)
 
 	if err := migrateGPTScriptCredentials(ctx, gatewayClient, gatewayDB, config.DSN); err != nil {
 		return nil, fmt.Errorf("failed to migrate GPTScript credentials: %w", err)
@@ -716,17 +633,13 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		serviceAccountIssuerURL   string
 		serviceAccountIssuerError string
 	)
-	// Hosted agents can require a cluster independently of how MCP servers run,
-	// so either feature is reason enough to build a local config.
-	if mcp.IsKubernetesBackend(config.MCPRuntimeBackend) || hostedAgentsNeedK8s(config) {
+	if mcp.IsKubernetesBackend(config.MCPRuntimeBackend) {
 		localK8sConfig, err = BuildLocalK8sConfig()
 		if err != nil {
 			return nil, fmt.Errorf("failed to build local Kubernetes config: %w", err)
 		}
 	}
 	if localK8sConfig != nil && mcp.IsKubernetesBackend(config.MCPRuntimeBackend) {
-		// Image pull secret issuance is an MCP concern and has no bearing on
-		// hosted agents.
 		serviceAccountIssuerURL, err = imagepullsecrets.DiscoverServiceAccountIssuer(ctx, localK8sConfig)
 		if err != nil {
 			serviceAccountIssuerError = err.Error()
@@ -879,7 +792,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	mcpOAuthTokenStorage := mcp.NewGlobalTokenStore(gatewayClient, mcp.WithTokenRefreshHTTPClient(
 		mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfigFromOptions(mcp.Options(config.MCPConfig))),
 	))
-	mcpSessionManager, err := mcp.NewSessionManager(ctx, config.EnableAuthentication, mcpOAuthTokenStorage, persistentTokenServer, config.Hostname, config.HTTPListenPort, mcp.Options(config.MCPConfig), webhookHelper, localK8sConfig, apiLocalK8sClient, localCacheClient, storageClient, gatewayClient, config.ServiceNamespace, tunnelManager)
+	mcpSessionManager, err := mcp.NewSessionManager(ctx, config.EnableAuthentication, config.DevMode, mcpOAuthTokenStorage, persistentTokenServer, config.Hostname, config.HTTPListenPort, mcp.Options(config.MCPConfig), webhookHelper, localK8sConfig, apiLocalK8sClient, localCacheClient, storageClient, gatewayClient, config.ServiceNamespace, tunnelManager)
 	if err != nil {
 		return nil, err
 	}
@@ -1002,6 +915,16 @@ func New(ctx context.Context, config Config) (*Services, error) {
 			}
 			return results, nil
 		},
+		skillaccessrule.ObotGroupIDIndex: func(obj any) ([]string, error) {
+			rule := obj.(*v1.SkillAccessRule)
+			var results []string
+			for _, subject := range rule.Spec.Manifest.Subjects {
+				if subject.Type == apiclienttypes.SubjectTypeObotGroup {
+					results = append(results, subject.ID)
+				}
+			}
+			return results, nil
+		},
 		skillaccessrule.SubjectSelectorIndex: func(obj any) ([]string, error) {
 			rule := obj.(*v1.SkillAccessRule)
 			var results []string
@@ -1018,73 +941,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 
 	skillAccessRuleHelper := skillaccessrule.NewHelper(skillAccessRuleInformer.GetIndexer())
 
-	hostedAgentAccessRuleGVK, err := r.Backend().GroupVersionKindFor(&v1.HostedAgentAccessRule{})
-	if err != nil {
-		return nil, err
-	}
-
-	hostedAgentAccessRuleInformer, err := r.Backend().GetInformerForKind(ctx, hostedAgentAccessRuleGVK)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = hostedAgentAccessRuleInformer.AddIndexers(map[string]gocache.IndexFunc{
-		hostedagentaccessrule.HostedAgentIDIndex: func(obj any) ([]string, error) {
-			rule := obj.(*v1.HostedAgentAccessRule)
-			var results []string
-			for _, resource := range rule.Spec.Manifest.Resources {
-				if resource.Type == apiclienttypes.HostedAgentResourceTypeHostedAgent {
-					results = append(results, resource.ID)
-				}
-			}
-			return results, nil
-		},
-		hostedagentaccessrule.ResourceSelectorIndex: func(obj any) ([]string, error) {
-			rule := obj.(*v1.HostedAgentAccessRule)
-			var results []string
-			for _, resource := range rule.Spec.Manifest.Resources {
-				if resource.Type == apiclienttypes.HostedAgentResourceTypeSelector {
-					results = append(results, resource.ID)
-				}
-			}
-			return results, nil
-		},
-		hostedagentaccessrule.UserIDIndex: func(obj any) ([]string, error) {
-			rule := obj.(*v1.HostedAgentAccessRule)
-			var results []string
-			for _, subject := range rule.Spec.Manifest.Subjects {
-				if subject.Type == apiclienttypes.SubjectTypeUser {
-					results = append(results, subject.ID)
-				}
-			}
-			return results, nil
-		},
-		hostedagentaccessrule.GroupIDIndex: func(obj any) ([]string, error) {
-			rule := obj.(*v1.HostedAgentAccessRule)
-			var results []string
-			for _, subject := range rule.Spec.Manifest.Subjects {
-				if subject.Type == apiclienttypes.SubjectTypeGroup {
-					results = append(results, subject.ID)
-				}
-			}
-			return results, nil
-		},
-		hostedagentaccessrule.SubjectSelectorIndex: func(obj any) ([]string, error) {
-			rule := obj.(*v1.HostedAgentAccessRule)
-			var results []string
-			for _, subject := range rule.Spec.Manifest.Subjects {
-				if subject.Type == apiclienttypes.SubjectTypeSelector {
-					results = append(results, subject.ID)
-				}
-			}
-			return results, nil
-		},
-	}); err != nil {
-		return nil, err
-	}
-
-	hostedAgentAccessRuleHelper := hostedagentaccessrule.NewHelper(hostedAgentAccessRuleInformer.GetIndexer())
-
 	mapHelper, err := modelaccesspolicy.NewHelper(ctx, r.Backend())
 	if err != nil {
 		return nil, err
@@ -1095,7 +951,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		return nil, fmt.Errorf("failed to create license provider: %w", err)
 	}
 
-	providerDispatcher := dispatcher.New(mcpSessionManager, storageClient, gatewayClient, licenseProvider, config.Hostname, fmt.Sprintf("http://localhost:%d", config.HTTPListenPort), postgresDSN)
+	providerDispatcher := dispatcher.New(mcpSessionManager, storageClient, gatewayClient, licenseProvider, config.Hostname, system.LocalServerURL(config.HTTPListenPort), postgresDSN)
 
 	var msgPolicyHelper *messagepolicy.Helper
 	if config.EnableMessagePolicies {
@@ -1176,7 +1032,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		authenticators = union.New(authenticators, tunnel.NewTunnelAuthenticator(storageClient))
 		// API Key authentication (for MCP server access) - restricted to GroupAPIKey only
 		// Must come after UserDecorator since it handles its own user lookup
-		authenticators = union.New(authenticators, gserver.NewAPIKeyAuthenticator(gatewayClient, storageClient))
+		authenticators = union.New(authenticators, gserver.NewAPIKeyAuthenticator(gatewayClient))
 		// Device enrollment tokens (ode1-) and device access JWTs. Both yield
 		// non-user principals, so they must come after the UserDecorator.
 		authenticators = union.New(authenticators, gserver.NewDeviceEnrollmentAuthenticator(gatewayClient))
@@ -1239,6 +1095,15 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	// authenticators and outside the user decorator.
 	authenticators = union.New(tunnelManager, authenticators)
 
+	// SCIM routes authenticate only with a SCIM connection's bearer token. The SCIM authenticator runs ahead of every
+	// other authenticator and ends the chain on SCIM routes whatever its answer, so no cookie, credential, redirect, or
+	// just-in-time user creation applies there. Off SCIM routes, it declines.
+	authenticators = union.NewFailOnError(scim.NewAuthenticator(gatewayClient), authenticators)
+
+	// Deny disabled and deleted users whichever credential they present. This wraps the complete chain so that it
+	// runs once per request, after authentication and before authorization.
+	authenticators = authn.NewAdmissionCheck(authenticators)
+
 	auditLogger, err := audit.New(ctx, audit.Options(config.AuditConfig))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audit logger: %w", err)
@@ -1273,82 +1138,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		ClientIDMetadataDocumentSupported: true,
 	}
 
-	authorizer := authz.NewAuthorizer(gatewayClient, r.Backend(), storageClient, config.DevMode, acrHelper, skillAccessRuleHelper, hostedAgentAccessRuleHelper, registryNoAuth)
-
-	// The kubernetes agent backend needs a client to the local cluster even when
-	// MCP servers do not run there -- the "hosted agents get the client
-	// directly" case the comment further down anticipates. It reuses the MCP
-	// client when one exists, and otherwise builds its own from the same
-	// config, so hosted agents work with a docker MCP backend without switching
-	// on the MCP-scoped router and its handlers.
-	agentLocalK8sClient := apiLocalK8sClient
-	if agentLocalK8sClient == nil && hostedAgentsNeedK8s(config) {
-		agentLocalK8sClient, err = kclient.NewWithWatch(localK8sConfig, kclient.Options{Scheme: k8sscheme.Scheme})
-		if err != nil {
-			return nil, fmt.Errorf("failed to build local k8s client for the agent backend: %w", err)
-		}
-	}
-	agentBackendKind, agentBackend, err := newHostedAgentsBackend(config, localK8sConfig, agentLocalK8sClient, localCacheClient)
-	if err != nil {
-		return nil, err
-	}
-
-	// Where a sandbox finds Obot depends on where Obot itself is running, and
-	// the two cases need different answers.
-	//
-	// In the cluster, the configured hostname resolving is not enough: it has to
-	// resolve somewhere a sandbox is permitted to reach, and the egress policy
-	// shipped with the chart excludes private ranges, so a hostname pointing at
-	// an internal load balancer or a node is refused even though it resolves.
-	// MCP servers have always answered this by addressing Obot's Service, and a
-	// sandbox reaches Obot for the same things, so TransformObotHostname gives
-	// it the same address rather than inventing a second mechanism.
-	//
-	// Outside the cluster -- a developer running Obot on their own machine --
-	// that method cannot answer at all: it substitutes Obot's Service, and there
-	// is no Service, so ServiceName is unset and it returns the hostname
-	// untouched. The hostname is a loopback address, which inside a sandbox
-	// means the sandbox. A node stands in for the developer's machine, since
-	// Obot listens on all of its interfaces, which is what ReachableServerURL
-	// resolves. It leaves any non-loopback hostname alone, so the in-cluster
-	// case falls through to the method above.
-	agentServerURL := config.Hostname
-	if agentBackendKind == "kubernetes" && agentLocalK8sClient != nil {
-		reachable, err := agentbackendkubernetes.ReachableServerURL(ctx, agentLocalK8sClient, config.Hostname)
-		if err != nil {
-			return nil, err
-		}
-		if reachable != config.Hostname {
-			agentServerURL = reachable
-		} else {
-			agentServerURL = mcpSessionManager.TransformObotHostname(config.Hostname)
-		}
-		if agentServerURL != config.Hostname {
-			slog.Info("hosted agent sandboxes will reach Obot at a rewritten URL", "agentServerURL", agentServerURL)
-		}
-	}
-
-	// Running outside the cluster is what makes a sandbox unreachable, and it is
-	// exactly what falling back to a kubeconfig means. Reaching one through the
-	// API server needs services/proxy, which grants access to every Service in
-	// the cluster, so this is deliberately confined to development rather than
-	// something a production deployment is granted.
-	var agentDevRouter agentconnect.DevRouter
-	if router, ok := agentBackend.(agentconnect.DevRouter); ok && config.DevMode {
-		if _, inClusterErr := rest.InClusterConfig(); inClusterErr != nil {
-			agentDevRouter = router
-		}
-	}
-
-	// LocalK8sClient drives MCP-side cluster features: service account key
-	// rotation, image pull secret issuance, network policies. Hosted agents get
-	// the client directly, so this stays nil when MCP does not run on
-	// Kubernetes. Otherwise enabling hosted agents alone would switch on MCP
-	// machinery that needs configuration the deployment has no reason to set.
-	var mcpLocalK8sClient kclient.WithWatch
-	if mcp.IsKubernetesBackend(config.MCPRuntimeBackend) {
-		mcpLocalK8sClient = apiLocalK8sClient
-	}
+	authorizer := authz.NewAuthorizer(gatewayClient, r.Backend(), storageClient, config.DevMode, acrHelper, skillAccessRuleHelper, registryNoAuth)
 
 	versionChecker, err := upgrade.NewVersionChecker(ctx, upgrade.VersionCheckerOptions{
 		GatewayClient:      gatewayClient,
@@ -1358,12 +1148,13 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		return nil, err
 	}
 
-	telemetryConsent := producttelemetry.NewConsent(gatewayClient, config.ProductAnalyticsForceEnabled)
+	telemetryConsent := producttelemetry.NewConsent(gatewayClient, config.ProductAnalyticsMode)
 
 	// For now, always auto-migrate the gateway database
 	svcs := &Services{
 		EncryptionConfig:      encryptionConfig,
 		ServerURL:             config.Hostname,
+		LocalServerURL:        system.LocalServerURL(config.HTTPListenPort),
 		StorageClient:         storageClient,
 		StorageDB:             dbAccess,
 		Router:                r,
@@ -1371,7 +1162,8 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		APIServer: server.NewServer(
 			storageClient,
 			gatewayClient,
-			apiLocalK8sClient,
+			// Request handlers only read bound Secrets, so serve them from the cache.
+			localCacheClient,
 			config.ServiceNamespace,
 			authn.NewAuthenticator(authenticators),
 			authorizer,
@@ -1409,12 +1201,11 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		LocalAuthProvider:            localAuthProvider,
 
 		DefaultMCPCatalogPath:          config.DefaultMCPCatalogPath,
+		GitMaxRepoSizeMB:               config.GitMaxRepoSizeMB,
 		MDMAssetSource:                 config.MDMAssetSource,
 		DefaultSystemMCPCatalogPath:    config.DefaultSystemMCPCatalogPath,
 		DefaultSkillRepoURL:            config.DefaultSkillRepoURL,
 		DefaultSkillRepoRef:            config.DefaultSkillRepoRef,
-		DefaultHostedAgentsCatalogURL:  config.DefaultHostedAgentsCatalogURL,
-		DefaultHostedAgentsCatalogRef:  config.DefaultHostedAgentsCatalogRef,
 		ModelInfoSourceURL:             config.ModelInfoSourceURL,
 		MCPOAuthClientSecretExpiration: oauthClientExpiration,
 		MCPOAuthClientNativeExceptions: config.MCPOAuthClientNativeExceptions,
@@ -1426,8 +1217,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		ModelAccessPolicyHelper:        mapHelper,
 
 		SkillAccessRuleHelper:                skillAccessRuleHelper,
-		HostedAgentAccessRuleHelper:          hostedAgentAccessRuleHelper,
-		LocalK8sClient:                       mcpLocalK8sClient,
+		LocalK8sClient:                       apiLocalK8sClient,
 		LocalRouter:                          localRouter,
 		K8SEveryReplicaRouter:                tunnelPeerRouter,
 		EveryReplicaRouter:                   everyReplicaRouter,
@@ -1447,51 +1237,58 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		MCPHTTPWebhookBaseImage:              config.MCPHTTPWebhookBaseImage,
 		SingleUserIdleServerShutdownInterval: time.Duration(config.SingleUserIdleServerShutdownHours) * time.Hour,
 		MultiUserIdleServerShutdownInterval:  time.Duration(config.MultiUserIdleServerShutdownHours) * time.Hour,
-		AgentIdleServerShutdownInterval:      time.Duration(config.IdleAgentShutdownHours) * time.Hour,
 		MessagePoliciesEnabled:               config.EnableMessagePolicies,
-		EnableAgents:                         config.EnableAgents,
-		HostedAgentsEnabled:                  config.EnableHostedAgents,
-		AgentBackend:                         agentBackend,
-		AgentServerURL:                       agentServerURL,
-		AgentBackendKind:                     agentBackendKind,
-		AgentDevRouter:                       agentDevRouter,
 		MCPNetworkPolicyEnabled:              mcpNetworkPolicyEnabled,
 		MCPDefaultDenyAllEgress:              config.MCPDefaultDenyAllEgress,
-		MCPServerSearchImage:                 config.MCPServerSearchImage,
-		NanobotAgentImage:                    config.NanobotAgentImage,
 		MCPNetworkPolicyProviderChartRepo:    config.MCPNetworkPolicyProviderChartRepo,
 		MCPNetworkPolicyProviderChartName:    config.MCPNetworkPolicyProviderChartName,
 		MCPNetworkPolicyProviderChartVersion: config.MCPNetworkPolicyProviderChartVersion,
 		MCPNetworkPolicyProviderChartPath:    config.MCPNetworkPolicyProviderChartPath,
 		MCPNetworkPolicyProviderValues:       config.MCPNetworkPolicyProviderValues,
-		ArtifactBlobBucket:                   config.ArtifactStorageBucket,
 		LicenseProvider:                      licenseProvider,
 		VersionChecker:                       versionChecker,
 	}
 
-	if (config.ArtifactStorageProvider == "") != (config.ArtifactStorageBucket == "") {
-		return nil, fmt.Errorf("both OBOT_ARTIFACT_STORAGE_PROVIDER and OBOT_ARTIFACT_STORAGE_BUCKET must be set together")
+	obotURL := config.SubstrateObotURL
+	if obotURL == "" {
+		obotURL = svcs.ServerURL
+	}
+	workerNodeSelector := map[string]string{}
+	var workerTolerations []corev1.Toleration
+	if config.SubstrateAddress != "" {
+		if config.SubstrateWorkerNodeSelector != "" {
+			if err := unmarshalJSONStrict([]byte(config.SubstrateWorkerNodeSelector), &workerNodeSelector); err != nil {
+				return nil, fmt.Errorf("invalid Substrate worker node selector: %w", err)
+			}
+		}
+		if config.SubstrateWorkerTolerations != "" {
+			if err := unmarshalJSONStrict([]byte(config.SubstrateWorkerTolerations), &workerTolerations); err != nil {
+				return nil, fmt.Errorf("invalid Substrate worker tolerations: %w", err)
+			}
+		}
 	}
 
-	if config.ArtifactStorageProvider != "" && config.ArtifactStorageBucket != "" {
-		artifactStorageConfig := buildArtifactStorageConfig(config)
-		artifactBlobStore, err := blob.New(apiclienttypes.StorageProviderType(config.ArtifactStorageProvider), artifactStorageConfig)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create artifact blob store: %w", err)
-		}
-		if err := artifactBlobStore.Test(ctx); err != nil {
-			return nil, fmt.Errorf("failed to validate artifact blob store: %w", err)
-		}
-		svcs.ArtifactBlobStore = artifactBlobStore
-	} else {
-		// Fallback: local directory storage when no cloud provider is configured.
-		defaultDir := filepath.Join(xdg.DataHome, "obot", "published-artifacts")
-		artifactBlobStore, err := blob.NewDirectoryStore(defaultDir)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create local artifact blob store: %w", err)
-		}
-		svcs.ArtifactBlobStore = artifactBlobStore
-		svcs.ArtifactBlobBucket = "default"
+	svcs.Substrate, err = substrate.New(ctx, substrate.Config{
+		WorkerNodeSelector: workerNodeSelector,
+		WorkerTolerations:  workerTolerations,
+		Address:            config.SubstrateAddress,
+		WorkerImage:        config.SubstrateWorkerImage,
+		RunnerImage:        config.SubstrateRunnerImage,
+		Namespace:          config.SubstrateNamespace,
+		CAFile:             "/run/substrate/ca.pem",
+		TokenFile:          "/run/substrate/token",
+		SnapshotLocation:   config.SubstrateSnapshotLocation,
+		ObotURL:            obotURL,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if svcs.Substrate != nil {
+		svcs.Substrate.Kube = svcs.LocalK8sClient
+	}
+	if config.DevMode {
+		svcs.APIServer.ServeDevUI()
 	}
 
 	return svcs, nil
@@ -1539,45 +1336,6 @@ func migrateGPTScriptCredentials(ctx context.Context, gatewayClient *client.Clie
 	return gatewayClient.MigrateGPTScriptCredentials(ctx, oldDB)
 }
 
-func buildArtifactStorageConfig(config Config) apiclienttypes.StorageConfig {
-	switch apiclienttypes.StorageProviderType(config.ArtifactStorageProvider) {
-	case apiclienttypes.StorageProviderS3:
-		return apiclienttypes.StorageConfig{
-			S3Config: &apiclienttypes.S3Config{
-				Region:          config.ArtifactS3Region,
-				AccessKeyID:     config.ArtifactS3AccessKeyID,
-				SecretAccessKey: config.ArtifactS3SecretAccessKey,
-			},
-		}
-	case apiclienttypes.StorageProviderCustomS3:
-		return apiclienttypes.StorageConfig{
-			CustomS3Config: &apiclienttypes.CustomS3Config{
-				Endpoint:        config.ArtifactS3Endpoint,
-				Region:          config.ArtifactS3Region,
-				AccessKeyID:     config.ArtifactS3AccessKeyID,
-				SecretAccessKey: config.ArtifactS3SecretAccessKey,
-			},
-		}
-	case apiclienttypes.StorageProviderGCS:
-		return apiclienttypes.StorageConfig{
-			GCSConfig: &apiclienttypes.GCSConfig{
-				ServiceAccountJSON: config.ArtifactGCSServiceAccountJSON,
-			},
-		}
-	case apiclienttypes.StorageProviderAzureBlob:
-		return apiclienttypes.StorageConfig{
-			AzureConfig: &apiclienttypes.AzureConfig{
-				StorageAccount: config.ArtifactAzureStorageAccount,
-				TenantID:       config.ArtifactAzureTenantID,
-				ClientID:       config.ArtifactAzureClientID,
-				ClientSecret:   config.ArtifactAzureClientSecret,
-			},
-		}
-	default:
-		return apiclienttypes.StorageConfig{}
-	}
-}
-
 func configureDevMode(config Config) (int, Config) {
 	if !config.DevMode {
 		return 0, config
@@ -1604,82 +1362,6 @@ func leaderElectionRESTConfig(config *rest.Config) *rest.Config {
 		config.Timeout = leaderElectionRequestTimeout
 	}
 	return config
-}
-
-// resolveHostedAgentsBackendKind applies the default so that callers which need to know
-// the backend before it is constructed agree with newHostedAgentsBackend.
-//
-// Unset follows the MCP runtime, because a deployment that already runs MCP
-// servers on a cluster has everything hosted agents need and would otherwise
-// have to name the same backend twice.
-//
-// A docker MCP runtime resolves to the fake backend for now, because there is
-// no docker agent backend yet. When one lands, this is where it goes: the
-// docker case becomes "docker" and the fallback stops being a placeholder.
-func resolveHostedAgentsBackendKind(config Config) string {
-	kind := strings.ToLower(strings.TrimSpace(config.HostedAgentsBackend))
-	if kind != "" {
-		return kind
-	}
-	if mcp.IsKubernetesBackend(config.MCPRuntimeBackend) {
-		return "kubernetes"
-	}
-	return "fake"
-}
-
-func hostedAgentsNeedK8s(config Config) bool {
-	switch resolveHostedAgentsBackendKind(config) {
-	case "kubernetes", "k8s":
-		return true
-	default:
-		return false
-	}
-}
-
-func newHostedAgentsBackend(config Config, restConfig *rest.Config, client, cachedClient kclient.Client) (string, agentbackend.Backend, error) {
-	kind := resolveHostedAgentsBackendKind(config)
-
-	switch kind {
-	case "disabled":
-		return kind, agentbackend.Disabled{}, nil
-	case "fake":
-		return kind, agentbackendfake.New(agentbackendfake.Config{
-			TransitionDelay: time.Second,
-		}), nil
-	case "kubernetes", "k8s":
-		if client == nil {
-			return "", nil, fmt.Errorf("agent backend %q requires a local Kubernetes cluster, but no local K8s config is available", kind)
-		}
-		scheduling, err := parseHostedAgentPodSchedulingSettings(config)
-		if err != nil {
-			return "", nil, err
-		}
-		backend, err := agentbackendkubernetes.New(client, cachedClient, agentbackendkubernetes.Options{
-			// Sandboxes share the MCP namespace so that the existing local
-			// cluster router, which is scoped to it, sees them. Pools are
-			// separated by PriorityClass rather than by namespace.
-			Namespace:        config.MCPNamespace,
-			ClusterDomain:    config.MCPClusterDomain,
-			StorageClassName: config.HostedAgentsStorageClassName,
-			RuntimeClassName: config.HostedAgentsRuntimeClassName,
-			Affinity:         scheduling.Affinity,
-			Tolerations:      scheduling.Tolerations,
-			NodeSelector:     scheduling.NodeSelector,
-			// Sandboxes share the MCP namespace, so they are admitted against
-			// whatever Pod Security level that namespace carries.
-			PodSecurityLevel: agentbackendkubernetes.ParsePodSecurityLevel(config.HostedAgentsPodSecurityLevel),
-			ImagePullSecrets: config.MCPImagePullSecrets,
-			CleanupImage:     config.HostedAgentsCleanupImage,
-			ImagePullPolicy:  config.HostedAgentsImagePullPolicy,
-			RESTConfig:       restConfig,
-		})
-		if err != nil {
-			return "", nil, err
-		}
-		return "kubernetes", backend, nil
-	default:
-		return "", nil, fmt.Errorf("unsupported agent backend %q (expected disabled, fake, or kubernetes)", kind)
-	}
 }
 
 func startDevMode(ctx context.Context, storageClient storage.Client) {

@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
-	"strings"
 	"time"
 
 	clienttypes "github.com/obot-platform/obot/apiclient/types"
@@ -40,8 +39,13 @@ type Publisher struct {
 	done            chan struct{}
 }
 
-// NewPublisher creates and immediately starts a product telemetry publisher.
+// NewPublisher starts a product telemetry publisher, or returns nil when the
+// operator has disabled analytics.
 func NewPublisher(ctx context.Context, consent *Consent, gatewayClient *gatewayclient.Client, storageClient storage.Client, licenseProvider licenseEntitlementProvider, engine string) *Publisher {
+	if consent.DisabledByOperator() {
+		return nil
+	}
+
 	publisher := newPublisher(
 		consent,
 		gatewayClient,
@@ -70,7 +74,7 @@ func newPublisher(consent consentReader, gatewayClient requestGatewayClient, sto
 }
 
 func (p *Publisher) start(ctx context.Context, currentVersion string, force bool) {
-	if strings.HasPrefix(currentVersion, "v0.0.0") && !force {
+	if version.IsDev(currentVersion) && !force {
 		close(p.done)
 		return
 	}

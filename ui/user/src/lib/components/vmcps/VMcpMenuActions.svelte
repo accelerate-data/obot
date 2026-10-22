@@ -1,0 +1,231 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import { m } from '$lib/i18n';
+	import Loading from '$lib/icons/Loading.svelte';
+	import {
+		editVMcpInstanceConfiguration,
+		resetVMcpConnection,
+		updateVMcp,
+		vmcpIsDisconnecting,
+		vmcpIsUpdating,
+		vmcpItemContext,
+		type OpenDiff,
+		type OpenEditInstanceConfiguration,
+		type OpenSelectInstance,
+		type OpenUpdateConfirm
+	} from '$lib/runes/vmcps/vmcpItem.svelte';
+	import { UserService, type VMCP } from '$lib/services';
+	import { profile } from '$lib/stores';
+	import {
+		CircleFadingArrowUp,
+		ExternalLink,
+		GitCompare,
+		KeyRound,
+		Power,
+		ServerCog,
+		Trash2
+	} from '@lucide/svelte';
+	import { onDestroy } from 'svelte';
+	import { twMerge } from 'tailwind-merge';
+
+	interface Props {
+		vmcp: VMCP;
+		menuOpen?: boolean;
+		openReauthenticate?: (vmcp: VMCP, componentIDs: string[]) => void;
+		toggle: (open?: boolean) => void;
+		onDelete?: () => void;
+		onUpdated?: (vmcp: VMCP) => void;
+		openSelectInstance?: OpenSelectInstance;
+		openDiff?: OpenDiff;
+		openUpdateConfirm?: OpenUpdateConfirm;
+		openEditInstanceConfiguration?: OpenEditInstanceConfiguration;
+	}
+
+	let {
+		vmcp,
+		menuOpen = false,
+		openReauthenticate,
+		toggle,
+		onDelete,
+		onUpdated,
+		openSelectInstance,
+		openDiff,
+		openUpdateConfirm,
+		openEditInstanceConfiguration
+	}: Props = $props();
+
+	let destroyed = false;
+	let ctx = $derived(vmcpItemContext(vmcp));
+	let disconnecting = $derived(
+		vmcpIsDisconnecting(
+			vmcp.id,
+			ctx.myInstances.map((instance) => instance.id)
+		)
+	);
+	let updating = $derived(vmcpIsUpdating(vmcp.id));
+	let canEditInstanceConfiguration = $derived(
+		Boolean(openEditInstanceConfiguration) && ctx.canEditInstanceConfiguration
+	);
+
+	let authenticatedComponents = $state<string[]>([]);
+	let checkingOauth = $state(false);
+
+	$effect(() => {
+		const vmcpID = vmcp.id;
+		authenticatedComponents = [];
+		checkingOauth = false;
+		if (!menuOpen || !openReauthenticate || !ctx.connected) return;
+
+		const controller = new AbortController();
+		checkingOauth = true;
+		void UserService.getVMCPOAuthStatus(vmcpID, {
+			signal: controller.signal,
+			dontLogErrors: true
+		})
+			.then((ids) => {
+				if (!controller.signal.aborted) authenticatedComponents = ids;
+			})
+			.catch(() => {
+				// Leave the other actions available if OAuth status cannot be loaded.
+			})
+			.finally(() => {
+				if (!controller.signal.aborted) checkingOauth = false;
+			});
+		return () => controller.abort();
+	});
+
+	onDestroy(() => {
+		destroyed = true;
+	});
+</script>
+
+<button
+	class="menu-button"
+	disabled={disconnecting}
+	onclick={(e) => {
+		e.stopPropagation();
+		void resetVMcpConnection(vmcp, toggle, openSelectInstance);
+	}}
+>
+	{#if disconnecting}
+		<Loading class="size-4" />
+	{:else}
+		<Power class="size-4" />
+	{/if}
+	{m.core_reset_page()}
+</button>
+{#if openUpdateConfirm && ctx.needsUpdate && ctx.canUpdate}
+	<button
+		class="menu-button-primary"
+		disabled={updating}
+		onclick={(e) => {
+			e.stopPropagation();
+			openUpdateConfirm(vmcp, () => updateVMcp(vmcp, onUpdated, () => destroyed));
+			toggle(false);
+		}}
+	>
+		{#if updating}
+			<Loading class="size-4" />
+		{:else}
+			<CircleFadingArrowUp class="size-4" />
+		{/if}
+		{m.vmcps_update_vmcp()}
+	</button>
+{/if}
+{#if canEditInstanceConfiguration}
+	<button
+		class={twMerge(
+			'menu-button',
+			ctx.instancesNeedingConfiguration.length > 0 &&
+				'bg-warning/10 text-warning hover:bg-warning/30'
+		)}
+		onclick={(e) => {
+			e.stopPropagation();
+			editVMcpInstanceConfiguration(
+				vmcp,
+				openSelectInstance,
+				openEditInstanceConfiguration,
+				toggle
+			);
+		}}
+	>
+		<ServerCog class="size-4" />
+		{m.vmcps_deployments_edit_configuration()}
+	</button>
+{/if}
+
+{#if openReauthenticate && (checkingOauth || authenticatedComponents.length > 0)}
+	<button
+		class="menu-button"
+		disabled={checkingOauth}
+		onclick={(e) => {
+			e.stopPropagation();
+			if (checkingOauth || authenticatedComponents.length === 0) return;
+			openReauthenticate?.(vmcp, authenticatedComponents);
+			toggle(false);
+		}}
+	>
+		{#if checkingOauth}
+			<Loading class="size-4" />
+		{:else}
+			<KeyRound class="size-4" />
+		{/if}
+		{m.vmcps_reauthenticate()}
+	</button>
+{/if}
+
+{#if openDiff && ctx.needsUpdate}
+	<button
+		class="menu-button-primary"
+		disabled={updating}
+		onclick={(e) => {
+			e.stopPropagation();
+			openDiff(vmcp);
+			toggle(false);
+		}}
+	>
+		<GitCompare class="size-4" />
+		{m.vmcps_view_diff()}
+	</button>
+{/if}
+{#if ctx.isCreator || profile.current.hasAdminAccess?.()}
+	<a
+		class="menu-button justify-between"
+		href={resolve(`/audit-logs?mcp_id=${encodeURIComponent(vmcp.id)}`)}
+		target="_blank"
+		rel="noopener"
+		onclick={(e) => {
+			e.stopPropagation();
+			toggle(false);
+		}}
+	>
+		{m.vmcps_deployments_view_audit_logs()}
+		<ExternalLink class="size-4" />
+	</a>
+	<a
+		class="menu-button justify-between"
+		href={resolve(`/usage?mcp_id=${encodeURIComponent(vmcp.id)}`)}
+		target="_blank"
+		rel="noopener"
+		onclick={(e) => {
+			e.stopPropagation();
+			toggle(false);
+		}}
+	>
+		{m.vmcps_view_usage()}
+		<ExternalLink class="size-4" />
+	</a>
+{/if}
+{#if ctx.canDelete}
+	<button
+		class="menu-button-destructive"
+		onclick={(e) => {
+			e.stopPropagation();
+			onDelete?.();
+			toggle(false);
+		}}
+	>
+		<Trash2 class="size-4" />
+		{m.core_delete()}
+	</button>
+{/if}

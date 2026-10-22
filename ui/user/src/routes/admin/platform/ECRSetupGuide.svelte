@@ -1,5 +1,6 @@
 <script lang="ts">
 	import CopyButton from '$lib/components/CopyButton.svelte';
+	import { m } from '$lib/i18n';
 
 	interface Props {
 		effectiveIssuerURL: string;
@@ -11,55 +12,54 @@
 	let { effectiveIssuerURL, effectiveAudience, trustPolicyJSON, ecrPolicyJSON }: Props = $props();
 </script>
 
-<section class="paper gap-5">
-	<div class="flex flex-col gap-1">
-		<h3 class="text-base font-semibold">AWS Setup Guide</h3>
-		<p class="text-muted-content text-sm">
-			Configure AWS to trust Obot's service account, then paste the role ARN above and save the
-			image pull secret in Obot.
-		</p>
-	</div>
+<div class="flex flex-col gap-1">
+	<h3 class="text-base font-semibold">{m.platform_settings_registry_guide_title()}</h3>
+	<p class="text-muted-content text-sm">
+		{m.platform_settings_registry_guide_description()}
+	</p>
+</div>
 
+<section class="flex flex-col gap-5">
 	<div class="divide-base-300 dark:divide-base-400 flex flex-col divide-y">
 		<div class="pb-5">
 			{@render setupStep(
 				'1',
-				'Create an IAM OIDC provider',
-				'In AWS IAM, create or reuse an OpenID Connect provider for this Kubernetes service account issuer.'
+				m.platform_settings_registry_step1_title(),
+				m.platform_settings_registry_step1_description()
 			)}
 			<div class="mt-4 grid gap-x-6 gap-y-3 pl-9 lg:grid-cols-2">
-				{@render setupValue('Issuer URL', effectiveIssuerURL)}
-				{@render setupValue('Audience', effectiveAudience)}
+				{@render setupValue(m.platform_settings_registry_issuer_url(), effectiveIssuerURL)}
+				{@render setupValue(m.platform_settings_image_pull_secrets_audience(), effectiveAudience)}
 			</div>
 		</div>
 
 		<div class="py-5">
 			{@render setupStep(
 				'2',
-				'Create the IAM role trust policy',
-				'Create an IAM role with this trust policy so Obot can assume it with web identity.'
+				m.platform_settings_registry_step2_title(),
+				m.platform_settings_registry_step2_description()
 			)}
 			<div class="mt-4 pl-9">
-				{@render policyBlock('Trust Policy', trustPolicyJSON)}
+				{@render policyBlock(m.platform_settings_registry_trust_policy(), trustPolicyJSON)}
 			</div>
 		</div>
 
 		<div class="py-5">
 			{@render setupStep(
 				'3',
-				'Attach ECR pull permissions',
-				'Attach this policy to the IAM role, or use an equivalent policy scoped to your repositories.'
+				m.platform_settings_registry_step3_title(),
+				m.platform_settings_registry_step3_description()
 			)}
 			<div class="mt-4 pl-9">
-				{@render policyBlock('ECR IAM Policy', ecrPolicyJSON)}
+				{@render policyBlock(m.platform_settings_registry_iam_policy(), ecrPolicyJSON)}
 			</div>
 		</div>
 
 		<div class="pt-5">
 			{@render setupStep(
 				'4',
-				'Save the secret in Obot',
-				'Paste the role ARN into the form, then click Create or Save. Obot writes the Kubernetes image pull secret and returns you to the list view.'
+				m.platform_settings_registry_step4_title(),
+				m.platform_settings_registry_step4_description()
 			)}
 		</div>
 	</div>

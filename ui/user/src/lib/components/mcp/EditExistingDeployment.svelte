@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { HttpError } from '$lib/errors';
+	import { m } from '$lib/i18n';
 	import {
 		AdminService,
 		UserService,
@@ -37,7 +38,6 @@
 
 	let entry = $state<MCPCatalogEntry>();
 	let server = $state<MCPCatalogServer>();
-	let mode = $state<'edit' | 'catalog-update'>('edit');
 
 	let editingError = $state<string>();
 	let editingManifest = $derived(server?.manifest);
@@ -129,7 +129,6 @@
 	}) {
 		server = initServer;
 		entry = initEntry;
-		mode = 'edit';
 		editingError = isKubernetesRuntimeBackend(version.current.engine)
 			? undefined
 			: getSecretBindingEngineError(initServer.manifest);
@@ -144,7 +143,7 @@
 					dontLogErrors: true
 				});
 			} catch (err) {
-				errors.append(`Failed to load Kubernetes Secrets for binding: ${err}`);
+				errors.append(m.mcps_deployments_secret_targets_load_failed({ error: String(err) }));
 				secretBindingTargets = [];
 			}
 		} else {
@@ -167,88 +166,18 @@
 			name: server.alias || '',
 			envs: getManifestConfiguration(server.manifest).env?.map((env) => ({
 				...markPinnedSecretBinding(env, templateEnvBindings),
-				value: values[env.key] ?? ''
+				value: values[env.key] ?? '',
+				isStatic: Boolean(env.static)
 			})),
 			headers: getManifestConfiguration(server.manifest).headers?.map((header) => ({
 				...markPinnedSecretBinding(header, templateHeaderBindings),
 				value: values[header.key] ?? '',
-				isStatic: header.value !== ''
+				isStatic: Boolean(header.static) || header.value !== ''
 			})),
 			url: server.manifest.remoteConfig?.url,
 			hostname: entry?.manifest.remoteConfig?.hostname
 		};
 		configDialog?.open();
-	}
-
-	export async function updateFromCatalogEntry({
-		server: initServer,
-		entry: initEntry
-	}: {
-		server: MCPCatalogServer;
-		entry: MCPCatalogEntry;
-	}): Promise<boolean> {
-		server = initServer;
-		entry = initEntry;
-		mode = 'catalog-update';
-
-		// Apply the catalog manifest first; the updated server response tells us what is missing.
-		const updatedServer = await triggerCatalogUpdate(initServer);
-		server = updatedServer;
-		editingError = isKubernetesRuntimeBackend(version.current.engine)
-			? undefined
-			: getSecretBindingEngineError(updatedServer.manifest);
-
-		// Load secret binding targets so an admin can re-select a secret during the update flow
-		if (
-			isKubernetesRuntimeBackend(version.current.engine) &&
-			updatedServer.mcpCatalogID &&
-			isMultiUserServer(updatedServer)
-		) {
-			try {
-				secretBindingTargets = await AdminService.listMCPSecretBindingTargets({
-					dontLogErrors: true
-				});
-			} catch (err) {
-				errors.append(`Failed to load Kubernetes Secrets for binding: ${err}`);
-				secretBindingTargets = [];
-			}
-		} else {
-			secretBindingTargets = [];
-		}
-
-		// Keep existing shared values so the dialog only asks for newly required input.
-		let values: Record<string, string>;
-		try {
-			values = await revealServerValues(updatedServer);
-		} catch (error) {
-			if (!(error instanceof HttpError) || error.statusCode !== 404) {
-				console.error('Failed to reveal server values due to unexpected error', error);
-			}
-			values = {};
-		}
-
-		const templateConfiguration = getManifestConfiguration(entry?.manifest);
-		const templateEnvBindings = templateBindingByKey(templateConfiguration.env);
-		const templateHeaderBindings = templateBindingByKey(templateConfiguration.headers);
-		const form: LaunchFormData = {
-			envs: getManifestConfiguration(updatedServer.manifest).env?.map((env) => ({
-				...markPinnedSecretBinding(env, templateEnvBindings),
-				value: values[env.key] ?? ''
-			})),
-			headers: getManifestConfiguration(updatedServer.manifest).headers?.map((header) => ({
-				...markPinnedSecretBinding(header, templateHeaderBindings),
-				value: values[header.key] ?? '',
-				isStatic: header.value !== ''
-			}))
-		};
-
-		if (!hasMissingRequiredSharedConfiguration(updatedServer, form)) {
-			return false;
-		}
-
-		configureForm = form;
-		configDialog?.open();
-		return true;
 	}
 
 	async function revealServerValues(server: MCPCatalogServer) {
@@ -278,7 +207,6 @@
 	}) {
 		server = initServer;
 		entry = initEntry;
-		mode = 'edit';
 
 		editAliasDialog?.open();
 	}
@@ -362,70 +290,6 @@
 		server = { ...server, alias };
 	}
 
-	function hasMissingRequiredSharedConfiguration(server: MCPCatalogServer, form: LaunchFormData) {
-		const missingKeys = new Set([
-			...(server.missingRequiredEnvVars ?? []),
-			...(server.missingRequiredHeader ?? [])
-		]);
-		if (missingKeys.size === 0) return false;
-
-		// Secret-bound and static values are managed outside this shared config form.
-		return [...(form.envs ?? []), ...(form.headers ?? [])].some(
-			(field) =>
-				missingKeys.has(field.key) &&
-				!hasSecretBinding(field) &&
-				!('isStatic' in field && field.isStatic) &&
-				field.required &&
-				!field.value
-		);
-	}
-
-	async function triggerCatalogUpdate(server: MCPCatalogServer): Promise<MCPCatalogServer> {
-		// trigger-update has no useful body, so fetch the scoped server after applying it.
-		if (server.powerUserWorkspaceID && server.catalogEntryID) {
-			await UserService.triggerWorkspaceMcpServerUpdate(
-				server.powerUserWorkspaceID,
-				server.catalogEntryID,
-				server.id
-			);
-			return UserService.getWorkspaceMCPCatalogServer(server.powerUserWorkspaceID, server.id);
-		}
-		if (server.mcpCatalogID) {
-			await AdminService.triggerMcpCatalogServerUpdate(server.mcpCatalogID, server.id);
-			return AdminService.getMCPCatalogServer(server.mcpCatalogID, server.id);
-		}
-		throw new Error('This server cannot be updated from the current view.');
-	}
-
-	async function configureSharedServer(server: MCPCatalogServer, envs: Record<string, string>) {
-		if (server.powerUserWorkspaceID) {
-			return UserService.configureWorkspaceMCPCatalogServer(
-				server.powerUserWorkspaceID,
-				server.id,
-				envs
-			);
-		}
-		if (server.mcpCatalogID) {
-			return AdminService.configureMCPCatalogServer(server.mcpCatalogID, server.id, envs);
-		}
-		throw new Error('This server cannot be configured from the current view.');
-	}
-
-	async function configureUpdatedCatalogServer(lf: LaunchFormData) {
-		if (!server) return;
-		// Persist any secret binding the admin (re)selected before applying shared config;
-		// configureSharedServer only writes user-supplied values, not the manifest bindings.
-		if (server.mcpCatalogID && isMultiUserServer(server)) {
-			await AdminService.updateMCPCatalogServer(
-				server.mcpCatalogID,
-				server.id,
-				applyFormBindingsToManifest(server.manifest, lf)
-			);
-		}
-		const envs = convertEnvHeadersToRecord(lf.envs, lf.headers);
-		server = await configureSharedServer(server, envs);
-	}
-
 	async function handleConfigureForm() {
 		if (!server) return;
 		if (!configureForm) return;
@@ -433,12 +297,7 @@
 		editing = true;
 		try {
 			const { timeout1, timeout2, timeout3 } = initUpdatingOrLaunchProgress();
-			if (mode === 'catalog-update') {
-				const lf = configureForm as LaunchFormData;
-				await configureUpdatedCatalogServer(lf);
-			} else {
-				await updateExistingRemoteOrSingleUser(configureForm);
-			}
+			await updateExistingRemoteOrSingleUser(configureForm);
 			launchProgress = 100;
 			clearTimeout(timeout1);
 			clearTimeout(timeout2);
@@ -453,7 +312,7 @@
 			}, 1000);
 		} catch (_error) {
 			console.error('Error during configuration:', _error);
-			launchError = _error instanceof Error ? _error.message : 'An unknown error occurred';
+			launchError = _error instanceof Error ? _error.message : m.mcps_unknown_error();
 		}
 	}
 </script>
@@ -465,12 +324,11 @@
 	icon={editingManifest?.icon}
 	name={getMCPDisplayName(server)}
 	onSave={handleConfigureForm}
-	submitText="Update"
+	submitText={m.core_update()}
 	loading={editing}
 	disableSave={!!secretBindingEngineError}
 	isNew={false}
-	showAlias={mode === 'edit'}
-	configurationTitle={mode === 'catalog-update' ? 'Required Configuration' : undefined}
+	showAlias
 	secretBindingTargets={editableSecretBindingTargets}
 	disableEnvSecretBindings={editingManifest?.runtime === 'remote'}
 	{deprecated}
@@ -481,7 +339,7 @@
 				<div class="flex flex-col gap-1 mb-4 w-full h-full" in:fade>
 					<div class="notification-error flex items-center gap-2">
 						<CircleAlert class="size-6 text-error" />
-						<h4 class="text-md font-medium">MCP Server Launch Failed</h4>
+						<h4 class="text-md font-medium">{m.mcps_deployments_launch_failed_title()}</h4>
 					</div>
 					{#if launchLogs.length > 0}
 						<div
@@ -494,7 +352,7 @@
 							{/each}
 						</div>
 					{:else}
-						<p class="text-sm self-start">An issue occurred while launching the MCP server.</p>
+						<p class="text-sm self-start">{m.mcps_deployments_launch_failed_description()}</p>
 					{/if}
 
 					<div class="flex w-full flex-col items-center gap-2 md:flex-row mt-2">
@@ -508,7 +366,7 @@
 									editing = false;
 								}}
 							>
-								Update Configuration and Try Again
+								{m.mcps_deployments_launch_update_and_retry()}
 							</button>
 						{/if}
 					</div>
@@ -527,7 +385,7 @@
 					</div>
 
 					<div class="flex w-md flex-col justify-center gap-2 text-center">
-						<p class="text-xs font-light">Launching MCP server...</p>
+						<p class="text-xs font-light">{m.mcps_deployments_launching_server()}</p>
 					</div>
 				</div>
 			{/if}

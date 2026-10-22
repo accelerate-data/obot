@@ -1,33 +1,44 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import { tooltip } from '$lib/actions/tooltip.svelte';
 	import Confirm from '$lib/components/Confirm.svelte';
 	import ResponsiveDialog from '$lib/components/ResponsiveDialog.svelte';
 	import CompositeEditTools from '$lib/components/mcp/composite/CompositeEditTools.svelte';
-	import IconButton from '$lib/components/primitives/IconButton.svelte';
+	import { m } from '$lib/i18n';
 	import type { VMcpToolDialog, VMcpToolFlow } from '$lib/runes/vmcps/vmcpToolFlow.svelte';
-	import { UserService } from '$lib/services';
+	import { UserService, type ToolOverride, type VMCPProfile } from '$lib/services';
 	import { configurationWithRevealedValues, vmcpComponentId } from '$lib/services/vmcps/utils';
+	import { goto, setUrlParam } from '$lib/url';
 	import McpServerIcon from './McpServerIcon.svelte';
 	import VMcpComponentConfigurationDialog from './VMcpComponentConfigurationDialog.svelte';
+	import VMcpComponentDetailsDialog from './VMcpComponentDetailsDialog.svelte';
 	import VMcpToolsSetup from './VMcpToolsSetup.svelte';
-	import { ArrowRightLeft, RefreshCcw, Server, Settings2, Trash2 } from '@lucide/svelte';
+	import { ArrowRightLeft, RefreshCcw, Server, Settings2 } from '@lucide/svelte';
 	import { tick } from 'svelte';
 
 	interface Props {
 		flow: VMcpToolFlow;
+		readonly?: boolean;
 	}
 
-	let { flow }: Props = $props();
+	let { flow, readonly }: Props = $props();
 	let addedCreateDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let asIsButton = $state<HTMLButtonElement>();
 	let setupDialog = $state<ReturnType<typeof VMcpToolsSetup>>();
 	let editDialog = $state<ReturnType<typeof CompositeEditTools>>();
 	let componentActionsDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let configurationDialog = $state<ReturnType<typeof VMcpComponentConfigurationDialog>>();
+	let detailsDialog = $state<ReturnType<typeof VMcpComponentDetailsDialog>>();
 	let renderedDialog: VMcpToolDialog | undefined;
 	let synchronizing = false;
+	let pendingAffectedProfiles = $state<VMCPProfile[]>([]);
 	const isLastComponent = $derived((flow.modifyingVMcp?.components ?? []).length <= 1);
-	const lastComponentTooltip = 'VMCP requires at least one component.';
+	const lastComponentTooltip = m.vmcps_requires_one_component();
+	const otherComponentNames = $derived(
+		(flow.modifyingVMcp?.components ?? [])
+			.filter((component) => vmcpComponentId(component) !== flow.configuringComponentId)
+			.map((component) => component.name)
+	);
 
 	async function openConfigureDialog() {
 		if (!flow.configuringEntry) return;
@@ -51,9 +62,11 @@
 
 		configurationDialog?.open(flow.configuringEntry, {
 			configuration,
+			isShared: Boolean(flow.modifyingVMcp && !flow.modifyingVMcp.userID),
 			forceSingleUser: flow.configuringComponent?.forceSingleUser,
-			submitLabel: flow.postCreateConfiguration ? 'Next' : 'Save',
-			errorMessage: 'Failed to update configuration.'
+			submitLabel: flow.postCreateConfiguration ? m.core_next() : m.core_save(),
+			errorMessage: m.vmcps_failed_to_update_configuration(),
+			hideCancel: flow.postCreateConfiguration
 		});
 	}
 
@@ -68,6 +81,12 @@
 		if (dialog === 'configure' && flow.configuringEntry) {
 			void openConfigureDialog();
 		}
+		if (dialog === 'details') {
+			detailsDialog?.open({
+				name: flow.configuringComponent?.name ?? '',
+				toolPrefix: flow.configuringComponent?.toolPrefix ?? ''
+			});
+		}
 	}
 
 	function closeDialog(dialog: VMcpToolDialog | undefined) {
@@ -76,14 +95,11 @@
 		if (dialog === 'edit') editDialog?.close();
 		if (dialog === 'actions') componentActionsDialog?.close();
 		if (dialog === 'configure') configurationDialog?.close();
+		if (dialog === 'details') detailsDialog?.close();
 	}
 
 	function handleDialogClose(dialog: VMcpToolDialog) {
 		if (synchronizing || flow.dialog !== dialog) return;
-		if (dialog === 'configure') {
-			flow.returnToActions();
-			return;
-		}
 		flow.close();
 	}
 
@@ -94,7 +110,78 @@
 		if (dialog === 'edit') return Boolean(editDialog);
 		if (dialog === 'actions') return Boolean(componentActionsDialog);
 		if (dialog === 'configure') return Boolean(configurationDialog);
+		if (dialog === 'details') return Boolean(detailsDialog);
 		return true;
+	}
+
+	function droppedToolNames(
+		previous: ToolOverride[] | undefined,
+		next: ToolOverride[] | undefined
+	) {
+		const previousByName = new Map((previous ?? []).map((tool) => [tool.name, tool]));
+		const nextByName = new Map((next ?? []).map((tool) => [tool.name, tool]));
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity
+		const dropped = new Set<string>();
+		for (const [name, tool] of previousByName) {
+			const updated = nextByName.get(name);
+			const wasEnabled = tool.enabled !== false;
+			const stillEnabled = Boolean(updated && updated.enabled !== false && !updated.removed);
+			if ((wasEnabled && !stillEnabled) || !updated || updated.removed) dropped.add(name);
+		}
+		for (const [name, tool] of nextByName) {
+			if (!previousByName.has(name) && (tool.removed || tool.enabled === false)) dropped.add(name);
+		}
+		return dropped;
+	}
+
+	function profilesAffectedByToolSave(
+		componentId: string | undefined,
+		previous: ToolOverride[] | undefined,
+		next: ToolOverride[] | undefined,
+		profiles: VMCPProfile[] | undefined
+	) {
+		if (!componentId || !profiles?.length) return [];
+		const dropped = droppedToolNames(previous, next);
+		if (dropped.size === 0) return [];
+		return profiles.filter((profile) => {
+			const allowed = profile.vmcpPermissions?.allowedComponents?.[componentId]?.allowedTools;
+			return Array.isArray(allowed) && allowed.some((name) => dropped.has(name));
+		});
+	}
+
+	async function saveAndOfferProfileUpdate(
+		config: {
+			toolPrefix?: string;
+			toolOverrides?: ToolOverride[];
+		},
+		offerProfileUpdate: boolean
+	) {
+		const component = flow.configuringComponent;
+		if (!component) return;
+		const affected = offerProfileUpdate
+			? profilesAffectedByToolSave(
+					flow.configuringComponentId,
+					component.toolOverrides,
+					config.toolOverrides,
+					flow.modifyingVMcp?.profiles
+				)
+			: [];
+		const saved = await flow.saveTools({
+			...component,
+			toolPrefix: config.toolPrefix,
+			toolOverrides: config.toolOverrides
+		});
+		if (saved && affected.length > 0) pendingAffectedProfiles = affected;
+	}
+
+	function openAffectedProfiles() {
+		const targets = pendingAffectedProfiles;
+		pendingAffectedProfiles = [];
+		const url = new URL(page.url);
+		setUrlParam(url, 'view', 'profiles');
+		const profileId = targets.length === 1 ? targets[0].name : null;
+		setUrlParam(url, 'profile', profileId);
+		goto(url, { replaceState: true, noScroll: true, keepFocus: true });
 	}
 
 	$effect(() => {
@@ -111,17 +198,64 @@
 </script>
 
 <Confirm
+	show={Boolean(flow.pendingToolSearchRecommendation) && !flow.dialog}
+	onsuccess={flow.enableToolSearch}
+	oncancel={flow.dismissToolSearchRecommendation}
+	type="info"
+	title={m.vmcps_tool_search_prompt_title()}
+	submitText={m.vmcps_tool_search_enable()}
+	cancelText={m.vmcps_tool_search_keep_direct()}
+	loading={flow.enablingToolSearch}
+	classes={{ body: '[&_p]:text-sm [&_p]:font-normal' }}
+	msg={flow.pendingToolSearchRecommendation?.approximate
+		? m.vmcps_tool_search_prompt_preview()
+		: m.vmcps_tool_search_prompt_description()}
+>
+	{#snippet titleContent()}
+		<span class="font-normal">{m.vmcps_tool_search_prompt_title()}</span>
+	{/snippet}
+	{#snippet note()}
+		{#if flow.toolSearchError}
+			<p class="text-error text-sm" role="alert">{flow.toolSearchError}</p>
+		{/if}
+	{/snippet}
+</Confirm>
+
+<Confirm
+	show={pendingAffectedProfiles.length > 0 && !flow.pendingToolSearchRecommendation}
+	onsuccess={openAffectedProfiles}
+	oncancel={() => (pendingAffectedProfiles = [])}
+	type="info"
+	title={m.vmcps_update_profiles_title()}
+	submitText={pendingAffectedProfiles.length === 1
+		? m.vmcps_update_profile()
+		: m.vmcps_go_to_profiles()}
+	cancelText={m.vmcps_skip()}
+	msg={m.vmcps_update_profiles_msg()}
+>
+	{#snippet note()}
+		<p class="text-sm font-light">
+			{pendingAffectedProfiles.length === 1
+				? m.vmcps_affected_profiles_note_one()
+				: m.vmcps_affected_profiles_note_other()}
+		</p>
+	{/snippet}
+</Confirm>
+
+<Confirm
 	show={Boolean(flow.pendingRemoval)}
 	onsuccess={flow.removeComponent}
 	oncancel={flow.cancelRemove}
 	msg=""
 	loading={flow.removing}
-	title="Confirm Remove"
+	title={m.vmcps_confirm_remove()}
 >
 	{#snippet note()}
-		Are you sure you want to remove "<b>{flow.pendingRemoval?.component.name ?? 'this server'}</b>"
-		from <b>{flow.pendingRemoval?.vmcp.displayName ?? 'this vMCP'}</b>? The tools for this server
-		will no longer be available.
+		{m.vmcps_remove_confirm_prefix()}<b
+			>{flow.pendingRemoval?.component.name ?? m.vmcps_this_server()}</b
+		>{m.vmcps_remove_confirm_middle()}<b
+			>{flow.pendingRemoval?.vmcp.displayName ?? m.vmcps_deployments_this_vmcp()}</b
+		>{m.vmcps_remove_confirm_suffix()}
 	{/snippet}
 </Confirm>
 
@@ -129,7 +263,7 @@
 	animate="slide"
 	class="md:w-lg"
 	bind:this={addedCreateDialog}
-	title="Add Tools"
+	title={m.vmcps_add_tools()}
 	onClose={() => handleDialogClose('added-create')}
 >
 	<div class="flex flex-col gap-4 p-4 md:p-0">
@@ -137,7 +271,7 @@
 			<div class="flex flex-col items-center gap-4">
 				{@render serverHeading()}
 				<p class="text-center text-sm font-light">
-					How would you like to set up the MCP server tools?
+					{m.vmcps_how_set_up_tools()}
 				</p>
 			</div>
 			<div class="flex w-full flex-col gap-4">
@@ -150,11 +284,9 @@
 						class="text-muted-content size-12 shrink-0 pl-1 transition-colors group-hover:text-inherit group-focus:text-inherit"
 					/>
 					<div>
-						<p class="mb-1 text-sm font-semibold">As-is</p>
+						<p class="mb-1 text-sm font-semibold">{m.vmcps_as_is()}</p>
 						<span class="text-muted-content block text-xs leading-4">
-							Use the MCP server as-is. Tools and their definitions are passed through
-							automatically, including future changes from the source. No authentication is required
-							during setup.
+							{m.vmcps_as_is_description()}
 						</span>
 					</div>
 				</button>
@@ -167,11 +299,11 @@
 					/>
 					<div>
 						<p class="mb-1 text-sm font-semibold">
-							Managed <span class="text-muted-content font-normal">[Recommended]</span>
+							{m.vmcps_managed()}
+							<span class="text-muted-content font-normal">{m.vmcps_recommended_tag()}</span>
 						</p>
 						<span class="text-muted-content block text-xs leading-4">
-							Authenticate to discover and select specific tools. Tool names and descriptions are
-							captured and can be customized, protecting the vMCP from unexpected upstream changes.
+							{m.vmcps_managed_description()}
 						</span>
 					</div>
 				</button>
@@ -188,24 +320,12 @@
 	existingTools={flow.tools}
 	existingToolPrefix={flow.existingToolPrefix}
 	otherEffectiveNames={flow.otherEffectiveNames}
-	otherToolPrefixes={flow.otherToolPrefixes}
+	{readonly}
 	onCancel={flow.close}
 	onSuccess={(config) => {
-		const component = flow.configuringComponent;
-		if (!component) return;
-		void flow.saveTools({
-			...component,
-			toolPrefix: config.toolPrefix,
-			toolOverrides: config.toolOverrides
-		});
+		void saveAndOfferProfileUpdate(config, flow.refresh);
 	}}
->
-	{#snippet additionalActions()}
-		{#if flow.modifyingExistingComponent && !flow.collecting}
-			{@render removeComponentButton()}
-		{/if}
-	{/snippet}
-</VMcpToolsSetup>
+/>
 
 <ResponsiveDialog
 	class="md:w-sm"
@@ -221,96 +341,100 @@
 					<Server class="size-6" />
 				</div>
 			{/if}
-			{flow.configuringEntry?.manifest.name}
+			{flow.configuringComponent?.name}
 		</div>
 	{/snippet}
 	<div class="flex flex-col gap-2 md:px-0 px-4">
-		<p class="text-sm text-center mb-3 md:mt-0 mt-4">What would you like to do?</p>
-		<button class="btn btn-secondary w-full" onclick={flow.modifyToolsFromActions}>
-			Modify Tools
+		<p class="text-sm text-center mb-3 md:mt-0 mt-4">{m.vmcps_what_would_you_like_to_do()}</p>
+		<button class="btn btn-secondary w-full" onclick={() => flow.editDetails()}>
+			{readonly ? m.vmcps_view_details() : m.vmcps_edit_details()}
 		</button>
-		{#if flow.canConfigureComponent}
+		<button
+			class="btn btn-secondary w-full"
+			onclick={() => flow.modifyToolsFromActions(Boolean(readonly))}
+		>
+			{readonly ? m.vmcps_view_tools() : m.vmcps_modify_tools()}
+		</button>
+		{#if flow.canSeeComponentConfiguration}
 			<button class="btn btn-secondary w-full" onclick={flow.editConfiguration}>
-				Change Configuration
+				{readonly ? m.vmcps_view_configuration() : m.vmcps_change_configuration()}
 			</button>
 		{/if}
-		<div
-			class="w-full"
-			use:tooltip={isLastComponent
-				? { text: lastComponentTooltip, disablePortal: true, placement: 'bottom' }
-				: undefined}
-		>
-			<button
-				class="btn btn-secondary hover:btn-error w-full"
-				disabled={isLastComponent}
-				onclick={flow.promptRemove}
+		{#if !readonly}
+			<div
+				class="w-full"
+				use:tooltip={isLastComponent
+					? { text: lastComponentTooltip, disablePortal: true, placement: 'bottom' }
+					: undefined}
 			>
-				Remove {flow.configuringEntry?.manifest.name ?? 'this server'}
-			</button>
-		</div>
+				<button
+					class="btn btn-secondary hover:btn-error w-full"
+					disabled={isLastComponent}
+					onclick={flow.promptRemove}
+				>
+					{m.vmcps_remove_named({
+						name: flow.configuringEntry?.manifest.name ?? m.vmcps_this_server()
+					})}
+				</button>
+			</div>
+		{/if}
 	</div>
 </ResponsiveDialog>
 
+<VMcpComponentDetailsDialog
+	bind:this={detailsDialog}
+	{readonly}
+	otherNames={otherComponentNames}
+	otherToolPrefixes={flow.otherToolPrefixes}
+	otherEffectiveNames={flow.otherEffectiveNames}
+	toolOverrides={flow.configuringComponent?.toolOverrides}
+	onSave={flow.saveDetails}
+	onClose={() => handleDialogClose('details')}
+/>
+
 <VMcpComponentConfigurationDialog
 	bind:this={configurationDialog}
+	{readonly}
 	onNext={flow.saveConfiguration}
 	onClose={() => handleDialogClose('configure')}
 />
 
 <CompositeEditTools
 	bind:this={editDialog}
+	name={flow.configuringComponent?.name}
 	configuringEntry={flow.configuringEntry}
 	tools={flow.tools}
-	bind:toolPrefix={flow.toolPrefix}
+	profiles={flow.modifyingVMcp?.profiles}
+	componentId={flow.configuringComponentId}
+	toolPrefix={flow.toolPrefix}
 	otherEffectiveNames={flow.otherEffectiveNames}
-	otherToolPrefixes={flow.otherToolPrefixes}
+	{readonly}
 	onCancel={flow.close}
 	onClose={() => handleDialogClose('edit')}
 	onSuccess={flow.saveEditedTools}
 >
 	{#snippet additionalActions()}
 		<div class="flex items-center gap-3">
-			<IconButton
-				tooltip={{ text: 'Refresh tools', disablePortal: true, placement: 'right' }}
-				onclick={flow.refreshTools}
-				class="dark:hover:bg-base-300"
+			<button
+				onclick={() => flow.refreshTools()}
+				class="btn-sm btn-outline btn not-hover:border-muted-content/50 not-hover:text-muted-content rounded-full hover:btn-primary hover:btn-outline"
 			>
 				<RefreshCcw class="size-4" />
-			</IconButton>
+				{m.vmcps_refresh_tools()}
+			</button>
 		</div>
 	{/snippet}
 </CompositeEditTools>
 
 {#snippet serverHeading()}
 	<span class="flex items-center gap-2 text-base font-semibold">
-		{#if flow.addedServer?.component.manifest.icon}
-			<img src={flow.addedServer.component.manifest.icon} alt="" class="size-6 icon" />
+		{#if flow.addedServer?.component.catalogEntry?.manifest?.icon}
+			<img src={flow.addedServer.component.catalogEntry.manifest.icon} alt="" class="size-6 icon" />
 		{:else}
 			<div class="icon">
 				<Server class="size-6" />
 			</div>
 		{/if}
-		{flow.addedServer?.component.manifest.name}
+		{flow.addedServer?.component.name}
 	</span>
-{/snippet}
-
-{#snippet removeComponentButton()}
-	<div
-		use:tooltip={isLastComponent
-			? { text: lastComponentTooltip, disablePortal: true, placement: 'right' }
-			: undefined}
-	>
-		<IconButton
-			tooltip={{
-				text: isLastComponent ? lastComponentTooltip : 'Delete MCP Server',
-				disablePortal: true,
-				placement: 'right'
-			}}
-			onclick={flow.promptRemove}
-			variant="danger2"
-			disabled={isLastComponent}
-		>
-			<Trash2 class="size-4" />
-		</IconButton>
-	</div>
 {/snippet}

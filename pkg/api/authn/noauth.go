@@ -7,6 +7,7 @@ import (
 	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/principal"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
@@ -43,6 +44,10 @@ func (n *NoAuth) AuthenticateRequest(req *http.Request) (*authenticator.Response
 			Name:   "nobody",
 			UID:    fmt.Sprintf("%d", gatewayUser.ID),
 			Groups: gatewayUser.Role.Groups(),
+			Extra: map[string][]string{
+				"obot_groups":             gatewayUser.Role.Groups(),
+				principal.UserStatusExtra: {string(gatewayUser.Status())},
+			},
 		},
 	}, true, nil
 }

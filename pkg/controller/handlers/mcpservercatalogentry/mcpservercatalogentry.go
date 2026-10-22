@@ -274,11 +274,6 @@ func syncOAuthCredential(req router.Request, creds credentialClient, entry *v1.M
 	return false, nil
 }
 
-// RemoveOAuthCredentials removes OAuth credentials when a catalog entry is deleted.
-func (h *Handler) RemoveOAuthCredentials(req router.Request, _ router.Response) error {
-	return removeOAuthCredentials(req, h.gatewayClient)
-}
-
 func removeOAuthCredentials(req router.Request, creds credentialClient) error {
 	entry := req.Object.(*v1.MCPServerCatalogEntry)
 

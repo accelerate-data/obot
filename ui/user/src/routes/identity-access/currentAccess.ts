@@ -1,3 +1,4 @@
+import { m } from '$lib/i18n';
 import {
 	AdminService,
 	type AccessControlRule,
@@ -7,13 +8,21 @@ import {
 
 export type CurrentAccessKind = 'user' | 'group';
 
-export type AccessMatchReason = 'everyone' | 'direct-user' | 'direct-group' | 'via-group';
+export type AccessMatchReason =
+	| 'everyone'
+	| 'direct-user'
+	| 'direct-group'
+	| 'via-group'
+	| 'via-role'
+	| 'owner';
 
 export interface CurrentAccessTarget {
 	kind: CurrentAccessKind;
 	id: string;
 	name: string;
-	groupIds?: string[];
+	authProviderGroups?: string[];
+	/** Obot role groups (for example `admin`) the user belongs to through their effective role. */
+	obotGroups?: string[];
 }
 
 export type AccessResourceType =
@@ -22,7 +31,6 @@ export type AccessResourceType =
 	| 'model'
 	| 'skill'
 	| 'skillRepository'
-	| 'hostedAgent'
 	| 'vmcp'
 	| 'selector';
 
@@ -69,17 +77,18 @@ export interface CurrentAccessSections {
 	mcp: MatchedAccessPolicy[];
 	models: MatchedAccessPolicy[];
 	skills: MatchedAccessPolicy[];
-	hostedAgents: MatchedAccessPolicy[];
 	vmcps: MatchedAccessPolicy[];
 }
 
 export type CurrentAccessSectionKey = keyof CurrentAccessSections;
 
 export const ACCESS_MATCH_REASON_LABEL: Record<AccessMatchReason, string> = {
-	everyone: 'All Obot Users',
-	'direct-user': 'Assigned to this user',
-	'direct-group': 'Assigned to this group',
-	'via-group': 'Via group membership'
+	everyone: m.core_all_obot_users(),
+	'direct-user': m.identity_access_current_access_reason_direct_user(),
+	'direct-group': m.identity_access_current_access_reason_direct_group(),
+	'via-group': m.identity_access_current_access_reason_via_group(),
+	'via-role': m.identity_access_current_access_reason_via_role(),
+	owner: m.identity_access_current_access_reason_owner()
 };
 
 export function isEveryoneSubject(subject: AccessControlRuleSubject): boolean {
@@ -95,10 +104,11 @@ export function subjectsApplyTo(
 	}
 
 	const reasons = new Set<AccessMatchReason>();
-	const groupIds = new Set(target.groupIds ?? []);
+	const authProviderGroups = new Set(target.authProviderGroups ?? []);
 	if (target.kind === 'group') {
-		groupIds.add(target.id);
+		authProviderGroups.add(target.id);
 	}
+	const obotGroups = new Set(target.kind === 'user' ? (target.obotGroups ?? []) : []);
 
 	for (const subject of subjects) {
 		if (isEveryoneSubject(subject)) {
@@ -111,8 +121,13 @@ export function subjectsApplyTo(
 			continue;
 		}
 
-		if (subject.type === 'group' && groupIds.has(subject.id)) {
+		if (subject.type === 'group' && authProviderGroups.has(subject.id)) {
 			reasons.add(target.kind === 'group' ? 'direct-group' : 'via-group');
+			continue;
+		}
+
+		if (subject.type === 'obotGroup' && obotGroups.has(subject.id)) {
+			reasons.add('via-role');
 		}
 	}
 
@@ -128,6 +143,10 @@ export function mcpAccessPolicyHref(rule: AccessControlRule): `/${string}` {
 
 export function vmcpAccessHref(id: string): `/${string}` {
 	return `/vmcps/${id}?view=profiles`;
+}
+
+export function personalVmcpHref(id: string): `/${string}` {
+	return `/vmcps/${id}`;
 }
 
 function matchPolicies<
@@ -196,10 +215,13 @@ export function grantsEverything(policies: MatchedAccessPolicy[]): boolean {
 /**
  * Flattens the resources granted by the matched policies into a deduplicated list, tracking which
  * policies granted each resource. `describe` turns a resource reference into display text.
+ *
+ * A policy that grants everything (`*`) is expanded to display the concrete resources for that section if they are available.
  */
 export function collectAccessResources(
 	policies: MatchedAccessPolicy[],
-	describe: (resource: AccessPolicyResource) => AccessResourceDescription
+	describe: (resource: AccessPolicyResource) => AccessResourceDescription,
+	catalog?: AccessPolicyResource[]
 ): MatchedAccessResource[] {
 	const byKey = new Map<string, MatchedAccessResource>();
 
@@ -228,6 +250,37 @@ export function collectAccessResources(
 		}
 	}
 
+	if (catalog && grantsEverything(policies)) {
+		const everythingPolicies = policies.filter((policy) =>
+			policy.resources.some((resource) => resource.id === EVERYTHING_RESOURCE_ID)
+		);
+
+		for (const resource of catalog) {
+			if (resource.id === EVERYTHING_RESOURCE_ID) {
+				continue;
+			}
+
+			const key = `${resource.type}:${resource.id}`;
+			const existing = byKey.get(key);
+			if (existing) {
+				for (const policy of everythingPolicies) {
+					if (!existing.policies.some((granting) => granting.id === policy.id)) {
+						existing.policies.push(policy);
+					}
+				}
+				continue;
+			}
+
+			byKey.set(key, {
+				key,
+				id: resource.id,
+				type: resource.type,
+				...describe(resource),
+				policies: [...everythingPolicies]
+			});
+		}
+	}
+
 	return [...byKey.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -244,9 +297,23 @@ function dedupeById<T extends { id: string }>(items: T[]): T[] {
 
 function matchVmcpProfiles(vmcps: VMCP[], target: CurrentAccessTarget): MatchedAccessPolicy[] {
 	return vmcps
-		.flatMap((vmcp) => {
+		.flatMap((vmcp): MatchedAccessPolicy[] => {
+			const resources = [{ type: 'vmcp' as const, id: vmcp.id, name: vmcp.displayName }];
+
+			// Personal vMCPs have no profiles; only their owner can use them.
 			if (vmcp.userID) {
-				return [];
+				if (target.kind !== 'user' || vmcp.userID !== target.id) {
+					return [];
+				}
+				return [
+					{
+						id: `${vmcp.id}:owner`,
+						displayName: m.identity_access_current_access_personal_vmcp(),
+						href: personalVmcpHref(vmcp.id),
+						reasons: ['owner'],
+						resources
+					}
+				];
 			}
 
 			return (vmcp.profiles ?? []).flatMap((profile) => {
@@ -260,7 +327,7 @@ function matchVmcpProfiles(vmcps: VMCP[], target: CurrentAccessTarget): MatchedA
 						displayName: profile.name,
 						href: vmcpAccessHref(vmcp.id),
 						reasons,
-						resources: [{ type: 'vmcp' as const, id: vmcp.id, name: vmcp.displayName }]
+						resources
 					}
 				];
 			});
@@ -308,15 +375,6 @@ export async function loadCurrentAccess(
 				(policy) => policy.resources ?? []
 			);
 		}
-		case 'hostedAgents': {
-			const hostedAgents = await AdminService.listHostedAgentAccessPolicies();
-			return matchPolicies(
-				hostedAgents,
-				target,
-				(policy) => `/hosted-agents/access-policies/${policy.id}`,
-				(policy) => policy.resources ?? []
-			);
-		}
 		case 'vmcps': {
 			const vmcps = await AdminService.listAllVMCPs();
 			return matchVmcpProfiles(vmcps, target);
@@ -329,7 +387,6 @@ export function hasAnyCurrentAccess(sections: CurrentAccessSections): boolean {
 		sections.mcp.length > 0 ||
 		sections.models.length > 0 ||
 		sections.skills.length > 0 ||
-		sections.hostedAgents.length > 0 ||
 		sections.vmcps.length > 0
 	);
 }

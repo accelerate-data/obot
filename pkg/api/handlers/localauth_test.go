@@ -20,6 +20,7 @@ import (
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
 	gwtypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/hash"
+	"github.com/obot-platform/obot/pkg/i18n"
 	"github.com/obot-platform/obot/pkg/localauth"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -159,6 +160,23 @@ func TestLocalAuthBootstrapCreation(t *testing.T) {
 	users, err := f.gateway.LocalAuthUsers(t.Context())
 	require.NoError(t, err)
 	require.Len(t, users, 2)
+}
+
+func TestLocalAuthValidationUsesRequestLocale(t *testing.T) {
+	f := newLocalSetupFixture(t, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/local-auth/users", strings.NewReader(`{"email":"invalid","password":"long-enough-password"}`))
+	req = req.WithContext(i18n.WithLocale(req.Context(), "ko"))
+	recorder := httptest.NewRecorder()
+	err := f.handler.Create(api.Context{
+		Request:        req,
+		ResponseWriter: recorder,
+		GatewayClient:  f.gateway,
+		User:           &kuser.DefaultInfo{Name: "owner"},
+	})
+	var httpErr *apitypes.ErrHTTP
+	require.ErrorAs(t, err, &httpErr)
+	require.Equal(t, http.StatusBadRequest, httpErr.Code)
+	require.Contains(t, httpErr.Message, "유효한 이메일 주소")
 }
 
 func TestLocalAuthBootstrapLoginCompletesInOneSession(t *testing.T) {

@@ -1,7 +1,10 @@
+import { m } from '$lib/i18n';
 import type { DefaultModelAlias, MCPCatalogServer, Model, Version } from '$lib/services/user/types';
 import { LoggingTransport } from './logging-transport';
+import { TesterClient, type RejectedTesterTool } from './tester-client';
+import { testerErrorDetails } from './tester-errors';
 import { MCPTesterLog } from './tester-log.svelte';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import {
 	StreamableHTTPClientTransport,
 	StreamableHTTPError
@@ -39,6 +42,19 @@ export function isUnavailableTesterFailure(status: TesterStatus): boolean {
 	return status === 'error' || status === 'unhealthy';
 }
 
+export function testerStatusLabel(status: TesterStatus): string {
+	switch (status) {
+		case 'idle':
+			return m.mcps_tester_log_status_idle();
+		case 'initializing':
+			return m.mcps_tester_log_status_initializing();
+		case 'ready':
+			return m.core_mcp_value_connected();
+		default:
+			return m.mcps_tester_status_unavailable();
+	}
+}
+
 export type TesterWorkflowKind = 'chat' | 'direct';
 export type DirectOperationStatus =
 	| 'success'
@@ -53,6 +69,7 @@ export interface DirectOperationResult<T> {
 	durationMs: number;
 	value?: T;
 	message?: string;
+	details?: unknown;
 }
 
 export interface StagedPromptContext {
@@ -78,13 +95,13 @@ export interface StageResult {
 
 export function normalizeTesterSection(value: string | null | undefined): TesterSection {
 	switch (value) {
-		case 'tools':
+		case 'chat':
 		case 'prompts':
 		case 'resources':
 		case 'logs':
 			return value;
 		default:
-			return 'chat';
+			return 'tools';
 	}
 }
 
@@ -119,7 +136,7 @@ export function testerChatAvailability(
 	if (version.hasModelProvider === null) {
 		return {
 			available: false,
-			unavailableMessage: 'Model configuration is unavailable or changing. Try again later.'
+			unavailableMessage: m.mcps_tester_chat_model_config_unavailable()
 		};
 	}
 
@@ -132,8 +149,8 @@ export function testerChatAvailability(
 			available: false,
 			unavailableMessage:
 				version.hasValidLicense !== true
-					? 'The chat feature is managed by your administrator. Contact your Obot admin to enable access.'
-					: 'The MCP Tester model service is disabled or unavailable. Contact an administrator.'
+					? m.mcps_tester_chat_managed_by_admin()
+					: m.mcps_tester_chat_model_service_unavailable()
 		};
 	}
 
@@ -150,8 +167,8 @@ export function testerChatAvailability(
 	return {
 		available: Boolean(configuredDefault?.model && defaultModel),
 		unavailableMessage: !configuredDefault?.model
-			? 'No default llm model is configured. Configure one to use Chat.'
-			: 'The configured default llm model is inactive or unavailable to your account.'
+			? m.mcps_tester_chat_no_default_model()
+			: m.mcps_tester_chat_default_model_inactive()
 	};
 }
 
@@ -169,12 +186,14 @@ export interface CapabilityCache<T = unknown> {
 	items: T[];
 	pages: unknown[];
 	error?: string;
+	errorDetails?: unknown;
 	errorStatus?: DirectOperationStatus;
 }
 
 export interface MCPPageCollection<T, TPage = unknown> {
 	items: T[];
 	pages: TPage[];
+	rejectedTools?: RejectedTesterTool[];
 }
 
 type ToolsPage = Awaited<ReturnType<Client['listTools']>>;
@@ -234,21 +253,37 @@ function errorMessage(error: unknown): string {
 function classifyOperationError(
 	error: unknown,
 	signal?: AbortSignal
-): Pick<DirectOperationResult<never>, 'status' | 'message'> {
+): Pick<DirectOperationResult<never>, 'status' | 'message' | 'details'> {
 	if (
 		signal?.aborted ||
 		(error instanceof DOMException && error.name === 'AbortError') ||
 		(error instanceof Error && error.name === 'AbortError')
 	) {
-		return { status: 'cancelled', message: 'Cancelled by user' };
+		return {
+			status: 'cancelled',
+			message: m.mcps_tester_op_cancelled_by_user(),
+			details: testerErrorDetails(error)
+		};
 	}
 	if (error instanceof McpError && error.code === ErrorCode.RequestTimeout) {
-		return { status: 'timeout', message: 'The MCP operation timed out' };
+		return {
+			status: 'timeout',
+			message: m.mcps_tester_op_timed_out(),
+			details: testerErrorDetails(error)
+		};
 	}
 	if (error instanceof StreamableHTTPError && error.code === 403) {
-		return { status: 'denied', message: 'Access to this MCP operation was denied' };
+		return {
+			status: 'denied',
+			message: m.mcps_tester_op_denied(),
+			details: testerErrorDetails(error)
+		};
 	}
-	return { status: 'transport-error', message: errorMessage(error) };
+	return {
+		status: 'transport-error',
+		message: errorMessage(error),
+		details: testerErrorDetails(error)
+	};
 }
 
 function byteLength(value: string): number {
@@ -278,6 +313,12 @@ export function isTextualMimeType(mimeType?: string): boolean {
 	);
 }
 
+class NoValidTesterToolsError extends Error {
+	constructor(readonly rejectedTools: RejectedTesterTool[]) {
+		super(m.mcps_tester_no_valid_tools(), { cause: rejectedTools });
+	}
+}
+
 const maxPages = 500;
 
 async function collectPages<T, TPage extends { nextCursor?: string }>(
@@ -299,11 +340,11 @@ async function collectPages<T, TPage extends { nextCursor?: string }>(
 			// The tester talks to arbitrary servers, so a cursor that repeats (or cycles) would
 			// otherwise page forever and grow these arrays without bound.
 			if (seen.has(cursor)) {
-				throw new Error(`server repeated pagination cursor ${JSON.stringify(cursor)}`);
+				throw new Error(m.mcps_tester_op_repeated_cursor({ cursor: JSON.stringify(cursor) }));
 			}
 			seen.add(cursor);
 			if (seen.size > maxPages) {
-				throw new Error(`server returned more than ${maxPages} pages`);
+				throw new Error(m.mcps_tester_op_too_many_pages({ count: maxPages }));
 			}
 		}
 	} while (cursor);
@@ -356,7 +397,7 @@ function emptyCache<T>(): CapabilityCache<T> {
 }
 
 export class MCPTesterSession {
-	client: Client;
+	client: TesterClient;
 	readonly server: MCPCatalogServer;
 	readonly #clientInfo: Implementation;
 	readonly #fetcher: typeof fetch;
@@ -365,6 +406,8 @@ export class MCPTesterSession {
 	#connectionAttempted = false;
 	status = $state<TesterStatus>('idle');
 	error = $state<string>();
+	errorDetails = $state<unknown>();
+	toolDiscoveryIssues = $state<RejectedTesterTool[]>([]);
 	activeWorkflow = $state<TesterWorkflow>();
 	cache = $state<TesterCapabilityCaches>({
 		tools: emptyCache(),
@@ -381,9 +424,9 @@ export class MCPTesterSession {
 		({ client: this.client, transport: this.transport } = this.#createConnection());
 	}
 
-	#createConnection(): { client: Client; transport: LoggingTransport } {
+	#createConnection(): { client: TesterClient; transport: LoggingTransport } {
 		const origin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin;
-		const client = new Client(this.#clientInfo, { capabilities: {} });
+		const client = new TesterClient(this.#clientInfo, { capabilities: {} });
 		// The endpoint is immutable connection configuration, not reactive UI state.
 		// eslint-disable-next-line svelte/prefer-svelte-reactivity
 		const endpoint = new URL(`/mcp-connect/${encodeURIComponent(this.server.id)}`, origin);
@@ -421,6 +464,7 @@ export class MCPTesterSession {
 
 		this.status = 'initializing';
 		this.error = undefined;
+		this.errorDetails = undefined;
 		try {
 			if (this.#connectionAttempted) {
 				await this.#resetConnection();
@@ -433,6 +477,7 @@ export class MCPTesterSession {
 		} catch (error) {
 			if (this.isClosed()) return;
 			this.error = error instanceof Error ? error.message : String(error);
+			this.errorDetails = testerErrorDetails(error);
 			if (error instanceof StreamableHTTPError) {
 				switch (error.code) {
 					case 401:
@@ -452,13 +497,20 @@ export class MCPTesterSession {
 		}
 	}
 
-	listTools(
+	async listTools(
 		signal?: AbortSignal
 	): Promise<MCPPageCollection<ToolsPage['tools'][number], ToolsPage>> {
-		return collectPages(
-			(cursor) => this.client.listTools(cursor ? { cursor } : {}, { signal }),
+		const client = this.client;
+		client.rejectedTools = [];
+		const result = await collectPages(
+			(cursor) => client.listTools(cursor ? { cursor } : {}, { signal }),
 			(page) => page.tools
 		);
+		const rejectedTools = [...client.rejectedTools];
+		if (!result.items.length && rejectedTools.length) {
+			throw new NoValidTesterToolsError(rejectedTools);
+		}
+		return { ...result, rejectedTools };
 	}
 
 	listPrompts(
@@ -516,11 +568,13 @@ export class MCPTesterSession {
 		if (cache.loading || (!force && cache.loaded)) return;
 		if (this.activeWorkflow) return;
 		if (!this.isCapabilitySupported(section)) {
+			if (section === 'tools') this.toolDiscoveryIssues = [];
 			cache.loaded = true;
 			cache.unsupported = true;
 			cache.items = [];
 			cache.pages = [];
 			cache.error = undefined;
+			cache.errorDetails = undefined;
 			cache.errorStatus = undefined;
 			return;
 		}
@@ -529,12 +583,14 @@ export class MCPTesterSession {
 		cache.loading = true;
 		cache.unsupported = false;
 		cache.error = undefined;
+		cache.errorDetails = undefined;
 		cache.errorStatus = undefined;
 		try {
 			const result = await load(workflow.abort.signal);
 			if (workflow.abort.signal.aborted) return;
 			cache.items = result.items;
 			cache.pages = result.pages;
+			if (section === 'tools') this.toolDiscoveryIssues = result.rejectedTools ?? [];
 			cache.loaded = true;
 		} catch (error) {
 			if (
@@ -549,8 +605,16 @@ export class MCPTesterSession {
 				cache.pages = [];
 				return;
 			}
+			if (error instanceof NoValidTesterToolsError && !workflow.abort.signal.aborted) {
+				this.toolDiscoveryIssues = error.rejectedTools;
+				cache.items = [];
+				cache.pages = [];
+				cache.loaded = false;
+				this.inspectors.tools = {};
+			}
 			const classified = classifyOperationError(error, workflow.abort.signal);
 			cache.error = classified.message;
+			cache.errorDetails = classified.details;
 			cache.errorStatus = classified.status;
 			if (classified.status === 'denied') this.status = 'access-denied';
 		} finally {
@@ -592,11 +656,22 @@ export class MCPTesterSession {
 		});
 	}
 
-	async snapshotChatTools(signal: AbortSignal): Promise<Tool[]> {
-		if (!this.isCapabilitySupported('tools')) return [];
+	async snapshotChatTools(
+		signal: AbortSignal,
+		onRejectedTools?: (tools: RejectedTesterTool[]) => void
+	): Promise<Tool[]> {
+		if (!this.isCapabilitySupported('tools')) {
+			onRejectedTools?.([]);
+			return [];
+		}
 		try {
-			return (await this.listTools(signal)).items;
+			const result = await this.listTools(signal);
+			if (!signal.aborted) onRejectedTools?.(result.rejectedTools ?? []);
+			return result.items;
 		} catch (error) {
+			if (error instanceof NoValidTesterToolsError && !signal.aborted) {
+				onRejectedTools?.(error.rejectedTools);
+			}
 			const classified = classifyOperationError(error, signal);
 			if (classified.status === 'denied') this.status = 'access-denied';
 			throw new Error(classified.message, { cause: error });
@@ -643,12 +718,12 @@ export class MCPTesterSession {
 
 	stagePrompt(name: string, result: GetPromptResult): StageResult {
 		if (result.messages.length === 0) {
-			return { ok: false, message: 'This prompt resolved to no messages.' };
+			return { ok: false, message: m.mcps_tester_stage_prompt_empty() };
 		}
 		if (result.messages.some((message) => message.content.type !== 'text')) {
 			return {
 				ok: false,
-				message: 'This prompt contains content that the tester cannot send to Chat.'
+				message: m.mcps_tester_stage_prompt_unsupported()
 			};
 		}
 		const size = result.messages.reduce(
@@ -657,7 +732,7 @@ export class MCPTesterSession {
 			0
 		);
 		if (size > MAX_STAGED_CONTEXT_BYTES) {
-			return { ok: false, message: 'This prompt is larger than the 100 KiB staging limit.' };
+			return { ok: false, message: m.mcps_tester_stage_prompt_too_large() };
 		}
 		this.stagedContext.push({
 			id: crypto.randomUUID(),
@@ -670,7 +745,7 @@ export class MCPTesterSession {
 
 	stageResource(name: string, result: ReadResourceResult): StageResult {
 		if (result.contents.length === 0) {
-			return { ok: false, message: 'This resource returned no content.' };
+			return { ok: false, message: m.mcps_tester_stage_resource_empty() };
 		}
 		const textContents = result.contents.filter(
 			(content): content is ResourceContents & { text: string } =>
@@ -679,7 +754,7 @@ export class MCPTesterSession {
 		if (textContents.length !== result.contents.length) {
 			return {
 				ok: false,
-				message: 'Only textual resource content can be staged for Chat.'
+				message: m.mcps_tester_stage_resource_unsupported()
 			};
 		}
 		const size = textContents.reduce(
@@ -687,7 +762,7 @@ export class MCPTesterSession {
 			0
 		);
 		if (size > MAX_STAGED_CONTEXT_BYTES) {
-			return { ok: false, message: 'This resource is larger than the 100 KiB staging limit.' };
+			return { ok: false, message: m.mcps_tester_stage_resource_too_large() };
 		}
 		this.stagedContext.push({
 			id: crypto.randomUUID(),
@@ -712,10 +787,10 @@ export class MCPTesterSession {
 
 	beginWorkflow(kind: TesterWorkflowKind, label: string): TesterWorkflow {
 		if (this.status !== 'ready') {
-			throw new Error('The MCP tester is not ready');
+			throw new Error(m.mcps_tester_not_ready());
 		}
 		if (this.activeWorkflow) {
-			throw new Error(`Cannot start ${label} while ${this.activeWorkflow.label} is active`);
+			throw new Error(m.mcps_tester_workflow_busy({ label, active: this.activeWorkflow.label }));
 		}
 		const workflow: TesterWorkflow = {
 			id: Symbol(label),

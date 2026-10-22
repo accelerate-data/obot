@@ -43,7 +43,17 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "direct user skill grant",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeUser, ID: "user1"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkill, ID: "sk1"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeUser,
+						ID:   "user1",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkill,
+						ID:   "sk1",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -52,7 +62,17 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "group repository grant",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeGroup, ID: "eng"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkillRepository, ID: "skr1"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeGroup,
+						ID:   "eng",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkillRepository,
+						ID:   "skr1",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -61,7 +81,17 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "global wildcard grant",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}}, []types.SkillResource{{Type: types.SkillResourceTypeSelector, ID: "*"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeSelector,
+						ID:   "*",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSelector,
+						ID:   "*",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -70,7 +100,17 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "wildcard subject repo scoped grant",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkillRepository, ID: "skr1"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeSelector,
+						ID:   "*",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkillRepository,
+						ID:   "skr1",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -79,7 +119,17 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "different skill does not grant access",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeUser, ID: "user1"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkill, ID: "sk2"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeUser,
+						ID:   "user1",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkill,
+						ID:   "sk2",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -88,7 +138,17 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "different group does not grant access",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeGroup, ID: "ops"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkillRepository, ID: "skr1"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeGroup,
+						ID:   "ops",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkillRepository,
+						ID:   "skr1",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -97,8 +157,28 @@ func TestUserHasAccessToSkillID(t *testing.T) {
 		{
 			name: "multiple matching rules still grant access",
 			rules: []*v1.SkillAccessRule{
-				newRule("rule1", []types.Subject{{Type: types.SubjectTypeGroup, ID: "eng"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkillRepository, ID: "skr1"}}),
-				newRule("rule2", []types.Subject{{Type: types.SubjectTypeUser, ID: "user1"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkill, ID: "sk1"}}),
+				newRule("rule1", []types.Subject{
+					{
+						Type: types.SubjectTypeGroup,
+						ID:   "eng",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkillRepository,
+						ID:   "skr1",
+					},
+				}),
+				newRule("rule2", []types.Subject{
+					{
+						Type: types.SubjectTypeUser,
+						ID:   "user1",
+					},
+				}, []types.SkillResource{
+					{
+						Type: types.SkillResourceTypeSkill,
+						ID:   "sk1",
+					},
+				}),
 			},
 			skillID: "sk1",
 			repoID:  "skr1",
@@ -157,6 +237,25 @@ func TestGetUserSkillAccessScopeAggregatesAndDeduplicates(t *testing.T) {
 		"sk-user":  {},
 		"sk-group": {},
 	}, skillIDs)
+}
+
+func TestObotGroupSubjectGrantsSkillAccess(t *testing.T) {
+	helper := newTestHelper(t,
+		newRule("admin", []types.Subject{{Type: types.SubjectTypeObotGroup, ID: "admin"}}, []types.SkillResource{{Type: types.SkillResourceTypeSkill, ID: "sk1"}}),
+	)
+	admin := &kuser.DefaultInfo{UID: "user1", Extra: map[string][]string{"obot_groups": {"admin"}}}
+
+	hasAccess, err := helper.UserHasAccessToSkillID(admin, "sk1", "")
+	require.NoError(t, err)
+	assert.True(t, hasAccess)
+
+	hasAccess, err = helper.UserHasAccessToSkillID(testUser("admin"), "sk1", "")
+	require.NoError(t, err)
+	assert.False(t, hasAccess)
+
+	_, _, skillIDs, err := helper.GetUserSkillAccessScope(admin)
+	require.NoError(t, err)
+	assert.Contains(t, skillIDs, "sk1")
 }
 
 func TestGetUserSkillAccessScopeAllowAll(t *testing.T) {
@@ -220,6 +319,16 @@ func newTestHelper(t *testing.T, rules ...*v1.SkillAccessRule) *Helper {
 			var results []string
 			for _, subject := range rule.Spec.Manifest.Subjects {
 				if subject.Type == types.SubjectTypeGroup {
+					results = append(results, subject.ID)
+				}
+			}
+			return results, nil
+		},
+		ObotGroupIDIndex: func(obj any) ([]string, error) {
+			rule := obj.(*v1.SkillAccessRule)
+			var results []string
+			for _, subject := range rule.Spec.Manifest.Subjects {
+				if subject.Type == types.SubjectTypeObotGroup {
 					results = append(results, subject.ID)
 				}
 			}

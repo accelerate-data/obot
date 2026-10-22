@@ -3,6 +3,7 @@ package types
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -116,13 +117,13 @@ func TestVMCPComponentToolReferences(t *testing.T) {
 }
 
 func TestVMCPManifestDefault(t *testing.T) {
-	manifest := VMCPManifest{
-		Components: []VMCPComponent{{
-			Configuration: []VMCPConfigurationPolicy{{Key: "TOKEN"}},
-		}},
-	}
+	manifest := validVMCPManifest()
+	manifest.Components[0].Configuration = []VMCPConfigurationPolicy{{Key: "TOKEN"}}
 
-	manifest.Default(false, "user-1")
+	manifest.Default(false)
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("default manifest validation failed: %v", err)
+	}
 
 	if got := manifest.Components[0].Configuration[0].Policy; got != VMCPConfigurationPolicyProhibited {
 		t.Fatalf("default configuration policy = %q, want %q", got, VMCPConfigurationPolicyProhibited)
@@ -137,7 +138,7 @@ func TestVMCPManifestDefault(t *testing.T) {
 	if !profile.Permissions.AllowAllComponents {
 		t.Fatal("default profile must allow all tools")
 	}
-	if len(profile.Subjects) != 1 || profile.Subjects[0].Type != SubjectTypeGroup || profile.Subjects[0].ID != GroupAdmin {
+	if len(profile.Subjects) != 1 || profile.Subjects[0].Type != SubjectTypeObotGroup || profile.Subjects[0].ID != GroupAdmin {
 		t.Fatalf("unexpected default profile subjects: %#v", profile.Subjects)
 	}
 }
@@ -145,7 +146,7 @@ func TestVMCPManifestDefault(t *testing.T) {
 func TestVMCPManifestDefaultPreservesExplicitEmptyProfiles(t *testing.T) {
 	manifest := VMCPManifest{Profiles: []VMCPProfile{}}
 
-	manifest.Default(false, "user-1")
+	manifest.Default(false)
 
 	if manifest.Profiles == nil || len(manifest.Profiles) != 0 {
 		t.Fatalf("explicit empty profiles changed to %#v", manifest.Profiles)
@@ -161,7 +162,7 @@ func TestVMCPManifestDefaultPersonalServer(t *testing.T) {
 			}},
 		}
 
-		manifest.Default(true, "user-1")
+		manifest.Default(true)
 
 		if manifest.Profiles != nil {
 			t.Fatalf("personal server profiles = %#v, want nil", manifest.Profiles)
@@ -187,6 +188,40 @@ func TestVMCPProfileWithoutAllowAllComponentsMayGrantNoTools(t *testing.T) {
 	}
 	if len(manifest.Profiles[0].Permissions.AllowedComponents) != 0 {
 		t.Fatalf("AllowedTools = %#v, want empty", manifest.Profiles[0].Permissions.AllowedComponents)
+	}
+}
+
+func TestVMCPProfileSubjects(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		subject   Subject
+		wantError bool
+	}{
+		{
+			name:    "Obot group",
+			subject: Subject{Type: SubjectTypeObotGroup, ID: GroupAdmin},
+		},
+		{
+			name:      "Obot group requires ID",
+			subject:   Subject{Type: SubjectTypeObotGroup},
+			wantError: true,
+		},
+		{
+			name:      "unknown subject type",
+			subject:   Subject{Type: "unknown", ID: GroupAdmin},
+			wantError: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := validVMCPManifest()
+			manifest.Profiles = []VMCPProfile{{
+				Name:     "profile",
+				Subjects: []Subject{tc.subject},
+			}}
+			if err := manifest.Validate(); (err != nil) != tc.wantError {
+				t.Fatalf("Validate() = %v, want error %v", err, tc.wantError)
+			}
+		})
 	}
 }
 
@@ -281,7 +316,7 @@ func TestVMCPManifestRequiredConfigurationPolicy(t *testing.T) {
 		policy        VMCPConfigurationPolicyType
 		omitPolicy    bool
 		optional      bool
-		value         string
+		static        bool
 		secretBinding *MCPSecretBinding
 		wantError     bool
 	}{
@@ -313,9 +348,9 @@ func TestVMCPManifestRequiredConfigurationPolicy(t *testing.T) {
 			optional: true,
 		},
 		{
-			name:   "catalog value",
-			policy: VMCPConfigurationPolicyProhibited,
-			value:  "supplied",
+			name:       "catalog static configuration",
+			omitPolicy: true,
+			static:     true,
 		},
 		{
 			name:          "secret binding",
@@ -328,7 +363,7 @@ func TestVMCPManifestRequiredConfigurationPolicy(t *testing.T) {
 			manifest.Components[0].CatalogEntry.Manifest.Config = []MCPConfig{{
 				Key:           "TOKEN",
 				Required:      !tc.optional,
-				Value:         tc.value,
+				Static:        tc.static,
 				SecretBinding: tc.secretBinding,
 			}}
 			if !tc.omitPolicy {
@@ -339,6 +374,77 @@ func TestVMCPManifestRequiredConfigurationPolicy(t *testing.T) {
 			}
 			if err := manifest.Validate(); (err != nil) != tc.wantError {
 				t.Fatalf("Validate() = %v, want error %v", err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestVMCPManifestConfigurationSecretBinding(t *testing.T) {
+	binding := &MCPSecretBinding{Name: "gitlab-secret", Key: "gitlab_key"}
+	for _, tc := range []struct {
+		name      string
+		policy    VMCPConfigurationPolicy
+		wantError string
+	}{
+		{
+			name: "fixed",
+			policy: VMCPConfigurationPolicy{
+				Key:           "TOKEN",
+				Policy:        VMCPConfigurationPolicyFixed,
+				SecretBinding: binding,
+			},
+		},
+		{
+			name: "user allowed",
+			policy: VMCPConfigurationPolicy{
+				Key:           "TOKEN",
+				Policy:        VMCPConfigurationPolicyUserAllowed,
+				SecretBinding: binding,
+			},
+			wantError: "only set secretBinding with fixed policy",
+		},
+		{
+			name: "with value",
+			policy: VMCPConfigurationPolicy{
+				Key:           "TOKEN",
+				Policy:        VMCPConfigurationPolicyFixed,
+				Value:         "clear-text",
+				SecretBinding: binding,
+			},
+			wantError: "mutually exclusive",
+		},
+		{
+			name: "missing key",
+			policy: VMCPConfigurationPolicy{
+				Key:           "TOKEN",
+				Policy:        VMCPConfigurationPolicyFixed,
+				SecretBinding: &MCPSecretBinding{Name: "gitlab-secret"},
+			},
+			wantError: "requires both name and key",
+		},
+		{
+			name: "unknown field",
+			policy: VMCPConfigurationPolicy{
+				Key:           "OTHER",
+				Policy:        VMCPConfigurationPolicyFixed,
+				SecretBinding: binding,
+			},
+			wantError: "does not match a catalog entry configuration field",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := validVMCPManifest()
+			manifest.Components[0].CatalogEntry.Manifest.Config = []MCPConfig{{Key: "TOKEN", Required: true, Sensitive: true}}
+			manifest.Components[0].Configuration = []VMCPConfigurationPolicy{tc.policy}
+			err := manifest.Validate()
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("Validate() error = %v, want %q", err, tc.wantError)
 			}
 		})
 	}

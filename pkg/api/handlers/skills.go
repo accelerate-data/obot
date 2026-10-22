@@ -31,20 +31,23 @@ import (
 const (
 	defaultSkillListLimit = 50
 	maxSkillListLimit     = 200
+	maxSkillMDBytes       = 1024 * 1024
 )
 
 type SkillHandler struct {
+	maxRepoSizeMB          int
 	skillAccessRuleHelper  *skillaccessrule.Helper
-	materializeSkillSource func(ctx context.Context, skill *v1.Skill, token string) (func(), string, error)
+	materializeSkillSource func(ctx context.Context, skill *v1.Skill, token string, maxRepoSizeMB int) (func(), string, error)
 }
 
 type skillRepositoryCredentialRevealer interface {
 	RevealCredential(context.Context, []string, string) (gatewaytypes.Credential, error)
 }
 
-func NewSkillHandler(skillAccessRuleHelper *skillaccessrule.Helper) *SkillHandler {
+func NewSkillHandler(maxRepoSizeMB int, skillAccessRuleHelper *skillaccessrule.Helper) *SkillHandler {
 	return &SkillHandler{
 		skillAccessRuleHelper:  skillAccessRuleHelper,
+		maxRepoSizeMB:          maxRepoSizeMB,
 		materializeSkillSource: skillrepository.MaterializeSkillSource,
 	}
 }
@@ -77,7 +80,7 @@ func (h *SkillHandler) materialize(req api.Context, skill *v1.Skill) (func(), st
 	if err != nil {
 		return nil, "", err
 	}
-	return h.materializeSkillSource(req.Context(), skill, token)
+	return h.materializeSkillSource(req.Context(), skill, token, h.maxRepoSizeMB)
 }
 
 func (h *SkillHandler) List(req api.Context) error {

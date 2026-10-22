@@ -76,10 +76,14 @@ test('shared static OAuth modal keeps submitted values immutable and explains en
 
 	assert.match(modal, /id="clientID"[\s\S]*?disabled=\{loading\}/);
 	assert.match(modal, /name="clientSecret"[\s\S]*?disabled=\{loading\}/);
-	assert.match(modal, /all deployments remain[\s\S]*?all Users must reconnect/i);
+	const messages = await readFile(
+		new URL('../../../../messages/mcps/en.json', import.meta.url),
+		'utf8'
+	);
+	assert.match(messages, /all deployments remain[\s\S]*?all Users must reconnect/i);
 	assert.match(modal, /onDelete\?: \(expectedGeneration: string\)/);
 	assert.match(modal, /const expectedGeneration = oauthStatus\?\.generation/);
-	assert.match(modal, /Reload the OAuth application status before clearing credentials/);
+	assert.match(messages, /Reload the OAuth application status before clearing credentials/);
 });
 
 test('static OAuth Clear services send the reviewed generation in a DELETE body', async () => {

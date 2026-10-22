@@ -38,7 +38,7 @@ func TestStateManagerCreateTokenRefusesTokenEndpointRedirect(t *testing.T) {
 	gateway := newStaticOAuthCallbackGateway(t)
 	storeDynamicCallbackState(t, gateway, endpoint.URL, "state")
 
-	_, _, err := newStateManager(gateway, mcp.NewOAuthExchangeClient(allowAllRemoteMCP)).createToken(t.Context(), "state", "code", "", "")
+	_, _, err := newStateManager(gateway, fixedTokenClient(mcp.NewOAuthExchangeClient(allowAllRemoteMCP))).createToken(t.Context(), "state", "code", "", "")
 
 	if err == nil || !strings.Contains(err.Error(), "refusing to follow redirect") {
 		t.Fatalf("createToken returned %v, want redirect refusal", err)
@@ -59,7 +59,7 @@ func TestStateManagerCreateTokenEnforcesRemoteNetworkPolicy(t *testing.T) {
 	gateway := newStaticOAuthCallbackGateway(t)
 	storeDynamicCallbackState(t, gateway, endpoint.URL, "state")
 
-	_, _, err := newStateManager(gateway, mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfig{})).createToken(t.Context(), "state", "code", "", "")
+	_, _, err := newStateManager(gateway, fixedTokenClient(mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfig{}))).createToken(t.Context(), "state", "code", "", "")
 
 	if err == nil || !strings.Contains(err.Error(), "blocked") {
 		t.Fatalf("createToken returned %v, want the loopback token endpoint blocked", err)
@@ -72,7 +72,11 @@ func TestStateManagerCreateTokenEnforcesRemoteNetworkPolicy(t *testing.T) {
 func TestMCPOAuthHandlerFactoryExchangesOnRedirectRefusingClient(t *testing.T) {
 	factory := NewMCPOAuthHandlerFactory("https://obot.example.com", nil, nil, nil, nil, "", false)
 
-	if factory.stateMgr.exchangeHTTPClient == nil || factory.stateMgr.exchangeHTTPClient.CheckRedirect == nil {
-		t.Fatal("dynamic OAuth state manager exchanges on a client that follows redirects")
+	if factory.stateMgr.tokenClient == nil {
+		t.Fatal("missing token exchange client resolver")
+	}
+	client, err := factory.stateMgr.tokenClient("")
+	if err != nil || client == nil || client.CheckRedirect == nil {
+		t.Fatalf("token exchange client does not reject redirects: %v", err)
 	}
 }

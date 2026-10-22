@@ -25,7 +25,7 @@ import (
 )
 
 func TestVMCPConsentTargetUsesSelectedInstance(t *testing.T) {
-	vmcp := &v1.VMCP{Name: "vmcp1shared", Namespace: system.DefaultNamespace}
+	vmcp, _ := vmcpConsentConfigurationTarget()
 	oldest := &v1.VMCPInstance{
 		Name:              "vmcpi1oldest",
 		Namespace:         system.DefaultNamespace,
@@ -46,6 +46,72 @@ func TestVMCPConsentTargetUsesSelectedInstance(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, instance)
 		require.Equal(t, selected.Name, instance.Name)
+	}
+}
+
+func TestVMCPConsentTargetChecksAccessBeforeCreatingInstance(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ownerID   string
+		subjectID string
+		allowed   bool
+	}{
+		{
+			name:    "another user's personal vMCP",
+			ownerID: "other-user",
+		},
+		{
+			name:      "shared vMCP without a matching profile",
+			subjectID: "other-user",
+		},
+		{
+			name:    "owned personal vMCP",
+			ownerID: "user",
+			allowed: true,
+		},
+		{
+			name:      "shared vMCP with a matching profile",
+			subjectID: "user",
+			allowed:   true,
+		},
+	} {
+		for _, connectID := range []string{"vmcp1shared", "default-legacy"} {
+			t.Run(tc.name+"/"+connectID, func(t *testing.T) {
+				vmcp, _ := vmcpConsentConfigurationTarget()
+				vmcp.Spec.UserID = tc.ownerID
+				vmcp.Spec.LegacySlug = "default-legacy"
+				vmcp.Spec.Manifest.Profiles[0].Subjects = []types.Subject{
+					{
+						Type: types.SubjectTypeUser,
+						ID:   tc.subjectID,
+					},
+				}
+				storage := vmcpConsentStorage(vmcp)
+				req := vmcpConsentRequest(storage, nil)
+				resolved, instance, err := vmcpConsentTarget(req, connectID)
+				if tc.allowed {
+					require.NoError(t, err)
+					require.Equal(t, vmcp.Name, resolved.Name)
+					require.Equal(t, req.User.GetUID(), instance.Spec.UserID)
+					require.Equal(t, vmcp.Name, instance.Spec.Manifest.VMCPID)
+				} else {
+					var httpErr *types.ErrHTTP
+					require.ErrorAs(t, err, &httpErr)
+					require.Equal(t, http.StatusForbidden, httpErr.Code)
+					require.Nil(t, resolved)
+					require.Nil(t, instance)
+				}
+
+				var instances v1.VMCPInstanceList
+				require.NoError(t, storage.List(t.Context(), &instances))
+				if tc.allowed {
+					require.Len(t, instances.Items, 1)
+					require.Equal(t, instance.Name, instances.Items[0].Name)
+				} else {
+					require.Empty(t, instances.Items, "denied consent must not provision an instance")
+				}
+			})
+		}
 	}
 }
 
@@ -89,11 +155,40 @@ func TestVMCPConsentMissingConfigurationAllowsSavedRequiredAndOptionalEmpty(t *t
 	require.Empty(t, missing)
 }
 
+func TestVMCPConsentIgnoresDisabledComponents(t *testing.T) {
+	vmcp, instance := vmcpConsentConfigurationTarget()
+	disabled := vmcp.Spec.Manifest.Components[0]
+	disabled.ID = "disabled"
+	vmcp.Spec.Manifest.Components = append(vmcp.Spec.Manifest.Components, disabled)
+	vmcp.Spec.Manifest.Profiles[0].Permissions = types.VMCPProfilePermissions{
+		AllowedComponents: map[string]types.VMCPComponentSet{"component": {AllowedTools: []string{}}},
+	}
+	req := vmcpConsentRequest(vmcpConsentStorage(vmcp, instance), vmcpConsentGateway(t))
+
+	missing, err := vmcpConsentMissingConfiguration(req, *vmcp, *instance)
+	require.NoError(t, err)
+	require.Equal(t, []string{vmcpconfig.ConfigurationKey("component", "REQUIRED")}, missing)
+
+	components := vmcpConsentComponents(req.User, *vmcp, *instance)
+	require.Len(t, components, 1)
+	require.Equal(t, "component", components[0].ID)
+
+	// Deselecting a component's tools does not disable it; only the profiles do.
+	instance.Spec.Manifest.ComponentSet = map[string]types.VMCPComponentSet{"component": {AllowedTools: []string{}}}
+	missing, err = vmcpConsentMissingConfiguration(req, *vmcp, *instance)
+	require.NoError(t, err)
+	require.Equal(t, []string{vmcpconfig.ConfigurationKey("component", "REQUIRED")}, missing)
+	require.Len(t, vmcpConsentComponents(req.User, *vmcp, *instance), 1)
+}
+
 func vmcpConsentConfigurationTarget() (*v1.VMCP, *v1.VMCPInstance) {
 	return &v1.VMCP{
 		Name:      "vmcp1shared",
 		Namespace: system.DefaultNamespace,
-		Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{Components: []types.VMCPComponent{{
+		Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{Profiles: []types.VMCPProfile{{
+			Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+		}}, Components: []types.VMCPComponent{{
 			ID: "component",
 			CatalogEntry: types.MCPServerCatalogEntrySnapshot{Manifest: types.MCPServerCatalogEntryManifest{Config: []types.MCPConfig{
 				{Key: "REQUIRED", Required: true},
@@ -115,6 +210,7 @@ func vmcpConsentStorage(objects ...kclient.Object) storage.Client {
 	return clientfake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(objects...).
+		WithIndex(&v1.VMCP{}, "spec.legacySlug", func(obj kclient.Object) []string { return []string{obj.(*v1.VMCP).Spec.LegacySlug} }).
 		WithIndex(&v1.MCPServer{}, "spec.vmcpID", func(obj kclient.Object) []string { return []string{obj.(*v1.MCPServer).Spec.VMCPID} }).
 		WithIndex(&v1.MCPServerInstance{}, "spec.vmcpInstanceID", func(obj kclient.Object) []string { return []string{obj.(*v1.MCPServerInstance).Spec.VMCPInstanceID} }).
 		WithIndex(&v1.VMCPInstance{}, "spec.legacySlug", func(obj kclient.Object) []string { return []string{obj.(*v1.VMCPInstance).Spec.LegacySlug} }).

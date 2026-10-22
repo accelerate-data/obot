@@ -12,14 +12,15 @@ const (
 	RuntimeUVX           Runtime = "uvx"
 	RuntimeNPX           Runtime = "npx"
 	RuntimeContainerized Runtime = "containerized"
+	RuntimeOpenAPI       Runtime = "openapi"
 	RuntimeRemote        Runtime = "remote"
 	RuntimeVMCP          Runtime = "vmcp"
 
 	// RuntimeComposite is retained only to identify legacy resources during migration.
 	RuntimeComposite Runtime = "composite"
 
-	// defaultStartupTimeoutSeconds is the default value used when (UVX|NPX|Containerized)RuntimeConfig.StartupTimeout is not set
-	defaultStartupTimeoutSeconds = 60
+	// DefaultStartupTimeoutSeconds is the default value used when (UVX|NPX|Containerized)RuntimeConfig.StartupTimeout is not set
+	DefaultStartupTimeoutSeconds = 60
 
 	// Retained for legacy MCP servers.
 	ServerUserTypeSingleUser ServerUserType = "singleUser"
@@ -110,11 +111,13 @@ type ContainerOAuthConfig struct {
 
 // RemoteRuntimeConfig represents configuration for remote runtime (External MCP servers)
 type RemoteRuntimeConfig struct {
-	URL         string `json:"url"`                   // Required: Full URL to remote MCP server
-	TunnelName  string `json:"tunnelName,omitempty"`  // Optional: MCPTunnel used to reach the remote MCP server
-	IsTemplate  bool   `json:"isTemplate"`            // Optional: Whether the URL is a template
-	URLTemplate string `json:"urlTemplate,omitempty"` // URL template for user URLs
-	Hostname    string `json:"hostname,omitempty"`    // Optional: Hostname constraint the URL conforms to
+	LocalhostCallbackEnabled bool   `json:"localhostCallbackEnabled,omitempty"`
+	LocalhostCallbackPath    string `json:"localhostCallbackPath,omitempty"`
+	URL                      string `json:"url"`                   // Required: Full URL to remote MCP server
+	TunnelName               string `json:"tunnelName,omitempty"`  // Optional: MCPTunnel used to reach the remote MCP server
+	IsTemplate               bool   `json:"isTemplate"`            // Optional: Whether the URL is a template
+	URLTemplate              string `json:"urlTemplate,omitempty"` // URL template for user URLs
+	Hostname                 string `json:"hostname,omitempty"`    // Optional: Hostname constraint the URL conforms to
 	// Deprecated: retained only to migrate stored server configuration to Config.
 	DeprecatedHeaders   []MCPHeader `json:"headers,omitempty"`
 	StaticOAuthRequired bool        `json:"staticOAuthRequired,omitempty"` // Indicates static OAuth is required
@@ -122,11 +125,13 @@ type RemoteRuntimeConfig struct {
 
 // RemoteCatalogConfig represents template configuration for remote servers in catalog entries
 type RemoteCatalogConfig struct {
-	FixedURL            string `json:"fixedURL,omitempty"`            // Fixed URL for all instances
-	TunnelName          string `json:"tunnelName,omitempty"`          // Optional: MCPTunnel used to reach the remote MCP server
-	URLTemplate         string `json:"urlTemplate,omitempty"`         // URL template for user URLs
-	Hostname            string `json:"hostname,omitempty"`            // Required hostname for user URLs
-	StaticOAuthRequired bool   `json:"staticOAuthRequired,omitempty"` // Indicates static OAuth configuration is required
+	LocalhostCallbackEnabled bool   `json:"localhostCallbackEnabled,omitempty"`
+	LocalhostCallbackPath    string `json:"localhostCallbackPath,omitempty"`
+	FixedURL                 string `json:"fixedURL,omitempty"`            // Fixed URL for all instances
+	TunnelName               string `json:"tunnelName,omitempty"`          // Optional: MCPTunnel used to reach the remote MCP server
+	URLTemplate              string `json:"urlTemplate,omitempty"`         // URL template for user URLs
+	Hostname                 string `json:"hostname,omitempty"`            // Required hostname for user URLs
+	StaticOAuthRequired      bool   `json:"staticOAuthRequired,omitempty"` // Indicates static OAuth configuration is required
 	// Deprecated: retained to decode catalog source files still using the pre-vMCP schema; migrated into Config on load.
 	DeprecatedHeaders []MCPHeader `json:"headers,omitempty"`
 }
@@ -171,9 +176,6 @@ type MCPServerCatalogEntry struct {
 	PowerUserID               string                        `json:"powerUserID,omitempty"`
 	NeedsUpdate               bool                          `json:"needsUpdate,omitempty"`
 	OAuthCredentialConfigured bool                          `json:"oauthCredentialConfigured,omitempty"`
-
-	// ConnectURL is the default URL clients can use to connect before configuring a personal server.
-	ConnectURL string `json:"connectURL,omitempty"`
 }
 
 type MCPResourceRequirements struct {
@@ -194,6 +196,11 @@ type MCPServerCatalogEntryManifest struct {
 	// UpgradeNote is source-provided Markdown shown before applying catalog updates.
 	UpgradeNote string `json:"upgradeNote,omitempty"`
 
+	// MinObotVersion and MaxObotVersion bound, inclusively, the Obot versions on which a
+	// catalog-synced entry is available. Empty values are unrestricted.
+	MinObotVersion string `json:"minObotVersion,omitempty"`
+	MaxObotVersion string `json:"maxObotVersion,omitempty"`
+
 	// Runtime configuration
 	Runtime Runtime `json:"runtime"`
 
@@ -202,8 +209,13 @@ type MCPServerCatalogEntryManifest struct {
 	NPXConfig           *NPXRuntimeConfig           `json:"npxConfig,omitempty"`
 	ContainerizedConfig *ContainerizedRuntimeConfig `json:"containerizedConfig,omitempty"`
 	RemoteConfig        *RemoteCatalogConfig        `json:"remoteConfig,omitempty"`
+	OpenAPIConfig       *OpenAPIRuntimeConfig       `json:"openAPIConfig,omitempty"`
 
 	Config []MCPConfig `json:"config,omitempty"`
+
+	// StaticConfigurationRevision identifies the credential holding the values of Static
+	// configuration. It is assigned by Obot; values supplied by clients are ignored.
+	StaticConfigurationRevision string `json:"staticConfigurationRevision,omitempty"`
 
 	Resources *MCPResourceRequirements `json:"resources,omitempty"`
 
@@ -298,9 +310,6 @@ type MCPConfigurationOption struct {
 type MCPSecretBinding struct {
 	Name string `json:"name"`
 	Key  string `json:"key"`
-	// AdminAdded marks bindings selected on a deployed multi-user server by an admin.
-	// Catalog YAML must not set this; drift/diff logic uses it to ignore local admin config.
-	AdminAdded bool `json:"adminAdded,omitempty"`
 }
 
 // MCPAllowedSecretBindingTarget describes a Kubernetes Secret that admins can select for MCP secret bindings.
@@ -330,10 +339,14 @@ type MCPConfig struct {
 
 	Key string `json:"key"`
 
-	// For static config
+	// Value is static configuration. Catalog entries accept it on input but store it in a
+	// credential, so stored and returned catalog entry manifests mark the field Static instead.
 	Value string `json:"value"`
 
-	// For user-supplied config
+	// Static marks configuration whose value is stored in the catalog entry's static
+	// configuration credential instead of in the manifest.
+	Static bool `json:"static,omitempty"`
+
 	Sensitive bool   `json:"sensitive"`
 	Required  bool   `json:"required"`
 	Prefix    string `json:"prefix,omitempty"` // Optional prefix to prepend to user-supplied values (e.g., "Bearer ")
@@ -453,12 +466,16 @@ type MCPServerManifest struct {
 	NPXConfig           *NPXRuntimeConfig           `json:"npxConfig,omitempty"`
 	ContainerizedConfig *ContainerizedRuntimeConfig `json:"containerizedConfig,omitempty"`
 	RemoteConfig        *RemoteRuntimeConfig        `json:"remoteConfig,omitempty"`
+	OpenAPIConfig       *OpenAPIRuntimeConfig       `json:"openAPIConfig,omitempty"`
 	CompositeConfig     *CompositeRuntimeConfig     `json:"compositeConfig,omitempty"`
 
 	// Deprecated: migrate per-user headers to Config with UserAllowed set.
 	DeprecatedMultiUserConfig *MultiUserConfig `json:"multiUserConfig,omitempty"`
 
 	Config []MCPConfig `json:"config,omitempty"`
+	// StaticConfigurationRevision identifies the source catalog entry's credential holding the
+	// values of Static configuration.
+	StaticConfigurationRevision string `json:"staticConfigurationRevision,omitempty"`
 	// Deprecated: retained only to migrate stored server configuration to Config.
 	DeprecatedEnv []MCPEnv                 `json:"env,omitempty"`
 	Resources     *MCPResourceRequirements `json:"resources,omitempty"`
@@ -502,12 +519,6 @@ type MCPServer struct {
 	PowerUserWorkspaceID    string         `json:"powerUserWorkspaceID"`
 	MCPCatalogID            string         `json:"mcpCatalogID,omitempty"`
 	ServerUserType          ServerUserType `json:"serverUserType,omitempty"`
-	// ConnectURL is the URL clients can use to connect to this MCP server.
-	ConnectURL     string `json:"connectURL,omitempty"`
-	NanobotAgentID string `json:"nanobotAgentID,omitempty"`
-
-	// NeedsUpdate indicates whether the configuration in this server's catalog entry has drift from this server's configuration.
-	NeedsUpdate bool `json:"needsUpdate,omitempty"`
 
 	// NeedsK8sUpdate indicates whether this server needs redeployment with new K8s settings
 	NeedsK8sUpdate bool `json:"needsK8sUpdate,omitempty"`
@@ -701,7 +712,7 @@ func startupTimeoutSeconds(runtime Runtime, uvxConfig *UVXRuntimeConfig, npxConf
 	}
 
 	if timeout == 0 {
-		timeout = defaultStartupTimeoutSeconds
+		timeout = DefaultStartupTimeoutSeconds
 	}
 	return timeout
 }
@@ -734,6 +745,8 @@ func (m MCPServerManifest) ConvertToCatalogEntry() MCPServerCatalogEntryManifest
 		ToolPreview:      m.ToolPreview,
 		Resources:        m.Resources,
 		Config:           m.DeepCopy().Config,
+
+		StaticConfigurationRevision: m.StaticConfigurationRevision,
 	}
 	for i := range catalogManifest.Config {
 		catalogManifest.Config[i].UserAllowed = false
@@ -746,14 +759,18 @@ func (m MCPServerManifest) ConvertToCatalogEntry() MCPServerCatalogEntryManifest
 		catalogManifest.NPXConfig = m.NPXConfig
 	case RuntimeContainerized:
 		catalogManifest.ContainerizedConfig = m.ContainerizedConfig
+	case RuntimeOpenAPI:
+		catalogManifest.OpenAPIConfig = m.OpenAPIConfig
 	case RuntimeRemote:
 		if m.RemoteConfig != nil {
 			catalogManifest.RemoteConfig = &RemoteCatalogConfig{
-				FixedURL:            m.RemoteConfig.URL,
-				TunnelName:          m.RemoteConfig.TunnelName,
-				URLTemplate:         m.RemoteConfig.URLTemplate,
-				Hostname:            m.RemoteConfig.Hostname,
-				StaticOAuthRequired: m.RemoteConfig.StaticOAuthRequired,
+				FixedURL:                 m.RemoteConfig.URL,
+				TunnelName:               m.RemoteConfig.TunnelName,
+				URLTemplate:              m.RemoteConfig.URLTemplate,
+				Hostname:                 m.RemoteConfig.Hostname,
+				StaticOAuthRequired:      m.RemoteConfig.StaticOAuthRequired,
+				LocalhostCallbackEnabled: m.RemoteConfig.LocalhostCallbackEnabled,
+				LocalhostCallbackPath:    m.RemoteConfig.LocalhostCallbackPath,
 			}
 		}
 	}
@@ -783,10 +800,21 @@ func MapCatalogEntryToServer(catalogEntry MCPServerCatalogEntryManifest, userURL
 		Runtime:          catalogEntry.Runtime,
 		Config:           catalogConfiguration.Config,
 		Resources:        catalogEntry.Resources,
+
+		StaticConfigurationRevision: catalogEntry.StaticConfigurationRevision,
 	}
 
 	// Handle runtime-specific mapping
 	switch catalogEntry.Runtime {
+	case RuntimeOpenAPI:
+		if catalogEntry.OpenAPIConfig == nil {
+			return serverManifest, RuntimeValidationError{
+				Runtime: RuntimeOpenAPI,
+				Field:   "openAPIConfig",
+				Message: "OpenAPI configuration is required for OpenAPI runtime",
+			}
+		}
+		serverManifest.OpenAPIConfig = catalogConfiguration.OpenAPIConfig
 	case RuntimeUVX:
 		if catalogEntry.UVXConfig == nil {
 			return serverManifest, RuntimeValidationError{
@@ -886,6 +914,8 @@ func MapCatalogEntryToServer(catalogEntry MCPServerCatalogEntryManifest, userURL
 
 		// Copy the static OAuth flag from the catalog entry.
 		remoteConfig.StaticOAuthRequired = catalogEntry.RemoteConfig.StaticOAuthRequired
+		remoteConfig.LocalhostCallbackEnabled = catalogEntry.RemoteConfig.LocalhostCallbackEnabled
+		remoteConfig.LocalhostCallbackPath = catalogEntry.RemoteConfig.LocalhostCallbackPath
 		serverManifest.RemoteConfig = remoteConfig
 	default:
 		return serverManifest, RuntimeValidationError{

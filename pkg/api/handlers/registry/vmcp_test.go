@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	storageservices "github.com/obot-platform/obot/pkg/storage/services"
@@ -22,7 +24,17 @@ import (
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-type registryTestStorage struct{ kclient.WithWatch }
+type registryTestStorage struct {
+	kclient.WithWatch
+	instanceLists int
+}
+
+func (s *registryTestStorage) List(ctx context.Context, list kclient.ObjectList, opts ...kclient.ListOption) error {
+	if _, ok := list.(*v1.VMCPInstanceList); ok {
+		s.instanceLists++
+	}
+	return s.WithWatch.List(ctx, list, opts...)
+}
 
 func TestVMCPComponentsAreExcludedFromPersonalRegistryServers(t *testing.T) {
 	storage := newRegistryTestStorage(
@@ -32,7 +44,7 @@ func TestVMCPComponentsAreExcludedFromPersonalRegistryServers(t *testing.T) {
 	)
 
 	_, ctx := registryTestHandlerAndContext(t, storage)
-	servers, _, err := NewHandler(nil, "https://obot.example.com", false, "").listPersonalServers(ctx, "user-1")
+	servers, _, err := NewHandler(nil, "https://obot.example.com", false, "", mcp.RemoteMCPURLValidationConfig{}).listPersonalServers(ctx, "user-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +80,7 @@ func TestVMCPComponentsAreExcludedFromWorkspaceRegistryServers(t *testing.T) {
 	)
 
 	_, ctx := registryTestHandlerAndContext(t, storage)
-	servers, _, err := NewHandler(nil, "https://obot.example.com", false, "").listServersInWorkspaces(ctx)
+	servers, _, err := NewHandler(nil, "https://obot.example.com", false, "", mcp.RemoteMCPURLValidationConfig{}).listServersInWorkspaces(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,16 +130,13 @@ func TestRegistryDirectLookupExcludesVMCPComponents(t *testing.T) {
 	}
 }
 
-func TestRegistryDirectLookupIncludesOrdinaryServer(t *testing.T) {
+func TestRegistryDirectLookupExcludesLegacyPersonalServer(t *testing.T) {
 	server := registryOrdinaryServer("ms1ordinary", v1.MCPServerSpec{UserID: "user-1"})
 	h, ctx := registryTestHandlerAndContext(t, newRegistryTestStorage(server))
 
-	got, err := h.findMCPServer(ctx, server.Name, "com.example.obot")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Server.Name != "com.example.obot/ms1ordinary" {
-		t.Fatalf("findMCPServer() returned %q, want ordinary server", got.Server.Name)
+	_, err := h.findMCPServer(ctx, server.Name, "com.example.obot")
+	if err == nil {
+		t.Fatal("findMCPServer() found a legacy personal server without vMCP ownership")
 	}
 }
 
@@ -159,7 +168,7 @@ func registryTestHandlerAndContext(t *testing.T, storage *registryTestStorage) (
 	}); err != nil {
 		t.Fatal(err)
 	}
-	return NewHandler(accesscontrolrule.NewAccessControlRuleHelper(indexer, storage), "https://obot.example.com", false, ""), registryTestContext(storage, client)
+	return NewHandler(accesscontrolrule.NewAccessControlRuleHelper(indexer, storage), "https://obot.example.com", false, "", mcp.RemoteMCPURLValidationConfig{}), registryTestContext(storage, client)
 }
 
 func registryTestContext(storage *registryTestStorage, gatewayClient *gateway.Client) api.Context {
@@ -175,6 +184,12 @@ func newRegistryTestStorage(objects ...kclient.Object) *registryTestStorage {
 	return &registryTestStorage{WithWatch: clientfake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
 		WithObjects(objects...).
+		WithIndex(&v1.VMCPInstance{}, "spec.userID", func(object kclient.Object) []string {
+			return []string{object.(*v1.VMCPInstance).Spec.UserID}
+		}).
+		WithIndex(&v1.VMCPInstance{}, "spec.manifest.vmcpID", func(object kclient.Object) []string {
+			return []string{object.(*v1.VMCPInstance).Spec.Manifest.VMCPID}
+		}).
 		WithIndex(&v1.MCPServerCatalogEntry{}, "spec.mcpCatalogName", func(object kclient.Object) []string {
 			return []string{object.(*v1.MCPServerCatalogEntry).Spec.MCPCatalogName}
 		}).

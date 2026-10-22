@@ -1,12 +1,28 @@
+import { page as appPage } from '$app/state';
 import type { VMcpToolFlow } from '$lib/runes/vmcps/vmcpToolFlow.svelte';
 import type { VMCP, VMCPManifest, VMCPProfilePermissions } from '$lib/services';
 import { createVMCP, createVMCPComponent, createMCPCatalogEntry } from '../../../tests/helpers/mcp';
 import { worker } from '../../../tests/mocks/worker';
 import VMcpProfiles from './VMcpProfiles.svelte';
 import { http, HttpResponse } from 'msw';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page } from 'vitest/browser';
+
+vi.mock('$app/state', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$app/state')>();
+	const { createAppState } = await import('../../../tests/helpers/navigation.svelte');
+	return createAppState(actual);
+});
+
+vi.mock('$app/navigation', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$app/navigation')>();
+	const { applyTestGoto } = await import('../../../tests/helpers/navigation.svelte');
+	return {
+		...actual,
+		goto: (url: string | URL) => applyTestGoto(url)
+	};
+});
 
 function createVMcp(id: string, withPreview = true) {
 	const github = createMCPCatalogEntry({
@@ -76,6 +92,10 @@ async function expandServerTools() {
 	await page.getByRole('button', { name: 'Expand' }).click();
 }
 
+async function enableServer(name = 'GitHub') {
+	await page.getByRole('checkbox', { name: `Enable ${name}` }).click();
+}
+
 function toolSwitch(index = 0) {
 	return page.getByRole('switch', { name: /^(Enable|Disable) tool$/ }).nth(index);
 }
@@ -96,6 +116,9 @@ function createVMcpWithDisabledTool(id: string) {
 }
 
 describe('VMcpProfiles.svelte', () => {
+	afterEach(() => {
+		appPage.url.searchParams.delete('profile');
+	});
 	it.each<{
 		name: string;
 		permissions: VMCPProfilePermissions;
@@ -108,7 +131,9 @@ describe('VMcpProfiles.svelte', () => {
 				allowAllComponents: true,
 				allowedComponents: { github: { allowedTools: [] } }
 			},
-			expected: { allowAllComponents: true }
+			expected: {
+				allowedComponents: { github: { allowedTools: [] } }
+			}
 		},
 		{
 			name: 'null tools on one component',
@@ -170,8 +195,12 @@ describe('VMcpProfiles.svelte', () => {
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
 		await expect.element(page.getByRole('heading', { name: 'Create profile' })).toBeVisible();
+		await expect
+			.element(page.getByRole('checkbox', { name: 'Allow All Access' }))
+			.not.toBeChecked();
 
 		await page.getByLabelText('Name').fill('Support engineers');
+		await enableServer();
 		await expect.element(page.getByText('2 of 2 tools')).toBeVisible();
 		await expect.element(page.getByText('list_issues')).not.toBeInTheDocument();
 		await expandServerTools();
@@ -195,9 +224,23 @@ describe('VMcpProfiles.svelte', () => {
 			{
 				name: 'Support engineers',
 				subjects: [{ type: 'selector', id: '*' }],
-				vmcpPermissions: { allowedComponents: { github: { allowedTools: ['list_issues'] } } }
+				vmcpPermissions: {
+					allowedComponents: { github: { allowedTools: ['list_issues'] } }
+				}
 			}
 		]);
+	});
+
+	it('opens the profile selected in the URL', async () => {
+		const vmcp = createVMcp('vmcp-profile-from-url');
+		appPage.url.searchParams.set('profile', 'default');
+
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await expect.element(page.getByRole('heading', { name: 'Edit profile' })).toBeVisible();
+		await expect
+			.element(page.getByPlaceholder('ex. Marketing, Engineering, etc.'))
+			.toHaveValue('default');
 	});
 
 	it('edits and deletes an existing profile', async () => {
@@ -343,6 +386,7 @@ describe('VMcpProfiles.svelte', () => {
 		});
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await page.getByRole('button', { name: 'Refine tools' }).click();
 
 		expect(collectComponentTools).toHaveBeenCalledOnce();
@@ -350,11 +394,59 @@ describe('VMcpProfiles.svelte', () => {
 		await expect.element(page.getByText('list_issues')).toBeVisible();
 		await expect.element(page.getByText('list_pulls')).toBeVisible();
 		await expect.element(toolSwitch()).toBeChecked();
+
+		await page.getByLabelText('Name').fill('Refined tools');
+		await assignEveryone();
+		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+
 		await vi.waitFor(() => expect(saved).toHaveBeenCalled());
-		expect((saved.mock.calls[0][0] as VMCPManifest).components?.[0].toolOverrides).toEqual([
-			{ name: 'list_issues', enabled: true },
-			{ name: 'list_pulls', enabled: true }
-		]);
+		expect(savedProfiles(saved)[1]).toMatchObject({
+			name: 'Refined tools',
+			vmcpPermissions: {
+				allowedComponents: {
+					github: { allowedTools: ['list_issues', 'list_pulls'] }
+				}
+			}
+		});
+	});
+
+	it('refreshes a server’s tools onto the profile', async () => {
+		const vmcp = createVMcp('vmcp-refresh-profile-tools');
+		const refreshTools = vi.fn(
+			(
+				_component: Parameters<VMcpToolFlow['refreshTools']>[0],
+				_vmcp: Parameters<VMcpToolFlow['refreshTools']>[1],
+				onCollected: Parameters<VMcpToolFlow['refreshTools']>[2]
+			) => {
+				onCollected?.({
+					name: 'GitHub',
+					mcpCatalogID: 'default',
+					mcpServerCatalogEntryID: 'github',
+					catalogEntry: { manifest: { name: 'GitHub', runtime: 'remote' } },
+					toolOverrides: [
+						{ name: 'list_issues', enabled: true },
+						{ name: 'list_pulls', enabled: false },
+						{ name: 'list_reviews', enabled: true, description: 'List reviews' }
+					]
+				});
+			}
+		);
+		render(VMcpProfiles, {
+			vmcp,
+			toolFlow: toolFlowStub({ refreshTools })
+		});
+
+		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
+		await expandServerTools();
+		await page.getByRole('button', { name: 'Refresh tools' }).click();
+
+		expect(refreshTools).toHaveBeenCalledOnce();
+		await expect.element(page.getByText('2 of 3 tools')).toBeVisible();
+		await expect.element(page.getByText('list_reviews')).toBeVisible();
+		await expect.element(page.getByText('List reviews')).toBeVisible();
+		await expect.element(toolSwitch(1)).not.toBeChecked();
+		await expect.element(toolSwitch(2)).toBeChecked();
 	});
 
 	it('does not offer refine when the server already has tools', async () => {
@@ -365,6 +457,7 @@ describe('VMcpProfiles.svelte', () => {
 		});
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await expect.element(page.getByText('2 of 2 tools')).toBeVisible();
 		await expect
 			.element(page.getByRole('button', { name: 'Refine tools' }))
@@ -384,6 +477,7 @@ describe('VMcpProfiles.svelte', () => {
 		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await expandServerTools();
 
 		await expect.element(toolSwitch(0)).toBeChecked();
@@ -403,6 +497,7 @@ describe('VMcpProfiles.svelte', () => {
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
 		await page.getByLabelText('Name').fill('Support engineers');
+		await enableServer();
 		await expect.element(page.getByText('1 of 1 tools')).toBeVisible();
 		await expandServerTools();
 		await expect.element(toolSwitch(1)).not.toBeChecked();
@@ -413,8 +508,9 @@ describe('VMcpProfiles.svelte', () => {
 		await vi.waitFor(() => expect(saved).toHaveBeenCalled());
 		expect(savedProfiles(saved)[1]).toMatchObject({
 			name: 'Support engineers',
-			vmcpPermissions: { allowedComponents: { github: { allowedTools: ['list_issues'] } } }
+			vmcpPermissions: { allowedComponents: { github: {} } }
 		});
+		expect(savedProfiles(saved)[1].vmcpPermissions?.allowAllComponents).toBeUndefined();
 	});
 
 	it('keeps a tool the vMCP has disabled off and out of reach', async () => {
@@ -424,6 +520,7 @@ describe('VMcpProfiles.svelte', () => {
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
 		await page.getByLabelText('Name').fill('Support engineers');
+		await enableServer();
 		await expandServerTools();
 
 		const disabled = toolSwitch(1);
@@ -438,8 +535,9 @@ describe('VMcpProfiles.svelte', () => {
 		await vi.waitFor(() => expect(saved).toHaveBeenCalled());
 		expect(savedProfiles(saved)[1]).toMatchObject({
 			name: 'Support engineers',
-			vmcpPermissions: { allowedComponents: { github: { allowedTools: ['list_issues'] } } }
+			vmcpPermissions: { allowedComponents: { github: {} } }
 		});
+		expect(savedProfiles(saved)[1].vmcpPermissions?.allowAllComponents).toBeUndefined();
 	});
 
 	it('collapses and expands the tool override list', async () => {
@@ -449,6 +547,7 @@ describe('VMcpProfiles.svelte', () => {
 		});
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await expandServerTools();
 		await expect.element(page.getByText('list_issues')).toBeVisible();
 
@@ -467,6 +566,7 @@ describe('VMcpProfiles.svelte', () => {
 		});
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await page.getByText('2 of 2 tools').click();
 		await expect.element(page.getByText('list_issues')).toBeVisible();
 
@@ -481,6 +581,7 @@ describe('VMcpProfiles.svelte', () => {
 		});
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await expandServerTools();
 		await toolSwitch(1).click();
 
@@ -490,7 +591,7 @@ describe('VMcpProfiles.svelte', () => {
 		await expect.element(page.getByText('2 of 2 tools')).toBeVisible();
 	});
 
-	it('shows Default or the enabled tool count on each server chip', async () => {
+	it('shows Disabled or the enabled tool count on each server chip', async () => {
 		const vmcp = createVMcp('vmcp-profile-server-chips');
 		vmcp.profiles = [
 			{
@@ -513,6 +614,156 @@ describe('VMcpProfiles.svelte', () => {
 		await expect.element(page.getByText('GitHub')).not.toBeInTheDocument();
 	});
 
+	describe('as-is server without a stored tool list', () => {
+		function createAsIsVMcp(id: string) {
+			const vmcp = createVMcp(id, false);
+			vmcp.profiles = [
+				{
+					name: 'Limited tools',
+					subjects: [{ type: 'selector', id: '*' }],
+					vmcpPermissions: {
+						allowedComponents: { github: { allowedTools: ['list_issues', 'list_pulls'] } }
+					}
+				}
+			];
+			return vmcp;
+		}
+
+		it('shows the granted tool count on the server chip instead of Default', async () => {
+			render(VMcpProfiles, { vmcp: createAsIsVMcp('vmcp-asis-chip'), toolFlow: toolFlowStub() });
+
+			await expect.element(page.getByRole('button', { name: 'Edit Limited tools' })).toBeVisible();
+			await expect.element(page.getByText('2 tools', { exact: true })).toBeVisible();
+			await expect.element(page.getByText('Default', { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('lists the granted tools when editing the profile', async () => {
+			render(VMcpProfiles, { vmcp: createAsIsVMcp('vmcp-asis-edit'), toolFlow: toolFlowStub() });
+
+			await page.getByRole('button', { name: 'Edit Limited tools' }).click();
+			await expect.element(page.getByRole('checkbox', { name: 'Disable GitHub' })).toBeChecked();
+			await expect.element(page.getByText('2 tools', { exact: true })).toBeVisible();
+			await expandServerTools();
+			await expect.element(page.getByText('list_issues')).toBeVisible();
+			await expect.element(page.getByText('list_pulls')).toBeVisible();
+			await expect.element(toolSwitch(0)).toBeChecked();
+			await expect.element(toolSwitch(1)).toBeChecked();
+			// Other server tools are unknown until refreshed, so "all tools" is not claimed.
+			const toggleAll = page.getByRole('switch', { name: 'Enable All Tools' });
+			await expect.element(toggleAll).not.toBeChecked();
+			await expect.element(toggleAll).toBeDisabled();
+			await expect
+				.element(page.getByText(/Only the tools granted to this profile are shown/))
+				.toBeVisible();
+		});
+
+		it('opens a profile whose grant repeats a tool name', async () => {
+			const vmcp = createAsIsVMcp('vmcp-asis-duplicates');
+			vmcp.profiles![0].vmcpPermissions = {
+				allowedComponents: {
+					github: { allowedTools: ['list_issues', 'list_pulls', 'list_issues'] }
+				}
+			};
+			render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+			await expect.element(page.getByText('2 tools', { exact: true })).toBeVisible();
+			await page.getByRole('button', { name: 'Edit Limited tools' }).click();
+			await expandServerTools();
+			await expect.element(page.getByText('list_issues')).toBeVisible();
+			await expect.element(page.getByText('list_pulls')).toBeVisible();
+		});
+
+		it('shows Default after switching a partial profile to Allow All Access', async () => {
+			const vmcp = createAsIsVMcp('vmcp-asis-allow-all');
+			const saved = mockVMcpSave(vmcp);
+			render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+			await page.getByRole('button', { name: 'Edit Limited tools' }).click();
+			await page.getByRole('checkbox', { name: 'Allow All Access' }).click();
+			await page.getByRole('button', { name: 'Save changes' }).click();
+			await vi.waitFor(() => expect(saved).toHaveBeenCalledOnce());
+			expect(savedProfiles(saved)[0].vmcpPermissions).toEqual({ allowAllComponents: true });
+			await expect.element(page.getByRole('button', { name: 'Edit Limited tools' })).toBeVisible();
+			await expect.element(page.getByText('Default', { exact: true })).toBeVisible();
+			await expect.element(page.getByText('0 tools', { exact: true })).not.toBeInTheDocument();
+		});
+
+		it('saves the narrowed grant after disabling a granted tool', async () => {
+			const vmcp = createAsIsVMcp('vmcp-asis-narrow');
+			const saved = mockVMcpSave(vmcp);
+			render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+			await page.getByRole('button', { name: 'Edit Limited tools' }).click();
+			await expandServerTools();
+			await toolSwitch(1).click();
+			await page.getByRole('button', { name: 'Save changes' }).click();
+			await vi.waitFor(() => expect(saved).toHaveBeenCalledOnce());
+			expect(savedProfiles(saved)[0].vmcpPermissions).toEqual({
+				allowedComponents: { github: { allowedTools: ['list_issues'] } }
+			});
+		});
+	});
+
+	it('shows only allowedComponents servers as enabled when Allow All Access is off', async () => {
+		const vmcp = createVMcp('vmcp-allow-all-toggle-off');
+		vmcp.profiles = [
+			{
+				name: 'mixed',
+				subjects: [{ type: 'selector', id: '*' }],
+				vmcpPermissions: {
+					allowAllComponents: true,
+					allowedComponents: { github: { allowedTools: ['list_issues'] } }
+				}
+			}
+		];
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await page.getByRole('button', { name: 'Edit mixed' }).click();
+		await expect
+			.element(page.getByRole('checkbox', { name: 'Allow All Access' }))
+			.not.toBeChecked();
+		await expect.element(page.getByRole('checkbox', { name: 'Disable GitHub' })).toBeChecked();
+		await expect.element(page.getByText('1 of 2 tools')).toBeVisible();
+	});
+
+	it('keeps a server enabled with no tools when it is listed in allowedComponents', async () => {
+		const vmcp = createVMcp('vmcp-empty-tool-grant');
+		vmcp.profiles = [
+			{
+				name: 'tools optional',
+				subjects: [{ type: 'selector', id: '*' }],
+				vmcpPermissions: { allowedComponents: { github: { allowedTools: [] } } }
+			}
+		];
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await page.getByRole('button', { name: 'Edit tools optional' }).click();
+		await expect.element(page.getByRole('checkbox', { name: 'Disable GitHub' })).toBeChecked();
+		await expect.element(page.getByText('0 of 2 tools')).toBeVisible();
+	});
+
+	it('hides MCP server selection while Allow All Access is on and shows servers disabled after it is turned off', async () => {
+		const vmcp = createVMcp('vmcp-allow-all-toggle-off-default');
+		vmcp.profiles = [
+			{
+				name: 'default',
+				subjects: [{ type: 'selector', id: '*' }],
+				vmcpPermissions: { allowAllComponents: true }
+			}
+		];
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await page.getByRole('button', { name: 'Edit default' }).click();
+		const allowAll = page.getByRole('checkbox', { name: 'Allow All Access' });
+		await expect.element(allowAll).toBeChecked();
+		await expect
+			.element(page.getByRole('checkbox', { name: 'Disable GitHub' }))
+			.not.toBeInTheDocument();
+		await allowAll.click();
+		await expect.element(page.getByRole('checkbox', { name: 'Enable GitHub' })).not.toBeChecked();
+		await expect.element(page.getByText('Disabled', { exact: true })).toBeVisible();
+	});
+
 	it('assigns people from the search dropdown', async () => {
 		render(VMcpProfiles, {
 			vmcp: createVMcp('vmcp-people-dropdown'),
@@ -526,6 +777,56 @@ describe('VMcpProfiles.svelte', () => {
 		await expect.element(page.getByText('All Obot Users', { exact: true })).toBeVisible();
 		await page.getByRole('button', { name: 'Remove All Obot Users' }).click();
 		await expect.element(page.getByText('No people or groups assigned.')).toBeVisible();
+	});
+
+	it('does not offer disabled users, and marks an assigned one', async () => {
+		worker.use(
+			http.get('*/api/users', () =>
+				HttpResponse.json({
+					items: [
+						{ id: 'u1', displayName: 'Active Alice', status: 'active' },
+						{ id: 'u2', displayName: 'Disabled Dan', status: 'disabled' },
+						{ id: 'u3', displayName: 'Disabled Dora', status: 'disabled' }
+					]
+				})
+			)
+		);
+		const vmcp = createVMcp('vmcp-disabled-user');
+		vmcp.profiles = [
+			{
+				name: 'default',
+				subjects: [{ type: 'user', id: 'u2' }],
+				vmcpPermissions: { allowAllComponents: true }
+			}
+		];
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await expect.element(page.getByText('Disabled Dan (disabled)')).toBeVisible();
+		await page.getByRole('button', { name: 'Edit default' }).click();
+		await expect.element(page.getByText('Disabled', { exact: true })).toBeVisible();
+
+		await page.getByRole('combobox', { name: 'Add identities...' }).click();
+		await expect.element(page.getByRole('button', { name: 'Active Alice' })).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Disabled Dora' }))
+			.not.toBeInTheDocument();
+	});
+
+	it('labels Obot groups on the profile card and in the editor', async () => {
+		const vmcp = createVMcp('vmcp-obot-group');
+		vmcp.profiles = [
+			{
+				name: 'default',
+				subjects: [{ type: 'obotGroup', id: 'admin' }],
+				vmcpPermissions: { allowAllComponents: true }
+			}
+		];
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await expect.element(page.getByText('Obot Admin', { exact: true })).toBeVisible();
+		await page.getByRole('button', { name: 'Edit default' }).click();
+		await expect.element(page.getByText('Obot Admin', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('admin', { exact: true })).not.toBeInTheDocument();
 	});
 
 	it('shows a group name on the profile card instead of its directory id', async () => {
@@ -581,11 +882,122 @@ describe('VMcpProfiles.svelte', () => {
 		await expect.element(page.getByText(group.id)).not.toBeInTheDocument();
 	});
 
+	it('disables a server with the default grant without asking', async () => {
+		render(VMcpProfiles, {
+			vmcp: createVMcp('vmcp-disable-default-grant'),
+			toolFlow: toolFlowStub()
+		});
+
+		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await expect
+			.element(page.getByRole('checkbox', { name: 'Allow All Access' }))
+			.not.toBeChecked();
+		await enableServer();
+		const disable = page.getByRole('checkbox', { name: 'Disable GitHub' });
+		await expect.element(disable).toBeChecked();
+		await disable.click();
+
+		await expect.element(page.getByText('Disable Server')).not.toBeVisible();
+		await expect
+			.element(page.getByRole('checkbox', { name: 'Allow All Access' }))
+			.not.toBeChecked();
+		await expect.element(page.getByText('Disabled', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('2 of 2 tools')).not.toBeInTheDocument();
+
+		await page.getByRole('checkbox', { name: 'Enable GitHub' }).click();
+		await expect.element(page.getByText('2 of 2 tools')).toBeVisible();
+		await expect.element(page.getByRole('checkbox', { name: 'Disable GitHub' })).toBeChecked();
+	});
+
+	it('treats allow-all empty tool overrides as granted with zero tools', async () => {
+		const vmcp = createVMcp('vmcp-allow-all-empty-tools');
+		vmcp.profiles = [
+			{
+				name: 'default',
+				subjects: [{ type: 'selector', id: '*' }],
+				vmcpPermissions: {
+					allowAllComponents: true,
+					allowedComponents: { github: { allowedTools: [] } }
+				}
+			}
+		];
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await page.getByRole('button', { name: 'Edit default' }).click();
+		await expect
+			.element(page.getByRole('checkbox', { name: 'Allow All Access' }))
+			.not.toBeChecked();
+		await expect.element(page.getByRole('checkbox', { name: 'Disable GitHub' })).toBeChecked();
+		await expect.element(page.getByText('0 of 2 tools')).toBeVisible();
+	});
+
+	it('asks before disabling a server that has allowed tools', async () => {
+		const vmcp = createVMcp('vmcp-disable-allowed-tools');
+		vmcp.profiles = [
+			{
+				name: 'Limited tools',
+				subjects: [{ type: 'selector', id: '*' }],
+				vmcpPermissions: { allowedComponents: { github: { allowedTools: ['list_issues'] } } }
+			}
+		];
+		const saved = mockVMcpSave(vmcp);
+		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
+
+		await page.getByRole('button', { name: 'Edit Limited tools' }).click();
+		await expect.element(page.getByText('1 of 2 tools')).toBeVisible();
+		await page.getByRole('checkbox', { name: 'Disable GitHub' }).click();
+
+		await expect.element(page.getByText('Disable Server')).toBeVisible();
+		await expect
+			.element(page.getByText('Are you sure you want to disable this server?'))
+			.toBeVisible();
+		await page.getByRole('button', { name: 'Cancel' }).click();
+		await expect.element(page.getByText('Disable Server')).not.toBeVisible();
+		await expect.element(page.getByRole('checkbox', { name: 'Disable GitHub' })).toBeChecked();
+		await expect.element(page.getByText('1 of 2 tools')).toBeVisible();
+
+		await page.getByRole('checkbox', { name: 'Disable GitHub' }).click();
+		await page.getByRole('button', { name: 'Disable', exact: true }).click();
+		await expect.element(page.getByText('Disabled', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('1 of 2 tools')).not.toBeInTheDocument();
+		await expect.element(page.getByRole('checkbox', { name: 'Enable GitHub' })).not.toBeChecked();
+
+		await page.getByRole('button', { name: 'Save changes' }).click();
+		await vi.waitFor(() => expect(saved).toHaveBeenCalledOnce());
+		expect(savedProfiles(saved)[0]).toMatchObject({
+			name: 'Limited tools',
+			vmcpPermissions: { allowedComponents: {} }
+		});
+		expect(savedProfiles(saved)[0].vmcpPermissions?.allowedComponents?.github).toBeUndefined();
+	});
+
+	it('asks before disabling a server after its tool overrides change', async () => {
+		render(VMcpProfiles, {
+			vmcp: createVMcp('vmcp-disable-changed-tools'),
+			toolFlow: toolFlowStub()
+		});
+
+		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
+		await expandServerTools();
+		await toolSwitch(1).click();
+		await expect.element(page.getByText('1 of 2 tools')).toBeVisible();
+
+		await page.getByRole('checkbox', { name: 'Disable GitHub' }).click();
+		await expect.element(page.getByText('Disable Server')).toBeVisible();
+		await page.getByRole('button', { name: 'Disable', exact: true }).click();
+
+		await expect.element(page.getByText('Disabled', { exact: true })).toBeVisible();
+		await page.getByRole('checkbox', { name: 'Enable GitHub' }).click();
+		await expect.element(page.getByText('2 of 2 tools')).toBeVisible();
+	});
+
 	it('keeps search and toggle all from changing tools locked by the vMCP', async () => {
 		const vmcp = createVMcpWithDisabledTool('vmcp-locked-search-toggle');
 		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
 
 		await page.getByRole('button', { name: 'Create profile', exact: true }).click();
+		await enableServer();
 		await expandServerTools();
 
 		await expect.element(page.getByPlaceholder('Search tools...')).toBeVisible();

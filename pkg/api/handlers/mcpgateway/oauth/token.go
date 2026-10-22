@@ -18,13 +18,16 @@ import (
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authz"
+	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
+	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/storage/selectors"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/util/retry"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -37,6 +40,12 @@ const (
 func (h *handler) token(req api.Context) (err error) {
 	if err := req.ParseForm(); err != nil {
 		return types.NewErrBadRequest("failed to parse request body: %v", err)
+	}
+
+	if id := req.PathValue("mcp_id"); id != "" {
+		if _, _, err := resolveOAuthConnection(req, id); err != nil {
+			return newOAuthErrHTTP(http.StatusBadRequest, newOAuthError(ErrInvalidRequest, "mcp_id must identify a vMCP or vMCP instance", ""))
+		}
 	}
 
 	var clientSecret string
@@ -101,7 +110,7 @@ func (h *handler) token(req api.Context) (err error) {
 			return newInvalidClientErr("invalid client credentials")
 		}
 	case "private_key_jwt":
-		if err := h.validatePrivateKeyJWT(req.Context(), req.Form, client, clientID); err != nil {
+		if err := h.validatePrivateKeyJWT(req.Context(), req.Form, client, clientID, req.PathValue("mcp_id")); err != nil {
 			slog.Info("Denied OAuth token request due to invalid private_key_jwt client assertion", "clientNamespace", client.Namespace, "clientName", client.Name, "error", err)
 			return newInvalidClientErr(err.Error())
 		}
@@ -176,6 +185,16 @@ func (h *handler) doAuthorizationCode(req api.Context, oauthClient v1.OAuthClien
 	if err != nil {
 		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "invalid user", ""))
 	}
+	if user.Status() != types.UserStatusActive {
+		// The user was disabled after approving the request.
+		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "invalid user", ""))
+	}
+
+	if valid, err := validOAuthConnection(req, oauthAuthRequest.Spec.MCPID, oauthAuthRequest.Spec.Audience, oauthAuthRequest.Spec.Resource, userID); apierrors.IsNotFound(err) || !valid && err == nil {
+		return newOAuthErrHTTP(http.StatusBadRequest, newOAuthError(ErrInvalidGrant, "invalid vMCP connection", ""))
+	} else if err != nil {
+		return err
+	}
 
 	now := time.Now()
 	tknCtx := persistent.TokenContext{
@@ -224,6 +243,9 @@ func (h *handler) doAuthorizationCode(req api.Context, oauthClient v1.OAuthClien
 	if err = req.Create(&oauthToken); err != nil {
 		return fmt.Errorf("failed to create oauth token: %w", err)
 	}
+	if err := revokeIfUserDenied(req, &oauthToken); err != nil {
+		return err
+	}
 	slog.Info("Issued OAuth access and refresh token via authorization_code", "client", oauthClient.Name, "userID", oauthAuthRequest.Spec.UserID, "mcpID", oauthAuthRequest.Spec.MCPID)
 
 	return req.Write(types.OAuthToken{
@@ -234,19 +256,49 @@ func (h *handler) doAuthorizationCode(req api.Context, oauthClient v1.OAuthClien
 	})
 }
 
+// revokeIfUserDenied checks the owner again before delivering tokens. A disable
+// event can finish scanning grants before an authorization-code exchange creates
+// its grant, so issuance must also revoke a grant whose owner is now denied.
+func revokeIfUserDenied(req api.Context, token *v1.OAuthToken) error {
+	err := req.GatewayClient.CheckCredentialOwner(req.Context(), token.Spec.UserID)
+	if err == nil {
+		return nil
+	}
+	// A canceled or unavailable lookup is not a revocation decision.
+	if _, denied := errors.AsType[*gateway.UserAccessDeniedError](err); !denied {
+		return err
+	}
+	if deleteErr := req.Storage.Delete(req.Context(), token); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+		return errors.Join(err, fmt.Errorf("failed to revoke oauth token: %w", deleteErr))
+	}
+	return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "invalid user", ""))
+}
+
 func (h *handler) doRefreshToken(req api.Context, oauthClient v1.OAuthClient, refreshToken string) error {
+	// Revalidate the grant after conflicts; another replica may have rotated or revoked it.
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		return h.doRefreshTokenAttempt(req, oauthClient, refreshToken)
+	})
+}
+
+func (h *handler) doRefreshTokenAttempt(req api.Context, oauthClient v1.OAuthClient, refreshToken string) error {
 	if refreshToken == "" {
 		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "refresh_token is required", ""))
 	}
 
+	name, err := refreshTokenName(refreshToken)
+	if err != nil {
+		return err
+	}
+
 	var oauthToken v1.OAuthToken
-	if err := req.Storage.Get(req.Context(), kclient.ObjectKey{Namespace: oauthClient.Namespace, Name: fmt.Sprintf("%x", sha256.Sum256([]byte(refreshToken)))}, &oauthToken); err != nil {
+	if err := req.Storage.Get(req.Context(), kclient.ObjectKey{Namespace: oauthClient.Namespace, Name: name}, &oauthToken); err != nil {
 		if apierrors.IsNotFound(err) {
 			return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
 		}
-		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidRequest, "refresh_token is invalid", ""))
+		return fmt.Errorf("failed to retrieve oauth token: %w", err)
 	}
-	if oauthToken.Spec.ClientID != oauthClient.Name {
+	if oauthToken.Spec.ClientID != oauthClient.Name || !validRefreshToken(&oauthToken, refreshToken) {
 		return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
 	}
 
@@ -267,6 +319,16 @@ func (h *handler) doRefreshToken(req api.Context, oauthClient v1.OAuthClient, re
 		}
 		return newOAuthError(ErrServerError, fmt.Sprintf("failed to retrieve user: %v", err), "")
 	}
+	if status, _ := principal.UserStatus(user); status != types.UserStatusActive {
+		// Consuming the refresh token keeps it revoked if the user is reactivated.
+		return invalidGrant("invalid user")
+	}
+
+	if valid, err := validOAuthConnection(req, oauthToken.Spec.MCPID, oauthToken.Spec.Audience, oauthToken.Spec.Resource, user.GetUID()); apierrors.IsNotFound(err) || !valid && err == nil {
+		return invalidGrant("invalid vMCP connection")
+	} else if err != nil {
+		return err
+	}
 
 	allowed, err := authz.CheckMCPIDAccess(req.Context(), req.Storage, h.acrHelper, user, oauthToken.Spec.MCPID)
 	if apierrors.IsNotFound(err) {
@@ -276,13 +338,6 @@ func (h *handler) doRefreshToken(req api.Context, oauthClient v1.OAuthClient, re
 	}
 	if !allowed {
 		return invalidGrant("invalid MCP server")
-	}
-
-	if err := req.Storage.Delete(req.Context(), &oauthToken); err != nil {
-		if apierrors.IsNotFound(err) {
-			return types.NewErrBadRequest("%v", newOAuthError(ErrInvalidGrant, "refresh_token is invalid", ""))
-		}
-		return fmt.Errorf("failed to refresh oauth token: %w", err)
 	}
 
 	// For backwards compatibility, if the Audience field isn't set on the oauthToken, then set it from the Resource field.
@@ -310,31 +365,19 @@ func (h *handler) doRefreshToken(req api.Context, oauthClient v1.OAuthClient, re
 		tknCtx.AuthorizedMCPIDs = []string{oauthToken.Spec.Audience}
 	}
 
+	// Mint the access token first so a signing or owner-check failure leaves the
+	// current refresh token usable. Neither token is delivered until rotation succeeds.
 	_, tkn, err := h.tokenService.NewToken(req.Context(), tknCtx)
 	if err != nil {
 		return fmt.Errorf("failed to create auth token: %w", err)
 	}
 
-	refreshToken = strings.ToLower(rand.Text() + rand.Text())
-
-	oauthToken = v1.OAuthToken{
-		Namespace: oauthClient.Namespace,
-		Name:      fmt.Sprintf("%x", sha256.Sum256([]byte(refreshToken))),
-		Spec: v1.OAuthTokenSpec{
-			Scope:                 oauthToken.Spec.Scope,
-			Resource:              oauthToken.Spec.Resource,
-			ClientID:              oauthClient.Name,
-			UserID:                oauthToken.Spec.UserID,
-			AuthProviderNamespace: oauthToken.Spec.AuthProviderNamespace,
-			AuthProviderName:      oauthToken.Spec.AuthProviderName,
-			AuthProviderUserID:    oauthToken.Spec.AuthProviderUserID,
-			MCPID:                 oauthToken.Spec.MCPID,
-			Audience:              oauthToken.Spec.Audience,
-		},
+	refreshToken, err = rotateRefreshToken(req, &oauthToken, refreshToken)
+	if err != nil {
+		return err
 	}
-
-	if err = req.Create(&oauthToken); err != nil {
-		return fmt.Errorf("failed to create new oauth token: %w", err)
+	if err := revokeIfUserDenied(req, &oauthToken); err != nil {
+		return err
 	}
 	slog.Info("Issued OAuth access and refresh token via refresh_token", "client", oauthClient.Name, "userID", oauthToken.Spec.UserID, "mcpID", oauthToken.Spec.MCPID)
 

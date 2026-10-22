@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -26,87 +25,6 @@ import (
 type generatedNameClient struct {
 	kclient.WithWatch
 	next int
-}
-
-func TestRemoveGroupSubjects(t *testing.T) {
-	tests := []struct {
-		name          string
-		subjects      []clienttypes.Subject
-		groupIDPrefix string
-		want          []clienttypes.Subject
-		wantChange    bool
-	}{
-		{
-			name: "removes matching groups and preserves order",
-			subjects: []clienttypes.Subject{
-				{
-					Type: clienttypes.SubjectTypeUser,
-					ID:   "1",
-				},
-				{
-					Type: clienttypes.SubjectTypeGroup,
-					ID:   "entra/engineering",
-				},
-				{
-					Type: clienttypes.SubjectTypeGroup,
-					ID:   "okta/engineering",
-				},
-			},
-			groupIDPrefix: "entra/",
-			want: []clienttypes.Subject{
-				{
-					Type: clienttypes.SubjectTypeUser,
-					ID:   "1",
-				},
-				{
-					Type: clienttypes.SubjectTypeGroup,
-					ID:   "okta/engineering",
-				},
-			},
-			wantChange: true,
-		},
-		{
-			name: "keeps an empty policy after removing its only subject",
-			subjects: []clienttypes.Subject{
-				{
-					Type: clienttypes.SubjectTypeGroup,
-					ID:   "entra/engineering",
-				},
-			},
-			groupIDPrefix: "entra/",
-			want:          []clienttypes.Subject{},
-			wantChange:    true,
-		},
-		{
-			name: "does not change unrelated subjects",
-			subjects: []clienttypes.Subject{
-				{
-					Type: clienttypes.SubjectTypeGroup,
-					ID:   "okta/engineering",
-				},
-			},
-			groupIDPrefix: "entra/",
-			want: []clienttypes.Subject{
-				{
-					Type: clienttypes.SubjectTypeGroup,
-					ID:   "okta/engineering",
-				},
-			},
-			wantChange: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, changed := removeGroupSubjects(tt.subjects, tt.groupIDPrefix)
-			if changed != tt.wantChange {
-				t.Fatalf("changed = %v, want %v", changed, tt.wantChange)
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("subjects = %#v, want %#v", got, tt.want)
-			}
-		})
-	}
 }
 
 func TestAuthProviderCleanupCleansAllGroupReferencesAfterProviderPruned(t *testing.T) {
@@ -187,41 +105,9 @@ func TestAuthProviderCleanupCleansAllGroupReferencesAfterProviderPruned(t *testi
 			},
 		},
 	}
-	hostedAgentRule := &v1.HostedAgentAccessRule{
-		Name:      "hosted-agent-rule",
-		Namespace: namespace,
-		Spec: v1.HostedAgentAccessRuleSpec{
-			Manifest: clienttypes.HostedAgentAccessRuleManifest{
-				Subjects: mixedSubjects,
-			},
-		},
-	}
-	publishedArtifact := &v1.PublishedArtifact{
-		Name:      "artifact",
-		Namespace: namespace,
-		Status: v1.PublishedArtifactStatus{
-			Versions: []clienttypes.PublishedArtifactVersionEntry{
-				{
-					Version:  1,
-					Subjects: mixedSubjects,
-				},
-				{
-					Version: 2,
-					Subjects: []clienttypes.Subject{
-						{
-							Type: clienttypes.SubjectTypeGroup,
-							ID:   targetGroup,
-						},
-					},
-				},
-			},
-		},
-	}
-
 	baseClient := fake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
-		WithStatusSubresource(&v1.PublishedArtifact{}).
-		WithObjects(cleanupTask, accessRule, modelPolicy, skillRule, messagePolicy, hostedAgentRule, publishedArtifact).
+		WithObjects(cleanupTask, accessRule, modelPolicy, skillRule, messagePolicy).
 		Build()
 	storageClient := &generatedNameClient{WithWatch: baseClient}
 	gatewayClient, gatewayDB := newAuthProviderCleanupGatewayClient(t)
@@ -302,13 +188,6 @@ func TestAuthProviderCleanupCleansAllGroupReferencesAfterProviderPruned(t *testi
 	gotMessagePolicy := &v1.MessagePolicy{}
 	mustGet(t, storageClient, messagePolicy, gotMessagePolicy)
 	assertSubjects(t, gotMessagePolicy.Spec.Manifest.Subjects, wantSubjects)
-	gotHostedAgentRule := &v1.HostedAgentAccessRule{}
-	mustGet(t, storageClient, hostedAgentRule, gotHostedAgentRule)
-	assertSubjects(t, gotHostedAgentRule.Spec.Manifest.Subjects, wantSubjects)
-	gotArtifact := &v1.PublishedArtifact{}
-	mustGet(t, storageClient, publishedArtifact, gotArtifact)
-	assertSubjects(t, gotArtifact.Status.Versions[0].Subjects, wantSubjects)
-	assertSubjects(t, gotArtifact.Status.Versions[1].Subjects, []clienttypes.Subject{})
 
 	var roleChanges v1.UserRoleChangeList
 	if err := storageClient.List(t.Context(), &roleChanges); err != nil {

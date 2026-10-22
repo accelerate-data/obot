@@ -110,6 +110,7 @@ jobs:
           context: .
           platforms: linux/${{ matrix.arch }}
           build-args: |
+            OBOT_VERSION=${{ needs.resolve.outputs.upstream_version }}
             PROVIDERS_IMAGE=ghcr.io/accelerate-data/providers-vibedata@${{ needs.resolve.outputs.providers_digest }}
             ENTERPRISE_PROVIDERS_IMAGE=ghcr.io/obot-platform/enterprise-providers@${{ needs.resolve.outputs.enterprise_providers_digest }}
             ENCRYPTION_BINS_IMAGE=ghcr.io/accelerate-data/providers-vibedata/encryption-bins@${{ needs.resolve.outputs.encryption_bins_digest }}

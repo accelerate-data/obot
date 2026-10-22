@@ -21,16 +21,19 @@ func TestReadLocalProviderRegistryFromSubdirectories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(modelProvidersDir, "openai-model-provider.yaml"), []byte(`name: OpenAI
+	if err := os.WriteFile(filepath.Join(modelProvidersDir, "openai-model-provider.yaml"), []byte(`name: "${openai_model_provider_name}"
 command: bin/openai-model-provider
 dialect: OpenAIResponses
+requiredConfigurationParameters:
+  - name: API_KEY
+    friendlyName: "${openai_model_provider_api_key_friendly_name}"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(modelProvidersDir, "ignored.json"), []byte(`{"name":"ignored"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(authProvidersDir, "github-auth-provider.yaml"), []byte(`name: GitHub
+	if err := os.WriteFile(filepath.Join(authProvidersDir, "github-auth-provider.yaml"), []byte(`name: "${github_auth_provider_name}"
 command: bin/github-auth-provider
 groupIDPrefix: github/
 `), 0o644); err != nil {
@@ -67,7 +70,7 @@ optionalConfigurationParameters:
 			if provider.Name != "openai-model-provider" {
 				t.Fatalf("expected model provider name openai-model-provider, got %q", provider.Name)
 			}
-			if provider.Spec.Name != "OpenAI" {
+			if provider.Spec.Name != "${openai_model_provider_name}" {
 				t.Fatalf("expected model provider display name OpenAI, got %q", provider.Spec.Name)
 			}
 			if provider.Spec.Command != filepath.Join(dir, "bin/openai-model-provider") {
@@ -75,6 +78,9 @@ optionalConfigurationParameters:
 			}
 			if provider.Spec.Dialect != "OpenAIResponses" {
 				t.Fatalf("expected model provider dialect OpenAIResponses, got %q", provider.Spec.Dialect)
+			}
+			if provider.Spec.RequiredConfigurationParameters[0].FriendlyName != "${openai_model_provider_api_key_friendly_name}" {
+				t.Fatal("model provider reference was not preserved")
 			}
 		case *v1.AuthProvider:
 			if provider.Name == "generic-oauth-auth-provider" {
@@ -95,7 +101,7 @@ optionalConfigurationParameters:
 			if provider.Name != "github-auth-provider" {
 				t.Fatalf("expected auth provider name github-auth-provider, got %q", provider.Name)
 			}
-			if provider.Spec.Name != "GitHub" {
+			if provider.Spec.Name != "${github_auth_provider_name}" {
 				t.Fatalf("expected auth provider display name GitHub, got %q", provider.Spec.Name)
 			}
 			if provider.Spec.Command != filepath.Join(dir, "bin/github-auth-provider") {
@@ -104,6 +110,7 @@ optionalConfigurationParameters:
 			if provider.Spec.GroupIDPrefix != "github/" {
 				t.Fatalf("expected auth provider group ID prefix github/, got %q", provider.Spec.GroupIDPrefix)
 			}
+
 		default:
 			t.Fatalf("unexpected object type %T", obj)
 		}

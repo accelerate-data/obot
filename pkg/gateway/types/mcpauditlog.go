@@ -22,8 +22,8 @@ const (
 // MCPAuditLog represents an audit log entry for MCP API calls
 type MCPAuditLog struct {
 	ID         uint                      `json:"id" gorm:"primaryKey"`
-	CreatedAt  time.Time                 `json:"createdAt" gorm:"index;index:idx_mcp_audit_api_key_created,priority:2"`
-	SourceType types2.AuditLogSourceType `json:"sourceType" gorm:"index;default:mcp"`
+	CreatedAt  time.Time                 `json:"createdAt" gorm:"index;index:idx_mcp_audit_api_key_created,priority:2;index:idx_mcp_audit_tool_calls_daily,priority:3"`
+	SourceType types2.AuditLogSourceType `json:"sourceType" gorm:"index;default:mcp;index:idx_mcp_audit_tool_calls_daily,priority:1"`
 	UserID     string                    `json:"userID" gorm:"index"`
 	APIKeyID   *uint                     `json:"apiKeyID,omitempty" gorm:"index:idx_mcp_audit_api_key_created,priority:1"`
 	// APIKeyRevoked is current lifecycle metadata populated when audit logs are read.
@@ -41,13 +41,13 @@ type MCPAuditLog struct {
 
 type MCPAuditLogFields struct {
 	APIKey                    string                                `json:"apiKey,omitempty"`
-	MCPID                     string                                `json:"mcpID" gorm:"index"`
+	MCPID                     string                                `json:"mcpID" gorm:"index;index:idx_mcp_audit_tool_calls_daily,priority:4"`
 	PowerUserWorkspaceID      string                                `json:"powerUserWorkspaceID,omitempty" gorm:"index"`
 	MCPServerDisplayName      string                                `json:"mcpServerDisplayName" gorm:"index"`
 	MCPServerCatalogEntryName string                                `json:"mcpServerCatalogEntryName" gorm:"index"`
 	ClientName                string                                `json:"clientName" gorm:"index"`
 	ClientVersion             string                                `json:"clientVersion" gorm:"index"`
-	CallType                  string                                `json:"callType" gorm:"index"`
+	CallType                  string                                `json:"callType" gorm:"index;index:idx_mcp_audit_tool_calls_daily,priority:2"`
 	CallIdentifier            string                                `json:"callIdentifier,omitempty" gorm:"index"`
 	RequestMutated            bool                                  `json:"requestMutated"`
 	RequestBody               json.RawMessage                       `json:"requestBody,omitempty"`
@@ -300,9 +300,10 @@ func (a *MCPAuditLog) validateLocalAgentToolCallFields() error {
 	case types2.LocalAgentProviderClaudeCode,
 		types2.LocalAgentProviderCodex,
 		types2.LocalAgentProviderVSCode,
-		types2.LocalAgentProviderCursor:
+		types2.LocalAgentProviderCursor,
+		types2.LocalAgentProviderKiro:
 	default:
-		return errors.New("local agent audit provider must be one of: claude_code, codex, vscode, cursor")
+		return errors.New("local agent audit provider must be one of: claude_code, codex, vscode, cursor, kiro")
 	}
 	switch local.OutcomeStatus {
 	case types2.AuditLogOutcomeStatusSuccess,

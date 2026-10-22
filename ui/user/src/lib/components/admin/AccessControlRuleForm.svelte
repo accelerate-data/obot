@@ -1,11 +1,11 @@
 <script lang="ts">
 	import {
 		PAGE_TRANSITION_DURATION,
-		ADMIN_SESSION_STORAGE,
 		DEFAULT_MCP_CATALOG_ID,
 		ADMIN_ALL_OPTION,
 		MCP_ACCESS_POLICY_FIELD_IDS
 	} from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import {
 		AdminService,
@@ -18,16 +18,22 @@
 		type OrgGroup,
 		type MCPCatalogEntry
 	} from '$lib/services';
-	import { getUserRegistry } from '$lib/services/user/mcp';
+	import { getUserRegistry, getMcpValueLabel } from '$lib/services/user/mcp';
 	import { profile } from '$lib/stores';
 	import { goto } from '$lib/url';
 	import { getUserDisplayName } from '$lib/utils';
-	import { convertSubjectsToTableData, resolveSubjects } from '../../subjectResolver';
+	import {
+		convertSubjectsToTableData,
+		resolveSubjects,
+		resolveSubjectFromGroup,
+		resolveSubjectPickerById
+	} from '../../subjectResolver';
 	import Confirm from '../Confirm.svelte';
 	import IconButton from '../primitives/IconButton.svelte';
 	import Table from '../table/Table.svelte';
 	import SearchMcpServers from './SearchMcpServers.svelte';
 	import SearchUsers from './SearchUsers.svelte';
+	import SubjectName from './SubjectName.svelte';
 	import { Plus, Trash2 } from '@lucide/svelte';
 	import { untrack, type Snippet } from 'svelte';
 	import { fly } from 'svelte/transition';
@@ -37,6 +43,7 @@
 		accessControlRule?: AccessControlRule;
 		onCreate?: (accessControlRule: AccessControlRule) => void;
 		onUpdate?: (accessControlRule: AccessControlRule) => void;
+		onCancel?: () => void;
 		entity?: 'workspace' | 'catalog';
 		id?: string | null;
 		mcpEntriesContextFn: () => {
@@ -47,6 +54,7 @@
 		all?: { label: string; description: string };
 		readonly?: boolean;
 		isAdminView?: boolean;
+		animate?: boolean;
 	}
 
 	let {
@@ -54,14 +62,21 @@
 		accessControlRule: initialAccessControlRule,
 		onCreate,
 		onUpdate,
+		onCancel,
 		mcpEntriesContextFn,
 		readonly,
 		isAdminView,
 		all = ADMIN_ALL_OPTION,
 		id = DEFAULT_MCP_CATALOG_ID,
-		entity = 'catalog'
+		entity = 'catalog',
+		animate = true
 	}: Props = $props();
 	const duration = PAGE_TRANSITION_DURATION;
+	const noTransition = { duration: 0 };
+	const flyRightOut = $derived(animate ? { x: 100, duration } : noTransition);
+	const flyRightIn = $derived(animate ? { x: 100, delay: duration } : noTransition);
+	const flyLeftOut = $derived(animate ? { x: -100, duration } : noTransition);
+	const flyLeftIn = $derived(animate ? { x: -100 } : noTransition);
 	let accessControlRule = $state(
 		untrack(
 			() =>
@@ -76,7 +91,6 @@
 	);
 
 	let saving = $state<boolean | undefined>();
-	let redirect = $state('');
 	let usersAndGroups = $state<{ users: OrgUser[]; groups: OrgGroup[] }>();
 	let loadingUsersAndGroups = $state(false);
 
@@ -134,44 +148,6 @@
 		return () => controller.abort();
 	});
 
-	$effect(() => {
-		const initialAdditionId = sessionStorage.getItem(
-			ADMIN_SESSION_STORAGE.ACCESS_CONTROL_RULE_CREATION
-		);
-		if (
-			initialAdditionId &&
-			!mcpServerAndEntries.loading &&
-			(mcpServersMap.size > 0 || mcpEntriesMap.size > 0)
-		) {
-			// Check if this resource is already added to prevent duplicates
-			const existingResourceIds = new Set(
-				accessControlRule.resources?.map((resource) => resource.id) ?? []
-			);
-			if (!existingResourceIds.has(initialAdditionId)) {
-				const entry = mcpEntriesMap.get(initialAdditionId);
-				const workspaceScope = entity === 'workspace' ? `?wid=${id}` : '';
-
-				if (entry) {
-					accessControlRule.resources = [
-						...(accessControlRule.resources ?? []),
-						{ id: entry.id, type: 'mcpServerCatalogEntry' }
-					];
-					redirect = `/mcp-servers/c/${entry.id}${workspaceScope}`;
-				} else {
-					const server = mcpServersMap.get(initialAdditionId);
-					if (server) {
-						accessControlRule.resources = [
-							...(accessControlRule.resources ?? []),
-							{ id: server.id, type: 'mcpServer' }
-						];
-						redirect = `/mcp-servers/s/${server.id}${workspaceScope}`;
-					}
-				}
-			}
-			sessionStorage.removeItem(ADMIN_SESSION_STORAGE.ACCESS_CONTROL_RULE_CREATION);
-		}
-	});
-
 	function convertMcpServersToTableData(resources: AccessControlRuleResource[]) {
 		const owner = initialAccessControlRule?.powerUserID
 			? getUserDisplayName(usersMap, initialAccessControlRule.powerUserID)
@@ -198,8 +174,8 @@
 
 			const allLabel = owner
 				? isMe
-					? 'Everything In My Registry'
-					: `Everything In ${owner}'s Registry`
+					? m.mcps_access_policies_everything_in_my_registry()
+					: m.mcps_access_policies_everything_in_owner_registry({ owner })
 				: all.label;
 
 			return {
@@ -217,12 +193,8 @@
 	}
 </script>
 
-<div
-	class="flex h-full w-full flex-col gap-4"
-	out:fly={{ x: 100, duration }}
-	in:fly={{ x: 100, delay: duration }}
->
-	<div class="flex grow flex-col gap-4" out:fly={{ x: -100, duration }} in:fly={{ x: -100 }}>
+<div class="flex h-full w-full flex-col gap-4" out:fly={flyRightOut} in:fly={flyRightIn}>
+	<div class="flex grow flex-col gap-4" out:fly={flyLeftOut} in:fly={flyLeftIn}>
 		{#if topContent}
 			{@render topContent()}
 		{/if}
@@ -237,7 +209,7 @@
 							{@const registry = getUserRegistry(initialAccessControlRule, usersMap)}
 							{#if registry}
 								<div class="dark:bg-base-300 bg-base-400 rounded-full px-3 py-1 text-xs">
-									{registry}
+									{getMcpValueLabel(registry)}
 								</div>
 							{/if}
 						{/if}
@@ -246,7 +218,7 @@
 				{#if !readonly}
 					<IconButton
 						variant="danger2"
-						tooltip={{ text: 'Delete Catalog' }}
+						tooltip={{ text: m.mcps_access_policies_delete_catalog() }}
 						onclick={() => {
 							deletingRule = true;
 						}}
@@ -267,7 +239,7 @@
 							for={MCP_ACCESS_POLICY_FIELD_IDS.name}
 							class="flex-1 text-sm font-light capitalize"
 						>
-							Name
+							{m.core_name()}
 						</label>
 						<input
 							id={MCP_ACCESS_POLICY_FIELD_IDS.name}
@@ -282,7 +254,7 @@
 
 		<div id={MCP_ACCESS_POLICY_FIELD_IDS.usersGroupsSection} class="flex flex-col gap-2">
 			<div class="mb-2 flex items-center justify-between">
-				<h2 class="text-lg font-semibold">User & Groups</h2>
+				<h2 class="text-lg font-semibold">{m.mcps_access_policies_users_groups()}</h2>
 				{#if !readonly}
 					<div class="relative flex items-center gap-4">
 						{#if loadingUsersAndGroups}
@@ -291,7 +263,8 @@
 								class="btn btn-primary flex items-center gap-1 text-sm"
 								disabled
 							>
-								<Plus class="size-4" /> Add User/Group
+								<Plus class="size-4" />
+								{m.core_add_user_group()}
 							</button>
 						{:else}
 							<button
@@ -301,7 +274,8 @@
 									addUserGroupDialog?.open();
 								}}
 							>
-								<Plus class="size-4" /> Add User/Group
+								<Plus class="size-4" />
+								{m.core_add_user_group()}
 							</button>
 						{/if}
 					</div>
@@ -320,19 +294,29 @@
 				<Table
 					data={tableData}
 					fields={['displayName', 'type']}
-					headers={[{ property: 'displayName', title: 'Name' }]}
-					noDataMessage="No users or groups added."
+					headers={[
+						{ property: 'displayName', title: m.core_name() },
+						{ property: 'type', title: m.core_type() }
+					]}
+					noDataMessage={m.core_no_users_or_groups_added()}
 				>
+					{#snippet onRenderColumn(property, d)}
+						{#if property === 'displayName'}
+							<SubjectName name={d.displayName} disabled={d.disabled} />
+						{:else}
+							{d[property as keyof typeof d]}
+						{/if}
+					{/snippet}
 					{#snippet actions(d)}
 						{#if !readonly}
 							<IconButton
 								variant="danger"
 								onclick={() => {
 									accessControlRule.subjects = accessControlRule.subjects?.filter(
-										(subject) => subject.id !== d.id
+										(subject) => resolveSubjectPickerById(subject) !== d.id
 									);
 								}}
-								tooltip={{ text: 'Delete User/Group' }}
+								tooltip={{ text: m.core_delete_user_group() }}
 							>
 								<Trash2 class="size-4" />
 							</IconButton>
@@ -344,7 +328,7 @@
 
 		<div id={MCP_ACCESS_POLICY_FIELD_IDS.serversSection} class="flex flex-col gap-2">
 			<div class="mb-2 flex items-center justify-between">
-				<h2 class="text-lg font-semibold">Servers</h2>
+				<h2 class="text-lg font-semibold">{m.mcps_servers_tab()}</h2>
 				{#if !readonly}
 					<div class="relative flex items-center gap-4">
 						<button
@@ -354,7 +338,8 @@
 								addMcpServerDialog?.open();
 							}}
 						>
-							<Plus class="size-4" /> Add Server
+							<Plus class="size-4" />
+							{m.mcps_access_policies_add_server()}
 						</button>
 					</div>
 				{/if}
@@ -362,7 +347,8 @@
 			<Table
 				data={mcpServersTableData}
 				fields={['name']}
-				noDataMessage="No entries or servers added."
+				noDataMessage={m.mcps_access_policies_no_entries_servers()}
+				headers={[{ property: 'name', title: m.core_name() }]}
 			>
 				{#snippet actions(d)}
 					{#if !readonly}
@@ -372,7 +358,7 @@
 								accessControlRule.resources =
 									accessControlRule.resources?.filter((resource) => resource.id !== d.id) ?? [];
 							}}
-							tooltip={{ text: 'Remove MCP Server' }}
+							tooltip={{ text: m.mcps_filters_remove_mcp_server() }}
 						>
 							<Trash2 class="size-4" />
 						</IconButton>
@@ -384,24 +370,22 @@
 	{#if !readonly}
 		<div
 			class="bg-base-200 text-muted-content dark:bg-base-100 sticky bottom-0 left-0 flex w-full justify-end gap-2 py-4"
-			out:fly={{ x: -100, duration }}
-			in:fly={{ x: -100 }}
+			out:fly={flyLeftOut}
+			in:fly={flyLeftIn}
 		>
 			<div class="flex w-full justify-end gap-4">
 				{#if !accessControlRule.id}
 					<button
 						class="btn btn-secondary"
 						onclick={() => {
-							if (redirect) {
-								goto(redirect);
-							} else if (profile.current.hasAdminAccess?.()) {
-								goto('/mcp-servers?view=access-policies');
+							if (onCancel) {
+								onCancel();
 							} else {
 								goto('/mcp-servers?view=access-policies');
 							}
 						}}
 					>
-						Cancel
+						{m.common_cancel()}
 					</button>
 					<button
 						id={MCP_ACCESS_POLICY_FIELD_IDS.saveBtn}
@@ -415,18 +399,14 @@
 									? await UserService.createWorkspaceAccessControlRule(id, accessControlRule)
 									: await AdminService.createAccessControlRule(accessControlRule);
 							accessControlRule = response;
-							if (redirect) {
-								goto(redirect);
-							} else {
-								onCreate?.(response);
-							}
+							onCreate?.(response);
 							saving = false;
 						}}
 					>
 						{#if saving}
 							<Loading class="size-4" />
 						{:else}
-							Save
+							{m.core_save()}
 						{/if}
 					</button>
 				{:else}
@@ -443,7 +423,7 @@
 							saving = false;
 						}}
 					>
-						Reset
+						{m.core_reset_shared()}
 					</button>
 					<button
 						class="btn btn-primary"
@@ -470,7 +450,7 @@
 						{#if saving}
 							<Loading class="size-4" />
 						{:else}
-							Update
+							{m.core_update()}
 						{/if}
 					</button>
 				{/if}
@@ -481,10 +461,10 @@
 
 <SearchUsers
 	bind:this={addUserGroupDialog}
-	filterIds={accessControlRule.subjects?.map((subject) => subject.id) ?? []}
+	filterIds={accessControlRule.subjects?.map(resolveSubjectPickerById) ?? []}
 	onAdd={async (users: OrgUser[], groups: OrgGroup[]) => {
 		const existingSubjectIds = new Set(
-			accessControlRule.subjects?.map((subject) => subject.id) ?? []
+			accessControlRule.subjects?.map(resolveSubjectPickerById) ?? []
 		);
 		const newSubjects = [
 			...users
@@ -495,10 +475,7 @@
 				})),
 			...groups
 				.filter((group: OrgGroup) => !existingSubjectIds.has(group.id))
-				.map((group: OrgGroup) => ({
-					type: group.id === '*' ? ('selector' as const) : ('group' as const),
-					id: group.id
-				}))
+				.map((group: OrgGroup) => resolveSubjectFromGroup(group))
 		];
 		accessControlRule.subjects = [...(accessControlRule.subjects ?? []), ...newSubjects];
 	}}
@@ -530,7 +507,7 @@
 />
 
 <Confirm
-	msg={`Delete ${accessControlRule.displayName}?`}
+	msg={m.core_delete_named_form({ name: accessControlRule.displayName })}
 	show={deletingRule}
 	onsuccess={async () => {
 		if (!accessControlRule.id || !id) return;

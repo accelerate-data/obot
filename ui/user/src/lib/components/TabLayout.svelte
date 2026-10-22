@@ -5,15 +5,18 @@
 		label: string;
 		value: string;
 		content: Snippet;
+		tooltip?: string;
+		beta?: boolean;
 	};
 </script>
 
 <script lang="ts">
 	import { page } from '$app/state';
+	import InfoTooltip from '$lib/components/InfoTooltip.svelte';
 	import Layout from '$lib/components/Layout.svelte';
 	import OverflowContainer from '$lib/components/OverflowContainer.svelte';
 	import { clearUrlParams, goto } from '$lib/url';
-	import { ChevronLeft, ChevronRight } from '@lucide/svelte';
+	import { ChevronLeft, ChevronRight, Info } from '@lucide/svelte';
 	import type { Component } from 'svelte';
 	import { twMerge } from 'tailwind-merge';
 
@@ -63,7 +66,10 @@
 
 	let selected = $derived(views.find((candidate) => candidate.value === selectedView));
 
+	let tabAnchors = $state<Record<string, HTMLElement | undefined>>({});
+
 	function selectView(value: string) {
+		if (value === selectedView) return;
 		clearUrlParams(Array.from(page.url.searchParams.keys()).filter((key) => key !== VIEW_PARAM));
 		goto(`${page.url.pathname}?${VIEW_PARAM}=${value}`);
 	}
@@ -116,10 +122,11 @@
 							<div class={twMerge('flex flex-1 relative z-10 pr-2', x && 'pl-2')}>
 								{#each views as viewOption, index (viewOption.value)}
 									{@const isSelected = selectedView === viewOption.value}
-									<button
-										id={`tab-${viewOption.value}`}
+									{@const tooltip = viewOption.tooltip?.trim()}
+									<div
+										bind:this={tabAnchors[viewOption.value]}
 										class={twMerge(
-											'tab-flare relative font-light text-md rounded-t-lg text-nowrap px-8 py-2',
+											'tab-flare indicator relative font-light text-md rounded-t-lg text-nowrap px-8 py-2',
 											isSelected
 												? 'tab-selected z-10 font-medium bg-primary text-white after:absolute after:-bottom-0.75 after:left-1/2 after:-translate-x-1/2 after:h-0 after:w-0 after:border-x-5 after:border-x-transparent after:border-b-5 after:border-b-base-300 after:dark:border-base-100 after:content-[""]'
 												: 'tab-hover-flare hover:bg-primary/20',
@@ -130,10 +137,48 @@
 												index !== views.length - 1 &&
 												'tab-separator'
 										)}
-										onclick={() => selectView(viewOption.value)}
 									>
-										{viewOption.label}
-									</button>
+										{#if viewOption.beta}
+											<span
+												class={twMerge(
+													'indicator-item indicator-bottom indicator-center badge badge-primary badge-xs text-[8px] h-3',
+													isSelected ? 'bg-white text-primary' : ''
+												)}
+											>
+												BETA
+											</span>
+										{/if}
+										<button
+											id={`tab-${viewOption.value}`}
+											type="button"
+											class="absolute inset-0 rounded-t-lg"
+											aria-label={viewOption.label}
+											onclick={() => selectView(viewOption.value)}
+										></button>
+										<span class="pointer-events-none relative z-10 inline-flex items-center gap-2">
+											<span aria-hidden="true">{viewOption.label}</span>
+											{#if tooltip}
+												<span class="pointer-events-auto inline-flex">
+													<InfoTooltip
+														text={tooltip}
+														anchor={tabAnchors[viewOption.value]}
+														variant="hint"
+														classes={{
+															icon: twMerge(
+																'size-4 shrink-0',
+																isSelected ? 'text-white' : 'text-primary'
+															)
+														}}
+														icon={Info}
+														placement="bottom"
+														disablePortal={false}
+														offset={viewOption.beta ? { y: 3 } : undefined}
+														onClick={() => selectView(viewOption.value)}
+													/>
+												</span>
+											{/if}
+										</span>
+									</div>
 								{/each}
 							</div>
 							<div class="bg-primary h-0.75 w-full shrink-0"></div>
@@ -228,7 +273,7 @@
 
 	/* A flare takes the separator's place on whichever side is hovered */
 	.tab-separator:hover::after,
-	.tab-separator:has(+ button:hover)::after {
+	.tab-separator:has(+ .tab-flare:hover)::after {
 		display: none;
 	}
 </style>

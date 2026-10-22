@@ -1,7 +1,8 @@
 import {
 	defaultJSONSchemaValue,
+	generatedFormRepresents,
 	jsonValuesEqual,
-	nonNullableJSONSchema,
+	resolveUnionSchema,
 	pruneClearedProperties,
 	supportsGeneratedForm,
 	validateJSONSchema,
@@ -31,6 +32,30 @@ describe('MCP tester JSON Schema support', () => {
 			settings: { enabled: true }
 		});
 		expect(supportsGeneratedForm(schema)).toBe(true);
+	});
+
+	it('copies object and array defaults held in proxies such as Svelte $state', () => {
+		// structuredClone rejects proxies, which the tester's tool cache hands out.
+		const domains = new Proxy<string[]>([], {});
+		const filter = new Proxy({ site: 'example.com' }, {});
+		const proxied: JSONSchema = {
+			type: 'object',
+			properties: {
+				include_domains: { type: 'array', items: { type: 'string' }, default: domains },
+				filter: { type: 'object', const: filter },
+				options: { type: 'object', enum: [filter] }
+			},
+			required: ['filter', 'options']
+		};
+
+		const value = defaultJSONSchemaValue(proxied) as Record<string, unknown>;
+		expect(value).toEqual({
+			include_domains: [],
+			filter: { site: 'example.com' },
+			options: { site: 'example.com' }
+		});
+		expect(value.include_domains).not.toBe(domains);
+		expect(value.filter).not.toBe(filter);
 	});
 
 	it('validates required, nested, array, string, and numeric constraints', () => {
@@ -68,7 +93,7 @@ describe('MCP tester JSON Schema support', () => {
 		expect(performance.now() - started).toBeLessThan(100);
 	});
 
-	it('accepts every member of a union type and leaves multiple non-null types to Raw JSON', () => {
+	it('accepts every member of a union type and renders the first non-null type', () => {
 		const nullable: JSONSchema = {
 			type: 'object',
 			required: ['label'],
@@ -89,7 +114,13 @@ describe('MCP tester JSON Schema support', () => {
 		expect(validateJSONSchema(nullable, { label: null, amount: true })).toEqual([
 			'amount must be one of these types: integer, string'
 		]);
-		expect(supportsGeneratedForm(nullable)).toBe(false);
+		expect(supportsGeneratedForm(nullable)).toBe(true);
+		expect(resolveUnionSchema(nullable.properties!.amount)).toEqual({
+			schema: { type: 'integer' },
+			nullable: false,
+			alternatives: ['string'],
+			index: 0
+		});
 	});
 
 	it.each([
@@ -140,8 +171,8 @@ describe('MCP tester JSON Schema support', () => {
 			default: null
 		};
 		expect(defaultJSONSchemaValue(nullable)).toBeNull();
-		expect(defaultJSONSchemaValue(nonNullableJSONSchema(nullable)!)).toBe(5);
-		expect(defaultJSONSchemaValue(nonNullableJSONSchema({ ...nullable, default: 0 })!)).toBe(0);
+		expect(defaultJSONSchemaValue(resolveUnionSchema(nullable)!.schema)).toBe(5);
+		expect(defaultJSONSchemaValue(resolveUnionSchema({ ...nullable, default: 0 })!.schema)).toBe(0);
 		expect(nullable.default).toBeNull();
 	});
 
@@ -154,13 +185,13 @@ describe('MCP tester JSON Schema support', () => {
 		]);
 	});
 
-	it('keeps other anyOf unions in Raw JSON and validates sibling constraints', () => {
-		expect(supportsGeneratedForm({ anyOf: [{ type: 'string' }, { type: 'integer' }] })).toBe(false);
+	it('renders the first non-null anyOf member and validates sibling constraints', () => {
+		expect(supportsGeneratedForm({ anyOf: [{ type: 'string' }, { type: 'integer' }] })).toBe(true);
 		expect(
 			supportsGeneratedForm({
 				anyOf: [{ type: 'string' }, { type: 'integer' }, { type: 'null' }]
 			})
-		).toBe(false);
+		).toBe(true);
 		expect(
 			validateJSONSchema(
 				{
@@ -171,6 +202,174 @@ describe('MCP tester JSON Schema support', () => {
 				'other'
 			)
 		).toEqual(['Value must be one of the allowed values']);
+	});
+
+	it('prefers the member matching the current value, then the schema default, then the first', () => {
+		const union: JSONSchema = {
+			anyOf: [{ type: 'boolean' }, { type: 'string' }],
+			default: false,
+			description: 'Whether to reply to all'
+		};
+		const boolean = {
+			schema: { type: 'boolean', default: false, description: 'Whether to reply to all' },
+			nullable: false,
+			alternatives: ['string'],
+			index: 0
+		};
+		expect(resolveUnionSchema(union)).toEqual(boolean);
+		expect(resolveUnionSchema(union, true)).toEqual(boolean);
+		expect(resolveUnionSchema(union, 'yes')).toEqual({
+			schema: { type: 'string', description: 'Whether to reply to all' },
+			nullable: false,
+			alternatives: ['boolean'],
+			index: 1
+		});
+		expect(supportsGeneratedForm(union)).toBe(true);
+		expect(defaultJSONSchemaValue(union)).toBe(false);
+
+		const numeric: JSONSchema = { anyOf: [{ type: 'string' }, { type: 'integer' }], default: 5 };
+		expect(resolveUnionSchema(numeric)?.schema.type).toBe('integer');
+		expect(resolveUnionSchema(numeric, 2.5)?.schema.type).toBe('integer');
+		expect(resolveUnionSchema({ anyOf: numeric.anyOf }, 2.5)?.schema.type).toBe('string');
+		expect(resolveUnionSchema({ type: ['string', 'integer'] }, 7)).toEqual({
+			schema: { type: 'integer' },
+			nullable: false,
+			alternatives: ['string'],
+			index: 1
+		});
+	});
+
+	it('only gives a member the union default when the default fits it', () => {
+		const union: JSONSchema = {
+			anyOf: [{ type: 'boolean', default: true }, { type: 'string' }, { type: 'null' }],
+			default: 'auto'
+		};
+		expect(resolveUnionSchema(union, true)?.schema).toEqual({ type: 'boolean', default: true });
+		expect(defaultJSONSchemaValue(resolveUnionSchema(union, true)!.schema)).toBe(true);
+		expect(resolveUnionSchema(union)?.schema.default).toBe('auto');
+		expect(resolveUnionSchema({ type: ['integer', 'string'], default: 'x' }, 3)?.schema).toEqual({
+			type: 'integer'
+		});
+	});
+
+	it('keeps the previously rendered member while the value matches no member', () => {
+		const union: JSONSchema = { anyOf: [{ type: 'string' }, { type: 'integer' }] };
+		expect(resolveUnionSchema(union, undefined, 1)?.schema.type).toBe('integer');
+		expect(resolveUnionSchema(union, 2.5, 1)?.schema.type).toBe('integer');
+		// A value matching a member still selects that member.
+		expect(resolveUnionSchema(union, 'text', 1)?.schema.type).toBe('string');
+		// The previous member beats the default, and an out-of-range one is ignored.
+		expect(resolveUnionSchema({ ...union, default: 'a' }, undefined, 1)?.schema.type).toBe(
+			'integer'
+		);
+		expect(resolveUnionSchema(union, undefined, 5)?.schema.type).toBe('string');
+	});
+
+	it('keeps the null toggle for unions with several non-null members', () => {
+		for (const union of [
+			{ anyOf: [{ type: 'boolean' }, { type: 'string' }, { type: 'null' }] },
+			{ type: ['boolean', 'string', 'null'] }
+		] as JSONSchema[]) {
+			expect(resolveUnionSchema(union)).toEqual({
+				schema: { type: 'boolean' },
+				nullable: true,
+				alternatives: ['string'],
+				index: 0
+			});
+			expect(supportsGeneratedForm(union)).toBe(true);
+			expect(defaultJSONSchemaValue(union)).toBe(false);
+			expect(validateJSONSchema(union, null)).toEqual([]);
+			expect(validateJSONSchema(union, 'text')).toEqual([]);
+		}
+	});
+
+	it('prunes cleared fields using the member that matches the value', () => {
+		const union: JSONSchema = {
+			anyOf: [
+				{ type: 'string' },
+				{ type: 'object', properties: { label: { type: 'string' }, count: { type: 'integer' } } }
+			]
+		};
+		expect(pruneClearedProperties(union, { label: '', count: 2 })).toEqual({ count: 2 });
+		expect(pruneClearedProperties(union, 'text')).toBe('text');
+	});
+
+	it('falls back to the first member when the matching member cannot render', () => {
+		const union: JSONSchema = {
+			anyOf: [{ type: 'string' }, { type: 'object', properties: { nested: {} } }]
+		};
+		expect(resolveUnionSchema(union, { nested: 1 })?.schema.type).toBe('string');
+		expect(supportsGeneratedForm(union)).toBe(true);
+	});
+
+	it('reports values the generated form cannot show without misrepresenting them', () => {
+		const union: JSONSchema = {
+			anyOf: [{ type: 'string' }, { type: 'object', properties: { nested: {} } }]
+		};
+		const tool: JSONSchema = { type: 'object', properties: { value: union } };
+		// A valid object for the member that cannot render would show as an empty string.
+		expect(generatedFormRepresents(tool, { value: { nested: 1 } })).toBe(false);
+		expect(generatedFormRepresents({ type: 'array', items: union }, ['a', { nested: 1 }])).toBe(
+			false
+		);
+		// Values the rendered member shows, unset values, and invalid values the form
+		// reports as errors are all fine.
+		expect(generatedFormRepresents(tool, { value: 'text' })).toBe(true);
+		expect(generatedFormRepresents(tool, {})).toBe(true);
+		expect(generatedFormRepresents(tool, { value: 3 })).toBe(true);
+		expect(generatedFormRepresents({ anyOf: [{ type: 'string' }, { type: 'integer' }] }, 2.5)).toBe(
+			true
+		);
+		expect(generatedFormRepresents({ type: ['string', 'null'] }, null)).toBe(true);
+		// Null allowed without a null toggle would show as an empty string.
+		expect(generatedFormRepresents({ anyOf: [{ type: 'string' }, { const: null }] }, null)).toBe(
+			false
+		);
+		expect(generatedFormRepresents({ type: 'object', properties: { value: union } }, null)).toBe(
+			true
+		);
+	});
+
+	it('picks the same-typed member the value satisfies and represents it', () => {
+		const union: JSONSchema = {
+			anyOf: [
+				{ type: 'object', properties: { a: { type: 'string' } }, required: ['a'] },
+				{ type: 'object', properties: { b: { type: 'string' } }, required: ['b'] }
+			]
+		};
+		expect(resolveUnionSchema(union, { b: 'x' })?.schema.required).toEqual(['b']);
+		expect(resolveUnionSchema(union, { a: 'x' })?.schema.required).toEqual(['a']);
+		// Mid-edit values that satisfy neither member keep the remembered same-typed
+		// member, and otherwise fall back to the first type match.
+		expect(resolveUnionSchema(union, {}, 1)?.schema.required).toEqual(['b']);
+		expect(resolveUnionSchema(union, {})?.schema.required).toEqual(['a']);
+		expect(generatedFormRepresents(union, { b: 'x' })).toBe(true);
+		// A value valid only through a member the form renders differently is not.
+		const typeless: JSONSchema = { anyOf: [{ type: 'string', minLength: 3 }, { enum: [5] }] };
+		expect(generatedFormRepresents(typeless, 5)).toBe(false);
+		expect(generatedFormRepresents(typeless, 'abc')).toBe(true);
+	});
+
+	it('leaves members ruled out by a shared enum or const out of the hint', () => {
+		const members = [{ type: 'boolean' }, { type: 'string' }] as JSONSchema[];
+		expect(resolveUnionSchema({ anyOf: members, enum: [true, false] })?.alternatives).toEqual([]);
+		expect(resolveUnionSchema({ anyOf: members, const: true })?.alternatives).toEqual([]);
+		expect(resolveUnionSchema({ anyOf: members, enum: [true, 'yes'] })?.alternatives).toEqual([
+			'string'
+		]);
+	});
+
+	it('still declines unions whose first member cannot render or conflicts with the union', () => {
+		expect(supportsGeneratedForm({ anyOf: [{ enum: [1, 2] }, { type: 'string' }] })).toBe(false);
+		expect(
+			resolveUnionSchema({
+				anyOf: [{ type: 'string', minLength: 2 }, { type: 'integer' }],
+				minLength: 5
+			})
+		).toBeUndefined();
+		expect(
+			resolveUnionSchema({ anyOf: [{ type: 'string' }, { enum: [1, 2] }] })?.alternatives
+		).toEqual(['another type']);
 	});
 
 	it.each([
@@ -247,7 +446,7 @@ describe('MCP tester JSON Schema support', () => {
 		'declines nullable forms that would overwrite branch constraints: %j',
 		({ branch, sibling }) => {
 			const nullable: JSONSchema = { anyOf: [branch, { type: 'null' }], ...sibling };
-			expect(nonNullableJSONSchema(nullable)).toBeUndefined();
+			expect(resolveUnionSchema(nullable)).toBeUndefined();
 			expect(supportsGeneratedForm(nullable)).toBe(false);
 		}
 	);
@@ -263,11 +462,11 @@ describe('MCP tester JSON Schema support', () => {
 			minLength: 3
 		};
 		expect(supportsGeneratedForm(nullable)).toBe(true);
-		expect(nonNullableJSONSchema(nullable)).toEqual({
-			type: 'string',
-			title: 'Union',
-			description: 'Union hint',
-			minLength: 3
+		expect(resolveUnionSchema(nullable)).toEqual({
+			schema: { type: 'string', title: 'Union', description: 'Union hint', minLength: 3 },
+			nullable: true,
+			alternatives: [],
+			index: 0
 		});
 	});
 
@@ -279,7 +478,7 @@ describe('MCP tester JSON Schema support', () => {
 				{ type: ['string', 'null'] }
 			]) {
 				const nullable: JSONSchema = { ...union, ...constraint };
-				expect(nonNullableJSONSchema(nullable)).toBeUndefined();
+				expect(resolveUnionSchema(nullable)).toBeUndefined();
 				expect(supportsGeneratedForm(nullable)).toBe(false);
 				expect(validateJSONSchema(nullable, 'allowed')).toEqual([]);
 				expect(validateJSONSchema(nullable, null)).not.toEqual([]);
@@ -331,6 +530,21 @@ describe('MCP tester JSON Schema support', () => {
 		expect(
 			validateJSONSchema(optional, pruneClearedProperties(optional, { nickname: '' }))
 		).toEqual([]);
+	});
+
+	it('prunes cleared text inputs for untyped properties but keeps empty strings for other types', () => {
+		const optional: JSONSchema = {
+			type: 'object',
+			properties: {
+				untyped: { description: 'Rendered as a text input' },
+				union: { anyOf: [{ type: 'string' }, { type: 'number' }] },
+				count: { type: 'number' }
+			}
+		};
+
+		expect(pruneClearedProperties(optional, { untyped: '', union: '', count: '' })).toEqual({
+			count: ''
+		});
 	});
 
 	it('keeps cleared required properties so they report as required, and prunes nested optionals', () => {

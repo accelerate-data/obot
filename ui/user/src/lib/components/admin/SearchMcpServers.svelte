@@ -1,15 +1,10 @@
 <script lang="ts">
 	import { ADMIN_ALL_OPTION, MCP_ACCESS_POLICY_FIELD_IDS } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { stripMarkdownToText } from '$lib/markdown';
-	import {
-		UserService,
-		type MCPCatalogEntry,
-		type MCPCatalogServer,
-		type OrgUser,
-		type VMCP
-	} from '$lib/services';
-	import { isDeprecatedMCPServer } from '$lib/services/user/mcp';
+	import { UserService, type MCPCatalogEntry, type OrgUser, type VMCP } from '$lib/services';
+	import { isDeprecatedMCPServer, getMcpValueLabel } from '$lib/services/user/mcp';
 	import { getUserDisplayName } from '$lib/utils';
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
 	import Search from '../Search.svelte';
@@ -24,7 +19,6 @@
 		vmcps?: VMCP[];
 		mcpEntriesContextFn?: () => {
 			entries: MCPCatalogEntry[];
-			servers: MCPCatalogServer[];
 			loading: boolean;
 		};
 		all?: { label: string; description: string };
@@ -55,7 +49,7 @@
 		workspaceId,
 		isAdminView,
 		singleSelect,
-		title = 'Add Server(s)',
+		title = m.mcps_servers_add_servers(),
 		entity = 'catalog',
 		all = ADMIN_ALL_OPTION
 	}: Props = $props();
@@ -69,7 +63,6 @@
 	const mcpServerAndEntries = $derived(
 		mcpEntriesContextFn?.() ?? {
 			entries: [],
-			servers: [],
 			loading: false
 		}
 	);
@@ -114,31 +107,9 @@
 					deprecated: isDeprecatedMCPServer(entry),
 					registry:
 						entry.powerUserID && isAdminView
-							? `${getUserDisplayName(usersMap, entry.powerUserID)}'s Registry`
-							: ''
-				})),
-			...mcpServerAndEntries.servers
-				.filter((server) => {
-					if (type === 'filter') {
-						return true;
-					}
-
-					return entity === 'catalog'
-						? !server.powerUserWorkspaceID
-						: workspaceId
-							? server.powerUserWorkspaceID === workspaceId
-							: !!server.powerUserWorkspaceID;
-				})
-				.map((server) => ({
-					icon: server.manifest.icon,
-					name: server.alias || server.manifest.name || '',
-					description: server.manifest.description,
-					id: server.id,
-					type: 'mcpserver' as const,
-					deprecated: isDeprecatedMCPServer(server),
-					registry:
-						server.userID && server.powerUserWorkspaceID && isAdminView
-							? `${getUserDisplayName(usersMap, server.userID)}'s Registry`
+							? m.mcps_servers_users_registry({
+									name: getUserDisplayName(usersMap, entry.powerUserID)
+								})
 							: ''
 				}))
 		].filter((item) => !exclude?.includes(item.id))
@@ -202,7 +173,7 @@
 						class="dark:bg-base-200 dark:border-base-400 shadow-inner dark:border"
 						onChange={(val) => (search = val)}
 						value={search}
-						placeholder="Search by name..."
+						placeholder={m.mcps_servers_search_by_name()}
 					/>
 				</div>
 
@@ -234,11 +205,11 @@
 							}}
 						>
 							<div class="flex w-full items-center gap-2 overflow-hidden">
-								<div class="icon">
+								<div class="icon shrink-0">
 									{#if item.icon}
-										<img src={item.icon} alt={item.name} class="size-8 shrink-0" />
+										<img src={item.icon} alt={item.name} class="size-8" />
 									{:else}
-										<Server class="size-8 shrink-0" />
+										<Server class="size-8" />
 									{/if}
 								</div>
 								<div class="flex min-w-0 grow flex-col">
@@ -249,7 +220,7 @@
 
 										{#if item.registry}
 											<div class="badge badge-xs badge-soft badge-primary">
-												{item.registry}
+												{getMcpValueLabel(item.registry)}
 											</div>
 										{/if}
 										<McpDeprecatedNotice deprecated={item.deprecated} />
@@ -275,16 +246,16 @@
 			<div class="flex items-center gap-1 font-light">
 				{#if selected.length > 0}
 					<Server class="size-4" />
-					{selected.length} Selected
+					{m.core_n_selected({ count: selected.length })}
 				{/if}
 			</div>
-			<div class="flex items-center gap-2">
+			<div class="flex items-center gap-2 md:flex-row flex-col">
 				<button
 					id="search-mcp-servers-cancel-btn"
 					class="btn btn-secondary w-full md:w-fit"
 					onclick={() => addMcpServerDialog?.close()}
 				>
-					Cancel
+					{m.common_cancel()}
 				</button>
 				<button
 					id={type === 'acr'
@@ -293,7 +264,7 @@
 					class="btn btn-primary w-full md:w-fit"
 					onclick={handleAdd}
 				>
-					Confirm
+					{m.core_confirm()}
 				</button>
 			</div>
 		{/if}

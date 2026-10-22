@@ -12,10 +12,10 @@ import {
 	type VMCPManifest
 } from '$lib/services';
 import { catalogEntryToVMCPComponent } from '$lib/services/vmcps/utils';
-import { mcpServersAndEntries, vmcpInstances } from '$lib/stores';
+import { mcpServersAndEntries, responsive, vmcpInstances } from '$lib/stores';
 import { createMCPCatalogEntry, createVMCP, createVMCPComponent } from '../../../tests/helpers/mcp';
 import { createMockProfile, preparePageData } from '../../../tests/helpers/pageData';
-import { getProfileResponse } from '../../../tests/mocks/data';
+import { getProfileResponse, getVersionResponse } from '../../../tests/mocks/data';
 import { worker } from '../../../tests/mocks/worker';
 import VMcpDesigner from './VMcpDesigner.svelte';
 import { http, HttpResponse } from 'msw';
@@ -23,6 +23,21 @@ import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page, userEvent } from 'vitest/browser';
+
+vi.mock('$app/state', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$app/state')>();
+	const { createAppState } = await import('../../../tests/helpers/navigation.svelte');
+	return createAppState(actual);
+});
+
+vi.mock('$app/navigation', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('$app/navigation')>();
+	const { applyTestGoto } = await import('../../../tests/helpers/navigation.svelte');
+	return {
+		...actual,
+		goto: (url: string | URL) => applyTestGoto(url)
+	};
+});
 
 const componentEntry = createMCPCatalogEntry({
 	id: 'entry-github',
@@ -34,6 +49,20 @@ const componentEntry = createMCPCatalogEntry({
 		]
 	}
 });
+
+function unconfiguredSalesforceEntry() {
+	return createMCPCatalogEntry({
+		id: 'entry-salesforce',
+		name: 'Salesforce',
+		runtime: 'remote',
+		manifest: {
+			remoteConfig: {
+				fixedURL: 'https://api.salesforce.com/platform/mcp/v1/platform/sobject-all',
+				staticOAuthRequired: true
+			}
+		}
+	});
+}
 
 const toolOverrides: ToolOverride[] = [
 	{ name: 'create_issue', description: 'Create an issue', enabled: true },
@@ -61,10 +90,30 @@ function createIssueTrackerVMcp(overrides?: ToolOverride[]) {
 	);
 }
 
+function withExplicitToolGrant(vmcp: VMCP, toolNames: string[]) {
+	vmcp.profiles = [
+		{
+			name: 'Engineering',
+			subjects: [{ type: 'selector', id: '*' }],
+			vmcpPermissions: {
+				allowedComponents: {
+					[`component-${componentEntry.id}`]: { allowedTools: toolNames }
+				}
+			}
+		}
+	];
+	return vmcp;
+}
+
 async function renderDesigner(
 	entries: MCPCatalogEntry[],
 	vmcp?: VMCP,
-	options?: { groups?: string[]; instances?: VMCPInstance[]; onBack?: () => void }
+	options?: {
+		groups?: string[];
+		instances?: VMCPInstance[];
+		onBack?: () => void;
+		kubernetes?: boolean;
+	}
 ) {
 	localStorage.setItem('@obot/seen-vmcp-introduction', new Date().toISOString());
 	mcpServersAndEntries.current = {
@@ -77,7 +126,8 @@ async function renderDesigner(
 		isInitialized: true
 	};
 	await preparePageData({
-		profile: createMockProfile(options?.groups ?? [Group.ADMIN])
+		profile: createMockProfile(options?.groups ?? [Group.ADMIN]),
+		version: options?.kubernetes ? { ...getVersionResponse, engine: 'kubernetes' } : undefined
 	});
 	vmcpInstances.current = { items: options?.instances ?? [], loading: false };
 	return render(VMcpDesigner, {
@@ -185,8 +235,13 @@ async function pressCard(locator: ReturnType<typeof page.getByRole>, pointerId: 
 describe('VMcpDesigner.svelte', () => {
 	afterEach(() => {
 		appPage.url.searchParams.delete('view');
+		appPage.url.searchParams.delete('inspector');
+		appPage.url.searchParams.delete('connect');
+		appPage.url.searchParams.delete('profile');
 		appPage.url.searchParams.delete('tab');
+		appPage.url.searchParams.delete('modify-tools');
 		vmcpInstances.current = { items: [], loading: false };
+		responsive.isMobile = false;
 		finishVMcpCreateHandoff();
 	});
 
@@ -205,6 +260,180 @@ describe('VMcpDesigner.svelte', () => {
 				.not.toBeInTheDocument();
 		});
 
+		it('opens the tool editor from modify-tools and clears the param when dismissed', async () => {
+			const vmcp = createIssueTrackerVMcp(toolOverrides);
+			appPage.url.searchParams.set('modify-tools', `component-${componentEntry.id}`);
+			await renderDesigner([componentEntry], vmcp);
+
+			await expect.element(page.getByRole('button', { name: 'Refresh tools' })).toBeVisible();
+			await page.getByRole('button', { name: 'Cancel' }).click();
+
+			await expect
+				.element(page.getByRole('button', { name: 'Refresh tools' }))
+				.not.toBeInTheDocument();
+			expect(appPage.url.searchParams.get('modify-tools')).toBeNull();
+		});
+
+		it('renames the component and its tool prefix from Edit Details', async () => {
+			const vmcp = createIssueTrackerVMcp(toolOverrides);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry], vmcp);
+
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'Edit Details' }).click();
+
+			const dialog = page.getByRole('dialog').filter({ hasText: 'Tool name prefix' });
+			await expect.element(dialog.getByRole('heading', { name: 'Edit Details' })).toBeVisible();
+			await expect.element(dialog.getByRole('textbox', { name: 'Name *' })).toHaveValue('GitHub');
+			await expect
+				.element(dialog.getByRole('textbox', { name: 'Tool name prefix' }))
+				.toHaveValue('github_');
+
+			await dialog.getByRole('textbox', { name: 'Name *' }).fill('GitHub EU');
+			await dialog.getByRole('textbox', { name: 'Tool name prefix' }).fill('github_eu_');
+			await dialog.getByRole('button', { name: 'Save' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
+				name: 'GitHub EU',
+				toolPrefix: 'github_eu_'
+			});
+			await expect
+				.element(page.getByRole('button', { name: 'GitHub EU', exact: true }))
+				.toBeVisible();
+		});
+
+		it('rejects a blank name, a taken name, and a duplicate tool prefix', async () => {
+			const slack = createMCPCatalogEntry({ id: 'entry-slack', name: 'Slack' });
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					components: [
+						createVMCPComponent(componentEntry, { toolPrefix: 'github_' }),
+						createVMCPComponent(slack, { toolPrefix: 'slack_' })
+					]
+				},
+				[componentEntry, slack]
+			);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry, slack], vmcp);
+
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'Edit Details' }).click();
+			const dialog = page.getByRole('dialog').filter({ hasText: 'Tool name prefix' });
+
+			await dialog.getByRole('textbox', { name: 'Name *' }).fill(' ');
+			await expect.element(dialog.getByRole('alert')).toHaveTextContent('Enter a name.');
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeDisabled();
+
+			await dialog.getByRole('textbox', { name: 'Name *' }).fill('Slack');
+			await expect
+				.element(dialog.getByRole('alert'))
+				.toHaveTextContent('A component named Slack already exists.');
+
+			await dialog.getByRole('textbox', { name: 'Name *' }).fill('GitHub EU');
+			await dialog.getByRole('textbox', { name: 'Tool name prefix' }).fill('slack_');
+			await expect.element(dialog.getByText(/already uses the prefix/).last()).toBeVisible();
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeDisabled();
+			expect(update).not.toHaveBeenCalled();
+		});
+
+		it('rejects a prefix that makes two exposed tools share a name', async () => {
+			const slack = createMCPCatalogEntry({ id: 'entry-slack', name: 'Slack' });
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					components: [
+						createVMCPComponent(componentEntry, {
+							toolPrefix: 'gh_',
+							toolOverrides: [{ name: 'hub_create', enabled: true }]
+						}),
+						createVMCPComponent(slack, {
+							id: 'component-slack',
+							name: 'Slack',
+							toolPrefix: 'git_hub_',
+							toolOverrides: [{ name: 'create', enabled: true }]
+						})
+					]
+				},
+				[componentEntry, slack]
+			);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry, slack], vmcp);
+
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'Edit Details' }).click();
+			const dialog = page.getByRole('dialog').filter({ hasText: 'Tool name prefix' });
+
+			await dialog.getByRole('textbox', { name: 'Tool name prefix' }).fill('git_');
+			await expect
+				.element(dialog.getByText('Existing tool(s) must maintain uniqueness.'))
+				.toBeVisible();
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeDisabled();
+
+			await dialog.getByRole('textbox', { name: 'Tool name prefix' }).fill('gh_');
+			await expect
+				.element(dialog.getByText('Existing tool(s) must maintain uniqueness.'))
+				.not.toBeInTheDocument();
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeEnabled();
+			expect(update).not.toHaveBeenCalled();
+		});
+
+		it('rejects a prefix that pushes an exposed tool name past 128 characters', async () => {
+			const enabledName = 'e'.repeat(70);
+			const vmcp = createIssueTrackerVMcp([
+				{ name: enabledName, enabled: true },
+				{ name: 'd'.repeat(120), enabled: false },
+				{ name: 'r'.repeat(90), enabled: true, removed: true }
+			]);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry], vmcp);
+
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'Edit Details' }).click();
+			const dialog = page.getByRole('dialog').filter({ hasText: 'Tool name prefix' });
+			const prefix = dialog.getByRole('textbox', { name: 'Tool name prefix' });
+
+			await prefix.fill('p'.repeat(50));
+			await expect
+				.element(dialog.getByText('Existing tool(s) cannot exceed 128 characters.'))
+				.not.toBeInTheDocument();
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+			await prefix.fill('p'.repeat(60));
+			await expect
+				.element(dialog.getByText('Existing tool(s) cannot exceed 128 characters.'))
+				.toBeVisible();
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeDisabled();
+			expect(update).not.toHaveBeenCalled();
+		});
+
+		it('rejects save when two exposed tools on the component already share a name', async () => {
+			const vmcp = createIssueTrackerVMcp([
+				{ name: 'create_issue', enabled: true },
+				{ name: 'list_issues', overrideName: 'create_issue', enabled: true }
+			]);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry], vmcp);
+
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'Edit Details' }).click();
+			const dialog = page.getByRole('dialog').filter({ hasText: 'Tool name prefix' });
+
+			await expect
+				.element(dialog.getByText('Existing tool(s) must maintain uniqueness.'))
+				.toBeVisible();
+			await expect.element(dialog.getByRole('button', { name: 'Save' })).toBeDisabled();
+			expect(update).not.toHaveBeenCalled();
+		});
+
 		it('edits the stored overrides from Modify Tools instead of running setup', async () => {
 			const vmcp = createIssueTrackerVMcp(toolOverrides);
 			await renderDesigner([componentEntry], vmcp);
@@ -215,11 +444,10 @@ describe('VMcpDesigner.svelte', () => {
 			await expect
 				.element(page.getByRole('heading', { name: 'Configure GitHub Tools' }))
 				.toBeVisible();
-			await expect.element(page.getByText('create_issue').first()).toBeVisible();
-			await expect.element(page.getByText('list_issues').first()).toBeVisible();
-			await expect
-				.element(page.getByCSS('dialog[open] input[placeholder="No prefix"]'))
-				.toHaveValue('github_');
+			const editor = page.getByRole('dialog').filter({ hasText: 'Configure GitHub Tools' });
+			await expect.element(editor.getByText('github_create_issue').first()).toBeVisible();
+			await expect.element(editor.getByText('github_list_issues').first()).toBeVisible();
+			await expect.element(editor.getByPlaceholder('No prefix')).not.toBeInTheDocument();
 			await expect.element(page.getByRole('button', { name: 'Refresh tools' })).toBeVisible();
 			await expect
 				.element(page.getByRole('button', { name: 'Get Started', exact: true }))
@@ -235,7 +463,7 @@ describe('VMcpDesigner.svelte', () => {
 			await componentBlock().click();
 			await chooseModifyTools();
 
-			await page.getByRole('switch', { name: 'Enabled' }).nth(1).click();
+			await page.getByRole('switch', { name: 'Enable Tool' }).click();
 			await page.getByRole('button', { name: 'Confirm' }).click();
 
 			await vi.waitFor(() => expect(update).toHaveBeenCalled());
@@ -247,6 +475,49 @@ describe('VMcpDesigner.svelte', () => {
 					{ name: 'list_issues', enabled: true }
 				]
 			});
+		});
+
+		it('saves tool overrides only on the edited component', async () => {
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					components: [
+						createVMCPComponent(componentEntry, {
+							toolPrefix: 'github_',
+							toolOverrides
+						}),
+						createVMCPComponent(componentEntry, {
+							id: 'component-github-eu',
+							name: 'GitHub EU',
+							toolPrefix: 'github_eu_'
+						})
+					]
+				},
+				[componentEntry]
+			);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry], vmcp);
+
+			await componentBlock().click();
+			await chooseModifyTools();
+			await page.getByRole('switch', { name: 'Enable Tool' }).click();
+			await page.getByRole('button', { name: 'Confirm' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
+			const saved = componentsFrom(update.mock.calls[0][0]);
+			const source = saved.find((component) => component.name === 'GitHub');
+			const sibling = saved.find((component) => component.name === 'GitHub EU');
+			expect(source?.toolOverrides).toEqual([
+				expect.objectContaining({ name: 'create_issue', enabled: true }),
+				expect.objectContaining({ name: 'list_issues', enabled: true })
+			]);
+			expect(sibling?.toolOverrides).toBeUndefined();
+			expect(sibling?.toolPrefix).toBe('github_eu_');
+			await expect
+				.element(page.getByRole('heading', { name: 'Configure GitHub Tools' }))
+				.not.toBeInTheDocument();
 		});
 
 		it('refreshes tools from the server through the setup flow', async () => {
@@ -261,9 +532,111 @@ describe('VMcpDesigner.svelte', () => {
 				.element(page.getByRole('button', { name: 'Configure Tools', exact: true }))
 				.toBeVisible();
 		});
+
+		it('confirms before saving a disabled tool that a profile explicitly allows', async () => {
+			const vmcp = withExplicitToolGrant(createIssueTrackerVMcp(toolOverrides), ['create_issue']);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+
+			await renderDesigner([componentEntry], vmcp);
+			await componentBlock().click();
+			await chooseModifyTools();
+
+			await page.getByRole('switch', { name: 'Disable Tool' }).click();
+			await page.getByRole('button', { name: 'Confirm' }).click();
+
+			const warning = page
+				.getByRole('dialog')
+				.filter({ hasText: 'The following profile(s) will be impacted by these changes:' });
+			await expect.element(warning.getByText('Confirm Save')).toBeVisible();
+			await expect.element(warning.getByRole('cell', { name: 'Engineering' })).toBeVisible();
+			await expect.element(warning.getByRole('cell', { name: 'create_issue' })).toBeVisible();
+			expect(update).not.toHaveBeenCalled();
+
+			await warning.getByRole('button', { name: 'Save' }).click();
+			await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
+			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
+				toolOverrides: [
+					{ name: 'create_issue', enabled: false },
+					{ name: 'list_issues', enabled: false }
+				]
+			});
+			await expect
+				.element(page.getByRole('dialog').filter({ hasText: 'Update existing profile(s) now?' }))
+				.not.toBeInTheDocument();
+		});
+
+		it('offers to update a profile when a refresh removes a tool that profile allows', async () => {
+			const vmcp = withExplicitToolGrant(createIssueTrackerVMcp(toolOverrides), ['create_issue']);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			worker.use(
+				http.post(
+					`/api/vmcps/${vmcp.id}/components/${vmcp.components[0].id}/generate-tool-previews`,
+					() =>
+						HttpResponse.json({
+							...componentEntry,
+							manifest: {
+								...componentEntry.manifest,
+								toolPreview: [
+									{ id: 'list_issues', name: 'list_issues', description: 'List issues' }
+								]
+							}
+						})
+				)
+			);
+
+			await renderDesigner([componentEntry], vmcp);
+			await componentBlock().click();
+			await chooseModifyTools();
+			await page.getByRole('button', { name: 'Refresh tools' }).click();
+
+			const editor = page
+				.getByRole('dialog')
+				.filter({ hasText: 'This tool is no longer available.' });
+			await expect.element(editor).toBeVisible();
+			await editor.getByRole('button', { name: 'Confirm' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
+			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
+				toolOverrides: [{ name: 'list_issues', enabled: false }]
+			});
+
+			const offer = page.getByRole('dialog').filter({ hasText: 'Update existing profile(s) now?' });
+			await expect.element(offer.getByText('Update Profile(s)?')).toBeVisible();
+			await expect.element(offer.getByRole('button', { name: 'Update Profile' })).toBeVisible();
+			await expect.element(offer.getByRole('button', { name: 'Skip' })).toBeVisible();
+		});
 	});
 
 	describe('component without stored tool overrides', () => {
+		it('hides configuration actions when a remote server has nothing to configure', async () => {
+			const entry = createMCPCatalogEntry({
+				id: 'entry-remote',
+				name: 'Remote Server',
+				runtime: 'remote',
+				manifest: { remoteConfig: { fixedURL: 'https://example.com/mcp' } }
+			});
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					components: [createVMCPComponent(entry)]
+				},
+				[entry]
+			);
+			await renderDesigner([entry], vmcp);
+
+			await page.getByRole('button', { name: 'Remote Server', exact: true }).click();
+			await expect.element(page.getByRole('button', { name: 'Modify Tools' })).toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Change Configuration' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'View Configuration' }))
+				.not.toBeInTheDocument();
+		});
+
 		it('offers modifying tools or deleting the server', async () => {
 			const vmcp = createIssueTrackerVMcp();
 			await renderDesigner([componentEntry], vmcp);
@@ -337,10 +710,15 @@ describe('VMcpDesigner.svelte', () => {
 			await modify.click();
 			await expect.element(page.getByRole('button', { name: 'Configure Tools' })).toBeDisabled();
 			await page.getByLabelText('API token', { exact: false }).fill('preview-secret');
+			await expect.element(page.getByRole('button', { name: 'Configure Tools' })).toBeEnabled();
 			await page.getByRole('button', { name: 'Configure Tools' }).click();
+			await vi.waitFor(() => expect(preview).toHaveBeenCalledWith({ API_TOKEN: 'preview-secret' }));
+			await expect
+				.element(page.getByRole('heading', { name: 'Configure GitHub Tools' }))
+				.toBeVisible();
 			await expect.element(page.getByText('create_issue', { exact: true }).first()).toBeVisible();
 			expect(preview).toHaveBeenCalledWith({ API_TOKEN: 'preview-secret' });
-			await page.getByRole('switch', { name: 'Enabled' }).nth(1).click();
+			await page.getByRole('switch', { name: 'Disable Tool' }).nth(1).click();
 			await page.getByRole('button', { name: 'Confirm' }).click();
 			await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
 			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
@@ -401,11 +779,20 @@ describe('VMcpDesigner.svelte', () => {
 				.toHaveValue('userAllowed');
 
 			await page.getByRole('button', { name: 'Cancel' }).click();
-			await expect.element(page.getByRole('button', { name: 'Modify Tools' })).toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Modify Tools' }))
+				.not.toBeInTheDocument();
 
+			await componentBlock().click();
 			await page.getByRole('button', { name: 'Change Configuration' }).click();
 			await page.getByRole('combobox', { name: 'API token policy' }).selectOptions('Preconfigured');
 			await page.getByCSS('#fixed-API_TOKEN').fill('secret');
+			const advanced = page
+				.getByRole('dialog')
+				.getByRole('checkbox', { name: 'Advanced', exact: true });
+			await expect.element(advanced).toBeInTheDocument();
+			const advancedInput = advanced.element() as HTMLInputElement;
+			if (!advancedInput.checked) advancedInput.click();
 			await page.getByRole('checkbox', { name: 'Force single-user' }).click();
 			await page.getByRole('button', { name: 'Save' }).click();
 
@@ -422,6 +809,16 @@ describe('VMcpDesigner.svelte', () => {
 
 			await componentBlock().click();
 			await page.getByRole('button', { name: 'Modify Tools' }).click();
+
+			await expect
+				.element(page.getByRole('button', { name: 'Configure Tools', exact: true }))
+				.toBeVisible();
+		});
+
+		it('opens tool setup from modify-tools', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			appPage.url.searchParams.set('modify-tools', `component-${componentEntry.id}`);
+			await renderDesigner([componentEntry], vmcp);
 
 			await expect
 				.element(page.getByRole('button', { name: 'Configure Tools', exact: true }))
@@ -480,9 +877,229 @@ describe('VMcpDesigner.svelte', () => {
 		});
 	});
 
+	describe('catalog-synced component', () => {
+		const sourceURL = 'https://github.com/example/catalog';
+
+		it('shows stored tool overrides without letting them be changed', async () => {
+			const vmcp = { ...createIssueTrackerVMcp(toolOverrides), sourceURL };
+			await renderDesigner([componentEntry], vmcp);
+
+			await componentBlock().click();
+			await expect.element(page.getByRole('button', { name: 'View Tools' })).toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Remove GitHub' }))
+				.not.toBeInTheDocument();
+			await page.getByRole('button', { name: 'View Tools' }).click();
+
+			const editor = page.getByRole('dialog').filter({ hasText: 'They cannot be changed here.' });
+			await expect
+				.element(editor.getByRole('heading', { name: 'View GitHub Tools' }))
+				.toBeVisible();
+			await expect.element(editor.getByText('github_create_issue')).toBeVisible();
+			await expect.element(editor.getByText('github_list_issues')).toBeVisible();
+			await expect.element(editor.getByPlaceholder('No prefix')).not.toBeInTheDocument();
+			await expect
+				.element(editor.getByRole('button', { name: 'Refresh tools' }))
+				.not.toBeInTheDocument();
+			await expect.element(editor.getByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
+			await expect.element(editor.getByRole('button', { name: 'Clear' })).not.toBeInTheDocument();
+			await expect
+				.element(editor.getByRole('button', { name: 'Customize' }))
+				.not.toBeInTheDocument();
+			await expect.element(editor.getByRole('switch', { name: 'Disable Tool' })).toBeDisabled();
+			await expect.element(editor.getByRole('switch', { name: 'Enable Tool' })).toBeDisabled();
+			await expect.element(editor.getByRole('switch', { name: 'Enable All Tools' })).toBeDisabled();
+		});
+
+		it('opens configuration without letting it be changed', async () => {
+			const entry = createMCPCatalogEntry({
+				id: 'entry-github',
+				name: 'GitHub',
+				manifest: {
+					toolPreview: componentEntry.manifest.toolPreview,
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: false,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					sourceURL,
+					components: [
+						createVMCPComponent(entry, {
+							toolPrefix: 'github_',
+							configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
+						})
+					]
+				},
+				[entry]
+			);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			worker.use(
+				http.post(`/api/vmcps/${vmcp.id}/reveal`, () => HttpResponse.json({ components: {} }))
+			);
+			await renderDesigner([entry], vmcp);
+
+			await page.getByRole('button', { name: 'GitHub', exact: true }).click();
+			await page.getByRole('button', { name: 'View Configuration' }).click();
+
+			const configuration = page
+				.getByRole('dialog')
+				.filter({ hasText: 'Configuration for GitHub' });
+			await expect
+				.element(configuration.getByRole('heading', { name: 'View GitHub' }))
+				.toBeVisible();
+			await expect.element(configuration.getByText(/cannot be changed here/)).toBeVisible();
+			const policy = configuration.getByRole('combobox', { name: 'API token policy' });
+			await expect.element(policy).toBeDisabled();
+			await expect.element(policy).toHaveValue('userAllowed');
+			await expect
+				.element(configuration.getByRole('button', { name: 'Save' }))
+				.not.toBeInTheDocument();
+			await expect.element(configuration.getByRole('button', { name: 'Close' })).toBeVisible();
+			expect(update).not.toHaveBeenCalled();
+		});
+
+		it('shows catalog tool previews without discovery or authentication', async () => {
+			const entry = createMCPCatalogEntry({
+				id: 'entry-github',
+				name: 'GitHub',
+				manifest: {
+					toolPreview: componentEntry.manifest.toolPreview,
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: false,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					sourceURL,
+					components: [
+						createVMCPComponent(entry, {
+							toolPrefix: 'github_',
+							configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
+						})
+					]
+				},
+				[entry]
+			);
+			const componentId = vmcp.components[0].id;
+			const preview = vi.fn();
+			const oauth = vi.fn();
+			worker.use(
+				http.post(`/api/vmcps/${vmcp.id}/components/${componentId}/generate-tool-previews`, () => {
+					preview();
+					return HttpResponse.json({ message: 'forbidden' }, { status: 403 });
+				}),
+				http.post(
+					`/api/vmcps/${vmcp.id}/components/${componentId}/generate-tool-previews/oauth-url`,
+					() => {
+						oauth();
+						return HttpResponse.json({ oauthURL: 'https://oauth.example/authorize' });
+					}
+				)
+			);
+
+			await renderDesigner([entry], vmcp);
+			await page.getByRole('button', { name: 'GitHub', exact: true }).click();
+			await page.getByRole('button', { name: 'View Tools' }).click();
+
+			const editor = page.getByRole('dialog').filter({ hasText: 'They cannot be changed here.' });
+			await expect
+				.element(editor.getByRole('heading', { name: 'View GitHub Tools' }))
+				.toBeVisible();
+			await expect.element(editor.getByText('github_create_issue')).toBeVisible();
+			await expect.element(editor.getByText('github_list_issues')).toBeVisible();
+			await expect.element(page.getByLabelText('API token', { exact: false })).not.toBeVisible();
+			await expect
+				.element(page.getByRole('link', { name: 'Authenticate' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'Configure Tools' }))
+				.not.toBeInTheDocument();
+			await expect.element(editor.getByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
+			await expect
+				.element(editor.getByRole('switch', { name: 'Disable Tool' }).first())
+				.toBeDisabled();
+			expect(preview).not.toHaveBeenCalled();
+			expect(oauth).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('dragging a server from the panel onto the canvas', () => {
 		const slack = createMCPCatalogEntry({ id: 'entry-slack', name: 'Slack' });
 		let listSlackServers: ReturnType<typeof mockEntryDetails>;
+
+		function lockedCatalogEntry(id: string) {
+			return createMCPCatalogEntry({
+				id,
+				name: 'Locked Slack',
+				manifest: {
+					shortDescription: 'Already configured',
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token stored on the catalog entry',
+							required: true,
+							sensitive: true,
+							value: '',
+							static: true,
+							usage: 'env'
+						},
+						{
+							key: 'REGION',
+							name: 'Region',
+							description: 'Deployment region',
+							required: true,
+							sensitive: false,
+							value: 'us-east-1',
+							usage: 'env'
+						},
+						{
+							key: 'SECRET',
+							name: 'Secret',
+							description: 'Redacted catalog secret',
+							required: true,
+							sensitive: true,
+							value: '******',
+							usage: 'env'
+						},
+						{
+							key: 'BOUND',
+							name: 'Bound',
+							description: 'Secret binding',
+							required: true,
+							sensitive: true,
+							value: '',
+							secretBinding: { name: 'config', key: 'token' },
+							usage: 'env'
+						}
+					]
+				}
+			});
+		}
 
 		beforeEach(() => {
 			listSlackServers = mockEntryDetails(slack);
@@ -530,6 +1147,300 @@ describe('VMcpDesigner.svelte', () => {
 			});
 		});
 
+		async function dropGitHubOnVMcp(pointerId: number) {
+			const { el } = await pressCard(panelCard('GitHub'), pointerId);
+			const to = centerOf(await vmcpCard().element());
+			pointer(el, 'pointermove', pointerId, to);
+			await tick();
+			pointer(el, 'pointerup', pointerId, to);
+		}
+
+		function duplicateComponentDialog() {
+			return page.getByRole('dialog').filter({ hasText: 'Rename MCP Server' });
+		}
+
+		it('asks for a different component name when a catalog entry is added again from mobile', async () => {
+			responsive.isMobile = true;
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			mockEntryDetails(componentEntry);
+			await renderDesigner([componentEntry], vmcp);
+
+			await page.getByRole('button', { name: 'Click to view GitHub' }).click();
+
+			const details = page.getByRole('dialog').filter({ hasText: 'GitHub' });
+			const add = details.getByRole('button', { name: 'Add to vMCP' });
+			await expect.element(add).toBeEnabled();
+			await add.click();
+
+			const dialog = duplicateComponentDialog();
+			await expect.element(dialog).toBeVisible();
+			await expect.element(dialog.getByRole('textbox', { name: 'Name' })).toHaveValue('GitHub 2');
+			await dialog.getByRole('button', { name: 'Continue' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0]).at(-1)).toMatchObject({
+				mcpServerCatalogEntryID: componentEntry.id,
+				name: 'GitHub 2',
+				toolPrefix: 'github-2_'
+			});
+		});
+
+		it('asks for a different component name when the catalog entry is already on the vMCP', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			mockEntryDetails(componentEntry);
+			await renderDesigner([componentEntry], vmcp);
+
+			await dropGitHubOnVMcp(31);
+
+			const dialog = duplicateComponentDialog();
+			await expect.element(dialog).toBeVisible();
+			await expect
+				.element(dialog.getByText('GitHub has already been added to this vMCP', { exact: false }))
+				.toBeVisible();
+			const name = dialog.getByRole('textbox', { name: 'Name' });
+			await expect.element(name).toHaveValue('GitHub 2');
+			expect(update).not.toHaveBeenCalled();
+
+			await name.fill('GitHub');
+			await expect
+				.element(dialog.getByRole('alert'))
+				.toHaveTextContent('A component named GitHub already exists.');
+			await expect.element(dialog.getByRole('button', { name: 'Continue' })).toBeDisabled();
+			expect(update).not.toHaveBeenCalled();
+
+			await name.fill('GitHub EU');
+			await expect.element(dialog.getByRole('alert')).not.toBeInTheDocument();
+			await dialog.getByRole('button', { name: 'Continue' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0]).at(-1)).toMatchObject({
+				mcpServerCatalogEntryID: componentEntry.id,
+				name: 'GitHub EU'
+			});
+			await expect.element(dialog).not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('dialog').filter({ hasText: 'Add Tools' }).getByText('GitHub EU'))
+				.toBeVisible();
+		});
+
+		it('saves tool overrides on the renamed copy of a catalog entry', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			let current = vmcp;
+			worker.use(
+				http.get(`/api/vmcps/${vmcp.id}`, () => HttpResponse.json(current)),
+				http.put(`/api/vmcps/${vmcp.id}`, async ({ request }) => {
+					const manifest = (await request.json()) as VMCPManifest;
+					update(manifest);
+					current = {
+						...current,
+						...manifest,
+						components: (manifest.components ?? []).map((component, index) => ({
+							...component,
+							id: component.id || `component-added-${index}`
+						}))
+					};
+					return HttpResponse.json(current);
+				})
+			);
+			mockEntryDetails(componentEntry);
+			await renderDesigner([componentEntry], vmcp);
+
+			await dropGitHubOnVMcp(34);
+			await page.getByRole('button', { name: 'Continue' }).click();
+
+			const addTools = page.getByRole('dialog').filter({ hasText: 'Add Tools' });
+			await expect.element(addTools.getByText('GitHub 2')).toBeVisible();
+			await addTools.getByRole('button', { name: /Managed/ }).click();
+			await page.getByRole('button', { name: 'Configure Tools', exact: true }).click();
+			await page.getByRole('button', { name: 'Confirm' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+			const saved = componentsFrom(update.mock.calls[1][0]);
+			expect(saved.find((component) => component.name === 'GitHub')?.toolOverrides).toBeUndefined();
+			expect(
+				saved.find((component) => component.name === 'GitHub 2')?.toolOverrides?.length
+			).toBeGreaterThan(0);
+		});
+
+		it('rejects a duplicate component name that derives an existing tool prefix', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			vmcp.components[0].toolPrefix = 'github-eu_';
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			mockEntryDetails(componentEntry);
+			await renderDesigner([componentEntry], vmcp);
+
+			await dropGitHubOnVMcp(36);
+			const dialog = duplicateComponentDialog();
+			const name = dialog.getByRole('textbox', { name: 'Name' });
+			await name.fill('GitHub EU');
+
+			await expect
+				.element(dialog.getByRole('alert'))
+				.toHaveTextContent(
+					'Another component already uses the prefix "github-eu_". Non-empty prefixes must be unique across components.'
+				);
+			await expect.element(dialog.getByRole('button', { name: 'Continue' })).toBeDisabled();
+			expect(update).not.toHaveBeenCalled();
+
+			await name.fill('GitHub US');
+			await expect.element(dialog.getByRole('alert')).not.toBeInTheDocument();
+			await dialog.getByRole('button', { name: 'Continue' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0]).at(-1)).toMatchObject({
+				name: 'GitHub US',
+				toolPrefix: 'github-us_'
+			});
+		});
+
+		it('keeps underscores when deriving the duplicate component tool prefix', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			mockEntryDetails(componentEntry);
+			await renderDesigner([componentEntry], vmcp);
+
+			await dropGitHubOnVMcp(35);
+			const dialog = duplicateComponentDialog();
+			await dialog.getByRole('textbox', { name: 'Name' }).fill('GitHub_2');
+			await dialog.getByRole('button', { name: 'Continue' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0]).at(-1)).toMatchObject({
+				name: 'GitHub_2',
+				toolPrefix: 'github_2_'
+			});
+		});
+
+		it('does nothing when the duplicate component dialog is cancelled', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			mockEntryDetails(componentEntry);
+			await renderDesigner([componentEntry], vmcp);
+
+			await dropGitHubOnVMcp(32);
+
+			const dialog = duplicateComponentDialog();
+			await expect.element(dialog).toBeVisible();
+			await dialog.getByRole('button', { name: 'Cancel' }).click();
+
+			await expect.element(dialog).not.toBeInTheDocument();
+			expect(update).not.toHaveBeenCalled();
+		});
+
+		it('keeps the renamed component when a duplicate catalog entry needs configuration', async () => {
+			const entry = createMCPCatalogEntry({
+				id: 'entry-github',
+				name: 'GitHub',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: true,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					components: [
+						createVMCPComponent(entry),
+						createVMCPComponent(entry, { id: 'component-github-2', name: 'GitHub 2' })
+					]
+				},
+				[entry]
+			);
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			mockEntryDetails(entry);
+			await renderDesigner([entry], vmcp);
+
+			await dropGitHubOnVMcp(33);
+
+			const dialog = duplicateComponentDialog();
+			await expect.element(dialog.getByRole('textbox', { name: 'Name' })).toHaveValue('GitHub 3');
+			await dialog.getByRole('button', { name: 'Continue' }).click();
+
+			await expect.element(page.getByRole('heading', { name: /Configure GitHub/ })).toBeVisible();
+			expect(update).not.toHaveBeenCalled();
+
+			await page
+				.getByRole('combobox', { name: 'API token policy' })
+				.selectOptions('Provided at connection');
+			await page.getByRole('button', { name: 'Next' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0]).at(-1)).toMatchObject({
+				mcpServerCatalogEntryID: entry.id,
+				name: 'GitHub 3',
+				configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
+			});
+		});
+
+		it('adds a dropped server without configuration when no field is editable', async () => {
+			const locked = lockedCatalogEntry('entry-locked-add');
+			mockEntryDetails(locked);
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry, locked], vmcp);
+
+			const { el } = await pressCard(panelCard('Locked Slack'), 31);
+			const to = centerOf(await vmcpCard().element());
+			pointer(el, 'pointermove', 31, to);
+			await tick();
+			pointer(el, 'pointerup', 31, to);
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			const added = componentsFrom(update.mock.calls[0][0]).at(-1);
+			expect(added?.mcpServerCatalogEntryID).toBe(locked.id);
+			expect(added?.configuration).toEqual([
+				{ key: 'REGION', policy: 'fixed', value: 'us-east-1' },
+				{ key: 'SECRET', policy: 'fixed' }
+			]);
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Locked Slack/ }))
+				.not.toBeInTheDocument();
+		});
+
+		it('keeps an unconfigured server visible but disabled', async () => {
+			const salesforce = unconfiguredSalesforceEntry();
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry, salesforce], vmcp);
+
+			const card = page.getByCSS('#mcp-server-card-entry-salesforce');
+			await expect.element(card).toBeVisible();
+			await expect.element(card).toBeDisabled();
+			await expect
+				.element(page.getByLabelText('Administrator configuration required'))
+				.toBeVisible();
+			(await card.element()).parentElement?.dispatchEvent(
+				new MouseEvent('mouseenter', { bubbles: true })
+			);
+			await expect
+				.element(page.getByRole('tooltip'))
+				.toHaveTextContent(
+					'An administrator must finish configuring this MCP server on the MCP Servers page before it can be added to a vMCP.'
+				);
+			expect(update).not.toHaveBeenCalled();
+		});
+
 		it('still drops when later pointer events fire on the canvas instead of the source card', async () => {
 			const vmcp = createIssueTrackerVMcp();
 			const update = vi.fn();
@@ -574,7 +1485,12 @@ describe('VMcpDesigner.svelte', () => {
 			const vmcp = createIssueTrackerVMcp();
 			const update = vi.fn();
 			mockUpdateVMcp(vmcp, update);
-			await renderDesigner([componentEntry, tokenSlack], vmcp);
+			worker.use(
+				http.get('/api/mcp-server-binding-secrets', () =>
+					HttpResponse.json({ items: [{ name: 'token-secret', keys: ['token'] }] })
+				)
+			);
+			await renderDesigner([componentEntry, tokenSlack], vmcp, { kubernetes: true });
 
 			const { el } = await pressCard(panelCard('Token Slack'), 18);
 			const to = centerOf(await vmcpCard().element());
@@ -585,6 +1501,8 @@ describe('VMcpDesigner.svelte', () => {
 			await expect
 				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
 				.toBeVisible();
+			await expect.element(page.getByCSS('#secret-binding-source-API_TOKEN')).toBeVisible();
+			await expect.element(page.getByRole('button', { name: 'Cancel' })).toBeVisible();
 			expect(update).not.toHaveBeenCalled();
 
 			await page
@@ -599,6 +1517,97 @@ describe('VMcpDesigner.svelte', () => {
 				configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
 			});
 			await expect.element(page.getByRole('heading', { name: 'Add Tools' })).toBeVisible();
+		});
+
+		it('keeps catalog policies the configuration dialog omits when adding a server', async () => {
+			const regional = createMCPCatalogEntry({
+				id: 'entry-regional-add',
+				name: 'Regional',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: true,
+							value: '',
+							usage: 'env'
+						},
+						{
+							key: 'REGION',
+							name: 'Region',
+							description: 'Deployment region',
+							required: true,
+							sensitive: false,
+							value: 'us-east-1',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			mockEntryDetails(regional);
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry, regional], vmcp);
+
+			const { el } = await pressCard(panelCard('Regional'), 28);
+			const to = centerOf(await vmcpCard().element());
+			pointer(el, 'pointermove', 28, to);
+			await tick();
+			pointer(el, 'pointerup', 28, to);
+
+			await expect.element(page.getByRole('heading', { name: /Configure Regional/ })).toBeVisible();
+			await page
+				.getByRole('combobox', { name: 'API token policy' })
+				.selectOptions('Provided at connection');
+			await page.getByRole('button', { name: 'Next' }).click();
+
+			await vi.waitFor(() => expect(update).toHaveBeenCalled());
+			expect(componentsFrom(update.mock.calls[0][0]).at(-1)?.configuration).toEqual([
+				{ key: 'API_TOKEN', policy: 'userAllowed' },
+				{ key: 'REGION', policy: 'fixed', value: 'us-east-1' }
+			]);
+		});
+
+		it('drops the added server when configuration is cancelled', async () => {
+			const tokenSlack = createMCPCatalogEntry({
+				id: 'entry-slack-cancel',
+				name: 'Token Slack',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: true,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			mockEntryDetails(tokenSlack);
+			const vmcp = createIssueTrackerVMcp();
+			const update = vi.fn();
+			mockUpdateVMcp(vmcp, update);
+			await renderDesigner([componentEntry, tokenSlack], vmcp);
+
+			const { el } = await pressCard(panelCard('Token Slack'), 23);
+			const to = centerOf(await vmcpCard().element());
+			pointer(el, 'pointermove', 23, to);
+			await tick();
+			pointer(el, 'pointerup', 23, to);
+
+			await expect.element(page.getByRole('button', { name: 'Cancel' })).toBeVisible();
+			await page.getByRole('button', { name: 'Cancel' }).click();
+
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+				.not.toBeInTheDocument();
+			expect(update).not.toHaveBeenCalled();
 		});
 
 		it('offers tool selection after configuration when no policy is user-supplied', async () => {
@@ -677,10 +1686,47 @@ describe('VMcpDesigner.svelte', () => {
 			await tick();
 			pointer(el, 'pointerup', 17, to);
 
-			await expect.element(page.getByRole('dialog').getByText('Create vMCP').first()).toBeVisible();
+			const createDialog = page.getByRole('dialog').filter({ hasText: 'Create vMCP' });
+			await expect.element(createDialog).toBeVisible();
+			await createDialog.getByRole('textbox', { name: 'Name' }).fill('Chat Gateway');
+			await createDialog.getByRole('textbox', { name: 'Description' }).fill('Gateway tools');
 		});
 
-		it('opens create when a configurable server is dropped on the empty canvas', async () => {
+		it('creates a vMCP without configuration when the dropped server has no editable fields', async () => {
+			const locked = lockedCatalogEntry('entry-locked-create');
+			mockEntryDetails(locked);
+			const create = vi.fn();
+			worker.use(
+				http.post('/api/vmcps', async ({ request }) => {
+					const manifest = (await request.json()) as VMCPManifest;
+					create(manifest);
+					return HttpResponse.json(createVMCP({ ...manifest, id: 'vmcp-created' }, [locked]));
+				})
+			);
+			await renderDesigner([componentEntry, locked]);
+
+			const { el } = await pressCard(panelCard('Locked Slack'), 32);
+			const to = centerOf(await page.getByRole('button', { name: /Create New vMCP/ }).element());
+			pointer(el, 'pointermove', 32, to);
+			await tick();
+			pointer(el, 'pointerup', 32, to);
+
+			await expect.element(page.getByRole('dialog').getByText('Create vMCP').first()).toBeVisible();
+			await page.getByRole('button', { name: 'Create', exact: true }).click();
+
+			await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+			const added = componentsFrom(create.mock.calls[0][0])[0];
+			expect(added?.mcpServerCatalogEntryID).toBe(locked.id);
+			expect(added?.configuration).toEqual([
+				{ key: 'REGION', policy: 'fixed', value: 'us-east-1' },
+				{ key: 'SECRET', policy: 'fixed' }
+			]);
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Locked Slack/ }))
+				.not.toBeInTheDocument();
+		});
+
+		it('opens create before configuring a dropped server', async () => {
 			const tokenSlack = createMCPCatalogEntry({
 				id: 'entry-slack-create',
 				name: 'Token Slack',
@@ -707,10 +1753,333 @@ describe('VMcpDesigner.svelte', () => {
 			await tick();
 			pointer(el, 'pointerup', 20, to);
 
-			await expect.element(page.getByRole('dialog').getByText('Create vMCP').first()).toBeVisible();
+			const createDialog = page.getByRole('dialog').filter({ hasText: 'Create vMCP' });
+			await expect.element(createDialog).toBeVisible();
+			await createDialog.getByRole('textbox', { name: 'Name' }).fill('Chat Gateway');
+			await createDialog.getByRole('textbox', { name: 'Description' }).fill('Gateway tools');
 			await expect
 				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
 				.not.toBeInTheDocument();
+		});
+
+		it('drops vMCP creation when configuration is cancelled', async () => {
+			const tokenSlack = createMCPCatalogEntry({
+				id: 'entry-slack-create-cancel',
+				name: 'Token Slack',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: false,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			mockEntryDetails(tokenSlack);
+			const create = vi.fn();
+			worker.use(
+				http.post('/api/vmcps', () => {
+					create();
+					return HttpResponse.json({});
+				})
+			);
+			await renderDesigner([componentEntry, tokenSlack]);
+
+			const { el } = await pressCard(panelCard('Token Slack'), 24);
+			const to = centerOf(await page.getByRole('button', { name: /Create New vMCP/ }).element());
+			pointer(el, 'pointermove', 24, to);
+			await tick();
+			pointer(el, 'pointerup', 24, to);
+
+			await expect.element(page.getByRole('dialog').getByText('Create vMCP').first()).toBeVisible();
+			await page.getByRole('button', { name: 'Create', exact: true }).click();
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+				.toBeVisible();
+			await page.getByRole('button', { name: 'Cancel' }).click();
+
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('dialog').getByText('Create vMCP').first())
+				.not.toBeInTheDocument();
+			expect(create).not.toHaveBeenCalled();
+		});
+
+		it('drops vMCP creation when the create dialog is cancelled', async () => {
+			const tokenSlack = createMCPCatalogEntry({
+				id: 'entry-slack-create-dismiss',
+				name: 'Token Slack',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: false,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			mockEntryDetails(tokenSlack);
+			const create = vi.fn();
+			worker.use(
+				http.post('/api/vmcps', () => {
+					create();
+					return HttpResponse.json({});
+				})
+			);
+			await renderDesigner([componentEntry, tokenSlack]);
+
+			const { el } = await pressCard(panelCard('Token Slack'), 26);
+			const to = centerOf(await page.getByRole('button', { name: /Create New vMCP/ }).element());
+			pointer(el, 'pointermove', 26, to);
+			await tick();
+			pointer(el, 'pointerup', 26, to);
+
+			await page.getByRole('button', { name: 'Cancel' }).click();
+
+			await expect
+				.element(page.getByRole('dialog').getByText('Create vMCP').first())
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+				.not.toBeInTheDocument();
+			expect(create).not.toHaveBeenCalled();
+		});
+
+		it.each([true, false])(
+			'preserves toolSearch=%s through deferred component configuration',
+			async (toolSearch) => {
+				const tokenSlack = createMCPCatalogEntry({
+					id: 'entry-slack-create-next',
+					name: 'Token Slack',
+					manifest: {
+						shortDescription: 'Team chat',
+						toolPreview: Array.from({ length: 51 }, (_, index) => ({
+							id: `tool_${index}`,
+							name: `tool_${index}`
+						})),
+						config: [
+							{
+								key: 'API_TOKEN',
+								name: 'API token',
+								description: 'Token',
+								required: true,
+								sensitive: false,
+								value: '',
+								usage: 'env'
+							}
+						]
+					}
+				});
+				mockEntryDetails(tokenSlack);
+				const create = vi.fn();
+				worker.use(
+					http.get('/api/mcp-server-binding-secrets', () =>
+						HttpResponse.json({ items: [{ name: 'token-secret', keys: ['token'] }] })
+					),
+					http.post('/api/vmcps', async ({ request }) => {
+						const manifest = (await request.json()) as VMCPManifest;
+						create(manifest);
+						return HttpResponse.json(createVMCP({ ...manifest, id: 'vmcp-created' }, [tokenSlack]));
+					})
+				);
+				await renderDesigner([componentEntry, tokenSlack], undefined, { kubernetes: true });
+
+				const { el } = await pressCard(panelCard('Token Slack'), 25);
+				const to = centerOf(await page.getByRole('button', { name: /Create New vMCP/ }).element());
+				pointer(el, 'pointermove', 25, to);
+				await tick();
+				pointer(el, 'pointerup', 25, to);
+
+				const dialog = page.getByRole('dialog').filter({ hasText: 'Create vMCP' });
+				await expect.element(dialog.getByText('Create vMCP').first()).toBeVisible();
+				await dialog.getByLabelText(/^Name/).fill('Chat Gateway');
+				await dialog.getByLabelText(/^Description/).fill('Held until configuration');
+				await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+				await expect
+					.element(page.getByRole('heading', { name: 'Enable tool search?' }))
+					.toBeVisible();
+				expect(create).not.toHaveBeenCalled();
+				await page
+					.getByRole('button', {
+						name: toolSearch ? 'Enable tool search' : 'Keep direct tools',
+						exact: true
+					})
+					.click();
+
+				await expect
+					.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+					.toBeVisible();
+				await expect.element(page.getByCSS('#secret-binding-source-API_TOKEN')).toBeVisible();
+				expect(create).not.toHaveBeenCalled();
+				await page.getByCSS('#fixed-API_TOKEN').fill('secret');
+				await page.getByRole('button', { name: 'Next' }).click();
+
+				await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+				expect(create.mock.calls[0][0]).toMatchObject({
+					displayName: 'Chat Gateway',
+					description: 'Held until configuration',
+					toolSearch
+				});
+				expect(componentsFrom(create.mock.calls[0][0])[0]).toMatchObject({
+					mcpServerCatalogEntryID: tokenSlack.id,
+					configuration: [{ key: 'API_TOKEN', policy: 'fixed', value: 'secret' }]
+				});
+				await expect.element(dialog.getByText('Create vMCP').first()).not.toBeInTheDocument();
+			}
+		);
+
+		it('keeps the configuration draft when creation fails and retries it', async () => {
+			const tokenSlack = createMCPCatalogEntry({
+				id: 'entry-slack-create-retry',
+				name: 'Token Slack',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: false,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			mockEntryDetails(tokenSlack);
+			const create = vi.fn();
+			worker.use(
+				http.post('/api/vmcps', async ({ request }) => {
+					const manifest = (await request.json()) as VMCPManifest;
+					create(manifest);
+					if (create.mock.calls.length === 1) {
+						return new HttpResponse(null, { status: 500 });
+					}
+					return HttpResponse.json(createVMCP({ ...manifest, id: 'vmcp-created' }, [tokenSlack]));
+				})
+			);
+			await renderDesigner([componentEntry, tokenSlack]);
+
+			const { el } = await pressCard(panelCard('Token Slack'), 29);
+			const to = centerOf(await page.getByRole('button', { name: /Create New vMCP/ }).element());
+			pointer(el, 'pointermove', 29, to);
+			await tick();
+			pointer(el, 'pointerup', 29, to);
+
+			const dialog = page.getByRole('dialog').filter({ hasText: 'Create vMCP' });
+			await dialog.getByLabelText(/^Name/).fill('Chat Gateway');
+			await dialog.getByLabelText(/^Description/).fill('Held until configuration');
+			await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+				.toBeVisible();
+			await page.getByCSS('#fixed-API_TOKEN').fill('secret');
+			await page.getByRole('button', { name: 'Next' }).click();
+
+			const configuration = page.getByRole('dialog').filter({ hasText: 'Configure Token Slack' });
+			await expect
+				.element(configuration.getByRole('alert'))
+				.toHaveTextContent('Failed to create vMCP.');
+			await expect.element(page.getByCSS('#fixed-API_TOKEN')).toHaveValue('secret');
+			await expect
+				.element(page.getByRole('heading', { name: /Configure Token Slack/ }))
+				.toBeVisible();
+
+			await page.getByRole('button', { name: 'Next' }).click();
+			await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(2));
+			expect(create.mock.calls[1][0]).toMatchObject({
+				displayName: 'Chat Gateway',
+				description: 'Held until configuration'
+			});
+			expect(componentsFrom(create.mock.calls[1][0])[0]).toMatchObject({
+				configuration: [{ key: 'API_TOKEN', policy: 'fixed', value: 'secret' }]
+			});
+		});
+
+		it('keeps catalog policies the configuration dialog omits when creating a vMCP', async () => {
+			const regional = createMCPCatalogEntry({
+				id: 'entry-regional',
+				name: 'Regional',
+				manifest: {
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: true,
+							value: '',
+							usage: 'env'
+						},
+						{
+							key: 'REGION',
+							name: 'Region',
+							description: 'Deployment region',
+							required: true,
+							sensitive: false,
+							value: 'us-east-1',
+							usage: 'env'
+						},
+						{
+							key: 'SECRET',
+							name: 'Secret',
+							description: 'Redacted catalog secret',
+							required: true,
+							sensitive: true,
+							value: '******',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			mockEntryDetails(regional);
+			const create = vi.fn();
+			worker.use(
+				http.post('/api/vmcps', async ({ request }) => {
+					const manifest = (await request.json()) as VMCPManifest;
+					create(manifest);
+					return HttpResponse.json(createVMCP({ ...manifest, id: 'vmcp-created' }, [regional]));
+				})
+			);
+			await renderDesigner([componentEntry, regional]);
+
+			const { el } = await pressCard(panelCard('Regional'), 27);
+			const to = centerOf(await page.getByRole('button', { name: /Create New vMCP/ }).element());
+			pointer(el, 'pointermove', 27, to);
+			await tick();
+			pointer(el, 'pointerup', 27, to);
+
+			await page.getByRole('button', { name: 'Create', exact: true }).click();
+			await expect.element(page.getByRole('heading', { name: /Configure Regional/ })).toBeVisible();
+			await expect
+				.element(page.getByRole('combobox', { name: 'Region policy' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('combobox', { name: 'Secret policy' }))
+				.not.toBeInTheDocument();
+			await page
+				.getByRole('combobox', { name: 'API token policy' })
+				.selectOptions('Provided at connection');
+			await page.getByRole('button', { name: 'Next' }).click();
+
+			await vi.waitFor(() => expect(create).toHaveBeenCalledOnce());
+			expect(componentsFrom(create.mock.calls[0][0])[0].configuration).toEqual([
+				{ key: 'API_TOKEN', policy: 'userAllowed' },
+				{ key: 'REGION', policy: 'fixed', value: 'us-east-1' },
+				{ key: 'SECRET', policy: 'fixed' }
+			]);
 		});
 
 		it('leaves the vMCP alone when Escape cancels the drag before release', async () => {
@@ -852,11 +2221,97 @@ describe('VMcpDesigner.svelte', () => {
 			await expect
 				.element(page.getByRole('button', { name: 'Delete', exact: true }))
 				.not.toBeInTheDocument();
+			await page.getByCSS('#click-catch').click();
 
-			await expect.element(componentBlock()).not.toBeInTheDocument();
-			await expect.element(page.getByText('GitHub').first()).toBeVisible();
+			await componentBlock().click();
+			await expect.element(page.getByRole('button', { name: 'View Tools' })).toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'View Configuration' }))
+				.not.toBeInTheDocument();
 			await expect
 				.element(page.getByRole('button', { name: 'Modify Tools' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'Change Configuration' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'Remove GitHub' }))
+				.not.toBeInTheDocument();
+		});
+
+		it('shows component name and tool prefix as read-only', async () => {
+			await renderDesigner([componentEntry], orgVMcp(), { groups: [Group.AUDITOR] });
+
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'View Details' }).click();
+
+			const details = page.getByRole('dialog').filter({ hasText: 'Tool name prefix' });
+			await expect.element(details.getByRole('heading', { name: 'View Details' })).toBeVisible();
+			await expect.element(details.getByRole('textbox', { name: 'Name *' })).toHaveValue('GitHub');
+			await expect
+				.element(details.getByRole('textbox', { name: 'Tool name prefix' }))
+				.toHaveValue('github_');
+			await expect
+				.element(details.getByRole('textbox', { name: 'Name *' }))
+				.toHaveAttribute('readonly', '');
+			await expect.element(details.getByRole('button', { name: 'Save' })).not.toBeInTheDocument();
+		});
+
+		it('shows an admin a catalog-synced vMCP as read-only', async () => {
+			const vmcp = { ...orgVMcp(), sourceURL: 'https://github.com/example/catalog' };
+			await renderDesigner([componentEntry], vmcp);
+
+			await expectViewTabs(['Designer', 'Profiles', 'Inspector']);
+			await expect
+				.element(
+					page
+						.getByRole('heading', { level: 1 })
+						.getByRole('button', { name: 'Synced from catalog' })
+				)
+				.toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Connect', exact: true }))
+				.toBeEnabled();
+			await expect
+				.element(page.getByRole('button', { name: 'Hide MCP Servers' }))
+				.not.toBeInTheDocument();
+			await expect.element(page.getByPlaceholder('Search MCP servers...')).not.toBeInTheDocument();
+
+			await page.getByRole('button', { name: 'Actions for Issue Tracker vMCP' }).click();
+			await expect
+				.element(page.getByRole('button', { name: 'Delete', exact: true }))
+				.not.toBeInTheDocument();
+			await page.getByCSS('#click-catch').click();
+
+			await componentBlock().click();
+			await expect.element(page.getByRole('button', { name: 'View Tools' })).toBeVisible();
+			await expect.element(page.getByRole('button', { name: 'View Configuration' })).toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Modify Tools' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'Change Configuration' }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'Remove GitHub' }))
+				.not.toBeInTheDocument();
+		});
+
+		it('opens profiles as readonly for a catalog-synced vMCP', async () => {
+			appPage.url.searchParams.set('view', 'profiles');
+			const vmcp = { ...orgVMcp(), sourceURL: 'https://github.com/example/catalog' };
+			await renderDesigner([componentEntry], vmcp);
+
+			await expect
+				.element(page.getByRole('button', { name: 'Create profile', exact: true }))
+				.not.toBeInTheDocument();
+			await page.getByRole('button', { name: 'View default' }).click();
+			await expect.element(page.getByRole('heading', { name: 'View profile' })).toBeVisible();
+			await expect
+				.element(page.getByPlaceholder('ex. Marketing, Engineering, etc.'))
+				.toBeDisabled();
+			await expect
+				.element(page.getByRole('button', { name: 'Save changes' }))
 				.not.toBeInTheDocument();
 		});
 
@@ -996,7 +2451,98 @@ describe('VMcpDesigner.svelte', () => {
 			await expect.element(connect).toBeDisabled();
 		});
 
-		it('does not open edit or component actions, and omits delete from the card menu', async () => {
+		it('does not open a component that has no stored tool overrides', async () => {
+			const entry = createMCPCatalogEntry({
+				id: 'entry-github',
+				name: 'GitHub',
+				manifest: {
+					toolPreview: componentEntry.manifest.toolPreview,
+					config: [
+						{
+							key: 'API_TOKEN',
+							name: 'API token',
+							description: 'Token',
+							required: true,
+							sensitive: true,
+							value: '',
+							usage: 'env'
+						}
+					]
+				}
+			});
+			const vmcp = createVMCP(
+				{
+					id: 'vmcp-1',
+					displayName: 'Issue Tracker vMCP',
+					userID: 'someone-else',
+					components: [
+						createVMCPComponent(entry, {
+							toolPrefix: 'github_',
+							configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
+						})
+					]
+				},
+				[entry]
+			);
+			const componentId = vmcp.components[0].id;
+			const preview = vi.fn();
+			worker.use(
+				http.post(`/api/vmcps/${vmcp.id}/components/${componentId}/generate-tool-previews`, () => {
+					preview();
+					return HttpResponse.json({ message: 'forbidden' }, { status: 403 });
+				})
+			);
+
+			await renderDesigner([entry], vmcp, { groups: [Group.USER] });
+
+			await expect.element(page.getByText('GitHub', { exact: true }).first()).toBeVisible();
+			await expect.element(page.getByText('All tools enabled by default')).toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'GitHub', exact: true }))
+				.not.toBeInTheDocument();
+			await expect
+				.element(page.getByRole('button', { name: 'View Tools' }))
+				.not.toBeInTheDocument();
+			expect(preview).not.toHaveBeenCalled();
+		});
+
+		it('opens stored tool overrides without requesting discovery', async () => {
+			const vmcp = sharedVMcp(toolOverrides);
+			const componentId = vmcp.components[0].id;
+			const preview = vi.fn();
+			const oauth = vi.fn();
+			worker.use(
+				http.post(`/api/vmcps/${vmcp.id}/components/${componentId}/generate-tool-previews`, () => {
+					preview();
+					return HttpResponse.json({ message: 'forbidden' }, { status: 403 });
+				}),
+				http.post(
+					`/api/vmcps/${vmcp.id}/components/${componentId}/generate-tool-previews/oauth-url`,
+					() => {
+						oauth();
+						return HttpResponse.json({ oauthURL: 'https://oauth.example/authorize' });
+					}
+				)
+			);
+
+			await renderDesigner([componentEntry], vmcp, { groups: [Group.USER] });
+			await componentBlock().click();
+			await page.getByRole('button', { name: 'View Tools' }).click();
+
+			const editor = page.getByRole('dialog').filter({ hasText: 'They cannot be changed here.' });
+			await expect
+				.element(editor.getByRole('heading', { name: 'View GitHub Tools' }))
+				.toBeVisible();
+			await expect.element(editor.getByText('github_create_issue')).toBeVisible();
+			await expect.element(editor.getByText('github_list_issues')).toBeVisible();
+			await expect
+				.element(page.getByRole('link', { name: 'Authenticate' }))
+				.not.toBeInTheDocument();
+			expect(preview).not.toHaveBeenCalled();
+			expect(oauth).not.toHaveBeenCalled();
+		});
+
+		it('leaves a component without stored overrides closed and omits the card menu', async () => {
 			await renderDesigner([componentEntry], sharedVMcp(), { groups: [Group.USER] });
 
 			// Viewers cannot edit details, so clicking the title does not open the dialog.
@@ -1008,10 +2554,10 @@ describe('VMcpDesigner.svelte', () => {
 				.element(page.getByRole('heading', { name: 'Edit Details' }))
 				.not.toBeInTheDocument();
 
+			await expect.element(page.getByText('GitHub', { exact: true }).first()).toBeVisible();
 			await expect.element(componentBlock()).not.toBeInTheDocument();
-			await expect.element(page.getByText('GitHub').first()).toBeVisible();
 			await expect
-				.element(page.getByRole('button', { name: 'Modify Tools' }))
+				.element(page.getByRole('button', { name: 'View Tools' }))
 				.not.toBeInTheDocument();
 
 			await expect
@@ -1032,6 +2578,15 @@ describe('VMcpDesigner.svelte', () => {
 	});
 
 	describe('tester view', () => {
+		it('resumes the Test connection after returning from administrator OAuth', async () => {
+			const vmcp = createIssueTrackerVMcp();
+			appPage.url.searchParams.set('inspector', vmcp.id);
+			await renderDesigner([componentEntry], vmcp);
+
+			await expect.element(page.getByRole('button', { name: 'Continue' })).toBeVisible();
+			await expect.element(page.getByCSS('#connect-to-vmcp-dialog')).not.toBeVisible();
+		});
+
 		it('connects through the exact vMCP instance', async () => {
 			const connect = vi.fn();
 			const instance: VMCPInstance = {
@@ -1114,7 +2669,7 @@ describe('VMcpDesigner.svelte', () => {
 				vmcpID: vmcp.id,
 				userID: getProfileResponse.id,
 				created: vmcp.created,
-				status: { configured: true }
+				status: { configured: true, configurationCheckHash: 'configured' }
 			};
 			let authenticated = false;
 			let created = false;
@@ -1130,6 +2685,7 @@ describe('VMcpDesigner.svelte', () => {
 					created = true;
 					return HttpResponse.json(instance);
 				}),
+				http.get('/api/vmcp-instances/:id', () => HttpResponse.json(instance)),
 				http.get('/api/vmcp-instances', () =>
 					HttpResponse.json({ items: created ? [instance] : [] })
 				),
@@ -1195,7 +2751,7 @@ describe('VMcpDesigner.svelte', () => {
 				finishRefresh();
 			}
 
-			await expect.element(page.getByText('Status: Available')).toBeVisible();
+			await expect.element(page.getByText('Status: Connected')).toBeVisible();
 			await expect.element(page.getByRole('heading', { name: 'Tools', exact: true })).toBeVisible();
 			await expect
 				.element(page.getByRole('heading', { name: 'Server unavailable' }))
@@ -1211,7 +2767,11 @@ describe('VMcpDesigner.svelte', () => {
 			await page.getByRole('button', { name: 'Start Session' }).click();
 
 			await expect
-				.element(page.getByText('This will begin the initial setup process for this server.'))
+				.element(
+					page.getByText('This will begin the initial setup process for this server.', {
+						exact: false
+					})
+				)
 				.toBeVisible();
 			await expect.element(page.getByRole('button', { name: 'Continue' })).toBeVisible();
 		});
@@ -1385,21 +2945,13 @@ describe('VMcpDesigner.svelte', () => {
 			await expect.element(addToolsDialog()).not.toBeInTheDocument();
 		});
 
-		it('opens required configuration on the page the new vMCP navigated to', async () => {
+		it('opens tool selection on the page the new vMCP navigated to', async () => {
 			const entry = configurableGithub();
 			const vmcp = createVMCP(
 				{
 					id: 'vmcp-1',
 					displayName: 'Issue Tracker vMCP',
-					components: [
-						{
-							id: `component-${entry.id}`,
-							name: entry.manifest.name ?? entry.id,
-							mcpCatalogID: 'default',
-							mcpServerCatalogEntryID: entry.id,
-							catalogEntry: { manifest: entry.manifest }
-						}
-					]
+					components: [createVMCPComponent(entry)]
 				},
 				[entry]
 			);
@@ -1407,50 +2959,45 @@ describe('VMcpDesigner.svelte', () => {
 
 			await renderDesigner([entry], vmcp);
 
-			await expect.element(page.getByRole('heading', { name: /Configure GitHub/ })).toBeVisible();
-			await expect.element(page.getByRole('button', { name: 'Next' })).toBeVisible();
+			await expect.element(addToolsDialog()).toBeVisible();
+			await expect.element(page.getByRole('button', { name: /As-is/ })).toBeVisible();
+			await expect.element(page.getByRole('button', { name: /Managed/ })).toBeVisible();
 			await expect
-				.element(page.getByRole('heading', { name: 'Add Tools' }))
+				.element(page.getByRole('heading', { name: 'Configure GitHub', exact: true }))
 				.not.toBeInTheDocument();
 		});
 
-		it('opens configuration after creation even when required policies are already fixed', async () => {
+		it('opens tool selection after creation when required policies are already fixed', async () => {
 			const entry = configurableGithub();
-			const vmcp = createVMCP({
-				components: [catalogEntryToVMCPComponent(entry)]
-			});
+			const vmcp = createVMCP(
+				{
+					components: [catalogEntryToVMCPComponent(entry)]
+				},
+				[entry]
+			);
 			const update = vi.fn();
 			mockUpdateVMcp(vmcp, update);
 			queueToolSetupForCreatedVMcp(vmcp.id);
 
 			await renderDesigner([entry], vmcp);
 
-			await expect.element(page.getByRole('heading', { name: /Configure GitHub/ })).toBeVisible();
-			await expect.element(addToolsDialog()).not.toBeInTheDocument();
-			await page.getByCSS('#fixed-API_TOKEN').fill('secret');
-			await page.getByRole('button', { name: 'Next' }).click();
-
-			await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
-			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
-				configuration: [{ key: 'API_TOKEN', policy: 'fixed', value: 'secret' }]
-			});
 			await expect.element(addToolsDialog()).toBeVisible();
+			await expect
+				.element(page.getByRole('heading', { name: 'Configure GitHub', exact: true }))
+				.not.toBeInTheDocument();
+			expect(update).not.toHaveBeenCalled();
 		});
 
-		it('offers tool selection after post-create configuration when no policy is user-supplied', async () => {
+		it('offers tool selection after creation when no policy is user-supplied', async () => {
 			const entry = configurableGithub();
 			const vmcp = createVMCP(
 				{
 					id: 'vmcp-1',
 					displayName: 'Issue Tracker vMCP',
 					components: [
-						{
-							id: `component-${entry.id}`,
-							name: entry.manifest.name ?? entry.id,
-							mcpCatalogID: 'default',
-							mcpServerCatalogEntryID: entry.id,
-							catalogEntry: { manifest: entry.manifest }
-						}
+						createVMCPComponent(entry, {
+							configuration: [{ key: 'API_TOKEN', policy: 'fixed', value: 'secret' }]
+						})
 					]
 				},
 				[entry]
@@ -1460,30 +3007,24 @@ describe('VMcpDesigner.svelte', () => {
 			queueToolSetupForCreatedVMcp(vmcp.id);
 
 			await renderDesigner([entry], vmcp);
-			await page.getByCSS('#fixed-API_TOKEN').fill('secret');
-			await page.getByRole('button', { name: 'Next' }).click();
 
-			await vi.waitFor(() => expect(update).toHaveBeenCalled());
-			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
-				configuration: [{ key: 'API_TOKEN', policy: 'fixed', value: 'secret' }]
-			});
-			await expect.element(page.getByRole('heading', { name: 'Add Tools' })).toBeVisible();
+			await expect.element(addToolsDialog()).toBeVisible();
+			await expect
+				.element(page.getByRole('heading', { name: 'Configure GitHub', exact: true }))
+				.not.toBeInTheDocument();
+			expect(update).not.toHaveBeenCalled();
 		});
 
-		it('offers tool selection after post-create configuration when a policy is user-supplied', async () => {
+		it('offers tool selection after creation when a policy is user-supplied', async () => {
 			const entry = configurableGithub();
 			const vmcp = createVMCP(
 				{
 					id: 'vmcp-1',
 					displayName: 'Issue Tracker vMCP',
 					components: [
-						{
-							id: `component-${entry.id}`,
-							name: entry.manifest.name ?? entry.id,
-							mcpCatalogID: 'default',
-							mcpServerCatalogEntryID: entry.id,
-							catalogEntry: { manifest: entry.manifest }
-						}
+						createVMCPComponent(entry, {
+							configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
+						})
 					]
 				},
 				[entry]
@@ -1493,16 +3034,12 @@ describe('VMcpDesigner.svelte', () => {
 			queueToolSetupForCreatedVMcp(vmcp.id);
 
 			await renderDesigner([entry], vmcp);
-			await page
-				.getByRole('combobox', { name: 'API token policy' })
-				.selectOptions('Provided at connection');
-			await page.getByRole('button', { name: 'Next' }).click();
 
-			await vi.waitFor(() => expect(update).toHaveBeenCalled());
-			expect(componentsFrom(update.mock.calls[0][0])[0]).toMatchObject({
-				configuration: [{ key: 'API_TOKEN', policy: 'userAllowed' }]
-			});
-			await expect.element(page.getByRole('heading', { name: 'Add Tools' })).toBeVisible();
+			await expect.element(addToolsDialog()).toBeVisible();
+			await expect
+				.element(page.getByRole('heading', { name: 'Configure GitHub', exact: true }))
+				.not.toBeInTheDocument();
+			expect(update).not.toHaveBeenCalled();
 			await page.getByRole('button', { name: /Managed/ }).click();
 			await expect.element(page.getByLabelText('API token', { exact: false })).toBeVisible();
 		});

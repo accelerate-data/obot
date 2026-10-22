@@ -1,12 +1,8 @@
 <script lang="ts">
 	import InfoTooltip from '$lib/components/InfoTooltip.svelte';
-	import Select from '$lib/components/Select.svelte';
 	import Toggle from '$lib/components/Toggle.svelte';
-	import type {
-		ImagePullSecret,
-		ImagePullSecretCapability,
-		ImagePullSecretType
-	} from '$lib/services';
+	import { m } from '$lib/i18n';
+	import type { ImagePullSecret, ImagePullSecretCapability } from '$lib/services';
 	import CapabilityBanner from './CapabilityBanner.svelte';
 	import ECRSetupGuide from './ECRSetupGuide.svelte';
 	import FieldLabel from './FieldLabel.svelte';
@@ -30,14 +26,11 @@
 		refreshing?: boolean;
 		refreshMessage?: string;
 		requiredErrors?: Record<string, string>;
+		hideSubmit?: boolean;
+		showRefresh?: boolean;
 		onSave: () => void;
 		onRefresh: (secret: ImagePullSecret) => void;
 	}
-
-	const typeOptions: { id: ImagePullSecretType; label: string }[] = [
-		{ id: 'basic', label: 'Basic' },
-		{ id: 'ecr', label: 'ECR' }
-	];
 
 	let {
 		form = $bindable(),
@@ -50,6 +43,8 @@
 		refreshing = false,
 		refreshMessage = '',
 		requiredErrors = {},
+		hideSubmit = false,
+		showRefresh = true,
 		onSave,
 		onRefresh
 	}: Props = $props();
@@ -75,81 +70,66 @@
 	}
 </script>
 
-<div class="flex flex-col gap-6">
-	{#if !capability.available}
-		<CapabilityBanner reason={capability.reason} />
-	{/if}
+{#if !capability.available}
+	<CapabilityBanner reason={capability.reason} />
+{/if}
 
-	{#if selectedId && !currentSecret}
-		<div class="notification-info flex items-center gap-3">
-			<Info class="size-5" />
-			<div>Image pull secret not found.</div>
+{#if selectedId && !currentSecret}
+	<div class="notification-info flex items-center gap-3">
+		<Info class="size-5" />
+		<div>{m.platform_settings_image_pull_secrets_not_found()}</div>
+	</div>
+{:else}
+	<form
+		class="flex flex-col gap-4"
+		novalidate
+		onsubmit={(e) => {
+			e.preventDefault();
+			if (!hideSubmit) onSave();
+		}}
+	>
+		<div class="flex flex-col gap-4">
+			<label class="flex flex-col gap-1">
+				<FieldLabel
+					label={m.platform_settings_image_pull_secrets_display_name()}
+					help={m.platform_settings_image_pull_secrets_display_name_help()}
+				/>
+				<input
+					class="input-text-filled"
+					bind:value={form.displayName}
+					disabled={mutationsDisabled}
+					placeholder={form.type === 'ecr'
+						? m.platform_settings_image_pull_secrets_display_name_ecr_placeholder()
+						: m.platform_settings_image_pull_secrets_display_name_basic_placeholder()}
+				/>
+			</label>
 		</div>
-	{:else}
-		<form
-			class="paper"
-			novalidate
-			onsubmit={(e) => {
-				e.preventDefault();
-				onSave();
-			}}
-		>
-			<div class="flex flex-col gap-4">
-				<div class="flex flex-col gap-1">
-					<FieldLabel
-						label="Type"
-						help="Choose Basic for username/password registry credentials, or ECR for AWS IAM role based ECR access."
-					/>
-					<Select
-						id="image-pull-secret-type"
-						class="bg-base-200 dark:bg-base-100 dark:border-base-400 border border-transparent shadow-inner"
-						classes={{ root: 'w-full' }}
-						options={typeOptions}
-						selected={form.type}
-						disabled={Boolean(currentSecret) || mutationsDisabled}
-						onSelect={(option) => {
-							form.type = option.id as ImagePullSecretType;
-						}}
-					/>
-				</div>
-				<label class="flex flex-col gap-1">
-					<FieldLabel
-						label="Display Name"
-						help="Friendly name shown in the admin list. If omitted, Obot shows the generated secret ID."
-					/>
-					<input
-						class="input-text-filled"
-						bind:value={form.displayName}
-						disabled={mutationsDisabled}
-						placeholder={form.type === 'ecr' ? 'Production ECR access' : 'Production registry'}
-					/>
-				</label>
+
+		{#if form.type === 'basic'}
+			{@render basicFields()}
+		{:else}
+			{@render ecrFields()}
+		{/if}
+
+		{#if refreshMessage}
+			<div
+				class={twMerge(
+					'flex items-center gap-3 rounded-md border p-3 text-sm',
+					'border-green-500 bg-green-500/10 text-green-700 dark:text-green-300'
+				)}
+			>
+				<CircleCheck class="size-5" />
+				<span>{refreshMessage}</span>
 			</div>
+		{/if}
 
-			{#if form.type === 'basic'}
-				{@render basicFields()}
-			{:else}
-				{@render ecrFields()}
-			{/if}
+		{#if currentSecret}
+			{@render enabledToggle()}
+		{/if}
 
-			{#if refreshMessage}
-				<div
-					class={twMerge(
-						'flex items-center gap-3 rounded-md border p-3 text-sm',
-						'border-green-500 bg-green-500/10 text-green-700 dark:text-green-300'
-					)}
-				>
-					<CircleCheck class="size-5" />
-					<span>{refreshMessage}</span>
-				</div>
-			{/if}
-
-			{#if currentSecret}
-				{@render enabledToggle()}
-			{/if}
-
+		{#if !hideSubmit || (showRefresh && currentSecret && form.type === 'ecr')}
 			<div class="flex flex-wrap items-center justify-end gap-2">
-				{#if currentSecret && form.type === 'ecr'}
+				{#if showRefresh && currentSecret && form.type === 'ecr'}
 					<button
 						type="button"
 						class="btn btn-secondary flex items-center gap-1 text-sm"
@@ -157,46 +137,49 @@
 						onclick={() => onRefresh(currentSecret)}
 					>
 						<RefreshCw class={twMerge('size-4', refreshing && 'animate-spin')} />
-						Refresh Now
+						{m.platform_refresh_now()}
 					</button>
 				{/if}
-				<button
-					type="submit"
-					class="btn btn-primary flex items-center gap-1 text-sm"
-					disabled={mutationsDisabled || saving}
-				>
-					{#if saving}
-						<LoaderCircle class="size-4 animate-spin" />
-					{/if}
-					{currentSecret ? 'Save' : 'Create'}
-				</button>
+				{#if !hideSubmit}
+					<button
+						type="submit"
+						class="btn btn-primary flex items-center gap-1 text-sm"
+						disabled={mutationsDisabled || saving}
+					>
+						{#if saving}
+							<LoaderCircle class="size-4 animate-spin" />
+						{/if}
+						{currentSecret ? m.core_save() : m.platform_create()}
+					</button>
+				{/if}
 			</div>
-		</form>
-
-		{#if form.type === 'ecr'}
-			{#if issuerDiscoveryReason}
-				<div class="notification-info mt-5 flex items-center gap-3 text-sm">
-					<Info class="size-5" />
-					<div>
-						<p class="font-semibold">Issuer URL is required for ECR setup.</p>
-						<p>{issuerDiscoveryReason}</p>
-					</div>
-				</div>
-			{/if}
-			<ECRSetupGuide
-				{effectiveIssuerURL}
-				{effectiveAudience}
-				trustPolicyJSON={previewTrustPolicyJSON}
-				ecrPolicyJSON={previewECRPolicyJSON}
-			/>
 		{/if}
+	</form>
+
+	{#if form.type === 'ecr'}
+		<div class="divider my-0"></div>
+		{#if issuerDiscoveryReason}
+			<div class="notification-info mt-5 flex items-center gap-3 text-sm">
+				<Info class="size-5" />
+				<div>
+					<p class="font-semibold">{m.platform_settings_image_pull_secrets_issuer_required()}</p>
+					<p>{issuerDiscoveryReason}</p>
+				</div>
+			</div>
+		{/if}
+		<ECRSetupGuide
+			{effectiveIssuerURL}
+			{effectiveAudience}
+			trustPolicyJSON={previewTrustPolicyJSON}
+			ecrPolicyJSON={previewECRPolicyJSON}
+		/>
 	{/if}
-</div>
+{/if}
 
 {#snippet enabledToggle()}
 	<div class="border-base-300 dark:border-base-400 flex items-center gap-1 border-t pt-4 text-sm">
 		<Toggle
-			label="Enabled"
+			label={m.core_status_enabled()}
 			labelInline
 			checked={form.enabled}
 			disabled={mutationsDisabled}
@@ -205,7 +188,7 @@
 			}}
 		/>
 		<InfoTooltip
-			text="Controls whether Obot maintains and uses this managed image pull secret. Disabled secrets remain configured but are not active."
+			text={m.platform_settings_image_pull_secrets_enabled_help()}
 			placement="right"
 			class="ml-0.5 size-3.5"
 			classes={{ icon: 'size-3.5' }}
@@ -217,8 +200,8 @@
 	<div class="flex flex-col gap-4">
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Registry Server"
-				help="Registry host for the credentials, without an image path, query string, or user info. A scheme is optional."
+				label={m.platform_settings_image_pull_secrets_registry_server()}
+				help={m.platform_settings_image_pull_secrets_registry_server_help()}
 			/>
 			<input
 				class={inputClass('server')}
@@ -233,8 +216,8 @@
 		</label>
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Username"
-				help="Registry username or robot account name used with the password or token."
+				label={m.platform_settings_image_pull_secrets_username()}
+				help={m.platform_settings_image_pull_secrets_username_help()}
 			/>
 			<input
 				class={inputClass('username')}
@@ -249,10 +232,10 @@
 		</label>
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Password"
+				label={m.common_password()}
 				help={currentSecret?.status?.passwordConfigured
-					? 'Leave blank to keep the current stored registry password or token.'
-					: 'Registry password, access token, or robot account token. This is stored as a Kubernetes image pull secret.'}
+					? m.platform_settings_image_pull_secrets_password_keep_help()
+					: m.platform_settings_image_pull_secrets_password_help()}
 			/>
 			<input
 				class={inputClass('password')}
@@ -261,14 +244,16 @@
 				disabled={mutationsDisabled}
 				required={!currentSecret?.status?.passwordConfigured}
 				placeholder={currentSecret?.status?.passwordConfigured
-					? 'Leave blank to keep current password'
-					: 'Registry password or token'}
+					? m.platform_settings_image_pull_secrets_password_keep_placeholder()
+					: m.platform_settings_image_pull_secrets_password_placeholder()}
 			/>
 			{#if requiredErrors.password}
 				<span class="text-sm font-medium text-red-500">{requiredErrors.password}</span>
 			{/if}
 			{#if currentSecret?.status?.passwordConfigured}
-				<span class="input-description">Password configured</span>
+				<span class="input-description"
+					>{m.platform_settings_image_pull_secrets_password_configured()}</span
+				>
 			{/if}
 		</label>
 	</div>
@@ -278,8 +263,8 @@
 	<div class="flex flex-col gap-4">
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Role ARN"
-				help="AWS IAM role that Obot should assume to request ECR authorization tokens."
+				label={m.platform_settings_image_pull_secrets_role_arn()}
+				help={m.platform_settings_image_pull_secrets_role_arn_help()}
 			/>
 			<input
 				class={inputClass('roleARN')}
@@ -293,7 +278,10 @@
 			{/if}
 		</label>
 		<label class="flex flex-col gap-1">
-			<FieldLabel label="Region" help="AWS region that contains the target ECR registry." />
+			<FieldLabel
+				label={m.platform_settings_image_pull_secrets_col_region()}
+				help={m.platform_settings_image_pull_secrets_region_help()}
+			/>
 			<input
 				class={inputClass('region')}
 				bind:value={form.region}
@@ -306,7 +294,7 @@
 			{/if}
 		</label>
 
-		<div class="border-base-300 dark:border-base-400 flex flex-col gap-4 border-t pt-4">
+		<div class="flex flex-col gap-4">
 			<button
 				type="button"
 				class="text-muted-content hover:text-base-content flex w-fit items-center gap-1 text-sm font-medium"
@@ -318,7 +306,7 @@
 				<ChevronDown
 					class={twMerge('size-4 transition-transform', !showECRAdvanced && '-rotate-90')}
 				/>
-				Advanced
+				{m.platform_advanced()}
 			</button>
 
 			{#if showECRAdvanced}
@@ -332,8 +320,8 @@
 	<div class="flex flex-col gap-4">
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Refresh Schedule"
-				help="Cron expression for refreshing the generated ECR image pull secret. Leave blank to use the default, every 6 hours."
+				label={m.platform_settings_image_pull_secrets_refresh_schedule()}
+				help={m.platform_settings_image_pull_secrets_refresh_schedule_help()}
 			/>
 			<input
 				class="input-text-filled"
@@ -344,10 +332,10 @@
 		</label>
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Issuer URL Override"
+				label={m.platform_settings_image_pull_secrets_issuer_override()}
 				help={capability.issuerURL
-					? 'Optional HTTPS OIDC issuer URL to use in the AWS trust policy. Leave blank to use the Obot issuer.'
-					: 'HTTPS OIDC issuer URL to use in the AWS trust policy.'}
+					? m.platform_settings_image_pull_secrets_issuer_override_optional_help()
+					: m.platform_settings_image_pull_secrets_issuer_override_help()}
 			/>
 			<input
 				class="input-text-filled"
@@ -358,8 +346,8 @@
 		</label>
 		<label class="flex flex-col gap-1">
 			<FieldLabel
-				label="Audience"
-				help="Optional OIDC audience value for AWS STS. Leave blank to use sts.amazonaws.com."
+				label={m.platform_settings_image_pull_secrets_audience()}
+				help={m.platform_settings_image_pull_secrets_audience_help()}
 			/>
 			<input
 				class="input-text-filled"

@@ -5,8 +5,19 @@ metadata:
   labels:
     {{- include "obot.labels" . | nindent 4 }}
 data:
-  {{- $cfg := .Values.config -}}
-    {{- $forbidden := list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "OBOT_SERVER_OTEL_BEARER_TOKEN" "OBOT_SERVER_MCPIMAGE_PULL_SECRET" "OBOT_SERVER_DSN" "OPENAI_API_KEY" "ANTHROPIC_API_KEY" "GITHUB_AUTH_TOKEN" "OBOT_SERVER_ENCRYPTION_KEY" "OBOT_BOOTSTRAP_TOKEN" "OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN" "OBOT_SERVER_LICENSE_KEY" "OBOT_SERVER_MCPIMAGE_PULL_SECRETS" "OBOT_ARTIFACT_S3_ACCESS_KEY_ID" "OBOT_ARTIFACT_S3_SECRET_ACCESS_KEY" "OBOT_ARTIFACT_GCS_SERVICE_ACCOUNT_JSON" "OBOT_ARTIFACT_AZURE_CLIENT_SECRET" -}}
+  {{- $cfg := deepCopy .Values.config -}}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_ADDRESS" "" }}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_OBOT_URL" "" }}
+  {{- if .Values.substrate.enabled }}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_WORKER_NODE_SELECTOR" (.Values.substrate.worker.nodeSelector | toJson) }}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_WORKER_TOLERATIONS" (.Values.substrate.worker.tolerations | toJson) }}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_ADDRESS" "api.ate-system.svc:443" }}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_OBOT_URL" (printf "http://%s.%s.svc:%v" (include "obot.fullname" .) .Release.Namespace .Values.service.port) }}
+  {{- if not $cfg.OBOT_SERVER_SUBSTRATE_WORKER_IMAGE }}
+  {{- $_ := set $cfg "OBOT_SERVER_SUBSTRATE_WORKER_IMAGE" (printf "%s/ateom-gvisor:%s" .Values.substrate.image.repository .Subcharts.substrate.Chart.AppVersion) }}
+  {{- end }}
+  {{- end }}
+    {{- $forbidden := list "OBOT_SERVER_CLAUDE_PROVISIONING_TOKEN" "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "OBOT_SERVER_OTEL_BEARER_TOKEN" "OBOT_SERVER_MCPIMAGE_PULL_SECRET" "OBOT_SERVER_DSN" "OPENAI_API_KEY" "ANTHROPIC_API_KEY" "GITHUB_AUTH_TOKEN" "OBOT_SERVER_ENCRYPTION_KEY" "OBOT_BOOTSTRAP_TOKEN" "OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN" "OBOT_SERVER_LICENSE_KEY" "OBOT_SERVER_MCPIMAGE_PULL_SECRETS" "OBOT_ARTIFACT_S3_ACCESS_KEY_ID" "OBOT_ARTIFACT_S3_SECRET_ACCESS_KEY" -}}
   {{- range $key := keys $cfg | sortAlpha }}
     {{- if has $key $forbidden -}}
     {{- fail (printf "config.%s must be set under .Values.secret (not .Values.config)" $key) -}}
@@ -18,28 +29,9 @@ data:
   {{- end }}
   {{- end }}
   {{- if include "obot.mcpOnKubernetes" . }}
-  # Hosted agent sandboxes share this namespace, so leaving it unset would send
-  # the agent backend to its own default namespace, which this chart never
-  # creates and grants no permissions on.
   OBOT_SERVER_MCPNAMESPACE: {{ include "obot.config.mcpNamespace" . | quote }}
   OBOT_SERVER_SERVICE_NAME: {{ include "obot.fullname" . | quote }}
   OBOT_SERVER_SERVICE_NAMESPACE: {{ .Release.Namespace | quote }}
-  {{- if not .Values.config.OBOT_HOSTED_AGENTS_POD_SECURITY_LEVEL }}
-  # Sandboxes are admitted against the namespace's Pod Security level, so the
-  # backend is told what that level is rather than being configured separately
-  # and left to drift out of agreement with the label above. Setting
-  # config.OBOT_HOSTED_AGENTS_POD_SECURITY_LEVEL explicitly overrides this.
-  OBOT_HOSTED_AGENTS_POD_SECURITY_LEVEL: {{ if .Values.mcpNamespace.podSecurity.enabled }}{{ .Values.mcpNamespace.podSecurity.enforce | quote }}{{ else }}"privileged"{{ end }}
-  {{- end }}
-  {{- end }}
-  {{- if .Values.hostedAgentDefaults.affinity }}
-  OBOT_SERVER_HOSTED_AGENTS_AFFINITY: {{ .Values.hostedAgentDefaults.affinity | toJson | quote }}
-  {{- end }}
-  {{- if .Values.hostedAgentDefaults.tolerations }}
-  OBOT_SERVER_HOSTED_AGENTS_TOLERATIONS: {{ .Values.hostedAgentDefaults.tolerations | toJson | quote }}
-  {{- end }}
-  {{- if .Values.hostedAgentDefaults.nodeSelector }}
-  OBOT_SERVER_HOSTED_AGENTS_NODE_SELECTOR: {{ .Values.hostedAgentDefaults.nodeSelector | toJson | quote }}
   {{- end }}
   {{- if .Values.mcpServerDefaults.affinity }}
   OBOT_SERVER_MCPK8S_SETTINGS_AFFINITY: {{ .Values.mcpServerDefaults.affinity | toJson | quote }}
@@ -61,12 +53,6 @@ data:
   {{- end }}
   {{- if .Values.mcpServerDefaults.runtimeClassName }}
   OBOT_SERVER_MCPK8S_SETTINGS_RUNTIME_CLASS_NAME: {{ .Values.mcpServerDefaults.runtimeClassName | quote }}
-  {{- end }}
-  {{- if .Values.mcpServerDefaults.storageClassName }}
-  OBOT_SERVER_MCPK8S_SETTINGS_STORAGE_CLASS_NAME: {{ .Values.mcpServerDefaults.storageClassName | quote }}
-  {{- end }}
-  {{- if .Values.mcpServerDefaults.nanobotWorkspaceSize }}
-  OBOT_SERVER_MCPK8S_SETTINGS_NANOBOT_WORKSPACE_SIZE: {{ .Values.mcpServerDefaults.nanobotWorkspaceSize | quote }}
   {{- end }}
   {{- if .Values.mcpServerDefaults.maxCPURequest }}
   OBOT_SERVER_MCPK8S_MAX_CPUREQUEST: {{ .Values.mcpServerDefaults.maxCPURequest | quote }}

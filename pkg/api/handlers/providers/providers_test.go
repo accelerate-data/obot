@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/obot-platform/obot/apiclient/types"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/license"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 )
@@ -14,12 +15,17 @@ func TestAuthProviderStatus(t *testing.T) {
 		name         string
 		authProvider v1.AuthProvider
 		cred         map[string]string
+		conn         *gatewaytypes.SCIMConnection
 		want         types.CommonProviderStatus
 	}{
 		{
 			name: "configured when requirements are satisfied",
 			authProvider: authProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 			),
@@ -31,7 +37,11 @@ func TestAuthProviderStatus(t *testing.T) {
 		{
 			name: "missing entitlement does not make provider unconfigured",
 			authProvider: authProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				[]string{"ENTITLEMENT"},
 			),
@@ -44,7 +54,11 @@ func TestAuthProviderStatus(t *testing.T) {
 		{
 			name: "missing credential value is not configured",
 			authProvider: authProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 			),
@@ -55,9 +69,80 @@ func TestAuthProviderStatus(t *testing.T) {
 			},
 		},
 		{
+			name: "directory synchronization requires the directory parameters",
+			authProvider: authProvider(
+				oktaParameters(),
+				nil,
+				nil,
+			),
+			cred: map[string]string{
+				"OBOT_OKTA_AUTH_PROVIDER_ISSUER_URL": "https://example.okta.com",
+			},
+			want: types.CommonProviderStatus{
+				Configured: false,
+				MissingConfigurationParameters: []string{
+					"OBOT_OKTA_AUTH_PROVIDER_SERVICE_CLIENT_ID",
+					"OBOT_OKTA_AUTH_PROVIDER_SERVICE_PRIVATE_KEY",
+				},
+			},
+		},
+		{
+			name: "a SCIM connection does not require the directory parameters",
+			authProvider: authProvider(
+				oktaParameters(),
+				nil,
+				nil,
+			),
+			cred: map[string]string{
+				"OBOT_OKTA_AUTH_PROVIDER_ISSUER_URL": "https://example.okta.com",
+			},
+			conn: &gatewaytypes.SCIMConnection{
+				AdapterType: "okta",
+			},
+			want: types.CommonProviderStatus{
+				Configured: true,
+			},
+		},
+		{
+			name: "a SCIM connection still requires the other parameters",
+			authProvider: authProvider(
+				oktaParameters(),
+				nil,
+				nil,
+			),
+			cred: map[string]string{},
+			conn: &gatewaytypes.SCIMConnection{
+				AdapterType: "okta",
+			},
+			want: types.CommonProviderStatus{
+				Configured:                     false,
+				MissingConfigurationParameters: []string{"OBOT_OKTA_AUTH_PROVIDER_ISSUER_URL"},
+			},
+		},
+		{
+			name: "nil credential falls back to the effective required configuration",
+			authProvider: authProvider(
+				oktaParameters(),
+				nil,
+				nil,
+			),
+			cred: nil,
+			conn: &gatewaytypes.SCIMConnection{
+				AdapterType: "okta",
+			},
+			want: types.CommonProviderStatus{
+				Configured:                     false,
+				MissingConfigurationParameters: []string{"OBOT_OKTA_AUTH_PROVIDER_ISSUER_URL"},
+			},
+		},
+		{
 			name: "nil credential uses status missing configuration",
 			authProvider: authProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				[]string{"API_KEY"},
 				nil,
 			),
@@ -70,7 +155,11 @@ func TestAuthProviderStatus(t *testing.T) {
 		{
 			name: "nil credential falls back to required configuration when status is empty",
 			authProvider: authProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 			),
@@ -85,7 +174,7 @@ func TestAuthProviderStatus(t *testing.T) {
 	licenseProvider := testLicenseProvider(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := AuthProviderStatus(t.Context(), tt.authProvider, tt.cred, licenseProvider)
+			got, err := AuthProviderStatus(t.Context(), tt.authProvider, tt.cred, tt.conn, licenseProvider)
 			if err != nil {
 				t.Fatalf("AuthProviderStatus() error = %v", err)
 			}
@@ -105,7 +194,11 @@ func TestModelProviderStatus(t *testing.T) {
 		{
 			name: "configured when requirements are satisfied and models are current",
 			modelProvider: modelProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 				2,
@@ -119,7 +212,11 @@ func TestModelProviderStatus(t *testing.T) {
 		{
 			name: "configured when requirements are satisfied and models are stale",
 			modelProvider: modelProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 				1,
@@ -133,7 +230,11 @@ func TestModelProviderStatus(t *testing.T) {
 		{
 			name: "missing entitlement does not make provider unconfigured",
 			modelProvider: modelProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				[]string{"ENTITLEMENT"},
 				2,
@@ -150,7 +251,11 @@ func TestModelProviderStatus(t *testing.T) {
 		{
 			name: "missing credential value is not configured and skips model population status",
 			modelProvider: modelProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 				2,
@@ -166,7 +271,11 @@ func TestModelProviderStatus(t *testing.T) {
 		{
 			name: "nil credential uses status missing configuration",
 			modelProvider: modelProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				[]string{"API_KEY"},
 				nil,
 				2,
@@ -182,7 +291,11 @@ func TestModelProviderStatus(t *testing.T) {
 		{
 			name: "nil credential falls back to required configuration when status is empty",
 			modelProvider: modelProvider(
-				[]types.ProviderConfigurationParameter{{Name: "API_KEY"}},
+				[]types.ProviderConfigurationParameter{
+					{
+						Name: "API_KEY",
+					},
+				},
 				nil,
 				nil,
 				2,
@@ -234,6 +347,22 @@ func testLicenseProvider(t *testing.T) *license.Provider {
 		t.Fatalf("NewProvider() error = %v", err)
 	}
 	return provider
+}
+
+// oktaParameters returns required parameters like the Okta auth provider's: the issuer, and the two directory
+// parameters that only directory synchronization uses.
+func oktaParameters() []types.ProviderConfigurationParameter {
+	return []types.ProviderConfigurationParameter{
+		{
+			Name: "OBOT_OKTA_AUTH_PROVIDER_ISSUER_URL",
+		},
+		{
+			Name: "OBOT_OKTA_AUTH_PROVIDER_SERVICE_CLIENT_ID",
+		},
+		{
+			Name: "OBOT_OKTA_AUTH_PROVIDER_SERVICE_PRIVATE_KEY",
+		},
+	}
 }
 
 func authProvider(requiredConfig []types.ProviderConfigurationParameter, missingConfig []string, requiredEntitlements []string) v1.AuthProvider {

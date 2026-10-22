@@ -30,7 +30,7 @@
 		/>
 	</div>
 {:else}
-	<div class="bg-primary/10 text-primary rounded-md p-2 shrink-0">
-		<Server class="size-5" />
+	<div class={twMerge('bg-primary/10 text-primary rounded-md p-2 shrink-0', classes?.root)}>
+		<Server {width} {height} />
 	</div>
 {/if}

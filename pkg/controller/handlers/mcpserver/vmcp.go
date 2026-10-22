@@ -11,7 +11,7 @@ import (
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
-	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/utils"
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
@@ -61,15 +61,14 @@ func (h *Handler) SyncVMCPConfiguration(req router.Request, _ router.Response) e
 	// without touching either configuration hash, which drops any URL resolved from a template.
 	// Tracking the snapshot digest catches that rebuild without revealing a credential to find out.
 	snapshotHash := server.Annotations[v1.VMCPSnapshotDigestAnnotation]
-	if server.Status.VMCPStaticConfigurationHash == vmcp.Spec.StaticConfigurationHash &&
-		server.Status.VMCPUserConfigurationHash == instance.Status.UserConfigurationHash &&
-		server.Status.VMCPSnapshotHash == snapshotHash {
+	if vmcpconfig.ServerConfigurationSynced(*server, vmcp, instance) {
 		return nil
 	}
 
 	staticConfiguration, err := h.revealVMCPConfiguration(
 		req,
 		vmcpconfig.StaticConfigurationCredentialContext(vmcp.Name),
+		vmcpconfig.StaticConfigurationCredentialName(&vmcp),
 	)
 	if err != nil {
 		return fmt.Errorf("reveal static configuration for VMCP %q: %w", vmcp.Name, err)
@@ -79,6 +78,7 @@ func (h *Handler) SyncVMCPConfiguration(req router.Request, _ router.Response) e
 		userConfiguration, err = h.revealVMCPConfiguration(
 			req,
 			vmcpconfig.InstanceConfigurationCredentialContext(instance.Name),
+			vmcpconfig.ConfigurationCredentialName(),
 		)
 		if err != nil {
 			return fmt.Errorf("reveal user configuration for VMCP instance %q: %w", instance.Name, err)
@@ -96,7 +96,11 @@ func (h *Handler) SyncVMCPConfiguration(req router.Request, _ router.Response) e
 
 	// Update the spec before the status: the client writes the new resource version back onto
 	// the object, so the status update below still applies cleanly.
-	if url, owned := resolvedComponentURL(*component, server, configuration); owned && server.Spec.Manifest.RemoteConfig.URL != url {
+	resolvedServer, err := mcp.ResolveServerStaticConfiguration(req.Ctx, h.gatewayClient, *server)
+	if err != nil {
+		return err
+	}
+	if url, owned := resolvedComponentURL(*component, &resolvedServer, configuration); owned && server.Spec.Manifest.RemoteConfig.URL != url {
 		server.Spec.Manifest.RemoteConfig.URL = url
 		if err := req.Client.Update(req.Ctx, server); err != nil {
 			return fmt.Errorf("store resolved URL for MCPServer %q: %w", server.Name, err)
@@ -144,10 +148,10 @@ func resolvedComponentURL(component types.VMCPComponent, server *v1.MCPServer, c
 	return url, true
 }
 
-func (h *Handler) revealVMCPConfiguration(req router.Request, credentialContext string) (map[string]string, error) {
+func (h *Handler) revealVMCPConfiguration(req router.Request, credentialContext, credentialName string) (map[string]string, error) {
 	credential, err := h.gatewayClient.RevealCredential(req.Ctx,
 		[]string{credentialContext},
-		vmcpconfig.ConfigurationCredentialName(),
+		credentialName,
 	)
 	if err == nil {
 		return credential.Secrets, nil
@@ -196,16 +200,20 @@ func (h *Handler) syncVMCPOAuthCredentialStatus(req router.Request, server *v1.M
 	if err != nil {
 		return err
 	}
+	fixedURL := ""
+	if server.Spec.Manifest.RemoteConfig != nil {
+		fixedURL = server.Spec.Manifest.RemoteConfig.URL
+	}
+	checkHash = utils.Digest([]any{checkHash, fixedURL})
 	if server.Status.OAuthCredentialCheckHash == checkHash {
 		return nil
 	}
 	var configured bool
 	if ref != "" {
-		_, err := h.gatewayClient.RevealCredential(req.Ctx, []string{ref}, system.StaticOAuthCredentialName)
-		if err != nil && !errors.As(err, &client.CredentialNotFoundError{}) {
+		configured, err = vmcpconfig.OAuthCredentialReady(req.Ctx, h.gatewayClient, ref, fixedURL)
+		if err != nil {
 			return err
 		}
-		configured = err == nil
 	}
 	server.Status.OAuthCredentialCheckHash = checkHash
 	server.Status.OAuthCredentialConfigured = configured

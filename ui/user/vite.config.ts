@@ -1,4 +1,6 @@
+import { paraglideVitePlugin } from '@inlang/paraglide-js';
 import { sveltekit } from '@sveltejs/kit/vite';
+import tailwindcss from '@tailwindcss/vite';
 import { playwright } from '@vitest/browser-playwright';
 import { defineConfig, loadEnv } from 'vite';
 
@@ -35,7 +37,16 @@ export default defineConfig(({ mode }) => {
 							'/oauth2': proxyConfig
 						}
 		},
-		plugins: [sveltekit()],
+		plugins: [
+			paraglideVitePlugin({
+				project: './project.inlang',
+				outdir: './src/lib/paraglide',
+				// Keep in sync with the `i18n:compile` script in package.json
+				strategy: ['localStorage', 'preferredLanguage', 'baseLocale']
+			}),
+			tailwindcss(),
+			sveltekit()
+		],
 		optimizeDeps: {
 			// Only reachable via lazily-imported route nodes, so Vite would otherwise
 			// discover them mid-navigation and re-bundle, failing in-flight route
@@ -55,7 +66,8 @@ export default defineConfig(({ mode }) => {
 						testTimeout: 2000,
 						browser: {
 							enabled: true,
-							provider: playwright(),
+							// Exposes gc() so the setup file can collect each finished test file's iframe.
+							provider: playwright({ launchOptions: { args: ['--js-flags=--expose-gc'] } }),
 							screenshotFailures: false,
 							instances: [{ browser: 'chromium', viewport: { width: 1280, height: 720 } }]
 						},

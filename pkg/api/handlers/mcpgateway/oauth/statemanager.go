@@ -11,25 +11,35 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// tokenClientFunc returns the HTTP client for the code exchange with a server-supplied
+// token endpoint, going through the named tunnel when there is one.
+type tokenClientFunc func(tunnelName string) (*http.Client, error)
+
 type stateManager struct {
 	gatewayClient *client.Client
-	// exchangeHTTPClient carries the operator's remote-network policy and rejects
-	// redirects. Every OAuth code exchange runs through it.
-	exchangeHTTPClient *http.Client
+	// tokenClient builds the client for the code exchange. When nil, or when it returns
+	// no client, ExchangeOAuthToken falls back to its strict egress client.
+	tokenClient tokenClientFunc
 }
 
-func newStateManager(gatewayClient *client.Client, exchangeHTTPClient ...*http.Client) *stateManager {
+func newStateManager(gatewayClient *client.Client, tokenClients ...tokenClientFunc) *stateManager {
+	var tokenClient tokenClientFunc
+	if len(tokenClients) > 0 {
+		tokenClient = tokenClients[0]
+	}
 	manager := &stateManager{
 		gatewayClient: gatewayClient,
-	}
-	if len(exchangeHTTPClient) > 0 {
-		manager.exchangeHTTPClient = exchangeHTTPClient[0]
+		tokenClient:   tokenClient,
 	}
 	return manager
 }
 
 func (sm *stateManager) store(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, conf *oauth2.Config) error {
 	return sm.gatewayClient.CreateMCPOAuthPendingState(ctx, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL, conf)
+}
+
+func (sm *stateManager) storeWithTunnel(ctx context.Context, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, conf *oauth2.Config) error {
+	return sm.gatewayClient.CreateMCPOAuthPendingStateWithTunnel(ctx, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL, conf)
 }
 
 // createToken claims the callback state before anything else, so a replayed or
@@ -41,6 +51,9 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 	if err != nil {
 		return "", "", fmt.Errorf("failed to claim oauth state: %w", err)
 	}
+
+	// Once loaded, consume pending state on success and every failure.
+	defer func() { _ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState) }()
 
 	if errorStr != "" {
 		// Clean up the pending state before returning the error
@@ -74,7 +87,18 @@ func (sm *stateManager) createToken(ctx context.Context, state, code, errorStr, 
 		conf.Scopes = strings.Split(ps.Scopes, " ")
 	}
 
-	token, err := mcp.ExchangeOAuthToken(mcp.WithOAuthHTTPClient(ctx, sm.exchangeHTTPClient), conf, code, ps.Verifier, ps.ResourceURL)
+	exchangeCtx := ctx
+	if sm.tokenClient != nil {
+		httpClient, err := sm.tokenClient(ps.TunnelName)
+		if err != nil {
+			_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
+			return "", "", fmt.Errorf("failed to create OAuth token client: %w", err)
+		}
+		if httpClient != nil {
+			exchangeCtx = mcp.WithOAuthHTTPClient(ctx, httpClient)
+		}
+	}
+	token, err := mcp.ExchangeOAuthToken(exchangeCtx, conf, code, ps.Verifier, ps.ResourceURL)
 	if err != nil {
 		_ = sm.gatewayClient.DeleteMCPOAuthPendingState(ctx, ps.HashedState)
 		// The exchange error can quote the provider's response body, which may

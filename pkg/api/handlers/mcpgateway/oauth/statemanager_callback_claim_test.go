@@ -63,7 +63,7 @@ func storeDynamicCallbackState(t *testing.T, gateway *gatewayclient.Client, toke
 			AuthStyle: oauth2.AuthStyleInParams,
 		},
 	}
-	if err := newStateManager(gateway).store(t.Context(), "user", "mcp", "https://mcp.example/mcp", "", "", state, "pkce-verifier", "", conf); err != nil {
+	if err := newStateManager(gateway, fixedTokenClient(http.DefaultClient)).store(t.Context(), "user", "mcp", "https://mcp.example/mcp", "", "", state, "pkce-verifier", "", conf); err != nil {
 		t.Fatalf("store pending state: %v", err)
 	}
 }
@@ -83,7 +83,7 @@ func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
 		provider := newBlockingTokenServer(t)
 		gateway := newStaticOAuthCallbackGateway(t)
 		storeDynamicCallbackState(t, gateway, provider.URL, "state")
-		sm := newStateManager(gateway)
+		sm := newStateManager(gateway, fixedTokenClient(http.DefaultClient))
 
 		winner := make(chan error, 1)
 		go func() {
@@ -122,7 +122,7 @@ func TestStateManagerCreateTokenConsumesStateExactlyOnce(t *testing.T) {
 		storeDynamicCallbackState(t, gateway, provider.URL, "state")
 		ageDynamicCallbackState(t, database, "state")
 
-		if _, _, err := newStateManager(gateway).createToken(t.Context(), "state", "code", "", ""); !errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
+		if _, _, err := newStateManager(gateway, fixedTokenClient(http.DefaultClient)).createToken(t.Context(), "state", "code", "", ""); !errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
 			t.Fatalf("expired callback returned %v, want invalid state", err)
 		}
 		if got := provider.exchanges.Load(); got != 0 {

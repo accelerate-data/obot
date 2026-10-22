@@ -124,7 +124,7 @@ func TestCleanCatalogSyncWaitsForMutationLockBeforeRemoval(t *testing.T) {
 		done <- handler.Sync(syncRequest(ctx, storageClient, getCatalog(ctx, t, storageClient)), &router.ResponseWrapper{})
 	}()
 	require.Eventually(t, func() bool {
-		return getCatalog(ctx, t, storageClient).Annotations[v1.MCPCatalogSyncAnnotation] == ""
+		return getCatalog(ctx, t, storageClient).Status.IsSyncing
 	}, 5*time.Second, 10*time.Millisecond)
 
 	select {
@@ -300,7 +300,7 @@ func TestCleanCatalogSyncCancellationWhileWaitingForMutationLockDoesNotRemoveOrA
 		)
 	}()
 	require.Eventually(t, func() bool {
-		return getCatalog(context.Background(), t, baseClient).Annotations[v1.MCPCatalogSyncAnnotation] == ""
+		return getCatalog(context.Background(), t, baseClient).Status.IsSyncing
 	}, 5*time.Second, 10*time.Millisecond)
 	cancel()
 

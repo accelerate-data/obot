@@ -34,7 +34,7 @@ func newLeaseClaimCallbackRequest(ctx context.Context, callbackState string) api
 // blocked inside the provider token exchange, with its claim already recorded.
 func startLeaseClaimCallback(t *testing.T, gateway *gatewayclient.Client, req api.Context, tokenExchangeStarted <-chan struct{}) <-chan error {
 	t.Helper()
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
+	h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}}
 	handled := make(chan error, 1)
 	go func() { handled <- h.oauthCallback(req) }()
 	select {

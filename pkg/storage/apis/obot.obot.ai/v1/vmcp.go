@@ -30,15 +30,29 @@ type VMCP struct {
 }
 
 type VMCPSpec struct {
+	SourceURL  string             `json:"sourceURL,omitempty"`
 	LegacySlug string             `json:"legacySlug,omitempty"`
 	Manifest   types.VMCPManifest `json:"manifest"`
+	// Adopted is nil when adoption is unsupported, false when awaiting catalog
+	// adoption, and true after catalog sync has taken over the vMCP.
+	Adopted *bool `json:"adopted,omitempty"`
+	// AdoptionSourceURL and AdoptionEntryKey are recorded by composite migration.
+	// They identify the catalog source and key a vMCP must be synced from for
+	// catalog sync to adopt it without changing its identity.
+	AdoptionSourceURL string `json:"adoptionSourceURL,omitempty"`
+	AdoptionEntryKey  string `json:"adoptionEntryKey,omitempty"`
 	// UserID is set for a personal VMCP and empty for an administrator-created shared VMCP.
 	UserID string `json:"userID,omitempty"`
 	// CreatorUserID is the user ID of the user who created the VMCP. It is used to determine which admin created a server.
 	CreatorUserID           string `json:"creatorUserID,omitempty"`
 	StaticConfigurationHash string `json:"staticConfigurationHash,omitempty"`
+	// StaticConfigurationCredentialName selects an immutable configuration revision.
+	// Empty selects the legacy configuration credential.
+	StaticConfigurationCredentialName string `json:"staticConfigurationCredentialName,omitempty"`
 	// ComponentStaticConfigurationHashes retire migrated overrides only for the changed component.
 	ComponentStaticConfigurationHashes map[string]string `json:"componentStaticConfigurationHashes,omitempty"`
+	// ComponentCatalogReferences maps component IDs to normalized sourceID::entryKey references.
+	ComponentCatalogReferences map[string]string `json:"componentCatalogReferences,omitempty"`
 }
 
 type VMCPStatus struct {
@@ -56,6 +70,9 @@ type VMCPComponentStatus struct {
 	Error                     string `json:"error,omitempty"`
 	SourceMissing             bool   `json:"sourceMissing,omitempty"`
 	NeedsUpdate               bool   `json:"needsUpdate,omitempty"`
+	// ConnectionSnapshot is an outdated snapshot that migrated connections retain when the
+	// component itself is current. Updating the vMCP releases it.
+	ConnectionSnapshot *types.MCPServerCatalogEntrySnapshot `json:"connectionSnapshot,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object

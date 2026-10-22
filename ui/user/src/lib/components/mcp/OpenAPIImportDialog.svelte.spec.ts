@@ -1,0 +1,90 @@
+import { worker } from '../../../tests/mocks/worker';
+import OpenAPIImportDialog from './OpenAPIImportDialog.svelte';
+import { http, HttpResponse } from 'msw';
+import { expect, it, vi } from 'vitest';
+import { render } from 'vitest-browser-svelte';
+import { page, userEvent } from 'vitest/browser';
+
+const result = {
+	baseURL: '',
+	destinationValidation: { valid: false, error: 'no usable server URL; configure baseURL' },
+	suggestedHeaders: [],
+	suggestedMetadata: { name: 'Example' }
+};
+
+it('keeps import errors in the modal and allows retry', async () => {
+	let fail = true;
+	worker.use(
+		http.post('/api/openapi-import', () => {
+			if (fail) return new HttpResponse('Schema URL is unavailable', { status: 400 });
+			return HttpResponse.json(result);
+		})
+	);
+	const onComplete = vi.fn();
+	await render(OpenAPIImportDialog, {
+		onComplete,
+		onCancel: vi.fn()
+	});
+	await expect
+		.element(page.getByRole('button', { name: 'Import schema', exact: true }))
+		.not.toBeInTheDocument();
+	await expect.element(page.getByRole('button', { name: 'Import', exact: true })).toBeDisabled();
+	await page.getByLabelText('Schema URL', { exact: true }).fill('https://example.com/schema.json');
+	await expect.element(page.getByRole('button', { name: 'Import', exact: true })).toBeEnabled();
+	await page.getByRole('button', { name: 'Import', exact: true }).click();
+	await expect
+		.element(page.getByRole('alert'))
+		.toHaveTextContent('400 /openapi-import: Schema URL is unavailable');
+	expect(onComplete).not.toHaveBeenCalled();
+	fail = false;
+	await page.getByRole('button', { name: 'Import', exact: true }).click();
+	await vi.waitFor(() =>
+		expect(onComplete).toHaveBeenCalledWith({
+			config: expect.objectContaining({
+				source: { url: 'https://example.com/schema.json' }
+			}),
+			result
+		})
+	);
+});
+
+it('cancels when Escape closes the dialog', async () => {
+	const onCancel = vi.fn();
+	await render(OpenAPIImportDialog, {
+		onComplete: vi.fn(),
+		onCancel
+	});
+	await expect.element(page.getByRole('dialog')).toBeVisible();
+	await userEvent.keyboard('{Escape}');
+	await vi.waitFor(() => expect(onCancel).toHaveBeenCalledOnce());
+});
+
+it('ignores a pending response when the X button closes the dialog', async () => {
+	let finish!: () => void;
+	const pending = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	const responded = vi.fn();
+	worker.use(
+		http.post('/api/openapi-import', async () => {
+			await pending;
+			responded();
+			return HttpResponse.json(result);
+		})
+	);
+	const onComplete = vi.fn();
+	const onCancel = vi.fn();
+	const view = await render(OpenAPIImportDialog, {
+		onComplete,
+		onCancel
+	});
+	await page.getByLabelText('Schema URL', { exact: true }).fill('https://example.com/schema.json');
+	await page.getByRole('button', { name: 'Import', exact: true }).click();
+	await expect.element(page.getByLabelText('Schema URL', { exact: true })).toBeDisabled();
+	await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+	expect(onCancel).toHaveBeenCalledOnce();
+	await view.unmount();
+	finish();
+	await vi.waitFor(() => expect(responded).toHaveBeenCalledOnce());
+	expect(onComplete).not.toHaveBeenCalled();
+});

@@ -1,6 +1,5 @@
 import { DEFAULT_MCP_CATALOG_ID } from '$lib/constants';
 import { HttpError } from '$lib/errors';
-import type { Skill } from '$lib/services/nanobot/types';
 import { buildQueryString } from '$lib/url';
 import {
 	doDelete,
@@ -11,7 +10,6 @@ import {
 	doPut,
 	doWithBody,
 	type Fetcher,
-	type ErrorHandler,
 	type PaginatedResponse
 } from '../http';
 import { AUDIT_LOG_FILTER_OPTIONS_LIMIT } from '../user/constants';
@@ -32,6 +30,7 @@ import type {
 	K8sServerDetail,
 	MCPAllowedSecretBindingTarget,
 	MCPSubField,
+	Skill,
 	VMCP,
 	VMCPInstance
 } from '../user/types';
@@ -43,7 +42,22 @@ import type {
 	MCPCatalogServerManifest,
 	ModelAccessPolicy,
 	ModelAccessPolicyManifest,
+	ModelProxySettings,
+	ModelProxySettingsUpdateManifest,
+	ModelProxyUsage,
 	AuthProvider,
+	ResidualGroupData,
+	SCIMConnection,
+	SCIMConnectionReview,
+	SCIMEnablePreview,
+	SCIMEnableResult,
+	SCIMEnforceResult,
+	SCIMGroupDeletionResult,
+	SCIMGroupList,
+	SCIMPage,
+	SCIMRequestFailure,
+	SCIMSetupGroup,
+	SCIMSetupUser,
 	MCPFilter,
 	MCPFilterManifest,
 	TempUser,
@@ -81,28 +95,11 @@ import type {
 	SkillRepositoryManifest,
 	SkillAccessPolicy,
 	SkillAccessPolicyManifest,
-	AgentCatalog,
-	AgentCatalogManifest,
-	Harness,
-	HarnessManifest,
-	HostedAgent,
-	HostedAgentManifest,
-	HostedAgentPool,
-	HostedAgentPoolManifest,
-	HostedAgentPoolDefaults,
-	HostedAgentPoolAssignment,
-	HostedAgentPoolAssignmentManifest,
-	HostedAgentPoolUtilization,
-	HostedAgentInstance,
-	HostedAgentInstanceManifest,
-	HostedAgentAccessPolicy,
-	HostedAgentAccessPolicyManifest,
 	MessagePolicy,
 	MessagePolicyManifest,
 	MessagePolicyViolation,
 	MessagePolicyViolationFilters,
 	MessagePolicyViolationStats,
-	RestartNanobotAgentDeploymentsResult,
 	SystemMCPCatalog,
 	SystemMCPCatalogManifest,
 	SystemMCPServer,
@@ -131,6 +128,8 @@ import type {
 	CommunityLicenseEnrollment,
 	LLMAuditLog,
 	LLMAuditLogURLFilters,
+	EgressAuditLog,
+	EgressAuditLogURLFilters,
 	EnforcementDecisionAllowlistCheck,
 	EnforcementDecisionEvent,
 	EnforcementDecisionURLFilters,
@@ -333,6 +332,27 @@ export async function listLLMAuditLogFilterOptions(
 	return response;
 }
 
+// Egress audit logs
+
+export async function listEgressAuditLogs(
+	filters?: EgressAuditLogURLFilters,
+	opts?: { fetch?: Fetcher }
+) {
+	const queryString = buildQueryString(filters ?? {});
+	return (await doGet(`/egress-audit-logs${queryString ? `?${queryString}` : ''}`, opts)) as {
+		items: EgressAuditLog[] | null;
+		total: number;
+	};
+}
+
+export async function getEgressAuditLog(id: string, opts?: { fetch?: Fetcher }) {
+	return (await doGet(`/egress-audit-logs/${encodeURIComponent(id)}`, opts)) as EgressAuditLog;
+}
+
+export async function listEgressAuditLogEnvironments(opts?: { fetch?: Fetcher }) {
+	return (await doGet('/egress-audit-logs/environments', opts)) as Record<string, string>;
+}
+
 // Auth providers
 
 export async function listAuthProviders(opts?: { fetch?: Fetcher }): Promise<AuthProvider[]> {
@@ -343,7 +363,7 @@ export async function listAuthProviders(opts?: { fetch?: Fetcher }): Promise<Aut
 export async function configureAuthProvider(
 	authProviderID: string,
 	envs: Record<string, string>,
-	opts?: { fetch?: Fetcher }
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
 ): Promise<void> {
 	await doPost(`/auth-providers/${authProviderID}/configure`, envs, opts);
 }
@@ -373,7 +393,7 @@ export async function deconfigureAuthProvider(
 export async function stageAuthProvider(
 	authProviderID: string,
 	envs: Record<string, string>,
-	opts?: { fetch?: Fetcher }
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
 ): Promise<void> {
 	await doPost(`/auth-providers/${authProviderID}/stage`, envs, opts);
 }
@@ -401,6 +421,140 @@ export async function activateAuthProvider(
 	opts?: { fetch?: Fetcher }
 ): Promise<void> {
 	await doPost(`/auth-providers/${authProviderID}/activate`, {}, opts);
+}
+
+export async function getResidualGroupData(
+	authProviderID: string,
+	opts?: { fetch?: Fetcher }
+): Promise<ResidualGroupData> {
+	return (await doGet(`/auth-providers/${authProviderID}/residual-group-data`, {
+		...opts,
+		dontLogErrors: true
+	})) as ResidualGroupData;
+}
+
+// SCIM provisioning
+
+export async function listSCIMConnections(opts?: {
+	fetch?: Fetcher;
+	dontLogErrors?: boolean;
+}): Promise<SCIMConnection[]> {
+	const list = (await doGet('/scim-connections', opts)) as ItemsResponse<SCIMConnection>;
+	return list.items ?? [];
+}
+
+// Each list in the review holds its first page of `limit` items.
+export async function getSCIMConnectionReview(
+	id: string,
+	opts?: { fetch?: Fetcher; limit?: number; dontLogErrors?: boolean }
+): Promise<SCIMConnectionReview> {
+	const query = opts?.limit ? `?limit=${opts.limit}` : '';
+	return (await doGet(`/scim-connections/${id}/review${query}`, {
+		fetch: opts?.fetch,
+		dontLogErrors: opts?.dontLogErrors
+	})) as SCIMConnectionReview;
+}
+
+export async function listSCIMUsers(
+	id: string,
+	provisioned: boolean,
+	page: { offset: number; limit: number },
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<SCIMPage<SCIMSetupUser>> {
+	return (await doGet(
+		`/scim-connections/${id}/users?provisioned=${provisioned}&offset=${page.offset}&limit=${page.limit}`,
+		opts
+	)) as SCIMPage<SCIMSetupUser>;
+}
+
+export async function listSCIMGroups(
+	id: string,
+	list: SCIMGroupList,
+	page: { offset: number; limit: number },
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<SCIMPage<SCIMSetupGroup>> {
+	return (await doGet(
+		`/scim-connections/${id}/groups?list=${list}&offset=${page.offset}&limit=${page.limit}`,
+		opts
+	)) as SCIMPage<SCIMSetupGroup>;
+}
+
+export async function listSCIMFailures(
+	id: string,
+	page: { offset: number; limit: number },
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<SCIMPage<SCIMRequestFailure>> {
+	return (await doGet(
+		`/scim-connections/${id}/failures?offset=${page.offset}&limit=${page.limit}`,
+		opts
+	)) as SCIMPage<SCIMRequestFailure>;
+}
+
+export async function getSCIMEnablePreview(opts?: {
+	fetch?: Fetcher;
+	dontLogErrors?: boolean;
+}): Promise<SCIMEnablePreview> {
+	return (await doGet('/scim-connections/enable-preview', opts)) as SCIMEnablePreview;
+}
+
+// Enabling is permanent. The result carries the token, which is shown only once.
+export async function enableSCIM(opts?: { fetch?: Fetcher }): Promise<SCIMEnableResult> {
+	return (await doPost(
+		'/scim-connections',
+		{},
+		{ ...opts, dontLogErrors: true }
+	)) as SCIMEnableResult;
+}
+
+export async function deleteUnreferencedSCIMGroups(
+	id: string,
+	opts?: { fetch?: Fetcher }
+): Promise<SCIMGroupDeletionResult> {
+	return (await doPost(
+		`/scim-connections/${id}/delete-unreferenced-groups`,
+		{},
+		{ ...opts, dontLogErrors: true }
+	)) as SCIMGroupDeletionResult;
+}
+
+// Enforcing is permanent.
+export async function enforceSCIM(
+	id: string,
+	opts?: { fetch?: Fetcher }
+): Promise<SCIMEnforceResult> {
+	return (await doPost(
+		`/scim-connections/${id}/enforce`,
+		{},
+		{ ...opts, dontLogErrors: true }
+	)) as SCIMEnforceResult;
+}
+
+// Issues a new token, including the first one. The result carries it, and it is shown only once.
+export async function rotateSCIMToken(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<SCIMConnection> {
+	return (await doPost(`/scim-connections/${id}/rotate-token`, {}, opts)) as SCIMConnection;
+}
+
+// Replaces a leaked token: the current and previous tokens stop working at once. The result
+// carries the new token, which is shown only once.
+export async function revokeCurrentSCIMToken(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<SCIMConnection> {
+	return (await doPost(`/scim-connections/${id}/revoke-current-token`, {}, opts)) as SCIMConnection;
+}
+
+export async function revokePreviousSCIMToken(
+	id: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<SCIMConnection> {
+	return (await doPost(
+		`/scim-connections/${id}/revoke-previous-token`,
+		{},
+		opts
+	)) as SCIMConnection;
 }
 
 // Local auth provider users
@@ -930,6 +1084,17 @@ export async function createMCPCatalogEntry(
 	};
 }
 
+export async function revealMCPCatalogEntry(
+	catalogID: string,
+	entryID: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<Record<string, string>> {
+	return (await doPost(`/mcp-catalogs/${catalogID}/entries/${entryID}/reveal`, {}, opts)) as Record<
+		string,
+		string
+	>;
+}
+
 export async function updateMCPCatalogEntry(
 	catalogID: string,
 	entryID: string,
@@ -1325,36 +1490,6 @@ export async function getMCPCatalogServerOAuthURL(
 	}
 }
 
-export async function isMCPCatalogServerOauthNeeded(
-	catalogID: string,
-	serverID: string,
-	opts?: { signal?: AbortSignal }
-): Promise<boolean> {
-	try {
-		await doPost(`/mcp-catalogs/${catalogID}/servers/${serverID}/check-oauth`, {
-			dontLogErrors: true,
-			signal: opts?.signal
-		});
-	} catch (err) {
-		if (err instanceof HttpError && err.statusCode === 412) {
-			return true;
-		}
-	}
-	return false;
-}
-
-export async function triggerMcpCatalogServerUpdate(
-	catalogID: string,
-	mcpServerId: string,
-	opts?: { fetch?: Fetcher }
-): Promise<MCPCatalogServer> {
-	return (await doPost(
-		`/mcp-catalogs/${catalogID}/servers/${mcpServerId}/trigger-update`,
-		{},
-		opts
-	)) as MCPCatalogServer;
-}
-
 // MCP filters
 
 export async function listMCPFilters(opts?: { fetch?: Fetcher }) {
@@ -1459,35 +1594,49 @@ export async function getMCPServerById(
 	return response;
 }
 
+type OAuthDebuggerServer = Pick<MCPCatalogServer, 'id' | 'mcpCatalogID' | 'powerUserWorkspaceID'>;
+
+// The OAuth debugger routes are scoped like the server they debug; the backend rejects a
+// catalog or workspace server requested through another scope.
+function oauthDebuggerPath(server: OAuthDebuggerServer, action: string): string {
+	if (server.powerUserWorkspaceID) {
+		return `/workspaces/${server.powerUserWorkspaceID}/servers/${server.id}/oauth-debugger/${action}`;
+	}
+	if (server.mcpCatalogID) {
+		return `/mcp-catalogs/${server.mcpCatalogID}/servers/${server.id}/oauth-debugger/${action}`;
+	}
+	return `/mcp-servers/${server.id}/oauth-debugger/${action}`;
+}
+
 export async function registerMcpServerOAuthDebuggerClient(
-	serverID: string,
+	server: OAuthDebuggerServer,
 	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
 ): Promise<OAuthDebuggerRegisterClientResponse> {
 	return (await doPost(
-		`/mcp-servers/${serverID}/oauth-debugger/client`,
+		oauthDebuggerPath(server, 'client'),
 		{},
 		opts
 	)) as OAuthDebuggerRegisterClientResponse;
 }
 
 export async function getMCPServerOAuthDebuggerAuthorizationURL(
-	serverID: string,
+	server: OAuthDebuggerServer,
 	body: OAuthDebuggerAuthorizationURLRequest,
 	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
 ): Promise<OAuthDebuggerAuthorizationURL> {
 	return (await doPost(
-		`/mcp-servers/${serverID}/oauth-debugger/authorization-url`,
+		oauthDebuggerPath(server, 'authorization-url'),
 		body,
 		opts
 	)) as OAuthDebuggerAuthorizationURL;
 }
 
 export async function exchangeMCPServerOAuthDebuggerToken(
-	serverID: string,
+	server: OAuthDebuggerServer,
 	body: OAuthDebuggerTokenRequest,
 	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
 ): Promise<OAuthToken> {
-	return (await doPost(`/mcp-servers/${serverID}/oauth-debugger/token`, body, opts)) as OAuthToken;
+	return (await doPost(oauthDebuggerPath(server, 'token'), body, opts)) as OAuthToken;
 }
 
 // MCP tunnels
@@ -1705,6 +1854,23 @@ export async function validateModelProvider(
 	});
 }
 
+// Model proxy
+
+export async function getModelProxySettings(opts?: RequestOptions): Promise<ModelProxySettings> {
+	return (await doGet('/model-proxy', opts)) as ModelProxySettings;
+}
+
+export async function getModelProxyUsage(opts?: RequestOptions): Promise<ModelProxyUsage> {
+	return (await doGet('/model-proxy/usage', opts)) as ModelProxyUsage;
+}
+
+export async function updateModelProxySettings(
+	settings: ModelProxySettingsUpdateManifest,
+	opts?: RequestOptions
+): Promise<ModelProxySettings> {
+	return (await doPut('/model-proxy', settings, opts)) as ModelProxySettings;
+}
+
 // Models
 
 export async function listModels(opts?: { fetch?: Fetcher; all?: boolean }): Promise<Model[]> {
@@ -1722,12 +1888,6 @@ export async function updateDefaultModelAlias(
 	defaultModelAlias: DefaultModelAlias
 ): Promise<void> {
 	await doPut(`/default-model-aliases/${alias}`, defaultModelAlias);
-}
-
-// Projects
-
-export async function deleteProject(assistantID: string, projectID: string): Promise<void> {
-	await doDelete(`/assistants/${assistantID}/projects/${projectID}`);
 }
 
 // Setup
@@ -1887,312 +2047,6 @@ export async function deleteSkillAccessPolicy(
 	opts?: { signal?: AbortSignal }
 ): Promise<void> {
 	await doDelete(`/skill-access-rules/${id}`, opts);
-}
-
-// Agent sources
-
-export async function listAgentCatalogs(opts?: { fetch?: Fetcher }): Promise<AgentCatalog[]> {
-	const response = (await doGet('/agent-catalogs', opts)) as ItemsResponse<AgentCatalog>;
-	return response.items ?? [];
-}
-
-export async function getAgentCatalog(
-	id: string,
-	opts?: { fetch?: Fetcher }
-): Promise<AgentCatalog> {
-	return (await doGet(`/agent-catalogs/${id}`, opts)) as AgentCatalog;
-}
-
-export async function createAgentCatalog(
-	request: AgentCatalogManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<AgentCatalog> {
-	return (await doPost('/agent-catalogs', request, opts)) as AgentCatalog;
-}
-
-export async function updateAgentCatalog(
-	id: string,
-	request: AgentCatalogManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<AgentCatalog> {
-	return (await doPut(`/agent-catalogs/${id}`, request, opts)) as AgentCatalog;
-}
-
-export async function deleteAgentCatalog(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<void> {
-	await doDelete(`/agent-catalogs/${id}`, opts);
-}
-
-// refreshAgentCatalog asks the controller to sync now; poll getAgentCatalog until
-// isSyncing clears to see the result.
-export async function refreshAgentCatalog(id: string, opts?: { fetch?: Fetcher }): Promise<void> {
-	await doPost(`/agent-catalogs/${id}/refresh`, {}, opts);
-}
-
-// Harnesses
-
-export async function listHarnesses(opts?: { fetch?: Fetcher }): Promise<Harness[]> {
-	const response = (await doGet('/harnesses', opts)) as ItemsResponse<Harness>;
-	return response.items ?? [];
-}
-
-export async function getHarness(id: string, opts?: { fetch?: Fetcher }): Promise<Harness> {
-	return (await doGet(`/harnesses/${id}`, opts)) as Harness;
-}
-
-export async function createHarness(
-	request: HarnessManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<Harness> {
-	return (await doPost('/harnesses', request, opts)) as Harness;
-}
-
-export async function updateHarness(
-	id: string,
-	request: HarnessManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<Harness> {
-	return (await doPut(`/harnesses/${id}`, request, opts)) as Harness;
-}
-
-export async function deleteHarness(id: string, opts?: { signal?: AbortSignal }): Promise<void> {
-	await doDelete(`/harnesses/${id}`, opts);
-}
-
-// Hosted agents
-
-// Pass all: true as an admin to bypass access-policy filtering.
-export async function listHostedAgents(opts?: {
-	fetch?: Fetcher;
-	all?: boolean;
-}): Promise<HostedAgent[]> {
-	const url = opts?.all ? '/hosted-agents?all=true' : '/hosted-agents';
-	const response = (await doGet(url, opts)) as ItemsResponse<HostedAgent>;
-	return response.items ?? [];
-}
-
-export async function getHostedAgent(id: string, opts?: { fetch?: Fetcher }): Promise<HostedAgent> {
-	return (await doGet(`/hosted-agents/${id}`, opts)) as HostedAgent;
-}
-
-export async function createHostedAgent(
-	request: HostedAgentManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgent> {
-	return (await doPost('/hosted-agents', request, opts)) as HostedAgent;
-}
-
-export async function updateHostedAgent(
-	id: string,
-	request: HostedAgentManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgent> {
-	return (await doPut(`/hosted-agents/${id}`, request, opts)) as HostedAgent;
-}
-
-export async function deleteHostedAgent(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<void> {
-	await doDelete(`/hosted-agents/${id}`, opts);
-}
-
-// Hosted agent pools
-
-export async function listHostedAgentPools(opts?: { fetch?: Fetcher }): Promise<HostedAgentPool[]> {
-	const response = (await doGet('/hosted-agent-pools', opts)) as ItemsResponse<HostedAgentPool>;
-	return response.items ?? [];
-}
-
-export async function createHostedAgentPool(
-	request: HostedAgentPoolManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPool> {
-	return (await doPost('/hosted-agent-pools', request, opts)) as HostedAgentPool;
-}
-
-export async function updateHostedAgentPool(
-	id: string,
-	request: HostedAgentPoolManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPool> {
-	return (await doPut(`/hosted-agent-pools/${id}`, request, opts)) as HostedAgentPool;
-}
-
-export async function deleteHostedAgentPool(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<void> {
-	await doDelete(`/hosted-agent-pools/${id}`, opts);
-}
-
-export async function getHostedAgentPoolUtilization(
-	id: string,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPoolUtilization> {
-	return (await doGet(`/hosted-agent-pools/${id}/utilization`, opts)) as HostedAgentPoolUtilization;
-}
-
-export async function getHostedAgentPoolDefaults(opts?: {
-	fetch?: Fetcher;
-}): Promise<HostedAgentPoolDefaults> {
-	return (await doGet('/hosted-agent-pool-defaults', opts)) as HostedAgentPoolDefaults;
-}
-
-export async function createHostedAgentPoolDefaults(
-	request: HostedAgentPoolManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPoolDefaults> {
-	return (await doPost('/hosted-agent-pool-defaults', request, opts)) as HostedAgentPoolDefaults;
-}
-
-export async function updateHostedAgentPoolDefaults(
-	request: HostedAgentPoolManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPoolDefaults> {
-	return (await doPut('/hosted-agent-pool-defaults', request, opts)) as HostedAgentPoolDefaults;
-}
-
-export async function listHostedAgentPoolAssignments(opts?: {
-	fetch?: Fetcher;
-}): Promise<HostedAgentPoolAssignment[]> {
-	const response = (await doGet(
-		'/hosted-agent-pool-assignments',
-		opts
-	)) as ItemsResponse<HostedAgentPoolAssignment>;
-	return response.items ?? [];
-}
-
-export async function createHostedAgentPoolAssignment(
-	request: HostedAgentPoolAssignmentManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPoolAssignment> {
-	return (await doPost(
-		'/hosted-agent-pool-assignments',
-		request,
-		opts
-	)) as HostedAgentPoolAssignment;
-}
-
-export async function updateHostedAgentPoolAssignment(
-	id: string,
-	request: HostedAgentPoolAssignmentManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentPoolAssignment> {
-	return (await doPut(
-		`/hosted-agent-pool-assignments/${id}`,
-		request,
-		opts
-	)) as HostedAgentPoolAssignment;
-}
-
-export async function deleteHostedAgentPoolAssignment(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<void> {
-	await doDelete(`/hosted-agent-pool-assignments/${id}`, opts);
-}
-
-// revealHostedAgent returns the values of env vars marked sensitive, which are
-// never included in the agent itself.
-export async function revealHostedAgent(
-	id: string,
-	opts?: { fetch?: Fetcher }
-): Promise<Record<string, string>> {
-	return (await doPost(`/hosted-agents/${id}/reveal`, {}, opts)) as Record<string, string>;
-}
-
-// Hosted agent instances
-
-export async function listHostedAgentInstances(
-	hostedAgentID?: string,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentInstance[]> {
-	const queryString = hostedAgentID ? buildQueryString({ hosted_agent_id: hostedAgentID }) : '';
-	const response = (await doGet(
-		`/hosted-agent-instances${queryString ? `?${queryString}` : ''}`,
-		opts
-	)) as ItemsResponse<HostedAgentInstance>;
-	return response.items ?? [];
-}
-
-export async function getHostedAgentInstance(
-	id: string,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentInstance> {
-	return (await doGet(`/hosted-agent-instances/${id}`, opts)) as HostedAgentInstance;
-}
-
-export async function createHostedAgentInstance(
-	request: HostedAgentInstanceManifest & { hostedAgentID: string; poolID?: string },
-	opts?: { fetch?: Fetcher; errorHandler?: ErrorHandler }
-): Promise<HostedAgentInstance> {
-	return (await doPost('/hosted-agent-instances', request, opts)) as HostedAgentInstance;
-}
-
-export async function updateHostedAgentInstance(
-	id: string,
-	request: HostedAgentInstanceManifest,
-	opts?: { fetch?: Fetcher; errorHandler?: ErrorHandler }
-): Promise<HostedAgentInstance> {
-	return (await doPut(`/hosted-agent-instances/${id}`, request, opts)) as HostedAgentInstance;
-}
-
-export async function deleteHostedAgentInstance(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<void> {
-	await doDelete(`/hosted-agent-instances/${id}`, opts);
-}
-
-// Hosted agent access policies
-//
-// The UI calls these "Access Policies"; the API resource is
-// hosted-agent-access-rules. This mirrors the skill access policy naming.
-
-export async function listHostedAgentAccessPolicies(opts?: {
-	fetch?: Fetcher;
-}): Promise<HostedAgentAccessPolicy[]> {
-	const response = (await doGet(
-		'/hosted-agent-access-rules',
-		opts
-	)) as ItemsResponse<HostedAgentAccessPolicy>;
-	return response.items ?? [];
-}
-
-export async function getHostedAgentAccessPolicy(
-	id: string,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentAccessPolicy> {
-	return (await doGet(`/hosted-agent-access-rules/${id}`, opts)) as HostedAgentAccessPolicy;
-}
-
-export async function createHostedAgentAccessPolicy(
-	request: HostedAgentAccessPolicyManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentAccessPolicy> {
-	return (await doPost('/hosted-agent-access-rules', request, opts)) as HostedAgentAccessPolicy;
-}
-
-export async function updateHostedAgentAccessPolicy(
-	id: string,
-	request: HostedAgentAccessPolicyManifest,
-	opts?: { fetch?: Fetcher }
-): Promise<HostedAgentAccessPolicy> {
-	return (await doPut(
-		`/hosted-agent-access-rules/${id}`,
-		request,
-		opts
-	)) as HostedAgentAccessPolicy;
-}
-
-export async function deleteHostedAgentAccessPolicy(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<void> {
-	await doDelete(`/hosted-agent-access-rules/${id}`, opts);
 }
 
 // Storage credentials
@@ -2410,21 +2264,6 @@ export async function getSystemMCPServerTools(
 	return (await doGet(`/system-mcp-servers/${id}/tools`, opts)) as MCPServerTool[];
 }
 
-export async function restartNanobotAgentDeployments(opts?: {
-	fetch?: Fetcher;
-	dryRun?: boolean;
-}): Promise<RestartNanobotAgentDeploymentsResult> {
-	const params = new URLSearchParams();
-	if (opts?.dryRun != null) {
-		params.set('dryRun', String(opts.dryRun));
-	}
-	const qs = params.toString();
-	const path = qs
-		? `/system-mcp-servers/restart-nanobot-agent-deployments?${qs}`
-		: '/system-mcp-servers/restart-nanobot-agent-deployments';
-	return (await doPost(path, {}, opts)) as RestartNanobotAgentDeploymentsResult;
-}
-
 // Token usage
 
 function formatTokenUsageDate(d: Date | string): string {
@@ -2508,6 +2347,11 @@ export async function updateUserRole(
 
 export async function deleteUser(userID: string): Promise<void> {
 	await doDelete(`/users/${userID}`);
+}
+
+// Restores a disabled user's access. Refused while SCIM manages the user.
+export async function enableUser(userID: string): Promise<void> {
+	await doPost(`/users/${userID}/enable`, {});
 }
 
 // Workspaces

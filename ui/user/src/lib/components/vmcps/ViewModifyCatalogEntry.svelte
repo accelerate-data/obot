@@ -6,8 +6,15 @@
 	import McpServerActions from '$lib/components/mcp/McpServerActions.svelte';
 	import SelectServerType from '$lib/components/mcp/SelectServerType.svelte';
 	import { DEFAULT_MCP_CATALOG_ID } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import { AdminService, UserService, type LaunchType, type MCPCatalogEntry } from '$lib/services';
-	import { getServerTypeLabelByType, isDeprecatedMCPServer } from '$lib/services/user/mcp';
+	import type { OpenAPIImportDraft } from '$lib/services/openapi';
+	import {
+		getServerTypeLabelByType,
+		isDeprecatedMCPServer,
+		getMcpValueLabel
+	} from '$lib/services/user/mcp';
+	import { mcpServerNeedsStaticOAuthConfiguration } from '$lib/services/vmcps/utils';
 	import { errors, mcpServersAndEntries, profile, responsive } from '$lib/stores';
 	import { Plus } from '@lucide/svelte';
 	import { twMerge } from 'tailwind-merge';
@@ -18,7 +25,6 @@
 		onCreated?: (created: MCPCatalogEntry) => void | Promise<void>;
 		onAddToVMcp?: (entry: MCPCatalogEntry) => void | Promise<void>;
 		addToVMcpLabel?: string;
-		isAddedToVMcp?: (entry: MCPCatalogEntry) => boolean;
 	}
 
 	let {
@@ -26,12 +32,12 @@
 		rightOffsetWidth,
 		onCreated,
 		onAddToVMcp,
-		addToVMcpLabel = 'Add to vMCP',
-		isAddedToVMcp
+		addToVMcpLabel = m.vmcps_add_to_vmcp()
 	}: Props = $props();
 	let selectServerTypeDialog = $state<ReturnType<typeof SelectServerType>>();
 	let dialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let selectedServerType = $state<LaunchType>();
+	let initialOpenAPIImport = $state<OpenAPIImportDraft>();
 	let creating = $state(false);
 	let closeAfterCreate = $state(false);
 	let catalogEntry = $state<MCPCatalogEntry>();
@@ -45,17 +51,20 @@
 	let viewWorkspaceId = $derived(catalogEntry?.powerUserWorkspaceID);
 	let serverScopeEntity = $derived(viewWorkspaceId ? ('workspace' as const) : ('catalog' as const));
 	let serverScopeID = $derived(viewWorkspaceId || DEFAULT_MCP_CATALOG_ID);
-	let isSourcedEntry = $derived(
-		catalogEntry && 'sourceURL' in catalogEntry && !!catalogEntry.sourceURL
-	);
 	let deprecated = $derived(isDeprecatedMCPServer(catalogEntry));
 	let catalogEntryFormType = $derived<LaunchType>(
-		catalogEntry?.manifest.runtime === 'remote' ? 'remote' : 'hosted'
+		catalogEntry?.manifest.runtime === 'openapi'
+			? 'openapi'
+			: catalogEntry?.manifest.runtime === 'remote'
+				? 'remote'
+				: 'hosted'
 	);
 	let title = $derived(
 		creating
-			? `Create ${getServerTypeLabelByType(selectedServerType)} Entry`
-			: (catalogEntry?.manifest.name ?? 'MCP Server')
+			? m.vmcps_create_type_entry({
+					type: getMcpValueLabel(getServerTypeLabelByType(selectedServerType))
+				})
+			: (catalogEntry?.manifest.name ?? m.vmcps_mcp_server())
 	);
 	let formKey = $derived(
 		creating
@@ -87,11 +96,12 @@
 		if (hydrateController === controller) hydrateController = undefined;
 	}
 
-	function handleSelectServerType(serverType: LaunchType) {
+	function handleSelectServerType(serverType: LaunchType, openAPIImport?: OpenAPIImportDraft) {
 		selectServerTypeDialog?.close();
 		resetView();
 		selectedServerType = serverType;
 		creating = true;
+		initialOpenAPIImport = openAPIImport;
 		dialog?.open();
 	}
 
@@ -100,19 +110,22 @@
 		reset();
 	}
 
-	let alreadyAdded = $derived(Boolean(catalogEntry && isAddedToVMcp?.(catalogEntry)));
+	let needsConfiguration = $derived(
+		Boolean(catalogEntry && mcpServerNeedsStaticOAuthConfiguration(catalogEntry))
+	);
 	let showAddToVMcp = $derived(
 		Boolean(onAddToVMcp && catalogEntry && !creating && responsive.isMobile)
 	);
 
 	function handleAddToVMcp() {
-		if (!catalogEntry || alreadyAdded) return;
+		if (!catalogEntry || needsConfiguration) return;
 		const entry = catalogEntry;
 		close();
 		void onAddToVMcp?.(entry);
 	}
 
 	function resetView() {
+		initialOpenAPIImport = undefined;
 		hydrateController?.abort();
 		hydrateController = undefined;
 		catalogEntry = undefined;
@@ -169,7 +182,7 @@
 			await mcpServersAndEntries.refreshAll();
 			await onCreated?.(createdEntry);
 		} catch {
-			errors.append('The entry was created, but it could not be opened.');
+			errors.append(m.vmcps_entry_created_not_opened());
 			close();
 		}
 	}
@@ -213,26 +226,32 @@
 				/>
 			{/if}
 			{#if creating}
-				<McpServerEntryForm
-					hideTitleBarAction
-					entity={createEntity}
-					type={selectedServerType}
-					id={createScopeId}
-					onCancel={close}
-					onSubmit={handleCreated}
-					excludeViews={['overview']}
-					isDialogView
-				/>
+				{#if selectedServerType}
+					<McpServerEntryForm
+						hideTitleBarAction
+						{initialOpenAPIImport}
+						entity={createEntity}
+						type={selectedServerType}
+						id={createScopeId}
+						onCancel={close}
+						onSubmit={handleCreated}
+						excludeViews={['overview']}
+						isDialogView
+					/>
+				{/if}
 			{:else if catalogEntry}
 				<McpServerEntryForm
 					hideTitleBarAction
 					entry={catalogEntry}
 					type={catalogEntryFormType}
-					readonly={isAdminReadonly || isSourcedEntry}
+					readonly={isAdminReadonly || Boolean(catalogEntry?.sourceURL)}
 					id={serverScopeID}
 					entity={serverScopeEntity}
 					limitViews={['overview', 'tools']}
 					isDialogView
+					onAddFromTools={onAddToVMcp ? handleAddToVMcp : undefined}
+					disableAddFromTools={needsConfiguration}
+					disableAddFromToolsLabel={m.vmcps_admin_configuration_required()}
 				/>
 			{/if}
 			{#if showAddToVMcp}
@@ -240,11 +259,11 @@
 					<button
 						type="button"
 						class="btn btn-primary w-full"
-						disabled={alreadyAdded}
+						disabled={needsConfiguration}
 						onclick={handleAddToVMcp}
 					>
 						<Plus class="size-4" />
-						{alreadyAdded ? 'Already added to vMCP' : addToVMcpLabel}
+						{needsConfiguration ? m.vmcps_admin_configuration_required() : addToVMcpLabel}
 					</button>
 				</div>
 			{/if}
@@ -269,7 +288,6 @@
 			{promptOAuthConfig}
 			onOAuthConfigured={handleOAuthConfigured}
 			hideActions
-			skipConnectDialog
 		/>
 	{/if}
 {/key}

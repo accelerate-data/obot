@@ -1,4 +1,5 @@
 import { encodeUtf8ToBase64 } from '$lib/format';
+import { m } from '$lib/i18n';
 import { mcpServersAndEntries, profile } from '$lib/stores';
 import { getUserDisplayName } from '$lib/utils';
 import {
@@ -111,8 +112,9 @@ export function hasSecretBinding(field?: Partial<MCPSubField> | null): boolean {
 	return Boolean(field?.secretBinding?.name && field?.secretBinding?.key);
 }
 
-function hasEditableFields(fields?: MCPSubField[]) {
-	return (fields ?? []).some((field) => !hasSecretBinding(field));
+// Static and secret-bound values are supplied by the catalog, not entered by the user.
+export function hasEditableFields(fields?: MCPSubField[]) {
+	return (fields ?? []).some((field) => !field.value && !field.static && !hasSecretBinding(field));
 }
 
 function hasEditableURL(remoteConfig?: { fixedURL?: string; hostname?: string } | null) {
@@ -151,9 +153,7 @@ export function hasEditableConfiguration(
 	const hasUrlToFill = hasEditableURL(item.manifest?.remoteConfig);
 	const fields = getManifestConfiguration(item.manifest);
 	const hasEnvsToFill = hasEditableFields(fields.env);
-	const hasHeadersToFill =
-		(fields.headers.filter((header) => !header.value && !hasSecretBinding(header))?.length ?? 0) >
-		0;
+	const hasHeadersToFill = hasEditableFields(fields.headers);
 
 	return hasUrlToFill || hasEnvsToFill || hasHeadersToFill;
 }
@@ -203,7 +203,7 @@ export function getSecretBindingEngineError(
 	manifest?: SecretBindingManifest | null
 ): string | undefined {
 	if (!manifestHasSecretBindings(manifest)) return undefined;
-	return 'This MCP server uses Kubernetes Secret bindings and can only be launched when Obot is using the Kubernetes engine.';
+	return m.core_secret_binding_engine_error();
 }
 
 export function requiresUserUpdate(server?: MCPCatalogServer) {
@@ -250,11 +250,61 @@ export function requiresAdminOAuthConfig(server?: MCPCatalogServer): boolean {
 	return 'missingOAuthCredentials' in server && server.missingOAuthCredentials === true;
 }
 
+// MCP table rows keep these values in English because columns filter and sort on them and
+// filters are saved in URLs. Translate them only when displaying a cell or filter option.
+const MCP_VALUE_LABELS: Record<string, () => string> = {
+	'My Registry': m.core_mcp_value_my_registry,
+	'Global Registry': m.core_mcp_value_global_registry,
+	'Unknown Registry': m.core_mcp_value_unknown_registry,
+	'Obot Admin Console': m.core_mcp_value_admin_console,
+	Deployed: m.core_mcp_value_deployed,
+	Connected: m.core_mcp_value_connected,
+	'Requires OAuth Config': m.core_mcp_value_requires_oauth_config,
+	'Configuration Required': m.core_mcp_value_configuration_required,
+	Hosted: m.core_mcp_value_hosted,
+	Remote: m.core_mcp_value_remote,
+	Deployment: m.core_mcp_value_deployment,
+	'Up to date': m.core_mcp_value_up_to_date,
+	'Needs Scheduling Update': m.core_mcp_value_needs_scheduling_update,
+	'Not Configured': m.core_mcp_value_not_configured,
+	'Tunnel Disconnected': m.core_mcp_value_tunnel_disconnected
+};
+
+const USER_REGISTRY_SUFFIX = "'s Registry";
+
+/** Display label for a stable MCP table value (status, type, registry, source). Unknown values pass through. */
+export function getMcpValueLabel(value: unknown): string {
+	if (value === undefined || value === null) return '';
+	const text = String(value);
+	const label = MCP_VALUE_LABELS[text];
+	if (label) return label();
+	if (text.endsWith(USER_REGISTRY_SUFFIX)) {
+		return m.core_mcp_value_users_registry({ name: text.slice(0, -USER_REGISTRY_SUFFIX.length) });
+	}
+	return text;
+}
+
+const MCP_LABELED_COLUMNS = new Set([
+	'type',
+	'status',
+	'source',
+	'registry',
+	'updateStatus',
+	'updatesAvailable',
+	'deploymentStatus'
+]);
+
+/** `Table` `displayValue` for MCP server tables: translates the stable status/type/registry columns. */
+export function mcpTableDisplayValue(property: string, value: unknown): string {
+	if (Array.isArray(value)) return value.map((v) => mcpTableDisplayValue(property, v)).join(', ');
+	return MCP_LABELED_COLUMNS.has(property) ? getMcpValueLabel(value) : String(value ?? '');
+}
+
 function getRegistryName(userID: string, usersMap?: Map<string, OrgUser>): string {
 	return userID === profile.current.id
 		? 'My Registry'
 		: usersMap
-			? `${getUserDisplayName(usersMap, userID)}'s Registry`
+			? `${getUserDisplayName(usersMap, userID)}${USER_REGISTRY_SUFFIX}`
 			: 'Unknown Registry';
 }
 
@@ -470,6 +520,7 @@ export function isMultiUserServer(server?: MCPCatalogServer) {
 
 export function getServerTypeLabelByType(type?: string) {
 	if (!type) return '';
+	if (type === 'openapi') return 'OpenAPI';
 	return type === 'hosted'
 		? 'Hosted'
 		: type === 'multi'
@@ -515,17 +566,13 @@ export function getServerUrl(d: MCPCatalogServer, prefixPath?: string) {
 	return url;
 }
 
-const NANOBOT_AGENT_SERVER_PREFIX = 'nba1';
 export const compileAvailableMcpServers = (
 	servers: MCPCatalogServer[],
 	userConfiguredServers: MCPCatalogServer[]
 ) => {
 	const serverMap = new Map<string, MCPCatalogServer>();
 	for (const server of [...userConfiguredServers, ...servers]) {
-		const isNanobotAgentServer = server.manifest.name
-			? server.manifest.name.toLowerCase().startsWith(NANOBOT_AGENT_SERVER_PREFIX)
-			: false;
-		if (!server.deleted && !isNanobotAgentServer) {
+		if (!server.deleted) {
 			serverMap.set(server.id, server);
 		}
 	}
@@ -534,49 +581,26 @@ export const compileAvailableMcpServers = (
 
 const SERVER_UPGRADES_AVAILABLE = {
 	NONE: 'Up to date',
-	BOTH: 'Needs Scheduling and Config Update',
-	SERVER: 'Needs Config Update',
 	K8S: 'Needs Scheduling Update'
-};
-const SERVER_UPGRADES_AVAILABLE_TOOLTIP = {
-	SERVER:
-		'The configuration for this server’s registry entry has changed and can be applied to this server',
-	K8S: 'The default server scheduling rules have changed and can be applied to this server',
-	BOTH: 'The configuration for this server’s registry entry has changed and can be applied to this server\nThe default server scheduling rules have changed and can be applied to this server.'
 };
 
 export const getMcpServerDeploymentStatus = (
-	deployment: { needsUpdate?: boolean; needsK8sUpdate?: boolean; compositeName?: string },
+	deployment: { needsK8sUpdate?: boolean; compositeName?: string },
 	doesSupportK8sUpdates: boolean
 ) => {
-	const needsUpdate = deployment.needsUpdate && !deployment.compositeName;
-	const needsK8sUpdate =
-		doesSupportK8sUpdates && deployment.needsK8sUpdate && !deployment.compositeName;
-
-	type ServerUpgradesAvailable =
-		(typeof SERVER_UPGRADES_AVAILABLE)[keyof typeof SERVER_UPGRADES_AVAILABLE];
-	let updateStatus: ServerUpgradesAvailable;
-	let updatesAvailable: ServerUpgradesAvailable[];
-	let updateStatusTooltip: string | undefined = undefined;
-
-	if (needsUpdate && needsK8sUpdate && doesSupportK8sUpdates) {
-		updateStatus = SERVER_UPGRADES_AVAILABLE.BOTH;
-		updatesAvailable = [SERVER_UPGRADES_AVAILABLE.SERVER, SERVER_UPGRADES_AVAILABLE.K8S];
-		updateStatusTooltip = SERVER_UPGRADES_AVAILABLE_TOOLTIP.BOTH;
-	} else if (needsUpdate) {
-		updateStatus = SERVER_UPGRADES_AVAILABLE.SERVER;
-		updatesAvailable = [SERVER_UPGRADES_AVAILABLE.SERVER];
-		updateStatusTooltip = SERVER_UPGRADES_AVAILABLE_TOOLTIP.SERVER;
-	} else if (needsK8sUpdate && doesSupportK8sUpdates) {
-		updateStatus = SERVER_UPGRADES_AVAILABLE.K8S;
-		updatesAvailable = [SERVER_UPGRADES_AVAILABLE.K8S];
-		updateStatusTooltip = SERVER_UPGRADES_AVAILABLE_TOOLTIP.K8S;
-	} else {
-		updateStatus = SERVER_UPGRADES_AVAILABLE.NONE;
-		updatesAvailable = [SERVER_UPGRADES_AVAILABLE.NONE];
+	if (doesSupportK8sUpdates && deployment.needsK8sUpdate && !deployment.compositeName) {
+		return {
+			updateStatus: SERVER_UPGRADES_AVAILABLE.K8S,
+			updatesAvailable: [SERVER_UPGRADES_AVAILABLE.K8S],
+			updateStatusTooltip: m.core_mcp_update_tooltip_k8s()
+		};
 	}
 
-	return { updateStatus, updatesAvailable, updateStatusTooltip };
+	return {
+		updateStatus: SERVER_UPGRADES_AVAILABLE.NONE,
+		updatesAvailable: [SERVER_UPGRADES_AVAILABLE.NONE],
+		updateStatusTooltip: undefined
+	};
 };
 
 function hasCompleteConfigurationOptions(env: NonNullable<MCPServerInfo['env']>[number]) {
@@ -613,7 +637,12 @@ function validateEnvs(type: LaunchServerType | 'filter', envs: MCPServerInfo['en
 	return envs.every((env) => {
 		if (!env.key.trim()) return false;
 		if (env.options?.length) return hasCompleteConfigurationOptions(env);
-		return Boolean(env.value?.trim()) || hasSecretBinding(env) || Boolean(env.name.trim());
+		return (
+			Boolean(env.value?.trim()) ||
+			Boolean(env.static) ||
+			hasSecretBinding(env) ||
+			Boolean(env.name.trim())
+		);
 	});
 }
 
@@ -623,14 +652,20 @@ function validateHeaders(type: LaunchServerType | 'filter', headers: MCPServerIn
 	return headers.every((header) => {
 		if (!header.key.trim()) return false;
 		if (header.options?.length) return hasCompleteConfigurationOptions(header);
-		return Boolean(header.value?.trim()) || hasSecretBinding(header) || Boolean(header.name.trim());
+		return (
+			Boolean(header.value?.trim()) ||
+			Boolean(header.static) ||
+			hasSecretBinding(header) ||
+			Boolean(header.name.trim())
+		);
 	});
 }
 
 export const validateRuntimeForm = (
 	formData: RuntimeFormData,
 	type: LaunchServerType | 'filter',
-	nameNotRequired: boolean = false
+	nameNotRequired: boolean = false,
+	openAPIImported: boolean = false
 ): { required: Record<string, boolean>; invalid: Record<string, boolean> } => {
 	const missingFields: Record<string, boolean> = {};
 	const invalid: Record<string, boolean> = {};
@@ -664,6 +699,9 @@ export const validateRuntimeForm = (
 
 	// Runtime-specific validation
 	switch (formData.runtime) {
+		case 'openapi':
+			if (!openAPIImported) missingFields.openAPIImport = true;
+			break;
 		case 'npx':
 			if (!formData.npxConfig?.package?.trim()) {
 				missingFields.package = true;
@@ -880,6 +918,9 @@ export const convertServerRuntimeFormDataToManifest = (
 			if (baseData.remoteServerConfig) {
 				serverManifest.manifest.remoteConfig = {
 					url: baseData.remoteServerConfig.url,
+					localhostCallbackEnabled: baseData.remoteServerConfig.localhostCallbackEnabled,
+					localhostCallbackPath:
+						baseData.remoteServerConfig.localhostCallbackPath?.trim() || undefined,
 					tunnelName: baseData.remoteServerConfig.tunnelName
 				};
 			}
@@ -908,8 +949,7 @@ export function deriveToolPrefix(name: string): string {
 export const TOOL_NAME_CHARSET_REGEX = /^[A-Za-z0-9._/-]*$/;
 export const MAX_TOOL_PREFIX_LENGTH = 64;
 export const MAX_TOOL_NAME_LENGTH = 128;
-export const TOOL_NAME_SPECIAL_CHAR_WARNING =
-	"'.' and '/' in MCP server tool names are not supported by some clients.";
+export const TOOL_NAME_SPECIAL_CHAR_WARNING = m.core_tool_name_special_char_warning();
 
 export type ToolNameIssue = { severity: 'warning' | 'error'; message: string };
 
@@ -953,18 +993,18 @@ export function isToolCustomized(tool: {
 // the same severity, first match wins.
 export function toolNameIssue(effectiveName: string): ToolNameIssue | undefined {
 	if (!TOOL_NAME_CHARSET_REGEX.test(effectiveName)) {
-		return { severity: 'error', message: 'Tool name contains invalid characters.' };
+		return { severity: 'error', message: m.core_tool_name_invalid_chars() };
 	}
 	if (effectiveName.length > MAX_TOOL_NAME_LENGTH) {
 		return {
 			severity: 'error',
-			message: `Tool name exceeds the maximum length of ${MAX_TOOL_NAME_LENGTH} characters.`
+			message: m.core_tool_name_too_long({ max: MAX_TOOL_NAME_LENGTH })
 		};
 	}
 	if (effectiveName.length > 64) {
 		return {
 			severity: 'warning',
-			message: `Tool names exceeding 64 characters aren't supported by some MCP clients and inference APIs.`
+			message: m.core_tool_name_over_64()
 		};
 	}
 	if (/[./]/.test(effectiveName)) {
@@ -987,7 +1027,8 @@ export function toolOverridesFromRows(rows: CompositeServerToolRow[]): ToolOverr
 			description: row.description,
 			overrideName,
 			overrideDescription,
-			enabled: row.enabled
+			enabled: row.removed ? false : row.enabled,
+			...(row.removed ? { removed: true } : {})
 		};
 	});
 }
@@ -1030,7 +1071,7 @@ export function conflictIssue(
 	duplicates: Set<string>
 ): ToolNameIssue | undefined {
 	if (!duplicates.has(effectiveName)) return undefined;
-	return { severity: 'error', message: 'Tool name is not unique.' };
+	return { severity: 'error', message: m.core_tool_name_not_unique() };
 }
 
 // Shared scope-routing helpers for multi-user server operations.
@@ -1042,7 +1083,7 @@ export async function restartMcpServer(
 	catalogID?: string
 ): Promise<void> {
 	if (!supportsMCPBackendDetails(server)) {
-		throw new Error('This MCP server runtime does not support restart.');
+		throw new Error(m.core_runtime_no_restart());
 	}
 
 	if (isMultiUserServer(server)) {
@@ -1051,7 +1092,7 @@ export async function restartMcpServer(
 		} else {
 			const serverCatalogID = catalogID || server.mcpCatalogID;
 			if (!serverCatalogID) {
-				throw new Error('Catalog ID is required to restart this MCP server.');
+				throw new Error(m.core_catalog_id_required_restart());
 			}
 			await AdminService.restartMcpCatalogServerDeployment(serverCatalogID, server.id);
 		}
@@ -1070,7 +1111,7 @@ export async function deleteMcpServerDeployment(
 		} else {
 			const serverCatalogID = catalogID || server.mcpCatalogID;
 			if (!serverCatalogID) {
-				throw new Error('Catalog ID is required to delete this MCP server.');
+				throw new Error(m.core_catalog_id_required_delete());
 			}
 			await AdminService.deleteMCPCatalogServer(serverCatalogID, server.id);
 		}
@@ -1099,10 +1140,18 @@ export async function disconnectMcpServerUser(server: MCPCatalogServer): Promise
 	await UserService.deleteSingleOrRemoteMcpServer(server.id);
 }
 
+export function getLocalhostCallbackPaths(config?: {
+	localhostCallbackEnabled?: boolean;
+	localhostCallbackPath?: string;
+}): string[] {
+	return config?.localhostCallbackEnabled
+		? [config.localhostCallbackPath || '/oauth/callback']
+		: [];
+}
+
 export function getAiClientCommand(client: AiClient, id: string, url: string): string {
 	const idArg = JSON.stringify(id);
 	const urlArg = JSON.stringify(url);
-
 	const commands = {
 		[AiClient.Claude]: `claude mcp add --transport http ${idArg} ${urlArg}`,
 		[AiClient.Codex]: `codex mcp add ${idArg} --url ${urlArg}`
@@ -1111,21 +1160,12 @@ export function getAiClientCommand(client: AiClient, id: string, url: string): s
 }
 
 function generateCursorMagicLink(displayName: string, url: string): string {
-	const cursorConfig = {
-		type: 'http',
-		url: url
-	};
-	const cursorBase64 = encodeUtf8ToBase64(JSON.stringify(cursorConfig));
+	const cursorBase64 = encodeUtf8ToBase64(JSON.stringify({ type: 'http', url }));
 	return `cursor://anysphere.cursor-deeplink/mcp/install?name=${encodeURIComponent(displayName)}&config=${encodeURIComponent(cursorBase64)}`;
 }
 
 function generateVsCodeMagicLink(displayName: string, url: string): string {
-	const vscodeConfig = {
-		name: displayName,
-		type: 'http',
-		url: url
-	};
-	return `vscode:mcp/install?${encodeURIComponent(JSON.stringify(vscodeConfig))}`;
+	return `vscode:mcp/install?${encodeURIComponent(JSON.stringify({ name: displayName, type: 'http', url }))}`;
 }
 
 export function getAiClientMagicLink(client: AiClient, displayName: string, url: string): string {
@@ -1133,5 +1173,30 @@ export function getAiClientMagicLink(client: AiClient, displayName: string, url:
 		[AiClient.Cursor]: generateCursorMagicLink,
 		[AiClient.VSCode]: generateVsCodeMagicLink
 	};
-	return fn[client as keyof typeof fn] ? fn[client as keyof typeof fn](displayName, url) : '';
+	return fn[client as keyof typeof fn]?.(displayName, url) ?? '';
+}
+
+// Local UI login URLs refer to a specific pending OAuth attempt, not a server.
+export function isMcpLoginURL(value: string): boolean {
+	try {
+		const url = new URL(value, UserService.baseURL);
+		const trustedOrigins = [new URL(UserService.baseURL).origin];
+		// Development OAuth responses can point directly at Vite's API proxy target.
+		if (import.meta.env.DEV) {
+			trustedOrigins.push(
+				new URL(import.meta.env.VITE_API_TARGET || 'http://localhost:8080').origin
+			);
+		}
+		return (
+			(url.protocol === 'http:' || url.protocol === 'https:') &&
+			trustedOrigins.includes(url.origin) &&
+			!url.username &&
+			!url.password &&
+			[...url.searchParams.keys()].every((key) => key === 'serverName') &&
+			!url.hash &&
+			/\/oauth\/mcp\/login\/[^/]+$/.test(url.pathname)
+		);
+	} catch {
+		return false;
+	}
 }

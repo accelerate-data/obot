@@ -1,16 +1,21 @@
 <script lang="ts">
+	import { m } from '$lib/i18n';
 	import type { LaunchType } from '$lib/services';
+	import type { OpenAPIImportDraft } from '$lib/services/openapi';
+	import { profile } from '$lib/stores';
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
-	import { Container, Users } from '@lucide/svelte';
+	import OpenAPIImportDialog from './OpenAPIImportDialog.svelte';
+	import { Container, Users, FileCode } from '@lucide/svelte';
 
 	interface Props {
-		onSelectServerType: (type: LaunchType) => void;
+		onSelectServerType: (type: LaunchType, openAPIImport?: OpenAPIImportDraft) => void;
 		entity?: 'catalog' | 'workspace';
 		hideComposite?: boolean;
 	}
 
 	let selectServerTypeDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let { onSelectServerType }: Props = $props();
+	let importingOpenAPI = $state(false);
 
 	export function open() {
 		selectServerTypeDialog?.open();
@@ -19,42 +24,78 @@
 	export function close() {
 		selectServerTypeDialog?.close();
 	}
+
+	function startOpenAPIImport() {
+		selectServerTypeDialog?.close();
+		importingOpenAPI = true;
+	}
 </script>
 
-<ResponsiveDialog title="Select Server Type" class="md:w-lg" bind:this={selectServerTypeDialog}>
+<ResponsiveDialog
+	title={m.mcps_catalog_select_server_type_title()}
+	class="md:w-lg"
+	bind:this={selectServerTypeDialog}
+>
 	<div class="flex flex-col gap-4 p-4 md:p-0">
 		<button
 			id="add-hosted-server-button"
-			class="dark:bg-base-300 hover:bg-base-200 dark:hover:bg-base-400 dark:border-base-400 border-base-300 group bg-base-100 flex cursor-pointer items-center gap-4 rounded-md border px-2 py-4 text-left transition-colors duration-300"
+			class="dark:bg-base-300 hover:bg-base-200 dark:hover:bg-base-400 dark:border-base-400 border-base-300 group bg-base-100 flex cursor-pointer items-center gap-4 rounded-md border px-2 py-4 text-left transition-colors duration-300 min-h-30.5"
 			onclick={() => onSelectServerType('hosted')}
 		>
 			<Users
 				class="text-muted-content size-12 shrink-0 pl-1 transition-colors group-hover:text-inherit"
 			/>
 			<div>
-				<p class="mb-1 text-sm font-semibold">Hosted Server</p>
+				<p class="mb-1 text-sm font-semibold">{m.mcps_catalog_select_server_type_hosted()}</p>
 				<span class="text-muted-content block text-xs leading-4">
-					This option is appropriate for setting up a MCP server hosted under the Obot platform. It
-					can be configured for individualized access or shared under multiple users.
+					{m.mcps_catalog_select_server_type_hosted_description()}
 				</span>
 			</div>
 		</button>
 		<button
 			id="add-remote-server-button"
-			class="dark:bg-base-300 hover:bg-base-200 dark:hover:bg-base-400 dark:border-base-400 border-base-300 group bg-base-100 flex cursor-pointer items-center gap-4 rounded-md border px-2 py-4 text-left transition-colors duration-300"
+			class="dark:bg-base-300 hover:bg-base-200 dark:hover:bg-base-400 dark:border-base-400 border-base-300 group bg-base-100 flex cursor-pointer items-center gap-4 rounded-md border px-2 py-4 text-left transition-colors duration-300 min-h-30.5"
 			onclick={() => onSelectServerType('remote')}
 		>
 			<Container
 				class="text-muted-content size-12 shrink-0 pl-1 transition-colors group-hover:text-inherit"
 			/>
 			<div>
-				<p class="mb-1 text-sm font-semibold">Remote Server</p>
+				<p class="mb-1 text-sm font-semibold">{m.mcps_catalog_select_server_type_remote()}</p>
 				<span class="text-muted-content block text-xs leading-4">
-					This option is appropriate for allowing users to connect to MCP servers that are already
-					elsewhere. When a user selects this server, their connection to the remote MCP server will
-					go through the Obot gateway.
+					{m.mcps_catalog_select_server_type_remote_description()}
 				</span>
 			</div>
 		</button>
+		{#if profile.current.isAdmin?.()}
+			<button
+				id="add-openapi-server-button"
+				class="dark:bg-base-300 hover:bg-base-200 dark:hover:bg-base-400 dark:border-base-400 border-base-300 group bg-base-100 flex cursor-pointer items-center gap-4 rounded-md border px-2 py-4 text-left transition-colors duration-300 min-h-30.5"
+				onclick={startOpenAPIImport}
+			>
+				<FileCode
+					class="text-muted-content size-12 shrink-0 pl-1 transition-colors group-hover:text-inherit"
+				/>
+				<div>
+					<p class="mb-1 text-sm font-semibold">{m.mcps_catalog_select_server_type_openapi()}</p>
+					<span class="text-muted-content block text-xs leading-4"
+						>{m.mcps_catalog_select_server_type_openapi_description()}</span
+					>
+				</div>
+			</button>
+		{/if}
 	</div>
 </ResponsiveDialog>
+
+{#if importingOpenAPI}
+	<OpenAPIImportDialog
+		onComplete={(draft) => {
+			importingOpenAPI = false;
+			onSelectServerType('openapi', draft);
+		}}
+		onCancel={() => {
+			importingOpenAPI = false;
+			selectServerTypeDialog?.open();
+		}}
+	/>
+{/if}

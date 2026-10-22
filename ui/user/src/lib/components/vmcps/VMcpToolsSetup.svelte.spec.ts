@@ -1,12 +1,28 @@
-import { createMCPCatalogEntry, createVMCPComponent } from '../../../tests/helpers/mcp';
+import { page as appPage } from '$app/state';
+import { goto, replaceState } from '$lib/url';
+import { createMCPCatalogEntry, createVMCP, createVMCPComponent } from '../../../tests/helpers/mcp';
 import { preparePageData } from '../../../tests/helpers/pageData';
 import { worker } from '../../../tests/mocks/worker';
 import VMcpToolsSetup from './VMcpToolsSetup.svelte';
 import { http, HttpResponse } from 'msw';
 import { untrack } from 'svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page } from 'vitest/browser';
+
+vi.mock('$lib/url', async (importOriginal) => ({
+	...(await importOriginal<typeof import('$lib/url')>()),
+	goto: vi.fn().mockResolvedValue(undefined),
+	replaceState: vi.fn()
+}));
+
+function expectedOAuthPath(entryID: string, modifyToolsID: string) {
+	const params = new URLSearchParams({ 'configure-oauth': 'true' });
+	const returnURL = new URL(appPage.url);
+	returnURL.searchParams.set('modify-tools', modifyToolsID);
+	params.set('oauth-redirect', `${returnURL.pathname}${returnURL.search}${returnURL.hash}`);
+	return `/mcp-servers/c/${encodeURIComponent(entryID)}?${params.toString()}`;
+}
 
 const entry = createMCPCatalogEntry({
 	id: 'preview-entry',
@@ -67,6 +83,107 @@ async function fillConfiguration() {
 }
 
 describe('VMcpToolsSetup preview credentials', () => {
+	it('asks for static OAuth setup before requesting tool previews', async () => {
+		const salesforceEntry = createMCPCatalogEntry({
+			id: 'salesforce',
+			name: 'Salesforce',
+			runtime: 'remote',
+			manifest: {
+				remoteConfig: {
+					fixedURL: 'https://api.salesforce.com/platform/mcp/v1/platform/sobject-all',
+					staticOAuthRequired: true
+				}
+			}
+		});
+		const salesforceComponent = createVMCPComponent(salesforceEntry);
+		const vmcp = createVMCP({ id: 'vmcp-preview', components: [salesforceComponent] });
+		vmcp.status = {
+			ready: false,
+			components: [
+				{ name: salesforceComponent.name, error: 'static OAuth credentials are not configured' }
+			]
+		};
+		const preview = vi.fn();
+		worker.use(
+			http.get('/api/vmcps/vmcp-preview', () => HttpResponse.json(vmcp)),
+			http.post(
+				`/api/vmcps/vmcp-preview/components/${salesforceComponent.id}/generate-tool-previews`,
+				() => {
+					preview();
+					return HttpResponse.json(salesforceEntry);
+				}
+			)
+		);
+
+		await preparePageData();
+		const result = await render(VMcpToolsSetup, {
+			component: salesforceComponent,
+			vmcpID: vmcp.id,
+			refresh: true
+		});
+		untrack(() => result.component.open());
+		await expect
+			.element(page.getByText('Salesforce requires administrator OAuth setup.', { exact: false }))
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'Configure Salesforce OAuth' }))
+			.toHaveAttribute(
+				'href',
+				expectedOAuthPath(
+					'salesforce',
+					salesforceComponent.id || salesforceComponent.mcpServerCatalogEntryID
+				)
+			);
+		expect(preview).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ componentID: 'component-salesforce', expectedReturnID: 'component-salesforce' },
+		{ componentID: '', expectedReturnID: 'salesforce' }
+	])(
+		'stores modify-tools for component ID "$componentID" before OAuth setup',
+		async ({ componentID, expectedReturnID }) => {
+			vi.mocked(goto).mockClear();
+			vi.mocked(replaceState).mockClear();
+
+			const salesforceEntry = createMCPCatalogEntry({
+				id: 'salesforce',
+				name: 'Salesforce',
+				runtime: 'remote',
+				manifest: {
+					remoteConfig: {
+						fixedURL: 'https://api.salesforce.com/platform/mcp/v1/platform/sobject-all',
+						staticOAuthRequired: true
+					}
+				}
+			});
+			const salesforceComponent = createVMCPComponent(salesforceEntry, { id: componentID });
+			const vmcp = createVMCP({ id: 'vmcp-preview', components: [salesforceComponent] });
+			vmcp.status = {
+				ready: false,
+				components: [
+					{ name: salesforceComponent.name, error: 'static OAuth credentials are not configured' }
+				]
+			};
+			worker.use(http.get('/api/vmcps/vmcp-preview', () => HttpResponse.json(vmcp)));
+
+			await preparePageData();
+			const result = await render(VMcpToolsSetup, {
+				component: salesforceComponent,
+				vmcpID: vmcp.id,
+				refresh: true
+			});
+			untrack(() => result.component.open());
+			await page.getByRole('link', { name: 'Configure Salesforce OAuth' }).click();
+
+			const url = vi.mocked(replaceState).mock.calls[0]?.[0] as URL;
+			expect(url.searchParams.get('modify-tools')).toBe(expectedReturnID);
+			expect(vi.mocked(goto)).toHaveBeenCalledWith(
+				expectedOAuthPath('salesforce', expectedReturnID)
+			);
+		}
+	);
+
 	it('requests a hostname-constrained server URL for discovery and OAuth', async () => {
 		const remoteEntry = createMCPCatalogEntry({
 			id: entry.id,
@@ -189,6 +306,132 @@ describe('VMcpToolsSetup preview credentials', () => {
 		untrack(() => result.component.open());
 		await expect.element(page.getByLabelText('API token', { exact: false })).toHaveValue('');
 	});
+	it('keeps preview credentials for the specific CLI authentication attempt', async () => {
+		const preview = vi.fn();
+		const oauth = vi.fn();
+		worker.use(
+			http.post(previewURL, async ({ request }) => {
+				preview(await request.json());
+				if (preview.mock.calls.length === 1) {
+					return HttpResponse.json(
+						{ message: 'MCP server requires OAuth authentication' },
+						{ status: 400 }
+					);
+				}
+				return HttpResponse.json({
+					...entry,
+					manifest: {
+						...entry.manifest,
+						toolPreview: [{ id: 'search', name: 'search', description: 'Search' }]
+					}
+				});
+			}),
+			http.post(`${previewURL}/oauth-url`, async ({ request }) => {
+				oauth(await request.json());
+				return HttpResponse.json({
+					oauthURL: `${window.location.origin}/oauth/mcp/login/temporary-preview-state`
+				});
+			})
+		);
+		const result = await openSetup();
+		await expect.element(page.getByRole('button', { name: 'Configure Tools' })).toBeDisabled();
+		await expect.element(page.getByLabelText('Fixed credential')).not.toBeInTheDocument();
+		expect(preview).not.toHaveBeenCalled();
+		await fillConfiguration();
+		await page.getByRole('button', { name: 'Configure Tools' }).click();
+		await expect
+			.element(page.getByLabelText('Authentication command'))
+			.toHaveTextContent(
+				`obot mcp login "${window.location.origin}/oauth/mcp/login/temporary-preview-state"`
+			);
+		await expect.element(page.getByRole('link', { name: 'Authenticate' })).not.toBeInTheDocument();
+		const payload = { TOKEN: 'preview-secret', REGION: 'west' };
+		expect(preview).toHaveBeenCalledWith(payload);
+		expect(oauth).toHaveBeenCalledWith(payload);
+		worker.use(http.get('*/oauth/mcp/login/:state', () => new HttpResponse(null, { status: 400 })));
+		document.dispatchEvent(new Event('visibilitychange'));
+		await expect.element(page.getByText('search', { exact: true }).first()).toBeVisible();
+		expect(preview).toHaveBeenLastCalledWith(payload);
+		result.component.close();
+		untrack(() => result.component.open());
+		await expect.element(page.getByLabelText('API token', { exact: false })).toHaveValue('');
+	});
+
+	it.each(['refresh', 'returning to the tab'])(
+		'prevents duplicate authentication retries after %s starts validation',
+		async (trigger) => {
+			const preview = vi.fn();
+			const aborted = vi.fn();
+			let status = 200;
+			let finishPreview!: () => void;
+			const pendingPreview = new Promise<void>((resolve) => {
+				finishPreview = resolve;
+			});
+			worker.use(
+				http.get('*/oauth/mcp/login/preview', () =>
+					status === 200
+						? HttpResponse.json({ expiresIn: 600 })
+						: new HttpResponse(null, { status })
+				),
+				http.post(previewURL, async ({ request }) => {
+					preview();
+					if (preview.mock.calls.length === 1) {
+						return HttpResponse.json(
+							{ message: 'MCP server requires OAuth authentication' },
+							{ status: 400 }
+						);
+					}
+					request.signal.addEventListener('abort', aborted);
+					await pendingPreview;
+					return HttpResponse.json({
+						...entry,
+						manifest: {
+							...entry.manifest,
+							toolPreview: [{ id: 'search', name: 'search', description: 'Search' }]
+						}
+					});
+				}),
+				http.post(`${previewURL}/oauth-url`, () =>
+					HttpResponse.json({ oauthURL: `${window.location.origin}/oauth/mcp/login/preview` })
+				)
+			);
+			await openSetup();
+			await fillConfiguration();
+			await page.getByRole('button', { name: 'Configure Tools' }).click();
+			await expect.element(page.getByRole('timer')).toBeVisible();
+			status = trigger === 'refresh' ? 410 : 400;
+			const continueButton = page.getByRole('button', {
+				name: 'Generate new command',
+				exact: true
+			});
+			await expect.element(continueButton).toBeVisible();
+			try {
+				// Native clicks exercise repeated activation before Svelte updates the disabled state.
+				const button = continueButton.element() as HTMLButtonElement;
+				if (trigger === 'refresh') {
+					document.dispatchEvent(new Event('visibilitychange'));
+					await expect.element(continueButton).toBeEnabled();
+					button.click();
+				} else {
+					document.dispatchEvent(new Event('visibilitychange'));
+				}
+				button.click();
+				await expect.element(continueButton).toBeDisabled();
+				await expect
+					.element(page.getByRole('status'))
+					.toHaveTextContent('Checking for valid authentication…');
+				button.click();
+				document.dispatchEvent(new Event('visibilitychange'));
+				await vi.waitFor(() => expect(preview).toHaveBeenCalledTimes(2));
+				expect(aborted).not.toHaveBeenCalled();
+			} finally {
+				finishPreview();
+			}
+			await expect.element(page.getByText('search', { exact: true }).first()).toBeVisible();
+			expect(preview).toHaveBeenCalledTimes(2);
+			expect(aborted).not.toHaveBeenCalled();
+		}
+	);
 
 	it('allows retry after a preview error and clears credentials when cancelled', async () => {
 		const preview = vi.fn();
@@ -201,7 +444,7 @@ describe('VMcpToolsSetup preview credentials', () => {
 		const result = await openSetup();
 		await fillConfiguration();
 		await page.getByRole('button', { name: 'Configure Tools' }).click();
-		await expect.element(page.getByRole('alert')).toHaveTextContent('Invalid credentials');
+		await expect.element(page.getByRole('alert')).toMatchTextContent('Invalid credentials');
 		await expect.element(page.getByRole('button', { name: 'Configure Tools' })).toBeEnabled();
 		await page.getByLabelText('API token', { exact: false }).fill('corrected-secret');
 		await page.getByRole('button', { name: 'Configure Tools' }).click();
@@ -215,4 +458,8 @@ describe('VMcpToolsSetup preview credentials', () => {
 		await expect.element(page.getByLabelText('API token', { exact: false })).toHaveValue('');
 		await expect.element(page.getByRole('alert')).not.toBeInTheDocument();
 	});
+});
+
+beforeEach(() => {
+	worker.use(http.get('*/oauth/mcp/login/:state', () => HttpResponse.json({})));
 });

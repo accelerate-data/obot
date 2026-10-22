@@ -50,7 +50,9 @@ func TestServerInstanceGetOAuthURLRejectsNonOwner(t *testing.T) {
 	})
 
 	require.Error(t, err)
-	assert.True(t, types.IsNotFound(err), "expected not found error, got %v", err)
+	var httpErr *types.ErrHTTP
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusNotFound, httpErr.Code)
 }
 
 func TestServerInstanceRedirectOAuthURLRedirectsOwnedInstance(t *testing.T) {
@@ -171,7 +173,7 @@ func TestServerInstanceGetOAuthURLReturnsProviderDiagnostic(t *testing.T) {
 	assert.ErrorContains(t, err, diagnostic)
 }
 
-func (f fixedInstanceResolver) ServerForActionWithConnectIDAllowMissingConfig(context.Context, string, string) (string, v1.MCPServer, mcp.ServerConfig, []string, error) {
+func (f fixedInstanceResolver) ServerForActionWithConnectIDAllowMissingConfig(context.Context, string, kuser.Info) (string, v1.MCPServer, mcp.ServerConfig, []string, error) {
 	return f.server.Name, f.server, mcp.ServerConfig{}, nil, nil
 }
 

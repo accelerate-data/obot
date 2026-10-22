@@ -1,8 +1,12 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
 	import ResponsiveDialog from '$lib/components/ResponsiveDialog.svelte';
 	import SensitiveInput from '$lib/components/SensitiveInput.svelte';
+	import McpLogin from '$lib/components/mcp/McpLogin.svelte';
 	import CompositeEditTools from '$lib/components/mcp/composite/CompositeEditTools.svelte';
 	import { isMissingRequiredConfigurationField } from '$lib/components/mcp/configurationOptions';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { UserService } from '$lib/services';
 	import type {
@@ -11,8 +15,16 @@
 		ToolOverride,
 		VMCPComponent
 	} from '$lib/services';
+	import { isMcpLoginURL } from '$lib/services/user/mcp';
 	import { toolOverridesFromRows } from '$lib/services/user/mcp';
-	import { catalogConfigurationFields } from '$lib/services/vmcps/utils';
+	import {
+		catalogConfigurationFields,
+		configureOAuthPath,
+		handleConfigureOAuth,
+		vmcpMissingStaticOAuthComponent,
+		type OAuthReturnParam
+	} from '$lib/services/vmcps/utils';
+	import { profile } from '$lib/stores';
 	import { onDestroy } from 'svelte';
 	import type { Snippet } from 'svelte';
 	import { fade } from 'svelte/transition';
@@ -24,10 +36,10 @@
 		existingTools?: CompositeServerToolRow[];
 		existingToolPrefix?: string;
 		otherEffectiveNames?: string[];
-		otherToolPrefixes?: string[];
 		onCancel?: () => void;
 		onSuccess?: (config: { toolOverrides: ToolOverride[]; toolPrefix: string }) => void;
 		additionalActions?: Snippet;
+		readonly?: boolean;
 	}
 
 	let {
@@ -37,10 +49,10 @@
 		existingTools = [],
 		existingToolPrefix,
 		otherEffectiveNames,
-		otherToolPrefixes,
 		onCancel,
 		onSuccess,
-		additionalActions: additionalActionsSnippet
+		additionalActions: additionalActionsSnippet,
+		readonly = false
 	}: Props = $props();
 
 	let setupDialog = $state<ReturnType<typeof ResponsiveDialog>>();
@@ -52,6 +64,7 @@
 	let loading = $state(false);
 	let error = $state<string>();
 	let oauthURL = $state<string>();
+	let oauthSetupRequired = $state(false);
 	let oauthValidating = $state(false);
 	let listeningOauthVisibility = $state(false);
 	let requestGeneration = 0;
@@ -78,8 +91,8 @@
 		if (requiresURL && !fields.some((field) => field.key === '__url')) {
 			fields.push({
 				key: '__url',
-				name: 'Server URL',
-				description: `URL must have hostname ${remote.hostname}`,
+				name: m.vmcps_server_url(),
+				description: m.vmcps_url_must_have_hostname({ hostname: remote.hostname ?? '' }),
 				usage: 'interpolated',
 				required: true,
 				sensitive: false,
@@ -102,6 +115,12 @@
 		return value?.id || value?.mcpServerCatalogEntryID || '';
 	}
 
+	function toolsOAuthReturnParam(): OAuthReturnParam | undefined {
+		const returnComponentID = componentID(component);
+		if (!oauthSetupRequired || !returnComponentID) return;
+		return { key: 'modify-tools', value: returnComponentID };
+	}
+
 	function cancelToolPreviewRequest(preserveOauthState = false) {
 		requestGeneration += 1;
 		requestController?.abort();
@@ -121,8 +140,10 @@
 		const existingByName = new Map(existingTools.map((tool) => [tool.name, tool]));
 		const hasStoredOverrides = Boolean(component?.toolOverrides?.length);
 		const id = componentID(component);
+		const preview = entry.manifest.toolPreview ?? [];
+		const previewNames = new Set(preview.map((tool) => tool.name));
 
-		return (entry.manifest.toolPreview ?? []).map((previewTool) => {
+		const rows = preview.map((previewTool) => {
 			const existing = existingByName.get(previewTool.name);
 			const description = existing?.description ?? previewTool.description;
 			return {
@@ -132,16 +153,48 @@
 				overrideName: existing?.overrideName ?? previewTool.name,
 				overrideDescription:
 					existing?.overrideDescription ?? existing?.description ?? previewTool.description,
-				enabled: existing?.enabled ?? !hasStoredOverrides
+				enabled: existing?.enabled ?? !hasStoredOverrides,
+				removed: false
 			};
 		});
+
+		for (const previous of component?.toolOverrides ?? []) {
+			if (!previous.name || previewNames.has(previous.name)) continue;
+			const existing = existingByName.get(previous.name);
+			rows.push({
+				id: existing?.id ?? `${id}-${previous.name}`,
+				name: previous.name,
+				description: existing?.description ?? previous.description,
+				overrideName: existing?.overrideName ?? previous.overrideName ?? previous.name,
+				overrideDescription:
+					existing?.overrideDescription ??
+					previous.overrideDescription ??
+					existing?.description ??
+					previous.description,
+				enabled: false,
+				removed: true
+			});
+		}
+
+		return rows;
 	}
 
 	function handleVisibilityChange() {
-		if (dialogPhase === 'setup' && document.visibilityState === 'visible' && oauthURL && !loading) {
-			oauthValidating = true;
-			void fetchLiveTools();
+		if (
+			dialogPhase === 'setup' &&
+			document.visibilityState === 'visible' &&
+			oauthURL &&
+			!isMcpLoginURL(oauthURL) &&
+			!loading
+		) {
+			validateAuthentication();
 		}
+	}
+
+	function validateAuthentication() {
+		if (loading) return;
+		oauthValidating = true;
+		return fetchLiveTools();
 	}
 
 	$effect(() => {
@@ -156,7 +209,7 @@
 	async function fetchLiveTools() {
 		const id = componentID(component);
 		if (!vmcpID || !id) {
-			error = 'Unable to fetch tools for this vMCP component.';
+			error = m.vmcps_unable_to_fetch_tools();
 			return;
 		}
 
@@ -168,6 +221,19 @@
 		error = undefined;
 
 		try {
+			if (component?.catalogEntry.manifest.remoteConfig?.staticOAuthRequired) {
+				const current = await UserService.getVMCP(vmcpID, {
+					dontLogErrors: true,
+					signal: controller.signal
+				});
+				if (!isCurrentRequest(generation, controller)) return;
+				const missing = vmcpMissingStaticOAuthComponent(current);
+				if (missing && componentID(missing) === id) {
+					oauthSetupRequired = true;
+					return;
+				}
+				oauthSetupRequired = false;
+			}
 			const entry = await UserService.generateVMCPComponentToolPreviews(vmcpID, id, {
 				config: previewConfig,
 				signal: controller.signal
@@ -185,7 +251,12 @@
 			if (!isCurrentRequest(generation, controller)) return;
 
 			const message = err instanceof Error ? err.message : String(err);
-			if (message.includes('MCP server requires OAuth authentication')) {
+			if (message.includes('requires administrator static OAuth configuration')) {
+				oauthSetupRequired = true;
+				oauthURL = undefined;
+				listeningOauthVisibility = false;
+				oauthValidating = false;
+			} else if (message.includes('MCP server requires OAuth authentication')) {
 				try {
 					const nextOauthURL = await UserService.getVMCPComponentToolPreviewsOauth(vmcpID, id, {
 						config: previewConfig,
@@ -210,7 +281,7 @@
 					oauthValidating = false;
 				}
 			} else {
-				error = message || 'Failed to fetch tools for this vMCP component.';
+				error = message || m.vmcps_failed_to_fetch_tools();
 				oauthURL = undefined;
 				listeningOauthVisibility = false;
 				oauthValidating = false;
@@ -224,7 +295,7 @@
 	}
 
 	function configureTools() {
-		if (missingConfiguration) return;
+		if (missingConfiguration || oauthSetupRequired) return;
 		if (needsLiveTools && vmcpID && componentID(component)) {
 			void fetchLiveTools();
 			return;
@@ -237,6 +308,7 @@
 		previewConfig = {};
 		error = undefined;
 		oauthURL = undefined;
+		oauthSetupRequired = false;
 		tools = existingTools;
 		toolPrefix = existingToolPrefix ?? component?.toolPrefix ?? '';
 		dialogPhase = 'setup';
@@ -249,6 +321,7 @@
 	export function close() {
 		cancelToolPreviewRequest();
 		previewConfig = {};
+		oauthSetupRequired = false;
 		dialogPhase = 'closed';
 		setupDialog?.close();
 		editDialog?.close();
@@ -280,6 +353,10 @@
 	}
 
 	function save() {
+		if (readonly) {
+			cancelEditor();
+			return;
+		}
 		if (!component) {
 			close();
 			return;
@@ -299,7 +376,13 @@
 <ResponsiveDialog
 	bind:this={setupDialog}
 	animate="slide"
-	title={`Configure ${configuringEntry?.manifest.name ?? 'MCP Server'} Tools`}
+	title={oauthURL && isMcpLoginURL(oauthURL)
+		? m.mcps_login_tools_title({ name: component?.name || m.mcps_login_server() })
+		: readonly
+			? m.vmcps_view_named_tools({ name: component?.name ?? m.vmcps_mcp_server() })
+			: m.vmcps_configure_named_tools({
+					name: component?.name ?? m.vmcps_mcp_server()
+				})}
 	class="md:w-md"
 	onClose={cancelSetup}
 >
@@ -311,28 +394,42 @@
 		}}
 	>
 		{#if configuringEntry}
-			{#if oauthURL}
+			{#if oauthSetupRequired}
 				<p class="mb-4 text-sm">
-					MCP server requires OAuth authentication before its tools can be fetched.
+					{m.vmcps_tools_requires_oauth_setup({
+						name: component?.name ?? configuringEntry.manifest.name ?? ''
+					})}
 				</p>
-			{:else if userFields.length > 0}
-				<p class="text-muted-content mb-6 text-sm font-light">
-					Enter credentials to discover tools. These values are used only for this tool preview;
-					users will still provide their own values when connecting.
+			{:else if oauthURL && !isMcpLoginURL(oauthURL)}
+				<p class="mb-4 text-sm">
+					{m.vmcps_tools_requires_oauth_authentication()}
 				</p>
-			{:else if !needsLiveTools}
+			{:else if !oauthURL && userFields.length > 0}
 				<p class="text-muted-content mb-6 text-sm font-light">
-					Tools are read from the catalog-entry snapshot stored on this vMCP. The source catalog
-					entry is not queried while editing an existing component.
+					{m.vmcps_tools_enter_credentials()}
 				</p>
-			{:else}
+			{:else if !oauthURL && !needsLiveTools}
 				<p class="text-muted-content mb-6 text-sm font-light">
-					The MCP server's stored configuration will be used to fetch the tool list. In order to
-					discover the MCP server's tools, you may need to temporarily authenticate.
+					{m.vmcps_tools_read_from_stored()}
+				</p>
+			{:else if !oauthURL}
+				<p class="text-muted-content mb-6 text-sm font-light">
+					{m.vmcps_tools_use_stored_configuration()}
 				</p>
 			{/if}
 
-			{#if !oauthURL}
+			{#if oauthURL && isMcpLoginURL(oauthURL)}
+				<McpLogin
+					url={oauthURL}
+					serverName={configuringEntry.manifest.name}
+					purpose="tools"
+					showTitle={false}
+					{loading}
+					onComplete={validateAuthentication}
+				/>
+			{/if}
+
+			{#if !oauthURL && !oauthSetupRequired}
 				{#each userFields as field (field.key)}
 					<div class="mb-4 flex flex-col gap-2">
 						<label for={`preview-${field.key}`} class="text-sm font-medium">
@@ -346,7 +443,7 @@
 								required={field.required}
 								disabled={loading}
 							>
-								<option value="">Select an option</option>
+								<option value="">{m.vmcps_select_an_option()}</option>
 								{#each field.options as option (option.value)}
 									<option value={option.value}>{option.name}</option>
 								{/each}
@@ -369,8 +466,7 @@
 								class="input-text-filled w-full min-h-32 resize-y"
 								bind:value={previewConfig[field.key]}
 								required={field.required}
-								disabled={loading}
-							></textarea>
+								disabled={loading}></textarea>
 						{:else}
 							<input
 								id={`preview-${field.key}`}
@@ -391,9 +487,43 @@
 			{#if error}
 				<p class="text-error mb-4 text-sm" role="alert">{error}</p>
 			{/if}
-			<div class="flex w-full flex-col gap-2">
-				{#if oauthURL}
-					{#if oauthValidating}
+			<div class="mt-4 flex w-full flex-wrap justify-end gap-2">
+				{#if oauthSetupRequired}
+					{#if profile.current.isAdmin?.() && component?.mcpServerCatalogEntryID}
+						<a
+							class="btn btn-primary"
+							href={resolve(
+								configureOAuthPath(
+									component.mcpServerCatalogEntryID,
+									page.url,
+									toolsOAuthReturnParam()
+								)
+							)}
+							onclick={(event) =>
+								handleConfigureOAuth(
+									event,
+									component?.mcpServerCatalogEntryID,
+									page.url,
+									toolsOAuthReturnParam()
+								)}
+						>
+							{m.vmcps_configure_named_oauth({ name: component.name })}
+						</a>
+					{:else}
+						<p>{m.vmcps_ask_admin_configure_oauth()}</p>
+					{/if}
+					<button
+						type="button"
+						class="btn btn-secondary"
+						disabled={loading}
+						onclick={fetchLiveTools}
+					>
+						{m.vmcps_check_again()}
+					</button>
+				{:else if oauthURL}
+					{#if isMcpLoginURL(oauthURL)}
+						<!-- The shared login component waits for this attempt to finish. -->
+					{:else if oauthValidating}
 						<button
 							in:fade
 							class="btn btn-primary flex items-center justify-center gap-2"
@@ -401,7 +531,7 @@
 							type="button"
 						>
 							<Loading class="text-primary size-4" />
-							Validating authentication...
+							{m.vmcps_validating_authentication()}
 						</button>
 					{:else}
 						<a
@@ -411,7 +541,7 @@
 							target="_blank"
 							class="btn btn-primary"
 						>
-							Authenticate
+							{m.vmcps_authenticate()}
 						</a>
 					{/if}
 				{:else}
@@ -419,7 +549,7 @@
 						{#if loading}
 							<Loading class="text-primary-content size-4" />
 						{:else}
-							Configure Tools
+							{readonly ? m.vmcps_view_tools() : m.vmcps_configure_tools()}
 						{/if}
 					</button>
 				{/if}
@@ -430,18 +560,14 @@
 
 <CompositeEditTools
 	bind:this={editDialog}
+	name={component?.name}
 	{configuringEntry}
 	{tools}
-	bind:toolPrefix
+	{toolPrefix}
 	{otherEffectiveNames}
-	{otherToolPrefixes}
 	onCancel={cancelEditor}
 	onClose={cancelEditor}
 	onSuccess={save}
->
-	{#snippet additionalActions()}
-		{#if additionalActionsSnippet}
-			{@render additionalActionsSnippet()}
-		{/if}
-	{/snippet}
-</CompositeEditTools>
+	additionalActions={additionalActionsSnippet}
+	{readonly}
+/>

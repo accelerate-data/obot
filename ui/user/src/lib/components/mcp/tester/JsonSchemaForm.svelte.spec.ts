@@ -118,17 +118,183 @@ describe('JsonSchemaForm', () => {
 		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ count: 5 }));
 	});
 
-	it('offers only Raw JSON for unions with multiple non-null types', async () => {
+	it('renders the first union member and keeps the others reachable in Raw JSON', async () => {
+		const onvalidchange = vi.fn();
 		render(JsonSchemaForm, {
 			schema: {
 				type: 'object',
+				required: ['value'],
 				properties: { value: { anyOf: [{ type: 'string' }, { type: 'integer' }] } }
+			},
+			onvalidchange
+		});
+		await expect.element(page.getByRole('button', { name: 'Generated form' })).toBeVisible();
+		await expect
+			.element(page.getByText('Also accepts integer, which can be entered in Raw JSON.'))
+			.toBeVisible();
+		await page.getByLabelText('value *').fill('abc');
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ value: 'abc' }));
+
+		await page.getByRole('button', { name: 'Raw JSON' }).click();
+		await page.getByLabelText('Arguments JSON').fill('{"value":7}');
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ value: 7 }));
+		await page.getByRole('button', { name: 'Generated form' }).click();
+		await expect.element(page.getByLabelText('value *')).toHaveValue(7);
+		await expect
+			.element(page.getByText('Also accepts string, which can be entered in Raw JSON.'))
+			.toBeVisible();
+	});
+
+	it('keeps a union member control while its input is cleared or holds an unmatched value', async () => {
+		const onvalidchange = vi.fn();
+		render(JsonSchemaForm, {
+			schema: {
+				type: 'object',
+				properties: {
+					value: { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+					count: { anyOf: [{ type: 'string' }, { type: 'integer' }], default: 5 }
+				}
+			},
+			onvalidchange
+		});
+		await page.getByRole('button', { name: 'Raw JSON' }).click();
+		await page.getByLabelText('Arguments JSON').fill('{"value":7}');
+		await page.getByRole('button', { name: 'Generated form' }).click();
+
+		const value = page.getByLabelText('value', { exact: true });
+		await expect.element(value).toHaveValue(7);
+		await value.clear();
+		await expect.element(value).toHaveAttribute('type', 'number');
+		await value.fill('8');
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ value: 8 }));
+
+		const count = page.getByLabelText('count', { exact: true });
+		await expect.element(count).toHaveAttribute('type', 'number');
+		await count.fill('2.5');
+		await expect.element(count).toHaveAttribute('type', 'number');
+		await expect.element(count).toHaveValue(2.5);
+	});
+
+	it('describes a union control with its alternatives hint', async () => {
+		render(JsonSchemaForm, {
+			schema: {
+				type: 'object',
+				properties: {
+					value: { anyOf: [{ type: 'string' }, { type: 'integer' }], description: 'A value' }
+				}
 			}
 		});
 		await expect
-			.element(page.getByRole('button', { name: 'Generated form' }))
+			.element(page.getByLabelText('value', { exact: true }))
+			.toHaveAccessibleDescription(
+				'A value Also accepts integer, which can be entered in Raw JSON.'
+			);
+	});
+
+	it('keeps Raw JSON when its value cannot be shown in the generated form', async () => {
+		const onvalidchange = vi.fn();
+		render(JsonSchemaForm, {
+			schema: {
+				type: 'object',
+				properties: {
+					value: { anyOf: [{ type: 'string' }, { type: 'object', properties: { nested: {} } }] }
+				}
+			},
+			onvalidchange
+		});
+		const generated = page.getByRole('button', { name: 'Generated form' });
+		await page.getByRole('button', { name: 'Raw JSON' }).click();
+		await page.getByLabelText('Arguments JSON').fill('{"value":{"nested":1}}');
+		await vi.waitFor(() =>
+			expect(onvalidchange).toHaveBeenLastCalledWith({ value: { nested: 1 } })
+		);
+		await expect.element(generated).toBeDisabled();
+		await expect
+			.element(generated)
+			.toHaveAccessibleDescription('This value can only be edited in Raw JSON.');
+
+		await page.getByLabelText('Arguments JSON').fill('{"value":"text"}');
+		await expect.element(generated).toBeEnabled();
+		await expect
+			.element(page.getByText('This value can only be edited in Raw JSON.'))
 			.not.toBeInTheDocument();
-		await expect.element(page.getByLabelText('Arguments JSON')).toBeVisible();
+		await generated.click();
+		await expect.element(page.getByLabelText('value', { exact: true })).toHaveValue('text');
+	});
+
+	it('renders the same-typed union member that a Raw JSON value satisfies', async () => {
+		const onvalidchange = vi.fn();
+		render(JsonSchemaForm, {
+			schema: {
+				type: 'object',
+				properties: {
+					value: {
+						anyOf: [
+							{ type: 'object', properties: { a: { type: 'string' } }, required: ['a'] },
+							{ type: 'object', properties: { b: { type: 'string' } }, required: ['b'] }
+						]
+					}
+				}
+			},
+			onvalidchange
+		});
+		await page.getByRole('button', { name: 'Raw JSON' }).click();
+		await page.getByLabelText('Arguments JSON').fill('{"value":{"b":"x"}}');
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ value: { b: 'x' } }));
+		await page.getByRole('button', { name: 'Generated form' }).click();
+		await expect.element(page.getByLabelText('b *')).toHaveValue('x');
+		await expect.element(page.getByLabelText('a *')).not.toBeInTheDocument();
+	});
+
+	it('keeps a boolean member after toggling null when the union default is a string', async () => {
+		const onvalidchange = vi.fn();
+		render(JsonSchemaForm, {
+			schema: {
+				type: 'object',
+				properties: {
+					mode: {
+						anyOf: [{ type: 'boolean' }, { type: 'string' }, { type: 'null' }],
+						default: 'auto'
+					}
+				}
+			},
+			onvalidchange
+		});
+		await page.getByRole('button', { name: 'Raw JSON' }).click();
+		await page.getByLabelText('Arguments JSON').fill('{"mode":true}');
+		await page.getByRole('button', { name: 'Generated form' }).click();
+		const useNull = page.getByRole('checkbox', { name: 'Use null for mode' });
+		await useNull.click();
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ mode: null }));
+		await useNull.click();
+		await expect
+			.element(page.getByLabelText('mode', { exact: true }))
+			.toHaveAttribute('type', 'checkbox');
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ mode: false }));
+	});
+
+	it('offers a boolean toggle and a null switch for boolean, string, or null unions', async () => {
+		const onvalidchange = vi.fn();
+		render(JsonSchemaForm, {
+			schema: {
+				type: 'object',
+				properties: {
+					reply_all: {
+						anyOf: [{ type: 'boolean' }, { type: 'string' }, { type: 'null' }],
+						default: false
+					}
+				}
+			},
+			onvalidchange
+		});
+		const toggle = page.getByLabelText('reply_all', { exact: true });
+		await expect.element(toggle).not.toBeChecked();
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ reply_all: false }));
+		await toggle.click();
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ reply_all: true }));
+		await page.getByRole('checkbox', { name: 'Use null for reply_all' }).click();
+		await expect.element(toggle).toBeDisabled();
+		await vi.waitFor(() => expect(onvalidchange).toHaveBeenLastCalledWith({ reply_all: null }));
 	});
 
 	it('enforces anyOf sibling constraints in generated and raw input modes', async () => {

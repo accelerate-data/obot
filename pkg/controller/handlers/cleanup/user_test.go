@@ -1,7 +1,6 @@
 package cleanup
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/obot-platform/nah/pkg/fields"
@@ -25,8 +24,7 @@ func TestUserCleanupVMCPs(t *testing.T) {
 	}
 	builder := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(userDelete)
 	for _, obj := range []kclient.Object{
-		&v1.HostedAgentInstance{}, &v1.HostedAgentPoolAssignment{}, &v1.Project{},
-		&v1.VMCP{}, &v1.VMCPInstance{}, &v1.MCPServer{}, &v1.MCPServerInstance{}, &v1.PowerUserWorkspace{},
+		&v1.VMCP{}, &v1.VMCPInstance{}, &v1.MCPServer{}, &v1.MCPServerInstance{}, &v1.PowerUserWorkspace{}, &v1.AgentInstance{},
 	} {
 		builder.WithIndex(obj, "spec.userID", func(obj kclient.Object) []string {
 			return []string{obj.(fields.Fields).Get("spec.userID")}
@@ -75,31 +73,5 @@ func TestUserCleanupVMCPs(t *testing.T) {
 	// Component resources are left for reference cleanup; shared and other users' resources survive.
 	for _, obj := range retained {
 		require.NoError(t, client.Get(t.Context(), kclient.ObjectKeyFromObject(obj), obj))
-	}
-}
-
-func TestSavedPoolIDs(t *testing.T) {
-	userDelete := &v1.UserDelete{
-		Annotations: map[string]string{
-			hostedAgentPoolCleanupAnnotation: `["pool-a","pool-b"]`,
-		},
-	}
-	got, err := savedPoolIDs(userDelete)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"pool-a", "pool-b"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("pool IDs = %#v, want %#v", got, want)
-	}
-}
-
-func TestSavedPoolIDsRejectsInvalidCheckpoint(t *testing.T) {
-	userDelete := &v1.UserDelete{
-		Annotations: map[string]string{
-			hostedAgentPoolCleanupAnnotation: "not-json",
-		},
-	}
-	if _, err := savedPoolIDs(userDelete); err == nil {
-		t.Fatal("expected invalid cleanup checkpoint to fail")
 	}
 }

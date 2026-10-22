@@ -1,163 +1,337 @@
 package server
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"slices"
+	"reflect"
 	"testing"
 	"time"
 
-	apitypes "github.com/obot-platform/obot/apiclient/types"
+	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
-	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
+	"github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
-	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
-	gwtypes "github.com/obot-platform/obot/pkg/gateway/types"
-	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
-	"github.com/obot-platform/obot/pkg/storage/scheme"
-	storageservices "github.com/obot-platform/obot/pkg/storage/services"
+	"github.com/obot-platform/obot/pkg/gateway/types"
+	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
+	sservices "github.com/obot-platform/obot/pkg/storage/services"
 	"github.com/obot-platform/obot/pkg/system"
 	"k8s.io/apiserver/pkg/authentication/user"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestGetCurrentUserContinuesWhenAuthProviderURLUnavailable(t *testing.T) {
-	gatewayClient := newGatewayTestClient(t)
-	emailVerified := true
-	gatewayUser, err := gatewayClient.EnsureIdentityWithRole(t.Context(), &gwtypes.Identity{
-		Email:                 "alice@example.com",
-		AuthProviderName:      "generic-oauth-auth-provider",
-		AuthProviderNamespace: system.DefaultNamespace,
-		ProviderUsername:      "alice@example.com",
-		ProviderUserID:        "studio-sub",
-		ProviderIssuer:        "https://studio.example.com/api/auth",
-		ProviderEmailVerified: &emailVerified,
-	}, "", apitypes.RoleBasic, gatewayclient.UserLimit{Unlimited: true})
+func TestUserChangesThatSCIMManagesAreConflicts(t *testing.T) {
+	storageServices, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	kclient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(&v1.AuthProvider{
-		Name:      "generic-oauth-auth-provider",
-		Namespace: system.DefaultNamespace,
-		Spec: v1.AuthProviderSpec{AuthProviderManifest: apitypes.AuthProviderManifest{
-			CommonProviderMetadata: apitypes.CommonProviderMetadata{
-				RequiredConfigurationParameters: []apitypes.ProviderConfigurationParameter{{Name: "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID"}},
-			},
-		}},
-		Status: v1.AuthProviderStatus{
-			MissingConfigurationParameters: []string{"OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID"},
-		},
-	}).Build()
-	s := &Server{
-		dispatcher: dispatcher.New(nil, kclient, gatewayClient, nil, "", "", ""),
-	}
-
-	rec := httptest.NewRecorder()
-	err = s.getCurrentUser(api.Context{
-		ResponseWriter: rec,
-		Request:        httptest.NewRequest(http.MethodGet, "/api/me", nil),
-		GatewayClient:  gatewayClient,
-		User: &user.DefaultInfo{
-			Name: gatewayUser.Username,
-			UID:  "1",
-			Extra: map[string][]string{
-				"auth_provider_name":      {"generic-oauth-auth-provider"},
-				"auth_provider_namespace": {system.DefaultNamespace},
-				"auth_provider_groups":    {},
-			},
-			Groups: apitypes.RoleBasic.Groups(),
-		},
-	})
-	if err != nil {
-		t.Fatalf("expected /api/me to ignore unavailable provider URL, got %v", err)
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestGetCurrentUserIncludesRequestTimeAdminUplift(t *testing.T) {
-	gatewayClient := newGatewayTestClient(t)
-	gatewayUser, err := gatewayClient.EnsureIdentityWithRole(t.Context(), &gwtypes.Identity{
-		Email:                 "alice@example.com",
-		AuthProviderName:      "generic-oauth-auth-provider",
-		AuthProviderNamespace: system.DefaultNamespace,
-		ProviderUsername:      "alice@example.com",
-		ProviderUserID:        "studio-sub",
-		ProviderIssuer:        "https://studio.example.com/api/auth",
-	}, "", apitypes.RoleBasic, gatewayclient.UserLimit{Unlimited: true})
+	db, err := gatewaydb.New(storageServices.DB.DB, storageServices.DB.SQLDB, true)
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	rec := httptest.NewRecorder()
-	err = (&Server{}).getCurrentUser(api.Context{
-		ResponseWriter: rec,
-		Request:        httptest.NewRequest(http.MethodGet, "/api/me", nil),
-		GatewayClient:  gatewayClient,
-		User: &user.DefaultInfo{
-			Name: gatewayUser.Username,
-			UID:  fmt.Sprintf("%d", gatewayUser.ID),
-			Extra: map[string][]string{
-				"auth_provider_groups": {},
-			},
-			Groups: append(apitypes.RoleBasic.Groups(), apitypes.GroupAdmin),
-		},
-	})
-	if err != nil {
-		t.Fatalf("expected /api/me to preserve request-time admin uplift, got %v", err)
-	}
-
-	var body apitypes.User
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	if !contains(body.Groups, apitypes.GroupAdmin) {
-		t.Fatalf("expected response groups to include request-time admin, got %#v", body.Groups)
-	}
-	if contains(body.Groups, apitypes.GroupOwner) {
-		t.Fatalf("expected response groups not to include owner, got %#v", body.Groups)
-	}
-	if body.EffectiveRole.HasRole(apitypes.RoleOwner) {
-		t.Fatalf("expected response effective role not to include owner, got %v", body.EffectiveRole)
-	}
-}
-
-func TestApplyRequestTimeRoleUpliftPreservesOwnerRolePrecedence(t *testing.T) {
-	if got := applyRequestTimeRoleUplift(apitypes.RoleBasic, apitypes.RoleOwner.Groups()); got != apitypes.RoleOwner {
-		t.Fatalf("expected owner uplift, got %v", got)
-	}
-}
-
-func newGatewayTestClient(t *testing.T) *gatewayclient.Client {
-	t.Helper()
-
-	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
-	if err != nil {
-		t.Fatalf("failed to create storage services: %v", err)
-	}
-	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
-	if err != nil {
-		t.Fatalf("failed to create gateway db: %v", err)
 	}
 	if err := db.AutoMigrate(); err != nil {
-		t.Fatalf("failed to auto-migrate gateway db: %v", err)
+		t.Fatal(err)
+	}
+	gatewayClient := client.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
+	t.Cleanup(func() { _ = gatewayClient.Close() })
+	conn, _, err := gatewayClient.CreateSCIMConnection(t.Context(), client.CreateSCIMConnectionOptions{
+		AuthProviderNamespace: system.DefaultNamespace,
+		AuthProviderName:      "okta-auth-provider",
+		GroupIDPrefix:         "okta/",
+		Origin:                types.SCIMConnectionOriginSCIMFirst,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provisioned, err := gatewayClient.CreateSCIMUser(t.Context(), conn, client.SCIMUserInput{
+		UserName:   "alice@example.com",
+		ExternalID: "00u-alice",
+	}, client.SCIMUserCreateOptions{
+		UserLimit: client.UserLimit{
+			Unlimited: true,
+		},
+		DefaultRole: types2.RoleBasic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID := fmt.Sprint(provisioned.UserID)
+
+	request := func(method string, body any) api.Context {
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(method, "/api/users/"+userID, bytes.NewReader(data))
+		req.SetPathValue("user_id", userID)
+		return api.Context{
+			ResponseWriter: httptest.NewRecorder(),
+			Request:        req,
+			Storage:        clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).Build(),
+			GatewayClient:  gatewayClient,
+			User: &user.DefaultInfo{
+				Name:   "owner",
+				UID:    "1000",
+				Groups: types2.RoleOwner.Groups(),
+			},
+		}
 	}
 
-	storageClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(&v1.UserDefaultRoleSetting{
-		Name:      system.DefaultRoleSettingName,
-		Namespace: system.DefaultNamespace,
-		Spec: v1.UserDefaultRoleSettingSpec{
-			Role: apitypes.RoleBasic,
+	// The identity provider manages the user, so changing what it manages conflicts with it, as deleting the user
+	// while it still provisions them does.
+	for _, tt := range []struct {
+		name   string
+		handle func(api.Context) error
+		method string
+		body   any
+	}{
+		{
+			name:   "renaming the user",
+			handle: (&Server{}).updateUser,
+			method: http.MethodPatch,
+			body: types.User{
+				Username: "renamed",
+			},
 		},
-	}).Build()
-	return gatewayclient.New(context.Background(), db, storageClient, nil, nil, nil, nil, time.Hour, 100, 1, 1, 1, true)
+		{
+			name:   "deleting the user",
+			handle: (&Server{}).deleteUser,
+			method: http.MethodDelete,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var httpErr *types2.ErrHTTP
+			if err := tt.handle(request(tt.method, tt.body)); !errors.As(err, &httpErr) || httpErr.Code != http.StatusConflict {
+				t.Fatalf("%s = %v, want a conflict", tt.name, err)
+			}
+		})
+	}
 }
 
-func contains(values []string, target string) bool {
-	return slices.Contains(values, target)
+func TestEnableUser(t *testing.T) {
+	storageServices, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := gatewaydb.New(storageServices.DB.DB, storageServices.DB.SQLDB, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(); err != nil {
+		t.Fatal(err)
+	}
+	gatewayClient := client.New(t.Context(), db, nil, nil, nil, []string{"00u-explicit@example.com"}, nil, time.Hour, 10, 0, 0, 0, false)
+	t.Cleanup(func() { _ = gatewayClient.Close() })
+	okta := client.AuthProviderRef{
+		Namespace: system.DefaultNamespace,
+		Name:      "okta-auth-provider",
+	}
+	conn, _, err := gatewayClient.CreateSCIMConnection(t.Context(), client.CreateSCIMConnectionOptions{
+		AuthProviderNamespace: okta.Namespace,
+		AuthProviderName:      okta.Name,
+		GroupIDPrefix:         "okta/",
+		Origin:                types.SCIMConnectionOriginSCIMFirst,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The identity provider provisions users with various roles, deactivated.
+	deactivate := func(nativeID string, role types2.Role) uint {
+		t.Helper()
+		provisioned, err := gatewayClient.CreateSCIMUser(t.Context(), conn, client.SCIMUserInput{
+			UserName:   nativeID + "@example.com",
+			ExternalID: nativeID,
+			Active:     new(false),
+			Profile: types.SCIMUserProfile{
+				Emails: []types.SCIMMultiValue{
+					{
+						Value:   nativeID + "@example.com",
+						Primary: true,
+					},
+				},
+			},
+		}, client.SCIMUserCreateOptions{
+			UserLimit: client.UserLimit{
+				Unlimited: true,
+			},
+			DefaultRole: role,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return provisioned.UserID
+	}
+	users := map[string]uint{
+		"basic":         deactivate("00u-basic", types2.RoleBasic),
+		"owner":         deactivate("00u-owner", types2.RoleOwner),
+		"auditor":       deactivate("00u-auditor", types2.RoleBasic|types2.RoleAuditor),
+		"group owner":   deactivate("00u-group", types2.RoleBasic),
+		"explicit":      deactivate("00u-explicit", types2.RoleBasic),
+		"owner by role": deactivate("00u-owner2", types2.RoleOwner),
+	}
+	// A group of another provider, which outlives Okta's deconfiguration, grants the Owner role.
+	if _, err := gatewayClient.CreateGroupRoleAssignment(t.Context(), "github/owners", types2.RoleOwner, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := storageServices.DB.DB.Create(&types.GroupMemberships{
+		UserID:  users["group owner"],
+		GroupID: "github/owners",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	enable := func(userID string, role types2.Role) (*httptest.ResponseRecorder, error) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/users/"+userID+"/enable", nil)
+		req.SetPathValue("user_id", userID)
+		rec := httptest.NewRecorder()
+		return rec, (&Server{}).enableUser(api.Context{
+			ResponseWriter: rec,
+			Request:        req,
+			Storage:        clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).Build(),
+			GatewayClient:  gatewayClient,
+			User: &user.DefaultInfo{
+				Name:   "requester",
+				UID:    "1000",
+				Groups: role.Groups(),
+			},
+		})
+	}
+	status := func(err error) int {
+		t.Helper()
+		if err == nil {
+			return http.StatusOK
+		}
+		var httpErr *types2.ErrHTTP
+		if !errors.As(err, &httpErr) {
+			t.Fatalf("enableUser() = %v, want an HTTP error", err)
+		}
+		return httpErr.Code
+	}
+
+	// While SCIM manages a user, the identity provider decides.
+	if _, err := enable(fmt.Sprint(users["basic"]), types2.RoleAdmin); status(err) != http.StatusConflict {
+		t.Fatalf("enableUser() of a user SCIM manages = %v, want a conflict", err)
+	}
+
+	// Once their auth provider is deconfigured, an administrator can enable them, but only an Owner can enable a user
+	// with the Owner, auditor, or user impersonation role, however they get it.
+	if _, err := gatewayClient.DeleteAuthProviderSCIMConnection(t.Context(), okta); err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name       string
+		user       string
+		requester  types2.Role
+		wantStatus int
+	}{
+		{
+			name:       "an Admin enabling an Owner",
+			user:       "owner",
+			requester:  types2.RoleAdmin,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "an Admin enabling an auditor",
+			user:       "auditor",
+			requester:  types2.RoleAdmin,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "an Admin enabling a user whose group grants the Owner role",
+			user:       "group owner",
+			requester:  types2.RoleAdmin,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "an Admin enabling a user whose email is an explicit Owner",
+			user:       "explicit",
+			requester:  types2.RoleAdmin,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "an Owner enabling an Owner",
+			user:       "owner by role",
+			requester:  types2.RoleOwner,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "an Admin enabling a Basic user",
+			user:       "basic",
+			requester:  types2.RoleAdmin,
+			wantStatus: http.StatusOK,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec, err := enable(fmt.Sprint(users[tt.user]), tt.requester)
+			if got := status(err); got != tt.wantStatus {
+				t.Fatalf("enableUser() = %v, want status %d", err, tt.wantStatus)
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+			var enabled types2.User
+			if err := json.Unmarshal(rec.Body.Bytes(), &enabled); err != nil {
+				t.Fatal(err)
+			}
+			if enabled.Status != types2.UserStatusActive || enabled.DisabledReason != "" || enabled.ManagementSource == types2.UserManagementSourceSCIM {
+				t.Fatalf("enabled user = %+v, want an active user that SCIM does not manage", enabled)
+			}
+		})
+	}
+
+	if _, err := enable("4242", types2.RoleAdmin); status(err) != http.StatusNotFound {
+		t.Fatalf("enableUser() of an unknown user = %v, want not found", err)
+	}
+}
+
+func TestTrimUser(t *testing.T) {
+	disabledAt := time.Now()
+	tests := []struct {
+		name string
+		user types.User
+		want types2.User
+	}{
+		{
+			name: "active user",
+			user: types.User{
+				ID:          7,
+				DisplayName: "Ada",
+				Email:       "ada@example.com",
+				Username:    "ada",
+			},
+			want: types2.User{
+				ID:          "7",
+				DisplayName: "Ada",
+				Status:      types2.UserStatusActive,
+			},
+		},
+		{
+			name: "disabled user",
+			user: types.User{
+				ID:          8,
+				DisplayName: "Grace",
+				Email:       "grace@example.com",
+				DisabledAt:  &disabledAt,
+			},
+			want: types2.User{
+				ID:          "8",
+				DisplayName: "Grace",
+				Status:      types2.UserStatusDisabled,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Nothing else of the user is exposed, such as the email, the disable time, or the reason.
+			if got := trimUser(tt.user); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("trimUser() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
 }

@@ -78,7 +78,7 @@ remoteConfig:
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(manifest), 0o600))
 	}
 
-	objects, err := (&Handler{}).readMCPCatalog(t.Context(), "default", dir, "")
+	objects, _, err := (&Handler{}).readMCPCatalog(t.Context(), "default", dir, "")
 	require.NoError(t, err)
 	require.Len(t, objects, len(manifests))
 

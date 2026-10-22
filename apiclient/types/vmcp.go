@@ -15,9 +15,13 @@ const (
 
 // VMCP is a stable, optionally multi-component MCP endpoint definition.
 type VMCP struct {
-	Metadata                `json:",inline"`
-	VMCPManifest            `json:",inline"`
+	Metadata     `json:",inline"`
+	VMCPManifest `json:",inline"`
+	// LocalhostCallbackPaths contains the effective callback paths for the requesting user.
+	LocalhostCallbackPaths  []string   `json:"localhostCallbackPaths"`
 	LegacySlug              string     `json:"legacySlug,omitempty"`
+	SourceURL               string     `json:"sourceURL,omitempty"`
+	Adopted                 *bool      `json:"adopted,omitempty"`
 	UserID                  string     `json:"userID,omitempty"`
 	CreatorUserID           string     `json:"creatorUserID,omitempty"`
 	StaticConfigurationHash string     `json:"staticConfigurationHash,omitempty"`
@@ -29,6 +33,7 @@ type VMCPManifest struct {
 	DisplayName string          `json:"displayName"`
 	Description string          `json:"description,omitempty"`
 	Icon        string          `json:"icon,omitempty"`
+	ToolSearch  bool            `json:"toolSearch,omitempty"`
 	Components  []VMCPComponent `json:"components"`
 	Profiles    []VMCPProfile   `json:"profiles,omitempty"`
 }
@@ -37,7 +42,8 @@ type VMCPManifest struct {
 // Runtime resolution uses CatalogEntry rather than resolving the source live.
 // The API populates MCPCatalogID, CatalogEntry, and SourceDigest from the entry ID.
 type VMCPComponent struct {
-	// ID is the immutable, server-assigned identity used to scope component configuration.
+	// ID is the immutable identity used to scope component configuration. The API
+	// assigns it; catalog manifests may declare it for profile references.
 	ID                      string                        `json:"id,omitempty"`
 	Name                    string                        `json:"name"`
 	MCPCatalogID            string                        `json:"mcpCatalogID"`
@@ -47,7 +53,6 @@ type VMCPComponent struct {
 	Configuration           []VMCPConfigurationPolicy     `json:"configuration,omitempty"`
 	ForceSingleUser         bool                          `json:"forceSingleUser,omitempty"`
 	OAuthCredentialID       string                        `json:"oauthCredentialID,omitempty"`
-	AllowedTools            []string                      `json:"allowedTools,omitempty"`
 	ToolPrefix              string                        `json:"toolPrefix,omitempty"`
 	ToolOverrides           []ToolOverride                `json:"toolOverrides,omitempty"`
 }
@@ -73,6 +78,9 @@ type VMCPConfigurationPolicy struct {
 	// Value is write-only fixed configuration. The API removes it from the
 	// persisted VMCP manifest and stores it in the VMCP credential.
 	Value string `json:"value,omitempty"`
+	// SecretBinding sources fixed configuration from a Kubernetes Secret when
+	// the component server launches, so the value is never stored by Obot.
+	SecretBinding *MCPSecretBinding `json:"secretBinding,omitempty"`
 }
 
 type VMCPConfigurationPolicyType string
@@ -193,9 +201,27 @@ type VMCPComponentStatus struct {
 	Error         string `json:"error,omitempty"`
 	SourceMissing bool   `json:"sourceMissing,omitempty"`
 	NeedsUpdate   bool   `json:"needsUpdate,omitempty"`
+	// ConnectionSnapshot is an outdated snapshot that migrated connections retain when the
+	// component itself is current. Updating the vMCP releases it.
+	ConnectionSnapshot *MCPServerCatalogEntrySnapshot `json:"connectionSnapshot,omitempty"`
 }
 
 type VMCPList List[VMCP]
+
+// OrphanedVMCPCatalogItem is the catalog YAML that lets catalog sync take over
+// an orphaned vMCP: one migrated from a catalog-synced composite entry that no
+// catalog source defines yet.
+type OrphanedVMCPCatalogItem struct {
+	VMCPID      string `json:"vmcpID"`
+	DisplayName string `json:"displayName"`
+	EntryKey    string `json:"entryKey"`
+	// YAML is a single catalog item. It is empty when Error is set.
+	YAML string `json:"yaml,omitempty"`
+	// Error explains why the vMCP cannot be expressed as catalog YAML.
+	Error string `json:"error,omitempty"`
+}
+
+type OrphanedVMCPCatalogItemList List[OrphanedVMCPCatalogItem]
 
 type VMCPInstance struct {
 	LegacySlug           string `json:"legacySlug,omitempty"`
@@ -226,7 +252,7 @@ type VMCPInstanceStatus struct {
 type VMCPInstanceList List[VMCPInstance]
 
 // Default fills secure defaults that are omitted by clients.
-func (m *VMCPManifest) Default(personalServer bool, userID string) {
+func (m *VMCPManifest) Default(personalServer bool) {
 	m.DefaultConfigurationPolicies()
 
 	if personalServer {
@@ -234,7 +260,7 @@ func (m *VMCPManifest) Default(personalServer bool, userID string) {
 	} else if m.Profiles == nil {
 		m.Profiles = []VMCPProfile{{
 			Name:        "default",
-			Subjects:    []Subject{{Type: SubjectTypeGroup, ID: GroupAdmin}},
+			Subjects:    []Subject{{Type: SubjectTypeObotGroup, ID: GroupAdmin}},
 			Permissions: VMCPProfilePermissions{AllowAllComponents: true},
 		}}
 	}
@@ -249,6 +275,26 @@ func (m *VMCPManifest) DefaultConfigurationPolicies() {
 			}
 		}
 	}
+}
+
+func validateConfigurationSecretBinding(component VMCPComponent, policy VMCPConfigurationPolicy) error {
+	binding := policy.SecretBinding
+	if binding == nil {
+		return nil
+	}
+	if policy.Policy != VMCPConfigurationPolicyFixed {
+		return fmt.Errorf("component %q configuration %q may only set secretBinding with fixed policy", component.Name, policy.Key)
+	}
+	if policy.Value != "" {
+		return fmt.Errorf("component %q configuration %q secretBinding and value are mutually exclusive", component.Name, policy.Key)
+	}
+	if binding.Name == "" || binding.Key == "" {
+		return fmt.Errorf("component %q configuration %q secretBinding requires both name and key", component.Name, policy.Key)
+	}
+	if !slices.ContainsFunc(component.CatalogEntry.Manifest.Config, func(config MCPConfig) bool { return config.Key == policy.Key }) {
+		return fmt.Errorf("component %q configuration %q secretBinding does not match a catalog entry configuration field", component.Name, policy.Key)
+	}
+	return nil
 }
 
 func (m VMCPManifest) Validate() error {
@@ -296,9 +342,12 @@ func (m VMCPManifest) Validate() error {
 			if policy.Policy != VMCPConfigurationPolicyFixed && policy.Value != "" {
 				return fmt.Errorf("component %q configuration %q may only set value with fixed policy", component.Name, policy.Key)
 			}
+			if err := validateConfigurationSecretBinding(component, policy); err != nil {
+				return err
+			}
 		}
 		for _, config := range component.CatalogEntry.Manifest.Config {
-			if config.Required && config.Value == "" && config.SecretBinding == nil {
+			if config.Required && !config.Static && config.SecretBinding == nil {
 				if policy := configurationKeys[config.Key]; policy == "" || policy == VMCPConfigurationPolicyProhibited {
 					return fmt.Errorf("component %q required configuration %q cannot be prohibited", component.Name, config.Key)
 				}

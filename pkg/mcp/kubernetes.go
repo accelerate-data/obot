@@ -28,6 +28,7 @@ import (
 	"github.com/obot-platform/obot/pkg/wait"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,10 +50,9 @@ const (
 )
 
 var (
-	remoteMemoryRequest       = resource.MustParse("100Mi")
-	defaultMCPMemoryRequest   = resource.MustParse("200Mi")
-	defaultAgentMemoryRequest = resource.MustParse("400Mi")
-	defaultCPURequest         = resource.MustParse("10m")
+	remoteMemoryRequest     = resource.MustParse("100Mi")
+	defaultMCPMemoryRequest = resource.MustParse("200Mi")
+	defaultCPURequest       = resource.MustParse("10m")
 
 	// ValidPSALevels contains all valid Pod Security Admission levels
 	ValidPSALevels = []string{"privileged", "baseline", "restricted"}
@@ -67,6 +67,8 @@ type kubernetesBackend struct {
 	cachedClient      kclient.WithWatch
 	httpListenPort    int
 	baseImage         string
+	openAPIImage      string
+	validationOptions ValidationOptions
 	mcpNamespace      string
 	mcpClusterDomain  string
 	serviceFQDN       string
@@ -96,6 +98,7 @@ func newKubernetesBackend(
 	cachedClient kclient.WithWatch,
 	obotClient kclient.WithWatch,
 	opts Options,
+	validationOptions ValidationOptions,
 ) backend {
 	var serviceFQDN string
 	if opts.ServiceName != "" && opts.ServiceNamespace != "" {
@@ -103,18 +106,20 @@ func newKubernetesBackend(
 	}
 
 	return &kubernetesBackend{
-		clientset:        clientset,
-		client:           client,
-		cachedClient:     cachedClient,
-		httpListenPort:   httpListenPort,
-		baseImage:        opts.MCPBaseImage,
-		mcpNamespace:     opts.MCPNamespace,
-		mcpClusterDomain: opts.MCPClusterDomain,
-		serviceFQDN:      serviceFQDN,
-		authEnabled:      authEnabled,
-		imagePullSecrets: opts.MCPImagePullSecrets,
-		obotClient:       obotClient,
-		deploymentCache:  map[string]*kubernetesDeploymentCacheEntry{},
+		clientset:         clientset,
+		client:            client,
+		cachedClient:      cachedClient,
+		httpListenPort:    httpListenPort,
+		baseImage:         opts.MCPBaseImage,
+		openAPIImage:      opts.MCPOpenAPIImage,
+		validationOptions: validationOptions,
+		mcpNamespace:      opts.MCPNamespace,
+		mcpClusterDomain:  opts.MCPClusterDomain,
+		serviceFQDN:       serviceFQDN,
+		authEnabled:       authEnabled,
+		imagePullSecrets:  opts.MCPImagePullSecrets,
+		obotClient:        obotClient,
+		deploymentCache:   map[string]*kubernetesDeploymentCacheEntry{},
 	}
 }
 
@@ -130,7 +135,7 @@ func (k *kubernetesBackend) deployServer(ctx context.Context, server ServerConfi
 
 func (k *kubernetesBackend) deployServerObjects(ctx context.Context, server ServerConfig, objs []kclient.Object) error {
 	// Check capacity before deploying (fail-open if capacity can't be determined)
-	if err := k.CheckCapacity(ctx, server); err != nil {
+	if err := k.CheckCapacity(ctx, objs); err != nil {
 		return err
 	}
 
@@ -175,6 +180,11 @@ func (k *kubernetesBackend) ensureServerDeployment(ctx context.Context, server S
 		// Remove any existing deployment for remote and vMCP servers
 		return server, k.deployServerObjects(ctx, server, nil)
 	}
+	// k8sObjects also resolves this image for direct deployServer calls.
+	// Resolve it here so the deployment cache hashes the same image.
+	if server.Runtime == types.RuntimeOpenAPI {
+		server.ContainerImage = k.openAPIImage
+	}
 
 	// Also has the files so we update the dynamic files if we need to.
 	serverConfigHash := serverID(server) + utils.Digest(server.Files)
@@ -191,6 +201,10 @@ func (k *kubernetesBackend) ensureServerDeployment(ctx context.Context, server S
 	}
 
 	if shouldDeploy {
+		if err := validateDeployment(ctx, server, k.validationOptions); err != nil {
+			return ServerConfig{}, err
+		}
+
 		slog.Info("Triggering redeploy for MCP server", "mcpServerName", server.MCPServerName)
 		objs, err := k.k8sObjects(ctx, server)
 		if err != nil {
@@ -218,25 +232,6 @@ func (k *kubernetesBackend) ensureServerDeployment(ctx context.Context, server S
 		podName: podName,
 	})
 
-	if server.IsAgentServer() {
-		return ServerConfig{
-			URL:                  fmt.Sprintf("%s/%s", u, strings.TrimPrefix(server.ContainerPath, "/")),
-			MCPServerName:        server.MCPServerName,
-			Audiences:            server.Audiences,
-			MCPServerNamespace:   server.MCPServerNamespace,
-			MCPServerDisplayName: server.MCPServerDisplayName,
-			Scope:                podName,
-			UserID:               server.UserID,
-			OwnerUserID:          server.OwnerUserID,
-			Runtime:              types.RuntimeRemote,
-			ContainerPort:        server.ContainerPort,
-			ContainerPath:        server.ContainerPath,
-			AgentName:            server.AgentName,
-			AuditLogMetadata:     server.AuditLogMetadata,
-			StartupTimeout:       server.StartupTimeout,
-		}, nil
-	}
-
 	fullURL := fmt.Sprintf("%s/%s", u, strings.TrimPrefix(server.ContainerPath, "/"))
 
 	// Use the pod name as the scope, so we get a new session if the pod restarts. MCP sessions aren't persistent on the server side.
@@ -254,6 +249,7 @@ func (k *kubernetesBackend) ensureServerDeployment(ctx context.Context, server S
 		ContainerPort:           server.ContainerPort,
 		ContainerPath:           server.ContainerPath,
 		PassthroughHeaderNames:  server.PassthroughHeaderNames,
+		Headers:                 server.hostedConnectionHeaders(),
 		PassthroughHeaderValues: server.PassthroughHeaderValues,
 		StartupTimeout:          server.StartupTimeout,
 		Webhooks:                server.Webhooks,
@@ -416,6 +412,9 @@ func (k *kubernetesBackend) shutdownServer(ctx context.Context, id string, hardS
 }
 
 func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig) ([]kclient.Object, error) {
+	if server.Runtime == types.RuntimeOpenAPI {
+		server.ContainerImage = k.openAPIImage
+	}
 	if server.Runtime == types.RuntimeRemote || server.Runtime == types.RuntimeVMCP {
 		return nil, nil
 	}
@@ -447,8 +446,7 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 		err                error
 	)
 
-	switch server.Runtime {
-	case types.RuntimeContainerized:
+	if isHTTPContainerRuntime(server.Runtime) {
 		port = server.ContainerPort
 	}
 
@@ -461,6 +459,14 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 		metaEnv = append(metaEnv, file.EnvKey)
 		secretEnvData[file.EnvKey] = []byte("/files/" + filename)
 		fileMapping[file.EnvKey] = "/files/" + filename
+	}
+	// Kubernetes limits the combined data of a Secret, not each individual file.
+	var mountedFileBytes int
+	for _, data := range secretVolumeData {
+		mountedFileBytes += len(data)
+	}
+	if mountedFileBytes > corev1.MaxSecretSize {
+		return nil, fmt.Errorf("combined mounted files exceed Kubernetes' 1 MiB Secret limit")
 	}
 
 	objs = append(objs, &corev1.Secret{
@@ -496,16 +502,6 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 
 	secretEnvData["MMMCP_META_ENV"] = []byte(strings.Join(metaEnv, ","))
 
-	if server.Runtime == types.RuntimeContainerized {
-		// Containerized runtimes can still be Nanobot agents.
-		secretEnvData["NANOBOT_RUN_FORCE_FETCH_TOOL_LIST"] = []byte("true")
-		secretEnvData["NANOBOT_RUN_HEALTHZ_PATH"] = []byte("/healthz")
-	}
-
-	if server.IsAgentServer() {
-		maps.Copy(secretEnvData, OTELEnv("nanobot-agent", ""))
-	}
-
 	// Resolved secretBinding values are merged into secretEnvData by the
 	// caller (sm.ServerToServerConfig), so any rotation naturally bumps
 	// this revision via utils.Digest(secretEnvData) - no separate term
@@ -525,7 +521,6 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 	mcpResources := mcpContainerResources(
 		server.Resources,
 		server.Runtime,
-		server.IsAgentServer(),
 		k8sSettings,
 	)
 
@@ -538,48 +533,15 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 		k8sSettings,
 		server.Resources,
 		server.Runtime,
-		server.IsAgentServer(),
 		effectiveImagePullSecrets,
 	)
 
 	// Get PSA enforce level for security context decisions
 	psaLevel := GetPSAEnforceLevelFromSpec(k8sSettings)
 
-	var workspacePVCName string
-	if server.IsAgentServer() {
-		workspacePVCName = name.SafeConcatName(server.MCPServerName, "workspace")
-
-		workspaceSizeDef := k8sSettings.NanobotWorkspaceSize
-		if workspaceSizeDef == "" {
-			workspaceSizeDef = agentWorkspaceDefaultSize
-		}
-		workspaceSize, err := resource.ParseQuantity(workspaceSizeDef)
-		if err != nil {
-			return nil, fmt.Errorf("invalid workspace size '%s': %w", workspaceSizeDef, err)
-		}
-
-		pvcAnnotations := maps.Clone(annotations)
-		// Apply the annotation to prevent the PVC from being updated after creation.
-		pvcAnnotations[apply.AnnotationUpdate] = "false"
-		objs = append(objs, &corev1.PersistentVolumeClaim{
-			Name:        workspacePVCName,
-			Namespace:   k.mcpNamespace,
-			Annotations: pvcAnnotations,
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: workspaceSize,
-					},
-				},
-				StorageClassName: k8sSettings.StorageClassName,
-			},
-		})
-	}
-
 	containers := make([]corev1.Container, 0, 1)
 
-	if server.Runtime == types.RuntimeContainerized {
+	if isHTTPContainerRuntime(server.Runtime) {
 		if server.Command != "" {
 			command = []string{expandEnvVars(server.Command, fileMapping, nil)}
 		}
@@ -601,12 +563,6 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 			MountPath: "/files",
 		},
 	}
-	if workspacePVCName != "" {
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      agentWorkspaceVolumeName,
-			MountPath: agentWorkspaceMountPath,
-		})
-	}
 
 	// This is the "real" MCP container.
 	containers = append(containers, corev1.Container{
@@ -621,12 +577,6 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 		SecurityContext: getContainerSecurityContext(psaLevel),
 		Command:         command,
 		Args:            args,
-		WorkingDir: func() string {
-			if workspacePVCName != "" {
-				return agentWorkspaceMountPath
-			}
-			return ""
-		}(),
 		EnvFrom: []corev1.EnvFromSource{{
 			SecretRef: &corev1.SecretEnvSource{
 				Name: name.SafeConcatName(server.MCPServerName, "mcp", "config"),
@@ -673,20 +623,11 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 							},
 						}
 
-						if server.Runtime != types.RuntimeContainerized {
+						if !isHTTPContainerRuntime(server.Runtime) {
 							volumes = append(volumes, corev1.Volume{
 								Name: "run-file",
 								Secret: &corev1.SecretVolumeSource{
 									SecretName: name.SafeConcatName(server.MCPServerName, "mcp", "run"),
-								},
-							})
-						}
-
-						if workspacePVCName != "" {
-							volumes = append(volumes, corev1.Volume{
-								Name: agentWorkspaceVolumeName,
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: workspacePVCName,
 								},
 							})
 						}
@@ -701,7 +642,7 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 
 	objs = append(objs, dep)
 
-	if server.Runtime != types.RuntimeContainerized {
+	if !isHTTPContainerRuntime(server.Runtime) {
 		// Configure mmmcp to expose the command-based MCP server over HTTP.
 		mmmcpFileString, err := constructMCPServerMMMCPYAML(server, secretEnvData)
 		if err != nil {
@@ -728,15 +669,17 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 				Port: intstr.FromInt(port),
 			},
 		}
+	} else if server.Runtime == types.RuntimeOpenAPI {
+		dep.Spec.Template.Spec.Containers[len(containers)-1].ReadinessProbe = &corev1.Probe{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: server.HealthzPath,
+				Port: intstr.FromInt(port),
+			},
+		}
 	}
 
 	for _, secret := range effectiveImagePullSecrets {
 		dep.Spec.Template.Spec.ImagePullSecrets = append(dep.Spec.Template.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: secret})
-	}
-
-	if server.IsAgentServer() {
-		// We also need to replace since there is a PVC involved.
-		dep.Spec.Strategy.Type = appsv1.RecreateDeploymentStrategyType
 	}
 
 	servicePorts := []corev1.ServicePort{
@@ -746,8 +689,8 @@ func (k *kubernetesBackend) k8sObjects(ctx context.Context, server ServerConfig)
 			TargetPort: intstr.FromString(portName),
 		},
 	}
-	if server.Runtime == types.RuntimeContainerized {
-		// For containerized runtimes, expose the port of the real MCP server for health checks.
+	if isHTTPContainerRuntime(server.Runtime) {
+		// For HTTP container runtimes, expose the MCP server port for health checks.
 		servicePorts = append(servicePorts, corev1.ServicePort{
 			Name:       "mcp",
 			Port:       8080,
@@ -805,8 +748,7 @@ func analyzePodStatusWithClient(ctx context.Context, pod *corev1.Pod, server Ser
 		return false, fmt.Errorf("%w: pod is in Failed phase: %s", ErrHealthCheckTimeout, pod.Status.Message)
 	case corev1.PodSucceeded:
 		// This shouldn't happen for a long-running deployment, but if it does, it's an error
-		// Except for agents. We use "recreate" update strategy for agents, so it's possible that the old pod exited while the new one is initializing.
-		return server.IsAgentServer(), fmt.Errorf("%w: pod succeeded and exited", ErrHealthCheckTimeout)
+		return false, fmt.Errorf("%w: pod succeeded and exited", ErrHealthCheckTimeout)
 	case corev1.PodUnknown:
 		return false, fmt.Errorf("%w: pod is in Unknown phase", ErrHealthCheckTimeout)
 	}
@@ -1034,13 +976,13 @@ func (k *kubernetesBackend) deleteDeploymentCache(mcpServerName string) {
 	delete(k.deploymentCache, mcpServerName)
 }
 
-func mcpContainerResources(serverSpecificResources *corev1.ResourceRequirements, runtime types.Runtime, agent bool, k8sSettings v1.K8sSettingsSpec) corev1.ResourceRequirements {
+func mcpContainerResources(serverSpecificResources *corev1.ResourceRequirements, runtime types.Runtime, k8sSettings v1.K8sSettingsSpec) corev1.ResourceRequirements {
 	maximums := EffectiveResourceMaximums(k8sSettings, ResourceMaximums{})
-	return mcpContainerResourcesWithMaximums(serverSpecificResources, runtime, agent, k8sSettings, maximums)
+	return mcpContainerResourcesWithMaximums(serverSpecificResources, runtime, k8sSettings, maximums)
 }
 
-func mcpContainerResourcesWithMaximums(serverSpecificResources *corev1.ResourceRequirements, runtime types.Runtime, agent bool, k8sSettings v1.K8sSettingsSpec, maximums ResourceMaximums) corev1.ResourceRequirements {
-	defaults, implicitMemoryRequest := mcpContainerDefaultResources(runtime, agent, k8sSettings)
+func mcpContainerResourcesWithMaximums(serverSpecificResources *corev1.ResourceRequirements, runtime types.Runtime, k8sSettings v1.K8sSettingsSpec, maximums ResourceMaximums) corev1.ResourceRequirements {
+	defaults, implicitMemoryRequest := mcpContainerDefaultResources(runtime, k8sSettings)
 	defaults = withImplicitResourceMaximums(defaults, implicitMemoryRequest, maximums)
 	return withServerResourceOverrides(defaults, serverSpecificResources)
 }
@@ -1049,15 +991,9 @@ func mcpContainerResourcesWithMaximums(serverSpecificResources *corev1.ResourceR
 // its memory request came from a built-in fallback. Only built-in fallbacks are
 // capped by ResourceMaximums; explicit K8s settings remain explicit and are
 // validated separately.
-func mcpContainerDefaultResources(runtime types.Runtime, agent bool, k8sSettings v1.K8sSettingsSpec) (corev1.ResourceRequirements, bool) {
+func mcpContainerDefaultResources(runtime types.Runtime, k8sSettings v1.K8sSettingsSpec) (corev1.ResourceRequirements, bool) {
 	if runtime == types.RuntimeRemote {
 		return memoryRequestResources(remoteMemoryRequest), true
-	}
-	if agent {
-		if k8sSettings.NanobotAgentResources != nil {
-			return *k8sSettings.NanobotAgentResources, false
-		}
-		return memoryRequestResources(defaultAgentMemoryRequest), true
 	}
 	if k8sSettings.Resources != nil {
 		return *k8sSettings.Resources, false
@@ -1080,7 +1016,7 @@ func withImplicitResourceMaximums(resources corev1.ResourceRequirements, implici
 }
 
 func EffectiveDefaultMCPResourceRequirements(k8sSettings v1.K8sSettingsSpec) corev1.ResourceRequirements {
-	return mcpContainerResources(nil, types.RuntimeNPX, false, k8sSettings)
+	return mcpContainerResources(nil, types.RuntimeNPX, k8sSettings)
 }
 
 func withServerResourceOverrides(defaults corev1.ResourceRequirements, overrides *corev1.ResourceRequirements) corev1.ResourceRequirements {
@@ -1146,13 +1082,11 @@ func (k *kubernetesBackend) restartServer(ctx context.Context, server ServerConf
 		k8sSettings,
 		server.Resources,
 		server.Runtime,
-		server.IsAgentServer(),
 		effectiveImagePullSecrets,
 	)
 	desiredResources := mcpContainerResources(
 		server.Resources,
 		server.Runtime,
-		server.IsAgentServer(),
 		k8sSettings,
 	)
 
@@ -1262,9 +1196,13 @@ func (k *kubernetesBackend) patchDeploymentWithK8sSettings(ctx context.Context, 
 	// Add affinity if present
 	if k8sSettings.Affinity != nil {
 		// Use $patch: replace to completely replace the affinity field
-		// rather than merging with existing values
-		affinityMap := map[string]any{
-			"$patch": "replace",
+		// rather than merging with existing values. Only add the directive when the
+		// deployment already has an affinity: strategic merge patch drops any map
+		// containing a directive when the key is missing from the original object,
+		// which would silently discard the desired affinity.
+		affinityMap := map[string]any{}
+		if deployment.Spec.Template.Spec.Affinity != nil {
+			affinityMap["$patch"] = "replace"
 		}
 
 		// Set the actual affinity fields that are present
@@ -1741,7 +1679,6 @@ func ComputeK8sSettingsHash(
 	settings v1.K8sSettingsSpec,
 	serverSpecificResources *corev1.ResourceRequirements,
 	serverRuntime types.Runtime,
-	agentServer bool,
 	imagePullSecretNames []string,
 ) string {
 	var buf bytes.Buffer
@@ -1762,23 +1699,11 @@ func ComputeK8sSettingsHash(
 	// applied to the Deployment, including maximums from K8sSettings capping
 	// implicit built-in defaults.
 	// Ignoring errors from JSON encoding since the inputs are well-defined structs that should always marshal successfully
-	_ = json.NewEncoder(&buf).Encode(mcpContainerResources(serverSpecificResources, serverRuntime, agentServer, settings))
+	_ = json.NewEncoder(&buf).Encode(mcpContainerResources(serverSpecificResources, serverRuntime, settings))
 
 	// Hash runtimeClassName
 	if settings.RuntimeClassName != nil && *settings.RuntimeClassName != "" {
 		buf.WriteString(*settings.RuntimeClassName)
-	}
-
-	// Hash storageClassName
-	if settings.StorageClassName != nil {
-		buf.WriteString(*settings.StorageClassName)
-	}
-
-	// Hash agent-only settings.
-	if agentServer {
-		if settings.NanobotWorkspaceSize != "" {
-			buf.WriteString(settings.NanobotWorkspaceSize)
-		}
 	}
 
 	// Hash Pod Security Admission settings
@@ -1978,86 +1903,157 @@ func int64PtrValue(value *int64) string {
 	return strconv.FormatInt(*value, 10)
 }
 
-// CheckCapacity checks if there's enough capacity to deploy a new MCP server.
+// CheckCapacity checks if there's enough capacity to deploy the given MCP server objects.
 // Returns nil if capacity is available, or ErrInsufficientCapacity if not.
 // Uses fail-open strategy: if no ResourceQuota exists, allows deployment and lets Kubernetes decide.
 // Only ResourceQuota is used for precheck since node capacity checks are naive and don't account
 // for taints, affinity, other namespace workloads, or resource fragmentation.
-func (k *kubernetesBackend) CheckCapacity(ctx context.Context, server ServerConfig) error {
-	k8sSettings := k.getK8sSettings(ctx)
-
-	memoryRequest := resource.MustParse("0")
-	cpuRequest := resource.MustParse("0")
-	resources := mcpContainerResources(
-		server.Resources,
-		server.Runtime,
-		server.IsAgentServer(),
-		k8sSettings,
-	)
-	if mem, ok := resources.Requests[corev1.ResourceMemory]; ok {
-		memoryRequest = mem
-	}
-	if cpu, ok := resources.Requests[corev1.ResourceCPU]; ok {
-		cpuRequest = cpu
-	}
-
-	// Only use ResourceQuota for precheck - it's enforced at admission time and accurate
-	if available, err := k.checkResourceQuotaCapacity(ctx, memoryRequest, cpuRequest); err == nil {
-		if !available {
-			return ErrInsufficientCapacity
+//
+// If the deployment already exists and has pods running its current pod template, only the additional
+// requests that applying the objects would add to the namespace are checked, because the existing pods'
+// requests are already counted in the quota's usage.
+func (k *kubernetesBackend) CheckCapacity(ctx context.Context, objs []kclient.Object) error {
+	var desired *appsv1.Deployment
+	for _, obj := range objs {
+		if dep, ok := obj.(*appsv1.Deployment); ok {
+			desired = dep
+			break
 		}
+	}
+	if desired == nil {
+		// Nothing will be deployed, so no capacity is needed.
 		return nil
 	}
 
-	// No ResourceQuota or can't check - fail open, let Kubernetes decide
+	// Only use ResourceQuota for precheck - it's enforced at admission time and accurate
+	quotas, err := k.clientset.CoreV1().ResourceQuotas(k.mcpNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		// Can't check - fail open, let Kubernetes decide
+		slog.Warn("Failed to list resource quotas for capacity check", "error", err)
+		return nil
+	}
+
+	quota := requestsQuota(quotas.Items)
+	if quota == nil {
+		// No ResourceQuota limiting requests - fail open, let Kubernetes decide
+		return nil
+	}
+
+	memoryRequest, cpuRequest := k.additionalRequestsForDeploy(ctx, desired)
+	if !quotaHasCapacity(quota, memoryRequest, cpuRequest) {
+		return ErrInsufficientCapacity
+	}
 	return nil
 }
 
-// checkResourceQuotaCapacity checks if there's enough capacity based on ResourceQuota.
-// Returns (true, nil) if capacity is available, (false, nil) if not, or (false, error) if quota can't be checked.
-func (k *kubernetesBackend) checkResourceQuotaCapacity(ctx context.Context, memoryRequest, cpuRequest resource.Quantity) (bool, error) {
-	quotas, err := k.clientset.CoreV1().ResourceQuotas(k.mcpNamespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list resource quotas: %w", err)
+// additionalRequestsForDeploy returns the memory and CPU requests that applying the desired deployment
+// would add to the namespace quota's usage. If the existing deployment can't be compared, it returns the
+// full requests so that a real capacity shortage fails fast instead of timing out on a pod that the quota
+// rejects.
+func (k *kubernetesBackend) additionalRequestsForDeploy(ctx context.Context, desired *appsv1.Deployment) (resource.Quantity, resource.Quantity) {
+	var existing appsv1.Deployment
+	if err := k.client.Get(ctx, kclient.ObjectKey{Name: desired.Name, Namespace: desired.Namespace}, &existing); apierrors.IsNotFound(err) {
+		return additionalDeploymentRequests(desired, nil)
+	} else if err != nil {
+		slog.Warn("Failed to get existing MCP deployment for capacity check, checking full requests", "deployment", desired.Name, "error", err)
+		return additionalDeploymentRequests(desired, nil)
 	}
 
-	if len(quotas.Items) == 0 {
-		return false, fmt.Errorf("no resource quotas found")
+	// Ask the API server what the deployment would look like after the update, so that the comparison with
+	// the existing deployment includes server-side defaults (e.g. probe timings) and admission mutations.
+	// The update is unconditional (no resourceVersion), so concurrent writes such as status updates from the
+	// deployment controller can't make it fail with a conflict.
+	updated := desired.DeepCopy()
+	if err := k.client.Update(ctx, updated, kclient.DryRunAll); err != nil {
+		slog.Warn("Failed to dry-run MCP deployment update for capacity check, checking full requests", "deployment", desired.Name, "error", err)
+		return additionalDeploymentRequests(desired, nil)
 	}
 
-	// Check if any quota has memory or CPU request limits
-	for _, quota := range quotas.Items {
-		// Check memory
-		memHard, hasMemHard := quota.Status.Hard[corev1.ResourceRequestsMemory]
-		memUsed, hasMemUsed := quota.Status.Used[corev1.ResourceRequestsMemory]
+	return additionalDeploymentRequests(updated, &existing)
+}
 
-		if hasMemHard && hasMemUsed && memoryRequest.Cmp(resource.Quantity{}) > 0 {
-			available := memHard.DeepCopy()
-			available.Sub(memUsed)
-			if available.Cmp(memoryRequest) < 0 {
-				return false, nil
-			}
+// additionalDeploymentRequests returns the memory and CPU requests that applying the desired deployment
+// would add on top of what the existing deployment (if any) already consumes from the namespace quota.
+// The desired deployment should include server-side defaults so it can be compared with the existing one.
+func additionalDeploymentRequests(desired, existing *appsv1.Deployment) (resource.Quantity, resource.Quantity) {
+	memoryRequest, cpuRequest := podTemplateRequests(desired.Spec.Template.Spec)
+	// The existing deployment's requests are only known to be counted in the quota's usage if pods run its
+	// current pod template. That isn't the case if it has no pods (e.g. pod creation was rejected by the quota),
+	// if the deployment controller hasn't observed its latest spec, or if the rollout to it is stuck (e.g. its
+	// new pod was rejected by the quota while an old pod keeps running).
+	if existing == nil || existing.Status.ObservedGeneration < existing.Generation || existing.Status.UpdatedReplicas == 0 {
+		return memoryRequest, cpuRequest
+	}
+
+	// If the pod template is unchanged, applying the deployment won't create any new pods. DeepDerivative
+	// ignores fields that are only set on the existing deployment, because the real apply is a three-way merge
+	// that keeps fields obot didn't set (e.g. the restartedAt annotation added by restartServer). As a result, a
+	// change that only removes a field obot used to set is treated as unchanged and isn't prechecked; the quota
+	// is still enforced when the new pod is admitted.
+	if equality.Semantic.DeepDerivative(desired.Spec.Template, existing.Spec.Template) {
+		return resource.Quantity{}, resource.Quantity{}
+	}
+
+	// The pod template changed, so a new pod is created before the old one is removed (RollingUpdate)
+	// and the full request is needed.
+	return memoryRequest, cpuRequest
+}
+
+// podTemplateRequests returns the effective memory and CPU requests of a pod.
+func podTemplateRequests(spec corev1.PodSpec) (resource.Quantity, resource.Quantity) {
+	var memoryRequest, cpuRequest resource.Quantity
+	for _, container := range spec.Containers {
+		if mem, ok := container.Resources.Requests[corev1.ResourceMemory]; ok {
+			memoryRequest.Add(mem)
 		}
-
-		// Check CPU
-		cpuHard, hasCPUHard := quota.Status.Hard[corev1.ResourceRequestsCPU]
-		cpuUsed, hasCPUUsed := quota.Status.Used[corev1.ResourceRequestsCPU]
-
-		if hasCPUHard && hasCPUUsed && cpuRequest.Cmp(resource.Quantity{}) > 0 {
-			available := cpuHard.DeepCopy()
-			available.Sub(cpuUsed)
-			if available.Cmp(cpuRequest) < 0 {
-				return false, nil
-			}
+		if cpu, ok := container.Resources.Requests[corev1.ResourceCPU]; ok {
+			cpuRequest.Add(cpu)
 		}
+	}
+	return memoryRequest, cpuRequest
+}
 
-		// If we found at least one resource limit, we can make a decision
+// requestsQuota returns the first ResourceQuota that limits memory or CPU requests, or nil if there is none.
+func requestsQuota(quotas []corev1.ResourceQuota) *corev1.ResourceQuota {
+	for i, quota := range quotas {
+		_, hasMemHard := quota.Status.Hard[corev1.ResourceRequestsMemory]
+		_, hasMemUsed := quota.Status.Used[corev1.ResourceRequestsMemory]
+		_, hasCPUHard := quota.Status.Hard[corev1.ResourceRequestsCPU]
+		_, hasCPUUsed := quota.Status.Used[corev1.ResourceRequestsCPU]
 		if (hasMemHard && hasMemUsed) || (hasCPUHard && hasCPUUsed) {
-			return true, nil
+			return &quotas[i]
+		}
+	}
+	return nil
+}
+
+// quotaHasCapacity checks if the ResourceQuota has enough remaining capacity for the given requests.
+func quotaHasCapacity(quota *corev1.ResourceQuota, memoryRequest, cpuRequest resource.Quantity) bool {
+	// Check memory
+	memHard, hasMemHard := quota.Status.Hard[corev1.ResourceRequestsMemory]
+	memUsed, hasMemUsed := quota.Status.Used[corev1.ResourceRequestsMemory]
+
+	if hasMemHard && hasMemUsed && memoryRequest.Cmp(resource.Quantity{}) > 0 {
+		available := memHard.DeepCopy()
+		available.Sub(memUsed)
+		if available.Cmp(memoryRequest) < 0 {
+			return false
 		}
 	}
 
-	return false, fmt.Errorf("no memory or CPU quota found")
+	// Check CPU
+	cpuHard, hasCPUHard := quota.Status.Hard[corev1.ResourceRequestsCPU]
+	cpuUsed, hasCPUUsed := quota.Status.Used[corev1.ResourceRequestsCPU]
+
+	if hasCPUHard && hasCPUUsed && cpuRequest.Cmp(resource.Quantity{}) > 0 {
+		available := cpuHard.DeepCopy()
+		available.Sub(cpuUsed)
+		if available.Cmp(cpuRequest) < 0 {
+			return false
+		}
+	}
+
+	return true
 }
 
 // GetCapacityInfo returns capacity information for the MCP namespace.

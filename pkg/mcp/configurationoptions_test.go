@@ -79,7 +79,12 @@ func TestValidateCatalogEntryManifestConfigUsage(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:      types.RuntimeRemote,
 				RemoteConfig: &types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp"},
-				Config:       []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+				Config: []types.MCPConfig{
+					{
+						Key:   "Authorization",
+						Usage: types.Header,
+					},
+				},
 			},
 		},
 		{
@@ -87,7 +92,12 @@ func TestValidateCatalogEntryManifestConfigUsage(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:   types.RuntimeNPX,
 				NPXConfig: &types.NPXRuntimeConfig{Package: "test-server"},
-				Config:    []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+				Config: []types.MCPConfig{
+					{
+						Key:   "Authorization",
+						Usage: types.Header,
+					},
+				},
 			},
 		},
 		{
@@ -95,7 +105,12 @@ func TestValidateCatalogEntryManifestConfigUsage(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:   types.RuntimeUVX,
 				UVXConfig: &types.UVXRuntimeConfig{Package: "test-server"},
-				Config:    []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+				Config: []types.MCPConfig{
+					{
+						Key:   "Authorization",
+						Usage: types.Header,
+					},
+				},
 			},
 		},
 		{
@@ -107,7 +122,12 @@ func TestValidateCatalogEntryManifestConfigUsage(t *testing.T) {
 					Port:  8080,
 					Path:  "/mcp",
 				},
-				Config: []types.MCPConfig{{Key: "Authorization", Usage: types.Header}},
+				Config: []types.MCPConfig{
+					{
+						Key:   "Authorization",
+						Usage: types.Header,
+					},
+				},
 			},
 		},
 		{
@@ -115,7 +135,14 @@ func TestValidateCatalogEntryManifestConfigUsage(t *testing.T) {
 			manifest: types.MCPServerCatalogEntryManifest{
 				Runtime:      types.RuntimeRemote,
 				RemoteConfig: &types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp"},
-				Config:       []types.MCPConfig{{Key: "Authorization", Usage: types.Header, Value: "Bearer token", Sensitive: true}},
+				Config: []types.MCPConfig{
+					{
+						Key:       "Authorization",
+						Usage:     types.Header,
+						Value:     "Bearer token",
+						Sensitive: true,
+					},
+				},
 			},
 		},
 	}
@@ -186,42 +213,4 @@ func TestValidateConfiguredOptions(t *testing.T) {
 	require.Empty(t, missing)
 	_, err = ValidateConfiguredOptions([]types.MCPConfig{header}, map[string]string{"X-REGION": "stale"})
 	require.EqualError(t, err, `header "X-REGION" value "stale" is not one of the configured options`)
-}
-
-func TestValidateCatalogConfigurationConstraints(t *testing.T) {
-	catalog := types.MCPServerCatalogEntryManifest{
-		Runtime: types.RuntimeRemote,
-		Config: []types.MCPConfig{{
-			Key: "REGION", Usage: types.Env, Prefix: "region-", Required: true, Sensitive: true, Options: testConfigurationOptions()}},
-		RemoteConfig: &types.RemoteCatalogConfig{URLTemplate: "https://${REGION}.example.com/mcp"},
-	}
-	server, err := types.MapCatalogEntryToServer(catalog, "", false)
-	require.NoError(t, err)
-	require.NoError(t, ValidateCatalogConfigurationConstraints(server, catalog))
-
-	t.Run("option definition changed", func(t *testing.T) {
-		changed := *server.DeepCopy()
-		changed.Config[0].Options = []types.MCPConfigurationOption{{Name: "Anything", Value: "anything"}}
-		require.ErrorContains(t, ValidateCatalogConfigurationConstraints(changed, catalog), `config "REGION" configuration must match`)
-	})
-
-	t.Run("option semantics changed", func(t *testing.T) {
-		changed := *server.DeepCopy()
-		changed.Config[0].Required = false
-		require.ErrorContains(t, ValidateCatalogConfigurationConstraints(changed, catalog), `config "REGION" configuration must match`)
-	})
-
-	t.Run("option field injected", func(t *testing.T) {
-		changed := *server.DeepCopy()
-		changed.Config = append(changed.Config, types.MCPConfig{Usage: types.Env,
-			Key: "INJECTED", Options: []types.MCPConfigurationOption{{Name: "Injected", Value: "injected"}}})
-		require.ErrorContains(t, ValidateCatalogConfigurationConstraints(changed, catalog), `config "INJECTED" configuration must match`)
-	})
-
-	t.Run("unrelated remote fields are not constrained", func(t *testing.T) {
-		changed := *server.DeepCopy()
-		changed.RemoteConfig.URL = "https://changed.example.com/mcp"
-		changed.RemoteConfig.URLTemplate = "https://changed.example.com/${REGION}"
-		require.NoError(t, ValidateCatalogConfigurationConstraints(changed, catalog))
-	})
 }

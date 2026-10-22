@@ -7,6 +7,7 @@ import (
 	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -65,14 +66,14 @@ func TestVMCPInstancesInheritWebhooks(t *testing.T) {
 		backend:       &dockerBackend{hostBaseURLWithPort: "http://172.17.0.1:8080"},
 	}
 	for _, userID := range []string{"1", "2"} {
-		instance := &v1.VMCPInstance{
+		instance := syncedVMCPInstance(&v1.VMCPInstance{
 			Name:      "vmcpi1user" + userID,
 			Namespace: vmcp.Namespace,
 			Spec: v1.VMCPInstanceSpec{
 				UserID:   userID,
 				Manifest: types.VMCPInstanceManifest{VMCPID: vmcp.Name},
 			},
-		}
+		}, vmcp)
 		if err := storage.Create(t.Context(), instance); err != nil {
 			t.Fatal(err)
 		}
@@ -80,7 +81,7 @@ func TestVMCPInstancesInheritWebhooks(t *testing.T) {
 		if err := storage.Create(t.Context(), server); err != nil {
 			t.Fatal(err)
 		}
-		cfg, err := manager.ServerConfigForVMCP(t.Context(), instance.Name, userID)
+		cfg, err := manager.ServerConfigForVMCP(t.Context(), instance.Name, &kuser.DefaultInfo{UID: userID})
 		if err != nil {
 			t.Fatal(err)
 		}

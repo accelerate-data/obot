@@ -65,7 +65,7 @@ func TestServerToServerConfig_RemoteHeadersAreDeploymentConfigAndMultiUserHeader
 				},
 			}
 
-			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv)
+			config, missing, err := ServerToServerConfig(mcpServer, mcpServer.ValidConnectURLs(baseURL), "test-user-id", "test-scope", "test-catalog", tt.credEnv, false)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

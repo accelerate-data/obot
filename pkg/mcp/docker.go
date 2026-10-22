@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +15,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,10 +38,10 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// dockerMinMemoryBytes is Docker's own floor for a container memory limit. The
-// daemon rejects anything smaller when it creates the container, so accepting it
-// here would leave Obot running while every MCP server failed to start.
 const (
+	// initFilesDir is where runInitContainer places files before the init container starts.
+	initFilesDir = "/init-files"
+	// Docker rejects memory limits smaller than this.
 	dockerMinMemoryBytes int64 = 6 * 1024 * 1024
 )
 
@@ -50,9 +54,10 @@ type dockerBackend struct {
 	containerEnv           bool
 	network                string
 	httpListenPort         int
-	hostBaseURL            string
 	hostBaseURLWithPort    string
 	containerizedBaseImage string
+	openAPIImage           string
+	validationOptions      ValidationOptions
 	authEnabled            bool
 	deploymentCacheMu      sync.RWMutex
 	deploymentCache        map[string]*dockerDeploymentCacheEntry
@@ -68,7 +73,7 @@ type dockerDeploymentCacheEntry struct {
 	containerIDs map[string]string
 }
 
-func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, opts Options) (backend, error) {
+func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, opts Options, validationOptions ValidationOptions) (backend, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %w", err)
@@ -93,9 +98,10 @@ func newDockerBackend(ctx context.Context, authEnabled bool, exposedPort int, op
 		containerEnv:           containerEnv,
 		network:                network,
 		httpListenPort:         exposedPort,
-		hostBaseURL:            "http://" + host,
 		hostBaseURLWithPort:    "http://" + fmt.Sprintf("%s:%d", host, exposedPort),
 		containerizedBaseImage: opts.MCPBaseImage,
+		openAPIImage:           opts.MCPOpenAPIImage,
+		validationOptions:      validationOptions,
 		mcpResources:           mcpResources,
 		authEnabled:            authEnabled,
 		deploymentCache:        map[string]*dockerDeploymentCacheEntry{},
@@ -411,6 +417,11 @@ func (d *dockerBackend) ensureDeployment(ctx context.Context, server ServerConfi
 	}
 
 	needsRecreate := dockerContainerNeedsRecreate(existing, configHash, desiredFileEnvKeysHash, d.network, d.deploymentImage(server))
+	if needsRecreate {
+		if err := validateDeployment(ctx, server, d.validationOptions); err != nil {
+			return ServerConfig{}, err
+		}
+	}
 
 	// A recreate requires pulling the image first; a reuse of an
 	// already-running (or already-created) container does not. Either way,
@@ -433,6 +444,9 @@ func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server Serve
 		switch existing.State {
 		case container.StateCreated:
 			// Container exists and is created, start it and wait for it to be ready.
+			if err := validateDeployment(ctx, server, d.validationOptions); err != nil {
+				return ServerConfig{}, err
+			}
 			if err := d.client.ContainerStart(ctx, existing.ID, container.StartOptions{}); err != nil {
 				return ServerConfig{}, fmt.Errorf("failed to start container: %w", err)
 			}
@@ -459,7 +473,7 @@ func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server Serve
 			}
 
 			containerPort := defaultContainerPort
-			if server.Runtime == otypes.RuntimeContainerized && server.ContainerPort != 0 {
+			if isHTTPContainerRuntime(server.Runtime) && server.ContainerPort != 0 {
 				containerPort = server.ContainerPort
 			}
 
@@ -472,6 +486,9 @@ func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server Serve
 	}
 
 	if existing != nil {
+		if err := validateDeployment(ctx, server, d.validationOptions); err != nil {
+			return ServerConfig{}, err
+		}
 		// Container exists but is stale or otherwise not reusable, remove it and recreate.
 		if err := d.client.ContainerRemove(ctx, existing.ID, container.RemoveOptions{Force: true}); cerrdefs.IsConflict(err) {
 			// The container is already being removed, wait for it to finish
@@ -487,6 +504,8 @@ func (d *dockerBackend) createOrReuseContainer(ctx context.Context, server Serve
 		} else if err != nil {
 			return ServerConfig{}, fmt.Errorf("failed to remove stopped container: %w", err)
 		}
+	} else if err := validateDeployment(ctx, server, d.validationOptions); err != nil {
+		return ServerConfig{}, err
 	}
 
 	// Create new container
@@ -554,6 +573,8 @@ func (d *dockerBackend) deploymentImage(server ServerConfig) string {
 	switch server.Runtime {
 	case otypes.RuntimeUVX, otypes.RuntimeNPX:
 		return d.containerizedBaseImage
+	case otypes.RuntimeOpenAPI:
+		return d.openAPIImage
 	default:
 		return ""
 	}
@@ -568,6 +589,8 @@ func (d *dockerBackend) resolveDeploymentImage(server ServerConfig) (string, err
 	switch server.Runtime {
 	case otypes.RuntimeUVX, otypes.RuntimeNPX:
 		return d.containerizedBaseImage, nil
+	case otypes.RuntimeOpenAPI:
+		return d.openAPIImage, nil
 	case otypes.RuntimeContainerized:
 		if server.ContainerImage == "" {
 			return "", fmt.Errorf("container image must be specified for containerized runtime")
@@ -1066,8 +1089,8 @@ func (d *dockerBackend) buildServerConfig(server ServerConfig, c *container.Summ
 		Audiences:               server.Audiences,
 		AuditLogMetadata:        server.AuditLogMetadata,
 		ContainerPath:           server.ContainerPath,
-		AgentName:               server.AgentName,
 		PassthroughHeaderNames:  server.PassthroughHeaderNames,
+		Headers:                 server.hostedConnectionHeaders(),
 		PassthroughHeaderValues: server.PassthroughHeaderValues,
 		StartupTimeout:          server.StartupTimeout,
 		Webhooks:                server.Webhooks,
@@ -1105,7 +1128,6 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 		env           []string
 		containerPort int
 		image         string
-		workspaceName string
 	)
 
 	// Prepare file volumes and environment variables
@@ -1119,20 +1141,6 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 			Source: fileVolumeName,
 			Target: "/files",
 		})
-	}
-
-	if server.IsAgentServer() {
-		workspaceName, err = d.ensureWorkspaceVolume(ctx, server, mcpServerName)
-		if err != nil {
-			return "", 0, fmt.Errorf("failed to create workspace volume: %w", err)
-		}
-		if workspaceName != "" {
-			volumeMounts = append(volumeMounts, mount.Mount{
-				Type:   mount.TypeVolume,
-				Source: workspaceName,
-				Target: agentWorkspaceMountPath,
-			})
-		}
 	}
 
 	if len(fileEnvVars) > 0 {
@@ -1176,6 +1184,9 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 
 		cmd = []string{"--listen", fmt.Sprintf(":%d", defaultContainerPort), "--config", "/config/mmmcp.yaml"}
 
+	case otypes.RuntimeOpenAPI:
+		server.ContainerImage = d.openAPIImage
+		fallthrough
 	case otypes.RuntimeContainerized:
 		// Use specified container image or base image
 		if server.ContainerImage == "" {
@@ -1228,14 +1239,6 @@ func (d *dockerBackend) createAndStartContainer(ctx context.Context, server Serv
 			"mcp.config.hash":        configHash,
 			"mcp.file.env.keys.hash": fileEnvKeysHash,
 		},
-	}
-	if server.IsAgentServer() {
-		config.WorkingDir = agentWorkspaceMountPath
-		config.Env = append(config.Env, "NANOBOT_RUN_HEALTHZ_PATH=/healthz", "OBOT_KUBERNETES_MODE=true")
-
-		for key, value := range OTELEnv("nanobot-agent", d.hostBaseURL) {
-			config.Env = append(config.Env, key+"="+string(value))
-		}
 	}
 
 	// Host config with port bindings and volume mounts.
@@ -1504,43 +1507,6 @@ func (d *dockerBackend) syncContainerFiles(ctx context.Context, server ServerCon
 	return nil
 }
 
-func (d *dockerBackend) ensureWorkspaceVolume(ctx context.Context, server ServerConfig, mcpServerName string) (string, error) {
-	volumeName := server.MCPServerName + "-workspace"
-	labels := map[string]string{
-		"mcp.server.id": server.MCPServerName,
-		"mcp.purpose":   "workspace",
-	}
-	if mcpServerName != "" {
-		labels["mcp.deployment.id"] = mcpServerName
-	}
-
-	resp, err := d.client.VolumeList(ctx, volume.ListOptions{
-		Filters: filters.NewArgs(filters.KeyValuePair{
-			Key:   "name",
-			Value: volumeName,
-		}),
-	})
-	if err != nil {
-		return "", err
-	}
-
-	for _, v := range resp.Volumes {
-		if v.Name == volumeName {
-			return volumeName, nil
-		}
-	}
-
-	_, err = d.client.VolumeCreate(ctx, volume.CreateOptions{
-		Labels: labels,
-		Name:   volumeName,
-	})
-	if err != nil && !cerrdefs.IsAlreadyExists(err) {
-		return "", fmt.Errorf("failed to create workspace volume: %w", err)
-	}
-
-	return volumeName, nil
-}
-
 // createVolumeWithFiles creates an anonymous volume and populates it with file data using an init container
 func (d *dockerBackend) createVolumeWithFiles(ctx context.Context, files []File, containerName, mcpServerName string) (string, map[string]string, error) {
 	if len(files) == 0 {
@@ -1571,8 +1537,10 @@ func (d *dockerBackend) createVolumeWithFiles(ctx context.Context, files []File,
 }
 
 // runInitContainer pulls alpine:latest (if not present), runs a one-shot sh -c container
-// with the given script and mounts, waits for it to exit, and returns any error.
-func (d *dockerBackend) runInitContainer(ctx context.Context, namePrefix, script string, mounts []mount.Mount) error {
+// with the given script and mounts, waits for it to exit, and returns any error. When files is
+// not nil, initFilesDir is created in the container with those files before it starts, so their
+// contents never pass through the script or the container's arguments.
+func (d *dockerBackend) runInitContainer(ctx context.Context, namePrefix, script string, files map[string]string, mounts []mount.Mount) error {
 	initImage := "alpine:latest"
 	if err := d.pullImage(ctx, initImage, true); err != nil {
 		return fmt.Errorf("failed to ensure init image exists: %w", err)
@@ -1601,8 +1569,18 @@ func (d *dockerBackend) runInitContainer(ctx context.Context, namePrefix, script
 		return fmt.Errorf("failed to create init container: %w", err)
 	}
 
+	if files != nil {
+		archive, err := initFilesArchive(files)
+		if err != nil {
+			return errors.Join(err, d.removeInitContainer(ctx, resp.ID))
+		}
+		if err := d.client.CopyToContainer(ctx, resp.ID, "/", archive, container.CopyToContainerOptions{}); err != nil {
+			return errors.Join(fmt.Errorf("failed to copy files to init container: %w", err), d.removeInitContainer(ctx, resp.ID))
+		}
+	}
+
 	if err := d.client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("failed to start init container: %w", err)
+		return errors.Join(fmt.Errorf("failed to start init container: %w", err), d.removeInitContainer(ctx, resp.ID))
 	}
 
 	statusCh, errCh := d.client.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
@@ -1670,26 +1648,69 @@ func fileEnvKeysHash(files []File) string {
 }
 
 func (d *dockerBackend) populateFilesVolume(ctx context.Context, volumeName, containerName string, fileContents map[string]string) error {
-	var script strings.Builder
-	script.WriteString("#!/bin/sh\nset -e\n")
-	script.WriteString("rm -f /files/*\n")
-
-	fileNames := make([]string, 0, len(fileContents))
-	for filename := range fileContents {
-		fileNames = append(fileNames, filename)
+	if fileContents == nil {
+		// A non-nil map makes runInitContainer create initFilesDir, which the script copies from.
+		fileContents = map[string]string{}
 	}
-	sort.Strings(fileNames)
-
-	for _, filename := range fileNames {
-		containerPath := path.Join("/files", filename)
-		fmt.Fprintf(&script, "cat > '%s' << 'EOF'\n%s\nEOF\n", containerPath, fileContents[filename])
-	}
-
-	return d.runInitContainer(ctx, containerName+"-init", script.String(), []mount.Mount{{
+	script := "set -e\nrm -f /files/*\ncp -a " + initFilesDir + "/. /files/\n"
+	return d.runInitContainer(ctx, containerName+"-init", script, fileContents, []mount.Mount{{
 		Type:   mount.TypeVolume,
 		Source: volumeName,
 		Target: "/files",
 	}})
+}
+
+// initFilesArchive returns a tar archive that places each file, followed by a newline, under
+// initFilesDir when extracted at the container root.
+func initFilesArchive(files map[string]string) (io.Reader, error) {
+	names := slices.Sorted(maps.Keys(files))
+	now := time.Now()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	if err := tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeDir,
+		Name:     strings.TrimPrefix(initFilesDir, "/") + "/",
+		Mode:     0o755,
+		ModTime:  now,
+	}); err != nil {
+		return nil, fmt.Errorf("failed to write init files archive: %w", err)
+	}
+	for _, name := range names {
+		if name == "" || strings.Contains(name, "/") || name == "." || name == ".." {
+			return nil, fmt.Errorf("invalid init file name %q", name)
+		}
+		// Files have always ended with a newline, so keep that for anything that depends on it.
+		content := files[name] + "\n"
+		if err := tw.WriteHeader(&tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     path.Join(strings.TrimPrefix(initFilesDir, "/"), name),
+			Mode:     0o644,
+			Size:     int64(len(content)),
+			ModTime:  now,
+		}); err != nil {
+			return nil, fmt.Errorf("failed to write init files archive: %w", err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			return nil, fmt.Errorf("failed to write init files archive: %w", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, fmt.Errorf("failed to write init files archive: %w", err)
+	}
+	return &buf, nil
+}
+
+// removeInitContainer removes an init container that was never started, so AutoRemove does not
+// apply. It runs even when ctx is already canceled, since that is often why the start was skipped.
+func (d *dockerBackend) removeInitContainer(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+
+	if err := d.client.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil && !cerrdefs.IsNotFound(err) {
+		return fmt.Errorf("failed to remove init container: %w", err)
+	}
+	return nil
 }
 
 func (d *dockerBackend) pullImage(ctx context.Context, imageName string, ifNotExists bool) error {
@@ -1757,8 +1778,8 @@ func (d *dockerBackend) prepareMCPServerMMMCPConfig(ctx context.Context, server 
 		return "", fmt.Errorf("failed to create MCP server mmmcp config volume: %w", err)
 	}
 
-	script := fmt.Sprintf("cat > /config/mmmcp.yaml << 'EOF'\n%s\nEOF\n", mmmcpYAML)
-	if err = d.runInitContainer(ctx, server.MCPServerName+"-mmmcp-init", script, []mount.Mount{
+	script := "set -e\ncp " + initFilesDir + "/mmmcp.yaml /config/mmmcp.yaml\n"
+	if err = d.runInitContainer(ctx, server.MCPServerName+"-mmmcp-init", script, map[string]string{"mmmcp.yaml": string(mmmcpYAML)}, []mount.Mount{
 		{
 			Type:   mount.TypeVolume,
 			Source: volumeName,

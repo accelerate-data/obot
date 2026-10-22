@@ -1,6 +1,10 @@
 import { page as appPage } from '$app/state';
-import { COMMUNITY_ENTITLEMENT, SETUP_COMMUNITY_SIGNUP_BANNER_COPY } from '$lib/constants';
+import { COMMUNITY_ENTITLEMENT } from '$lib/constants';
 import { MCPTesterSession } from '$lib/services/mcp/tester.svelte';
+import {
+	createMcpConnectPostResolver,
+	type MCPRequest
+} from '../../../../tests/helpers/mcpConnect';
 import { preparePageData } from '../../../../tests/helpers/pageData';
 import { createMcpServerDetailsFixtures, getLicenseResponse } from '../../../../tests/mocks/data';
 import { worker } from '../../../../tests/mocks/worker';
@@ -13,43 +17,14 @@ import { page } from 'vitest/browser';
 
 const fixtures = createMcpServerDetailsFixtures();
 
-interface MCPRequest {
-	id?: string | number;
-	method: string;
-	params?: Record<string, unknown>;
-}
-
 function mockMCPInitialization(
 	capabilities: Record<string, unknown> = {},
 	handleRequest?: (request: MCPRequest) => unknown,
-	serverID = fixtures.serverSingle.id
+	_serverID = fixtures.serverSingle.id
 ) {
 	worker.use(
-		http.post(`/mcp-connect/${serverID}`, async ({ request }) => {
-			const body = (await request.json()) as MCPRequest;
-			if (body.method === 'initialize') {
-				return HttpResponse.json(
-					{
-						jsonrpc: '2.0',
-						id: body.id,
-						result: {
-							protocolVersion: body.params?.protocolVersion,
-							capabilities,
-							serverInfo: { name: 'tester-server', version: '1.0.0' }
-						}
-					},
-					{ headers: { 'Mcp-Session-Id': 'tester-session' } }
-				);
-			}
-			const result = handleRequest?.(body);
-			if (result !== undefined) {
-				return HttpResponse.json({ jsonrpc: '2.0', id: body.id, result });
-			}
-			return new HttpResponse(null, { status: 202 });
-		}),
-		http.get(`/mcp-connect/${serverID}`, () => {
-			return new HttpResponse(null, { status: 405 });
-		})
+		http.post('/mcp-connect/:connectId', createMcpConnectPostResolver(capabilities, handleRequest)),
+		http.get('/mcp-connect/:connectId', () => new HttpResponse(null, { status: 405 }))
 	);
 }
 
@@ -161,7 +136,7 @@ describe('MCP Tester page', () => {
 				http.get(`/api/oauth/vmcp/${connectID}/components/calendar`, () => {
 					return HttpResponse.json(componentCheck());
 				}),
-				http.post(`/api/mcp-servers/${connectID}/tester/chat`, () =>
+				http.post(`/api/vmcp-instances/${connectID}/tester/chat`, () =>
 					chatStream(
 						{ type: 'assistant_message_start' },
 						{ type: 'text_delta', delta: 'Your calendar is connected.' },
@@ -169,7 +144,7 @@ describe('MCP Tester page', () => {
 					)
 				)
 			);
-			appPage.url.searchParams.delete('tab');
+			appPage.url.searchParams.set('tab', 'chat');
 			const data = await preparePageData<PageData>({
 				...chatModelData,
 				server: {
@@ -254,7 +229,7 @@ describe('MCP Tester page', () => {
 			),
 			http.get(`/api/oauth/vmcp/${connectID}/components/calendar`, () => HttpResponse.json({})),
 			http.delete(`/mcp-connect/${connectID}`, () => new HttpResponse(null, { status: 204 })),
-			http.post(`/api/mcp-servers/${connectID}/tester/chat`, async ({ request }) => {
+			http.post(`/api/vmcp-instances/${connectID}/tester/chat`, async ({ request }) => {
 				requests(await request.json());
 				return chatStream(
 					{ type: 'assistant_message_start' },
@@ -321,7 +296,7 @@ describe('MCP Tester page', () => {
 		}
 	});
 
-	it('initializes the shell and defaults an invalid tab to Chat', async () => {
+	it('initializes the shell and defaults an invalid tab to Tools', async () => {
 		await renderTester('not-a-tab');
 
 		const serverName = fixtures.serverSingle.manifest.name;
@@ -329,12 +304,7 @@ describe('MCP Tester page', () => {
 		await expect.element(serverNameHeadings.first()).toBeVisible();
 		await expect.element(serverNameHeadings.nth(1)).toBeVisible();
 		expect(document.title).toBe(`Obot | MCP Tester | ${serverName}`);
-		await expect.element(testerSection('Chat')).toHaveClass(/page-tab-active/);
-		await expect
-			.element(page.getByRole('heading', { name: 'Unlock Chat & More!', exact: true }))
-			.toBeVisible();
-		await expect.element(page.getByText(SETUP_COMMUNITY_SIGNUP_BANNER_COPY)).toBeVisible();
-		await expect.element(page.getByRole('button', { name: 'Register' })).toBeVisible();
+		await expect.element(testerSection('Tools')).toHaveClass(/page-tab-active/);
 		await expect
 			.element(page.getByRole('link', { name: `Back to ${serverName}` }))
 			.toHaveAttribute(
@@ -365,15 +335,18 @@ describe('MCP Tester page', () => {
 	it('allows licensed installations without a provider to chat through the Tester backend', async () => {
 		const requests = vi.fn();
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, async ({ request }) => {
-				requests(await request.json());
+			http.post(
+				`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`,
+				async ({ request }) => {
+					requests(await request.json());
 
-				return chatStream(
-					{ type: 'assistant_message_start' },
-					{ type: 'text_delta', delta: 'Testing without a configured provider' },
-					{ type: 'completion', reason: 'stop' }
-				);
-			})
+					return chatStream(
+						{ type: 'assistant_message_start' },
+						{ type: 'text_delta', delta: 'Testing without a configured provider' },
+						{ type: 'completion', reason: 'stop' }
+					);
+				}
+			)
 		);
 
 		await renderTester('chat', {}, undefined, {
@@ -403,9 +376,18 @@ describe('MCP Tester page', () => {
 		});
 
 		await expect
-			.element(page.getByRole('heading', { name: 'Unlock Chat & More!', exact: true }))
+			.element(page.getByRole('heading', { name: 'Unlock MCP Inspector Chat', exact: true }))
 			.toBeVisible();
-		await expect.element(page.getByText(SETUP_COMMUNITY_SIGNUP_BANNER_COPY)).toBeVisible();
+		await expect
+			.element(
+				page.getByText(
+					/Register to get free access to the MCP Inspector Chat, powered by Obot’s model service/
+				)
+			)
+			.toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'configuring your own model provider' }))
+			.toHaveAttribute('href', '/models?view=model-providers');
 		await expect.element(page.getByRole('button', { name: 'Register' })).toBeVisible();
 		await expect
 			.element(page.getByRole('region', { name: 'Chat composer' }))
@@ -494,7 +476,7 @@ describe('MCP Tester page', () => {
 		'displays $code from the backend without offering immediate retry',
 		async ({ code, status, message }) => {
 			worker.use(
-				http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, () =>
+				http.post(`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`, () =>
 					HttpResponse.json({ error: { code, message, retryable: false } }, { status })
 				)
 			);
@@ -590,17 +572,20 @@ describe('MCP Tester page', () => {
 	it('sends with Enter and safely renders streamed Markdown', async () => {
 		const requests = vi.fn();
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, async ({ request }) => {
-				requests(await request.json());
-				return chatStream(
-					{ type: 'assistant_message_start' },
-					{
-						type: 'text_delta',
-						delta: '**Connected** [docs](https://example.com) <script>unsafe()</script>'
-					},
-					{ type: 'completion', reason: 'stop' }
-				);
-			})
+			http.post(
+				`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`,
+				async ({ request }) => {
+					requests(await request.json());
+					return chatStream(
+						{ type: 'assistant_message_start' },
+						{
+							type: 'text_delta',
+							delta: '**Connected** [docs](https://example.com) <script>unsafe()</script>'
+						},
+						{ type: 'completion', reason: 'stop' }
+					);
+				}
+			)
 		);
 		await renderTester('chat', {}, undefined, chatModelData);
 
@@ -630,7 +615,7 @@ describe('MCP Tester page', () => {
 
 	it('re-enables the composer after the assistant response completes', async () => {
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, () =>
+			http.post(`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`, () =>
 				chatStream(
 					{ type: 'assistant_message_start' },
 					{ type: 'text_delta', delta: 'First response complete.' },
@@ -653,7 +638,7 @@ describe('MCP Tester page', () => {
 	it('keeps a partial failure visible and replaces it on Retry', async () => {
 		let attempts = 0;
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, () => {
+			http.post(`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`, () => {
 				attempts += 1;
 				return attempts === 1
 					? chatStream(
@@ -697,24 +682,27 @@ describe('MCP Tester page', () => {
 		const modelRequests: unknown[] = [];
 		const toolCalls = vi.fn();
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, async ({ request }) => {
-				modelRequests.push(await request.json());
-				if (modelRequests.length === 1) {
+			http.post(
+				`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`,
+				async ({ request }) => {
+					modelRequests.push(await request.json());
+					if (modelRequests.length === 1) {
+						return chatStream(
+							{ type: 'assistant_message_start' },
+							{
+								type: 'tool_calls',
+								calls: [{ id: 'call-lookup', name: 'lookup', arguments: { query: 'safe' } }]
+							},
+							{ type: 'completion', reason: 'tool_calls' }
+						);
+					}
 					return chatStream(
 						{ type: 'assistant_message_start' },
-						{
-							type: 'tool_calls',
-							calls: [{ id: 'call-lookup', name: 'lookup', arguments: { query: 'safe' } }]
-						},
-						{ type: 'completion', reason: 'tool_calls' }
+						{ type: 'text_delta', delta: 'The lookup returned one result.' },
+						{ type: 'completion', reason: 'stop' }
 					);
 				}
-				return chatStream(
-					{ type: 'assistant_message_start' },
-					{ type: 'text_delta', delta: 'The lookup returned one result.' },
-					{ type: 'completion', reason: 'stop' }
-				);
-			})
+			)
 		);
 		await renderTester(
 			'chat',
@@ -749,7 +737,7 @@ describe('MCP Tester page', () => {
 		await expect.element(testerSection(/Chat Approval needed/)).toBeVisible();
 		await expect
 			.element(page.getByLabelText('lookup arguments'))
-			.toHaveTextContent('"query": "safe"');
+			.toMatchTextContent('"query": "safe"');
 		await expect
 			.element(page.getByRole('button', { name: /Always allow/ }))
 			.not.toBeInTheDocument();
@@ -784,27 +772,30 @@ describe('MCP Tester page', () => {
 		const modelRequests: unknown[] = [];
 		const executionOrder: string[] = [];
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, async ({ request }) => {
-				modelRequests.push(await request.json());
-				if (modelRequests.length === 1) {
+			http.post(
+				`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`,
+				async ({ request }) => {
+					modelRequests.push(await request.json());
+					if (modelRequests.length === 1) {
+						return chatStream(
+							{ type: 'assistant_message_start' },
+							{
+								type: 'tool_calls',
+								calls: [
+									{ id: 'call-first', name: 'first', arguments: { order: 1 } },
+									{ id: 'call-second', name: 'second', arguments: { order: 2 } }
+								]
+							},
+							{ type: 'completion', reason: 'tool_calls' }
+						);
+					}
 					return chatStream(
 						{ type: 'assistant_message_start' },
-						{
-							type: 'tool_calls',
-							calls: [
-								{ id: 'call-first', name: 'first', arguments: { order: 1 } },
-								{ id: 'call-second', name: 'second', arguments: { order: 2 } }
-							]
-						},
-						{ type: 'completion', reason: 'tool_calls' }
+						{ type: 'text_delta', delta: 'Both tools completed.' },
+						{ type: 'completion', reason: 'stop' }
 					);
 				}
-				return chatStream(
-					{ type: 'assistant_message_start' },
-					{ type: 'text_delta', delta: 'Both tools completed.' },
-					{ type: 'completion', reason: 'stop' }
-				);
-			})
+			)
 		);
 		await renderTester(
 			'chat',
@@ -850,14 +841,14 @@ describe('MCP Tester page', () => {
 					.getByRole('article', { name: 'first tool call' })
 					.getByRole('region', { name: 'first result' })
 			)
-			.toHaveTextContent('first result content');
+			.toMatchTextContent('first result content');
 		await expect
 			.element(
 				page
 					.getByRole('article', { name: 'second tool call' })
 					.getByRole('region', { name: 'second result' })
 			)
-			.toHaveTextContent('second result content');
+			.toMatchTextContent('second result content');
 		await expect
 			.element(page.getByRole('article', { name: 'Tool result' }))
 			.not.toBeInTheDocument();
@@ -865,7 +856,7 @@ describe('MCP Tester page', () => {
 
 	it('confirms New Chat before clearing an existing in-memory conversation', async () => {
 		worker.use(
-			http.post(`/api/mcp-servers/${fixtures.serverSingle.id}/tester/chat`, () =>
+			http.post(`/api/vmcp-instances/${fixtures.serverSingle.id}/tester/chat`, () =>
 				chatStream(
 					{ type: 'assistant_message_start' },
 					{ type: 'text_delta', delta: 'Temporary answer' },
@@ -1132,7 +1123,7 @@ describe('MCP Tester page', () => {
 		});
 		render(TesterPage, { data });
 
-		await expect.element(page.getByRole('alert')).toHaveTextContent('Connection failed');
+		await expect.element(page.getByRole('alert')).toMatchTextContent('Unavailable');
 		// The failed handshake is inspectable even though the session never connected.
 		await expect
 			.element(page.getByRole('button', { name: /transport .*Streamable HTTP error/ }))
@@ -1161,4 +1152,56 @@ describe('MCP Tester page', () => {
 			.element(page.getByRole('heading', { name: 'Server setup required' }))
 			.not.toBeInTheDocument();
 	});
+});
+
+it('shows CLI login and retries a localhost component in the inspector', async () => {
+	appPage.url.searchParams.delete('tab');
+	mockMCPInitializationFailure(401);
+	const attemptURL = `${window.location.origin}/oauth/mcp/login/ui-attempt`;
+	let checks = 0;
+	worker.use(
+		http.get('*/oauth/mcp/login/:state', () => HttpResponse.json({ expiresIn: 600 })),
+		http.get(`/api/oauth/vmcp/vmcpi1component/components/${fixtures.serverSingle.id}`, () =>
+			HttpResponse.json({ authURL: ++checks === 1 ? attemptURL : '' })
+		)
+	);
+
+	const server = structuredClone(fixtures.serverSingle);
+	server.configured = true;
+	server.vmcpInstanceID = 'vmcpi1component';
+	server.deploymentStatus = 'Available';
+	server.manifest.remoteConfig = { url: 'https://mcp.example.com', localhostCallbackEnabled: true };
+	const data = await preparePageData<PageData>({
+		server,
+		backTarget: `/mcp-servers/s/${server.id}`
+	});
+	await render(TesterPage, { data });
+	await expect
+		.element(page.getByLabelText('Authentication command'))
+		.toHaveTextContent(`obot mcp login "${attemptURL}"`);
+	await expect.element(page.getByRole('timer')).toBeVisible();
+	mockMCPInitialization();
+	worker.use(http.get('*/oauth/mcp/login/:state', () => new HttpResponse(null, { status: 400 })));
+	document.dispatchEvent(new Event('visibilitychange'));
+	await expect
+		.element(page.getByRole('heading', { name: 'Reauthentication required' }))
+		.not.toBeInTheDocument();
+});
+
+it('keeps management navigation for a legacy localhost deployment without a vMCP owner', async () => {
+	appPage.url.searchParams.delete('tab');
+	mockMCPInitializationFailure(401);
+	const server = structuredClone(fixtures.serverSingle);
+	server.configured = true;
+	server.deploymentStatus = 'Available';
+	server.manifest.remoteConfig = { url: 'https://mcp.example.com', localhostCallbackEnabled: true };
+	const data = await preparePageData<PageData>({
+		server,
+		backTarget: `/mcp-servers/s/${server.id}`
+	});
+	await render(TesterPage, { data });
+	await expect
+		.element(page.getByRole('link', { name: 'Manage authentication', exact: true }))
+		.toHaveAttribute('href', `/mcp-servers/s/${server.id}`);
+	await expect.element(page.getByLabelText('Authentication command')).not.toBeInTheDocument();
 });

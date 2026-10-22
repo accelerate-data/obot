@@ -1,6 +1,10 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
+	import McpCompositeOauth from '$lib/components/mcp/McpCompositeOauth.svelte';
 	import Tester from '$lib/components/mcp/tester/Tester.svelte';
 	import VMcpIcon from '$lib/components/vmcps/VMcpIcon.svelte';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import type { VMCP, VMCPInstance } from '$lib/services';
 	import {
@@ -9,9 +13,14 @@
 		type TesterStatus
 	} from '$lib/services/mcp/tester.svelte';
 	import { vmcpTesterServer } from '$lib/services/vmcps/tester';
+	import { vmcpLocalhostCallbackPaths } from '$lib/services/vmcps/utils';
 	import {
+		configureOAuthPath,
+		handleConfigureOAuth,
 		resolveVMcpComponents,
-		vmcpHasUserAllowedConfiguration
+		vmcpMissingStaticOAuthComponent,
+		vmcpHasUserAllowedConfiguration,
+		type OAuthReturnParam
 	} from '$lib/services/vmcps/utils';
 	import {
 		accessibleModels,
@@ -31,6 +40,7 @@
 
 	let { vmcp, onLaunch, loading = false, openEditInstanceConfiguration }: Props = $props();
 
+	let tester = $state<ReturnType<typeof Tester>>();
 	let componentViews = $derived(resolveVMcpComponents(vmcp));
 	let instance = $derived(
 		vmcpInstances.current.items.find(
@@ -46,6 +56,7 @@
 	let chatAvailable = $derived(chatAvailability.available);
 	let chatUnavailableMessage = $derived(chatAvailability.unavailableMessage);
 	let hasUserProvidedConfiguration = $derived(vmcpHasUserAllowedConfiguration(vmcp));
+	let missingOAuthComponent = $derived(vmcpMissingStaticOAuthComponent(vmcp));
 	let sessionStartFailed = $state(false);
 
 	$effect(() => {
@@ -69,8 +80,18 @@
 		openEditInstanceConfiguration?.(vmcp, instance);
 	}
 
-	let launching = $derived(loading || (vmcpInstances.current.loading && !launched));
-	let showTester = $derived(Boolean(instance?.status?.configured) && !sessionStartFailed);
+	function testerOAuthReturnParam(): OAuthReturnParam | undefined {
+		const entryID = missingOAuthComponent?.mcpServerCatalogEntryID;
+		if (!entryID || !vmcp.id) return;
+		return { key: 'inspector', value: vmcp.id };
+	}
+
+	let launching = $derived(
+		loading || (vmcpInstances.current.loading && !instance?.status?.configured)
+	);
+	let showTester = $derived(
+		Boolean(instance?.status?.configured) && !sessionStartFailed && !missingOAuthComponent
+	);
 	let needsConfigurationUpdate = $derived(
 		Boolean(!launching && instance && (!instance.status?.configured || sessionStartFailed))
 	);
@@ -79,6 +100,7 @@
 <div class="py-4 h-full w-full">
 	{#if showTester}
 		<Tester
+			bind:this={tester}
 			{server}
 			{serverName}
 			{chatAvailable}
@@ -92,13 +114,24 @@
 			{/snippet}
 
 			{#snippet reauthenticationAction()}
-				<button type="button" class="btn btn-primary btn-sm" onclick={onLaunch}
-					>Manage authentication</button
-				>
+				{#if vmcpLocalhostCallbackPaths(vmcp).length > 0}
+					<McpCompositeOauth
+						class="min-h-0"
+						compositeMcpId={instance?.id ?? vmcp.id}
+						vmcpId={vmcp.id}
+						onComplete={() => tester?.reconnect()}
+					/>
+				{:else}
+					<button type="button" class="btn btn-primary btn-sm" onclick={onLaunch}
+						>{m.vmcps_manage_authentication()}</button
+					>
+				{/if}
 			{/snippet}
 
 			{#snippet setupRequiredAction()}
-				<button type="button" class="btn btn-primary btn-sm" onclick={onLaunch}>Launch</button>
+				<button type="button" class="btn btn-primary btn-sm" onclick={onLaunch}
+					>{m.vmcps_launch()}</button
+				>
 			{/snippet}
 		</Tester>
 	{:else}
@@ -110,7 +143,9 @@
 				<div class="relative z-10 flex flex-col items-center gap-4">
 					{#if launching}
 						<Loading class="size-12" />
-						<p class="text-muted-content max-w-md text-sm font-light">Starting session...</p>
+						<p class="text-muted-content max-w-md text-sm font-light">
+							{m.vmcps_starting_session()}
+						</p>
 					{:else}
 						{#if needsConfigurationUpdate}
 							<div class="indicator p-2 rounded-full bg-warning/10">
@@ -120,22 +155,47 @@
 							<Layers class="text-muted-content size-12" />
 						{/if}
 						<p class="text-muted-content max-w-md text-sm font-light">
-							{#if sessionStartFailed}
-								There was an issue starting the session. Please verify configuration or contact
-								support if the issue persists.
+							{#if missingOAuthComponent}
+								{m.vmcps_tester_requires_oauth_setup({ name: missingOAuthComponent.name })}
+							{:else if sessionStartFailed}
+								{m.vmcps_tester_session_start_failed()}
 							{:else if instance && !instance.status?.configured}
-								Before you can continue inspecting this vMCP, an update is required.
+								{m.vmcps_tester_update_required()}
 							{:else}
-								Start your vMCP to use chat and inspect tools.
+								{m.vmcps_tester_start_prompt()}
 							{/if}
 						</p>
-						{#if needsConfigurationUpdate}
+						{#if missingOAuthComponent}
+							{#if profile.current.isAdmin?.()}
+								<a
+									class="btn btn-primary"
+									href={resolve(
+										configureOAuthPath(
+											missingOAuthComponent.mcpServerCatalogEntryID,
+											page.url,
+											testerOAuthReturnParam()
+										)
+									)}
+									onclick={(event) =>
+										handleConfigureOAuth(
+											event,
+											missingOAuthComponent.mcpServerCatalogEntryID,
+											page.url,
+											testerOAuthReturnParam()
+										)}
+								>
+									{m.vmcps_configure_named_oauth({ name: missingOAuthComponent.name })}
+								</a>
+							{:else}
+								<p>{m.vmcps_ask_admin_configure_oauth()}</p>
+							{/if}
+						{:else if needsConfigurationUpdate}
 							<button type="button" class="btn btn-primary" onclick={openInstanceConfiguration}>
-								Update Configuration
+								{m.vmcps_update_configuration()}
 							</button>
 						{:else}
 							<button type="button" class="btn btn-primary" onclick={onLaunch}>
-								Start Session
+								{m.vmcps_start_session()}
 							</button>
 						{/if}
 					{/if}

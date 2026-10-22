@@ -299,6 +299,30 @@ func TestUserHasAccessToModelWithWildcardSuffix(t *testing.T) {
 	}
 }
 
+func TestObotGroupSubjectGrantsModelAccess(t *testing.T) {
+	const modelID = "m1-openai-gpt-4o"
+	h := newModelHelper(t,
+		[]*v1.Model{newModel(modelID, "openai-model-provider", "gpt-4o", true)},
+		&v1.ModelAccessPolicy{
+			Name:      "admin",
+			Namespace: "default",
+			Spec: v1.ModelAccessPolicySpec{Manifest: types2.ModelAccessPolicyManifest{
+				Subjects: []types2.Subject{{Type: types2.SubjectTypeObotGroup, ID: "admin"}},
+				Models:   []types2.ModelResource{{ID: modelID}},
+			}},
+		},
+	)
+	admin := &kuser.DefaultInfo{UID: "user1", Extra: map[string][]string{"obot_groups": {"admin"}}}
+	got, err := h.UserHasAccessToModel(admin, modelID)
+	require.NoError(t, err)
+	assert.True(t, got)
+
+	idp := &kuser.DefaultInfo{UID: "user1", Extra: map[string][]string{"auth_provider_groups": {"admin"}}}
+	got, err = h.UserHasAccessToModel(idp, modelID)
+	require.NoError(t, err)
+	assert.False(t, got)
+}
+
 // newModelHelper returns a Helper whose model and policy indexers are populated,
 // mirroring the production indexes built in NewHelper.
 func newModelHelper(t *testing.T, models []*v1.Model, policies ...*v1.ModelAccessPolicy) *Helper {
@@ -312,9 +336,10 @@ func newModelHelper(t *testing.T, models []*v1.Model, policies ...*v1.ModelAcces
 	}
 
 	mapIndexer := gocache.NewIndexer(gocache.MetaNamespaceKeyFunc, gocache.Indexers{
-		mapUserIndex:     mapSubjectIndexFunc(types2.SubjectTypeUser),
-		mapGroupIndex:    mapSubjectIndexFunc(types2.SubjectTypeGroup),
-		mapSelectorIndex: mapSubjectIndexFunc(types2.SubjectTypeSelector),
+		mapUserIndex:      mapSubjectIndexFunc(types2.SubjectTypeUser),
+		mapGroupIndex:     mapSubjectIndexFunc(types2.SubjectTypeGroup),
+		mapObotGroupIndex: mapSubjectIndexFunc(types2.SubjectTypeObotGroup),
+		mapSelectorIndex:  mapSubjectIndexFunc(types2.SubjectTypeSelector),
 	})
 	for _, p := range policies {
 		require.NoError(t, mapIndexer.Add(p))
@@ -360,70 +385,4 @@ func newModel(name, provider, targetModel string, active bool, opts ...modelOpt)
 		opt(m)
 	}
 	return m
-}
-
-// A hosted agent's model list has to describe the requests it can actually
-// make. Enumerating from the owner's policies instead reports a set the agent's
-// own calls do not obey -- an agent told it may use nothing while every request
-// succeeds -- and a client that picks its model by listing then refuses to run.
-func TestGetAgentAllowedTargetModels(t *testing.T) {
-	const provider = "anthropic-model-provider"
-
-	models := []*v1.Model{
-		newModel("m1-haiku", provider, "claude-haiku-4-5-20251001", true),
-		newModel("m1-opus", provider, "claude-opus-4-8", true),
-		newModel("m1-gpt", "openai-model-provider", "gpt-4o", true),
-	}
-
-	// The owner is granted nothing, so any result drawn from policy is empty.
-	// That is what makes these cases prove the agent is not evaluated that way.
-	restrictive := &v1.ModelAccessPolicy{
-		Name: "p-none", Namespace: "default",
-		Spec: v1.ModelAccessPolicySpec{Manifest: types2.ModelAccessPolicyManifest{
-			Subjects: []types2.Subject{{Type: types2.SubjectTypeUser, ID: "someone-else"}},
-			Models:   []types2.ModelResource{},
-		}},
-	}
-
-	tests := []struct {
-		name         string
-		modelIDs     []string
-		dialect      string
-		want         map[string]bool
-		wantAllowAll bool
-	}{
-		{
-			name:         "wildcard allows every model without enumerating",
-			modelIDs:     []string{"*"},
-			wantAllowAll: true,
-		},
-		{
-			name:     "configured models are reported for this provider",
-			modelIDs: []string{"m1-haiku"},
-			want:     map[string]bool{"claude-haiku-4-5-20251001": true},
-		},
-		{
-			name:     "a model on another provider is not reported here",
-			modelIDs: []string{"m1-gpt"},
-			want:     map[string]bool{},
-		},
-		{
-			// An agent authorized for nothing may use nothing. This must be an
-			// empty set, not the nil that means "skip filtering".
-			name:     "an agent with no models is allowed none",
-			modelIDs: nil,
-			want:     map[string]bool{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := newModelHelper(t, models, restrictive)
-
-			got, allowAll, err := h.GetAgentAllowedTargetModels(tt.modelIDs, provider, tt.dialect)
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantAllowAll, allowAll)
-			assert.Equal(t, tt.want, got)
-		})
-	}
 }

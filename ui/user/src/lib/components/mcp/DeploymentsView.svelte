@@ -4,19 +4,19 @@
 	import { tooltip } from '$lib/actions/tooltip.svelte';
 	import Confirm from '$lib/components/Confirm.svelte';
 	import DotDotDot from '$lib/components/DotDotDot.svelte';
-	import DiffDialog from '$lib/components/admin/DiffDialog.svelte';
 	import McpConfirmDelete from '$lib/components/mcp/McpConfirmDelete.svelte';
 	import McpTunnelDisconnectedStatus from '$lib/components/mcp/McpTunnelDisconnectedStatus.svelte';
 	import Table, { type InitSort, type InitSortFn } from '$lib/components/table/Table.svelte';
 	import { ADMIN_SESSION_STORAGE } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
-	import { toHTMLFromMarkdownWithNewTabLinks } from '$lib/markdown';
 	import {
 		AdminService,
 		UserService,
 		type MCPCatalogEntry,
 		type MCPCatalogServer,
-		type OrgUser
+		type OrgUser,
+		type VMCP
 	} from '$lib/services';
 	import {
 		getMCPDisplayName,
@@ -26,7 +26,9 @@
 		hasEditableConfiguration,
 		hasMissingSecretBindingConfig,
 		isMultiUserServer,
-		supportsMCPBackendDetails
+		supportsMCPBackendDetails,
+		getMcpValueLabel,
+		mcpTableDisplayValue
 	} from '$lib/services/user/mcp';
 	import {
 		getMcpTunnelConnectionsKey,
@@ -39,7 +41,8 @@
 		profile,
 		mcpServersAndEntries,
 		mcpTunnelConnections,
-		version
+		version,
+		vmcpInstances
 	} from '$lib/stores';
 	import { formatTimeAgo } from '$lib/time';
 	import { getUserDisplayName, openUrl } from '$lib/utils';
@@ -51,7 +54,6 @@
 		CircleFadingArrowUp,
 		Ellipsis,
 		ExternalLink,
-		GitCompare,
 		Layers,
 		Layers2,
 		Power,
@@ -82,7 +84,7 @@
 		noDataContent?: Snippet;
 		onlyMyServers?: boolean;
 		servers?: MCPCatalogServer[];
-		skipLoadOnMount?: boolean;
+		skipLoadMcpsOnMount?: boolean;
 		serverPrefixPath?: string;
 		entry?: MCPCatalogEntry | MCPCatalogServer;
 	}
@@ -103,7 +105,7 @@
 		noDataContent,
 		onlyMyServers,
 		servers: initialServers,
-		skipLoadOnMount,
+		skipLoadMcpsOnMount,
 		serverPrefixPath,
 		entry
 	}: Props = $props();
@@ -119,14 +121,8 @@
 	const hasAdminAccess = $derived(profile.current.hasAdminAccess?.() ?? false);
 
 	let loading = $state(false);
+	let loadingVMcps = $state(false);
 
-	let diffDialog = $state<ReturnType<typeof DiffDialog>>();
-	let existingServer = $state<MCPCatalogServer>();
-	let updatedServer = $state<MCPCatalogServer | MCPCatalogEntry>();
-
-	let showUpgradeConfirm = $state<
-		{ type: 'multi' } | { type: 'single'; server: MCPCatalogServer } | undefined
-	>();
 	let showK8sUpgradeConfirm = $state<
 		{ type: 'multi' } | { type: 'single'; server: MCPCatalogServer } | undefined
 	>(undefined);
@@ -143,6 +139,7 @@
 
 	let deployedCatalogEntryServers = $state<MCPCatalogServer[]>([]);
 	let deployedWorkspaceCatalogEntryServers = $state<MCPCatalogServer[]>([]);
+	let vmcps = $state<VMCP[]>([]);
 	let serversData = $derived.by(() => {
 		if (initialServers) return initialServers;
 		if (entity === 'workspace') {
@@ -165,6 +162,11 @@
 			mcpServersAndEntries.current.userInstances.map((instance) => [instance.mcpServerID, instance])
 		)
 	);
+
+	let vmcpInstancesMap = $derived(
+		new Map(vmcpInstances.current.items.map((instance) => [instance.id, instance]))
+	);
+
 	let tableRef = $state<ReturnType<typeof Table>>();
 
 	let entriesMap = $derived(
@@ -175,6 +177,18 @@
 	);
 
 	let tableData = $derived.by(() => {
+		const vmcpsMap = new Map(vmcps.map((v) => [v.id, v]));
+
+		const getVMcp = (deployment: MCPCatalogServer) => {
+			if (deployment.vmcpID) {
+				return vmcpsMap.get(deployment.vmcpID)?.displayName;
+			}
+			if (deployment.vmcpInstanceID) {
+				const instance = vmcpInstancesMap.get(deployment.vmcpInstanceID);
+				return instance?.vmcpID && vmcpsMap.get(instance?.vmcpID)?.displayName;
+			}
+			return undefined;
+		};
 		const transformedData = serversData
 			// Legacy children can remain until migration cleanup finishes.
 			.filter((deployment) => !deployment.compositeName)
@@ -203,6 +217,7 @@
 								updateStatusTooltip: undefined
 							}
 						: getMcpServerDeploymentStatus(deployment, doesSupportK8sUpdates);
+				const vmcp = getVMcp(deployment);
 
 				return {
 					...deployment,
@@ -225,7 +240,8 @@
 						deployment.manifest,
 						deployment.missingRequiredEnvVars,
 						deployment.missingRequiredHeader
-					)
+					),
+					vmcp
 				};
 			})
 			.filter((d) => !onlyMyServers || d.isMyServer);
@@ -252,8 +268,23 @@
 		}
 	}
 
+	$effect(() => {
+		if (profile.current.loaded) {
+			return vmcpInstances.startWatching();
+		}
+	});
+
 	onMount(async () => {
-		if (!skipLoadOnMount) {
+		loadingVMcps = true;
+		const getVMcps = profile.current.hasAdminAccess?.()
+			? AdminService.listAllVMCPs
+			: UserService.listVMCPs;
+		getVMcps().then((response) => {
+			vmcps = response;
+			loadingVMcps = false;
+		});
+
+		if (!skipLoadMcpsOnMount) {
 			await reload(true);
 		}
 		// Start checking for progressing servers
@@ -296,10 +327,8 @@
 		}
 	}
 
-	function canTriggerUpdate(server: MCPCatalogServer) {
-		if (server.vmcpComponentID) return false;
-		if (!isMultiUserServer(server)) return true;
-		return !!server.catalogEntryID && (!!server.powerUserWorkspaceID || !!id);
+	function isVMcpServer(server: MCPCatalogServer) {
+		return Boolean(server.vmcpComponentID || server.vmcpID || server.vmcpInstanceID);
 	}
 
 	function canRestartServer(server: MCPCatalogServer) {
@@ -307,26 +336,8 @@
 	}
 
 	function canDeleteServer(server: MCPCatalogServer & { isMyServer?: boolean }) {
-		if (server.vmcpComponentID) return false;
+		if (isVMcpServer(server)) return false;
 		return !!(server.isMyServer || (hasAdminAccess && !readonly));
-	}
-
-	async function handleBulkUpdate() {
-		for (const serverId of Object.keys(selected)) {
-			const server = selected[serverId];
-			if (!server.needsUpdate || !canTriggerUpdate(server)) {
-				continue;
-			}
-			const prompted = await updateServer(server);
-			if (prompted) {
-				selected = {};
-				tableRef?.clearSelectAll();
-				return;
-			}
-		}
-
-		selected = {};
-		tableRef?.clearSelectAll();
 	}
 
 	async function handleK8sBulkUpdate(selections: typeof selected) {
@@ -359,78 +370,6 @@
 		}
 	}
 
-	async function updateCatalogServerAndPromptForConfiguration(server: MCPCatalogServer) {
-		if (!isMultiUserServer(server) || !server.catalogEntryID) return false;
-
-		const entry = entriesMap[server.catalogEntryID];
-		if (!entry) {
-			// Without the entry manifest loaded, fall back to the plain update path.
-			if (server.powerUserWorkspaceID) {
-				await UserService.triggerWorkspaceMcpServerUpdate(
-					server.powerUserWorkspaceID,
-					server.catalogEntryID,
-					server.id
-				);
-			} else if (id) {
-				await AdminService.triggerMcpCatalogServerUpdate(id, server.id);
-			}
-			return false;
-		}
-
-		return (
-			(await editExistingDialog?.updateFromCatalogEntry({
-				server,
-				entry
-			})) ?? false
-		);
-	}
-
-	async function updateServer(server?: MCPCatalogServer) {
-		if (!server || !canTriggerUpdate(server)) return false;
-
-		updating[server.id] = { inProgress: true, error: '' };
-		let prompted = false;
-		try {
-			if (isMultiUserServer(server)) {
-				if (server.catalogEntryID) {
-					// Catalog-backed multi-user servers may need shared config after the manifest update.
-					prompted = await updateCatalogServerAndPromptForConfiguration(server);
-				} else if (server.powerUserWorkspaceID) {
-					prompted = false;
-				} else if (id) {
-					await AdminService.triggerMcpCatalogServerUpdate(id, server.id);
-				}
-			} else {
-				await UserService.triggerMcpServerUpdate(server.id);
-			}
-		} catch (err) {
-			updating[server.id] = {
-				inProgress: false,
-				error: err instanceof Error ? err.message : 'An unknown error occurred'
-			};
-		}
-
-		delete updating[server.id];
-		return prompted;
-	}
-
-	function upgradeNotesForConfirmation() {
-		const servers =
-			showUpgradeConfirm?.type === 'single'
-				? [showUpgradeConfirm.server]
-				: Object.values(selected).filter(
-						(server) => server.needsUpdate && canTriggerUpdate(server)
-					);
-		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- local synchronous deduplication does not need reactive state
-		const seen = new Set<string>();
-		return servers.flatMap((server) => {
-			if (!server.catalogEntryID || seen.has(server.catalogEntryID)) return [];
-			const entry = entriesMap[server.catalogEntryID];
-			if (!entry?.manifest.upgradeNote?.trim()) return [];
-			seen.add(server.catalogEntryID);
-			return [{ id: entry.id, name: getMCPDisplayName(entry), note: entry.manifest.upgradeNote }];
-		});
-	}
 	async function updateK8sSettings(server?: MCPCatalogServer) {
 		if (!server) return;
 		updating[server.id] = { inProgress: true, error: '' };
@@ -457,7 +396,7 @@
 		} catch (err) {
 			updating[server.id] = {
 				inProgress: false,
-				error: err instanceof Error ? err.message : 'An unknown error occurred'
+				error: err instanceof Error ? err.message : m.mcps_unknown_error()
 			};
 
 			return undefined;
@@ -561,7 +500,7 @@
 </script>
 
 <div class="flex flex-col gap-0.5">
-	{#if loading}
+	{#if loading || loadingVMcps}
 		<div class="my-2 flex items-center justify-center h-72">
 			<Loading class="size-6" />
 		</div>
@@ -601,10 +540,13 @@
 				].filter(Boolean) as string[]}
 				{filters}
 				headers={[
-					{ title: 'Name', property: 'displayName' },
-					{ title: 'User', property: 'userName' },
-					{ title: 'Health', property: 'deploymentStatus' },
-					{ title: 'Update Status', property: 'updatesAvailable' }
+					{ title: m.core_name(), property: 'displayName' },
+					{ title: m.core_type(), property: 'type' },
+					{ title: m.core_col_user(), property: 'userName' },
+					{ title: m.mcps_deployments_column_health(), property: 'deploymentStatus' },
+					{ title: m.core_col_update_status(), property: 'updatesAvailable' },
+					{ title: m.core_col_registry(), property: 'registry' },
+					{ title: m.core_col_created(), property: 'created' }
 				]}
 				onClickRow={(d, isCtrlClick) => {
 					setLastVisitedMcpServer(d);
@@ -616,21 +558,14 @@
 				{onClearAllFilters}
 				{onSort}
 				{initSort}
+				displayValue={mcpTableDisplayValue}
 				sortable={['displayName', 'type', 'updatesAvailable', 'userName', 'registry', 'created']}
-				noDataMessage="No catalog servers added."
+				noDataMessage={m.mcps_deployments_no_data()}
 				classes={{
 					root: 'rounded-none rounded-b-md shadow-none',
 					thead: classes?.tableHeader
 				}}
 				setRowClasses={(d) => {
-					if (d.needsUpdate && d.needsK8sUpdate) {
-						return 'bg-orange-500/5 hover:bg-orange-500/10 border-orange-500/20';
-					}
-
-					if (d.needsUpdate) {
-						return 'bg-primary/5 hover:bg-primary/10 border-primary/20';
-					}
-
 					if (d.needsK8sUpdate) {
 						return 'bg-warning/5 hover:bg-warning/10 border-warning/20';
 					}
@@ -650,6 +585,9 @@
 							</div>
 							<p class="flex flex-col">
 								{d.displayName}
+								{#if d.vmcp}
+									<span class="text-muted-content/75 text-xs font-light">({d.vmcp})</span>
+								{/if}
 							</p>
 							<McpDeprecatedNotice item={d} />
 							{#if shouldShowMcpTunnelDisconnectedBadge(d.tunnelDisconnected, doesSupportK8sUpdates)}
@@ -659,22 +597,11 @@
 								<div
 									class="text-warning"
 									use:tooltip={{
-										text: 'Missing Kubernetes Secret.',
+										text: m.mcps_deployments_missing_secret(),
 										classes: ['break-words', 'w-58']
 									}}
 								>
 									<TriangleAlert class="size-4" />
-								</div>
-							{:else if d.needsUpdate}
-								<div
-									use:tooltip={{
-										text: d.vmcpComponentID
-											? 'In order to update, update the vMCP.'
-											: 'This deployment needs an update. View Diff to see the changes.',
-										classes: ['wrap-break-word', 'w-58']
-									}}
-								>
-									<CircleFadingArrowUp class="text-primary size-4" />
 								</div>
 							{/if}
 						</div>
@@ -684,24 +611,24 @@
 						<div
 							use:tooltip={{ text: d.updateStatusTooltip ?? '', classes: ['whitespace-pre-line'] }}
 						>
-							{d.updateStatus || '--'}
+							{getMcpValueLabel(d.updateStatus) || '--'}
 						</div>
 					{:else if property === 'deploymentStatus'}
-						{d.deploymentStatus || '--'}
+						{getMcpValueLabel(d.deploymentStatus) || '--'}
 					{:else if property === 'type'}
-						{d.type}
+						{getMcpValueLabel(d.type)}
 						{#if d.serverUserType === 'multiUser'}
-							<div class="p-2" use:tooltip={{ text: 'Multi-tenant' }}>
+							<div class="p-2" use:tooltip={{ text: m.mcps_deployments_multi_tenant() }}>
 								<UsersIcon class="size-3 text-muted-content" />
 							</div>
 						{/if}
 					{:else}
-						{d[property as keyof typeof d]}
+						{mcpTableDisplayValue(property, d[property as keyof typeof d])}
 					{/if}
 				{/snippet}
 
 				{#snippet actions(d)}
-					{@const isVmcpComponent = !!d.vmcpComponentID}
+					{@const isVmcpComponent = isVMcpServer(d)}
 					<DotDotDot class="hover:dark:bg-base-100/50" classes={{ menu: 'p-0 gap-0' }}>
 						{#snippet icon()}
 							<Ellipsis class="size-4" />
@@ -723,69 +650,28 @@
 									<ExternalLink class="size-4" />
 									<span>
 										{#if d.catalogEntryID}
-											View Catalog Entry
+											{m.mcps_deployments_view_catalog_entry()}
 										{:else}
-											View Server
+											{m.mcps_deployments_view_server()}
 										{/if}
 									</span>
 								</a>
 
-								{#if !isVmcpComponent}
-									{#if (d.isMyServer || (hasAdminAccess && !readonly)) && hasEditableDeploymentConfiguration(d)}
-										<button
-											class="menu-button"
-											onclick={(e) => {
-												e.stopPropagation();
-												editExistingDialog?.edit({
-													server: d,
-													entry: d.catalogEntryID ? entriesMap[d.catalogEntryID] : undefined
-												});
-												toggle(false);
-											}}
-										>
-											<ServerCog class="size-4" /> Edit Configuration
-										</button>
-									{/if}
-									{#if d.needsUpdate && canTriggerUpdate(d) && (d.isMyServer || (hasAdminAccess && !readonly))}
-										<button
-											class="menu-button-primary"
-											disabled={updating[d.id]?.inProgress || readonly}
-											onclick={(e) => {
-												e.stopPropagation();
-												if (!d) return;
-												showUpgradeConfirm = {
-													type: 'single',
-													server: d
-												};
-												toggle(false);
-											}}
-										>
-											{#if updating[d.id]?.inProgress}
-												<Loading class="size-4" />
-											{:else}
-												<CircleFadingArrowUp class="size-4" />
-											{/if}
-											Update Server
-										</button>
-									{/if}
-
-									{#if d.catalogEntryID && d.needsUpdate}
-										<button
-											class="menu-button-primary"
-											disabled={updating[d.id]?.inProgress || readonly}
-											onclick={(e) => {
-												e.stopPropagation();
-												if (!d.catalogEntryID) return;
-
-												existingServer = d;
-												updatedServer = entriesMap[d.catalogEntryID];
-												diffDialog?.open();
-												toggle(false);
-											}}
-										>
-											<GitCompare class="size-4" /> View Diff
-										</button>
-									{/if}
+								{#if !isVmcpComponent && (d.isMyServer || (hasAdminAccess && !readonly)) && hasEditableDeploymentConfiguration(d)}
+									<button
+										class="menu-button"
+										onclick={(e) => {
+											e.stopPropagation();
+											editExistingDialog?.edit({
+												server: d,
+												entry: d.catalogEntryID ? entriesMap[d.catalogEntryID] : undefined
+											});
+											toggle(false);
+										}}
+									>
+										<ServerCog class="size-4" />
+										{m.mcps_actions_edit_configuration()}
+									</button>
 								{/if}
 
 								{#if (d.isMyServer || (hasAdminAccess && !readonly)) && d.needsK8sUpdate}
@@ -807,18 +693,18 @@
 										{:else}
 											<CircleFadingArrowUp class="size-4" />
 										{/if}
-										Update Scheduling Config
+										{m.mcps_deployments_update_scheduling()}
 									</button>
 								{/if}
 
 								{#if d.vmcpID}
 									<a href={resolve(`/vmcps/${d.vmcpID}`)} class="menu-button">
 										<Layers class="size-4" />
-										View vMCP
+										{m.mcps_deployments_view_vmcp()}
 									</a>
 									<a href={resolve(`/vmcps?view=deployments&id=${d.vmcpID}`)} class="menu-button">
 										<Layers2 class="size-4" />
-										View vMCP Deployments
+										{m.mcps_deployments_view_vmcp_deployments()}
 									</a>
 								{:else if d.vmcpInstanceID}
 									<button
@@ -832,12 +718,12 @@
 												});
 												await goto(resolve(`/vmcps/${instance.vmcpID}`));
 											} catch {
-												errors.append('Failed to open vMCP.');
+												errors.append(m.mcps_deployments_open_vmcp_failed());
 											}
 										}}
 									>
 										<Layers class="size-4" />
-										View vMCP
+										{m.mcps_deployments_view_vmcp()}
 									</button>
 									<button
 										class="menu-button"
@@ -852,12 +738,12 @@
 													resolve(vmcpInstancePath(instance.vmcpID, instance.id) as `/${string}`)
 												);
 											} catch {
-												errors.append('Failed to open vMCP deployment.');
+												errors.append(m.mcps_deployments_open_vmcp_deployment_failed());
 											}
 										}}
 									>
 										<Layers class="size-4" />
-										View vMCP Deployment
+										{m.mcps_deployments_view_vmcp_deployment()}
 									</button>
 								{/if}
 
@@ -883,10 +769,10 @@
 										}}
 									>
 										{#if restarting}
-											<Loading class="size-4" /> Restarting...
+											<Loading class="size-4" /> {m.mcps_deployments_restarting()}
 										{:else}
 											<Power class="size-4" />
-											Restart Server
+											{m.mcps_deployments_restart_server()}
 										{/if}
 									</button>
 								{/if}
@@ -903,7 +789,8 @@
 											toggle(false);
 										}}
 									>
-										<Trash2 class="size-4" /> Delete Server
+										<Trash2 class="size-4" />
+										{m.mcps_catalog_delete_server()}
 									</button>
 								{/if}
 							</div>
@@ -914,9 +801,6 @@
 				{#snippet tableSelectActions(currentSelected)}
 					{@const restartableCount = Object.values(currentSelected).filter((s) =>
 						canRestartServer(s)
-					).length}
-					{@const upgradeableCount = Object.values(currentSelected).filter(
-						(s) => s.needsUpdate && canTriggerUpdate(s)
 					).length}
 					{@const k8sUpgradeableCount = Object.values(currentSelected).filter(
 						(s) => s.needsK8sUpdate
@@ -935,30 +819,13 @@
 							disabled={restarting || readonly || restartableCount === 0}
 						>
 							{#if restarting}
-								<Loading class="size-4 self-center" /> Restarting...
+								<Loading class="size-4 self-center" /> {m.mcps_deployments_restarting()}
 							{:else}
-								<Power class="size-4" /> Restart
+								<Power class="size-4" /> {m.mcps_actions_restart()}
 							{/if}
 							{#if restartableCount > 0 && !readonly}
 								<span class="pill-primary">
 									{restartableCount}
-								</span>
-							{/if}
-						</button>
-						<button
-							class="btn btn-secondary flex items-center gap-1 text-sm font-normal"
-							onclick={() => {
-								selected = currentSelected;
-								showUpgradeConfirm = {
-									type: 'multi'
-								};
-							}}
-							disabled={readonly || upgradeableCount === 0}
-						>
-							<CircleFadingArrowUp class="size-4" /> Upgrade
-							{#if upgradeableCount > 0 && !readonly}
-								<span class="pill-primary">
-									{upgradeableCount}
 								</span>
 							{/if}
 						</button>
@@ -982,7 +849,8 @@
 							}}
 							disabled={readonly || k8sUpgradeableCount === 0}
 						>
-							<CircleFadingArrowUp class="size-4" /> Kubernetes Upgrade
+							<CircleFadingArrowUp class="size-4" />
+							{m.mcps_deployments_kubernetes_upgrade()}
 							{#if k8sUpgradeableCount > 0 && !readonly}
 								<span class="pill-primary">
 									{k8sUpgradeableCount}
@@ -1001,7 +869,8 @@
 							}}
 							disabled={readonly || deletableCount === 0}
 						>
-							<Trash2 class="size-4" /> Delete
+							<Trash2 class="size-4" />
+							{m.core_delete()}
 							{#if deletableCount > 0 && !readonly}
 								<span class="pill-primary">
 									{deletableCount}
@@ -1016,55 +885,6 @@
 		{/if}
 	{/if}
 </div>
-
-<DiffDialog bind:this={diffDialog} fromServer={existingServer} toServer={updatedServer} />
-
-<Confirm
-	show={!!showUpgradeConfirm}
-	onsuccess={async () => {
-		if (!showUpgradeConfirm) return;
-		if (showUpgradeConfirm.type === 'single') {
-			await updateServer(showUpgradeConfirm.server);
-		} else {
-			await handleBulkUpdate();
-		}
-		await reload();
-		showUpgradeConfirm = undefined;
-	}}
-	oncancel={() => (showUpgradeConfirm = undefined)}
-	loading={Object.values(updating).some((u) => u.inProgress)}
-	type="info"
-	title="Confirm Update"
->
-	{#snippet msgContent()}
-		<h4 class="flex items-center justify-center gap-2 text-lg font-semibold">
-			<CircleAlert class="size-5" />
-			{`Update ${showUpgradeConfirm?.type === 'single' ? showUpgradeConfirm.server.id : 'selected server(s)'}?`}
-		</h4>
-	{/snippet}
-	{#snippet note()}
-		<p class="text-sm font-light">
-			The selected servers will be updated to their latest catalog configuration.
-		</p>
-		{#each upgradeNotesForConfirmation() as upgradeNote (upgradeNote.id)}
-			<div
-				class="border-warning bg-warning/10 mt-2 flex w-full items-start gap-2 rounded-md border p-3 text-left"
-			>
-				<TriangleAlert class="text-warning mt-0.5 size-4 shrink-0" />
-				<div class="min-w-0 text-sm">
-					<p class="font-medium">
-						{showUpgradeConfirm?.type === 'multi' ? upgradeNote.name : 'Upgrade notes'}
-					</p>
-					<div
-						class="prose prose-sm text-muted-content mt-1 max-w-none space-y-3 [&_ol]:list-decimal [&_ol]:pl-5 [&_ul]:list-disc [&_ul]:pl-5"
-					>
-						{@html toHTMLFromMarkdownWithNewTabLinks(upgradeNote.note)}
-					</div>
-				</div>
-			</div>
-		{/each}
-	{/snippet}
-</Confirm>
 
 <Confirm
 	show={!!showK8sUpgradeConfirm}
@@ -1088,23 +908,25 @@
 	oncancel={() => (showK8sUpgradeConfirm = undefined)}
 	loading={Object.values(updating).some((u) => u.inProgress)}
 	type="info"
-	title="Confirm Update"
+	title={m.mcps_deployments_confirm_update()}
 >
 	{#snippet msgContent()}
 		<h4 class="flex items-center justify-center gap-2 text-lg font-semibold">
 			<CircleAlert class="size-5" />
-			Update Kubernetes Settings
+			{m.mcps_deployments_update_k8s_settings()}
 		</h4>
 	{/snippet}
 	{#snippet note()}
 		<p class="text-sm font-light">
 			{#if showK8sUpgradeConfirm?.type === 'multi'}
-				The selected servers ({Object.values(selected).filter((s) => s.needsK8sUpdate).length})
+				{m.mcps_deployments_k8s_redeploy_multi({
+					count: Object.values(selected).filter((s) => s.needsK8sUpdate).length
+				})}
 			{:else}
-				The <span class="font-medium">{showK8sUpgradeConfirm?.server.manifest.name}</span> server
+				{m.mcps_deployments_k8s_redeploy_single_prefix()}<span class="font-medium"
+					>{showK8sUpgradeConfirm?.server.manifest.name}</span
+				>{m.mcps_deployments_k8s_redeploy_single_suffix()}
 			{/if}
-
-			will be redeployed with the latest Kubernetes settings.
 		</p>
 	{/snippet}
 </Confirm>

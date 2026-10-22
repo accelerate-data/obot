@@ -1,11 +1,23 @@
 import { worker } from '../../../tests/mocks/worker';
 import McpCompositeOauth from './McpCompositeOauth.svelte';
 import { http, HttpResponse } from 'msw';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page } from 'vitest/browser';
 
-function createVMCPResponse(id: string) {
+type VMCPResponseFixture = {
+	id: string;
+	displayName: string;
+	created: string;
+	components: Array<{
+		id?: string;
+		name?: string;
+		mcpServerCatalogEntryID: string;
+		catalogEntry: { manifest: { name: string; runtime: string } };
+	}>;
+};
+
+function createVMCPResponse(id: string): VMCPResponseFixture {
 	return {
 		id,
 		displayName: 'Virtual MCP',
@@ -24,7 +36,10 @@ function createVMCPResponse(id: string) {
 	};
 }
 
-function mockConsentApis(pending: Array<Record<string, string>> = []) {
+function mockConsentApis(
+	pending: Array<Record<string, string>> = [],
+	vmcp: ReturnType<typeof createVMCPResponse> = createVMCPResponse('')
+) {
 	const vmcpGet = vi.fn();
 	const oauthPendingGet = vi.fn();
 
@@ -32,7 +47,7 @@ function mockConsentApis(pending: Array<Record<string, string>> = []) {
 		http.get('/api/vmcps/:id', ({ params }) => {
 			const id = String(params.id);
 			vmcpGet(id);
-			return HttpResponse.json(createVMCPResponse(id));
+			return HttpResponse.json({ ...vmcp, id });
 		}),
 		http.get('/api/oauth/vmcp/:id', ({ params }) => {
 			oauthPendingGet(String(params.id));
@@ -46,11 +61,29 @@ function mockConsentApis(pending: Array<Record<string, string>> = []) {
 describe('McpCompositeOauth', () => {
 	it('loads migrated metadata by canonical ID while authenticating the legacy connection', async () => {
 		const { oauthPendingGet, vmcpGet } = mockConsentApis();
-		render(McpCompositeOauth, { compositeMcpId: 'ms1legacy', vmcpId: 'vmcp1migrated' });
+		worker.use(
+			http.get('/api/mcp-servers/ms1legacy', () =>
+				HttpResponse.json({ id: 'ms1legacy', vmcpID: 'vmcp1migrated' })
+			)
+		);
+		render(McpCompositeOauth, { compositeMcpId: 'ms1legacy' });
 		await expect.element(page.getByRole('heading', { name: 'Virtual MCP' })).toBeVisible();
 		await expect.element(page.getByText('All services authenticated successfully!')).toBeVisible();
 		await vi.waitFor(() => expect(oauthPendingGet).toHaveBeenCalledWith('ms1legacy'));
 		expect(vmcpGet).toHaveBeenCalledWith('vmcp1migrated');
+	});
+	it('resolves instance metadata while authenticating the selected instance', async () => {
+		const { oauthPendingGet, vmcpGet } = mockConsentApis();
+		worker.use(
+			http.get('/api/vmcp-instances/vmcpi1selected', () =>
+				HttpResponse.json({ id: 'vmcpi1selected', vmcpID: 'vmcp1parent' })
+			)
+		);
+
+		render(McpCompositeOauth, { compositeMcpId: 'vmcpi1selected' });
+		await expect.element(page.getByRole('heading', { name: 'Virtual MCP' })).toBeVisible();
+		expect(vmcpGet).toHaveBeenCalledWith('vmcp1parent');
+		expect(oauthPendingGet).toHaveBeenCalledWith('vmcpi1selected');
 	});
 	it('loads vMCP metadata from the vMCP endpoint for vmcp1 IDs', async () => {
 		const id = 'vmcp1-consent-test';
@@ -73,6 +106,53 @@ describe('McpCompositeOauth', () => {
 			.toHaveAttribute('src', icon);
 		await vi.waitFor(() => expect(vmcpGet).toHaveBeenCalledWith(id));
 		expect(oauthPendingGet).toHaveBeenCalledWith(id);
+	});
+
+	it('labels copied servers with their vMCP component names', async () => {
+		const id = 'vmcp1-component-names';
+		mockConsentApis(
+			[
+				{
+					mcpServerID: 'server-b',
+					catalogEntryID: 'gmail-entry',
+					componentID: 'gmail-b',
+					name: 'Gmail',
+					authURL: 'https://example.com/b'
+				},
+				{
+					mcpServerID: 'server-c',
+					catalogEntryID: 'gmail-entry',
+					componentID: 'gmail-c',
+					name: 'Gmail',
+					authURL: 'https://example.com/c'
+				}
+			],
+			{
+				id,
+				displayName: 'Gmail, Gmail B, Gmail C',
+				created: '2026-09-04T00:00:00Z',
+				components: [
+					{
+						id: 'gmail-b',
+						name: 'Gmail B',
+						mcpServerCatalogEntryID: 'gmail-entry',
+						catalogEntry: { manifest: { name: 'Gmail', runtime: 'remote' } }
+					},
+					{
+						id: 'gmail-c',
+						name: 'Gmail C',
+						mcpServerCatalogEntryID: 'gmail-entry',
+						catalogEntry: { manifest: { name: 'Gmail', runtime: 'remote' } }
+					}
+				]
+			}
+		);
+
+		render(McpCompositeOauth, { compositeMcpId: id });
+
+		await expect.element(page.getByText('Gmail B', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('Gmail C', { exact: true })).toBeVisible();
+		await expect.element(page.getByText('Gmail', { exact: true })).not.toBeInTheDocument();
 	});
 
 	it('falls back to the pending MCP server ID when its name is not set', async () => {
@@ -113,7 +193,9 @@ describe('McpCompositeOauth', () => {
 		);
 
 		render(McpCompositeOauth, { compositeMcpId: id });
-		await expect.element(page.getByText('Unable to load authentication')).toBeVisible();
+		await expect
+			.element(page.getByText('Unable to load authentication', { exact: false }))
+			.toBeVisible();
 
 		document.dispatchEvent(new Event('visibilitychange'));
 
@@ -181,7 +263,9 @@ describe('McpCompositeOauth', () => {
 		await page.getByRole('link', { name: 'Authenticate' }).click();
 		document.dispatchEvent(new Event('visibilitychange'));
 		await vi.waitFor(() => expect(calls).toBe(2));
-		await expect.element(page.getByText('Authentication check failed')).toBeVisible();
+		await expect
+			.element(page.getByText('Authentication check failed', { exact: false }))
+			.toBeVisible();
 
 		await page.getByRole('button', { name: 'Retry' }).click();
 		await vi.waitFor(() => expect(calls).toBe(3));
@@ -189,4 +273,172 @@ describe('McpCompositeOauth', () => {
 		await vi.waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
 		expect(oauthPendingGet).toHaveBeenCalledTimes(1);
 	});
+});
+
+it('keeps mixed client authentication pending after a local component completes', async () => {
+	const checked = vi.fn();
+	mockConsentApis([
+		{
+			mcpServerID: 'local',
+			name: 'Local',
+			authURL: `${window.location.origin}/oauth/mcp/login/ui-local-component`
+		},
+		{ mcpServerID: 'hosted', name: 'Hosted', authURL: 'https://provider.example/authorize' }
+	]);
+	worker.use(
+		http.get('/api/oauth/vmcp/:id/components/:componentID', ({ request, params }) => {
+			checked(params.componentID, new URL(request.url).searchParams.get('oauth_auth_request'));
+			return HttpResponse.json({ authURL: '' });
+		})
+	);
+	const onComplete = vi.fn();
+	await render(McpCompositeOauth, {
+		compositeMcpId: 'vmcp1mixed',
+		oauthAuthRequestId: 'original-request',
+		onComplete
+	});
+	await page.getByRole('button', { name: 'Authenticate', exact: true }).click();
+	await expect
+		.element(page.getByLabelText('Authentication command'))
+		.toHaveTextContent(
+			`obot mcp login "${window.location.origin}/oauth/mcp/login/ui-local-component"`
+		);
+	worker.use(
+		http.get('*/oauth/mcp/login/ui-local-component', () => new HttpResponse(null, { status: 400 }))
+	);
+	document.dispatchEvent(new Event('visibilitychange'));
+	await vi.waitFor(() => expect(checked).toHaveBeenCalledWith('local', 'original-request'));
+	await expect.element(page.getByLabelText('Authentication command')).not.toBeInTheDocument();
+	await expect
+		.element(page.getByRole('link', { name: 'Authenticate', exact: true }))
+		.toHaveAttribute('href', 'https://provider.example/authorize');
+	await expect
+		.element(page.getByText('All services authenticated successfully!'))
+		.not.toBeInTheDocument();
+	expect(onComplete).not.toHaveBeenCalled();
+});
+
+it('embeds login instructions without duplicating the parent dialog heading', async () => {
+	mockConsentApis([
+		{
+			mcpServerID: 'vercel',
+			name: 'Vercel',
+			authURL: '/oauth/mcp/login/ui-local-vercel'
+		}
+	]);
+	render(McpCompositeOauth, { compositeMcpId: 'vmcp1-embedded', embedded: true });
+	await page.getByRole('button', { name: 'Authenticate', exact: true }).click();
+	await expect.element(page.getByText('Vercel', { exact: true })).toBeVisible();
+	await expect.element(page.getByLabelText('Authentication command')).toBeVisible();
+	await expect
+		.element(page.getByRole('button', { name: 'Generate new command', exact: true }))
+		.toBeVisible();
+	await expect.element(page.getByRole('heading', { name: 'Virtual MCP' })).not.toBeInTheDocument();
+});
+
+it.each([390, 1280])('keeps mixed authentication readable at %ipx', async (width) => {
+	await page.viewport(width, 900);
+	try {
+		mockConsentApis([
+			{ mcpServerID: 'vercel', name: 'Vercel', authURL: '/oauth/mcp/login/ui-local-vercel' },
+			{
+				mcpServerID: 'calendar',
+				name: 'Microsoft 365 Calendar',
+				authURL: 'https://provider.example/calendar'
+			},
+			{
+				mcpServerID: 'second-local',
+				name: 'Another locally authenticated MCP server',
+				authURL: '/oauth/mcp/login/ui-local-second'
+			}
+		]);
+		render(McpCompositeOauth, {
+			compositeMcpId: 'vmcp1-layout',
+			embedded: true,
+			class: 'max-w-lg'
+		});
+		await page
+			.getByRole('group', { name: 'Vercel', exact: true })
+			.getByRole('button', { name: 'Authenticate', exact: true })
+			.click();
+		await page
+			.getByRole('group', { name: 'Another locally authenticated MCP server', exact: true })
+			.getByRole('button', { name: 'Authenticate', exact: true })
+			.click();
+		const commands = page.getByLabelText('Authentication command');
+		await expect.element(commands.nth(1)).toBeVisible();
+		await expect
+			.element(page.getByRole('link', { name: 'Authenticate', exact: true }))
+			.toHaveAttribute('href', 'https://provider.example/calendar');
+		const name = page.getByText('Vercel', { exact: true }).element().getBoundingClientRect();
+		const command = commands.first().element().getBoundingClientRect();
+		expect(command.top).toBeGreaterThan(name.bottom);
+		expect(command.width).toBeGreaterThan(250);
+		expect(command.right).toBeLessThanOrEqual(width);
+	} finally {
+		await page.viewport(1280, 720);
+	}
+});
+
+beforeEach(() => {
+	worker.use(http.get('*/oauth/mcp/login/:state', () => HttpResponse.json({})));
+});
+
+it('automatically resumes only after both local login and browser OAuth have finished', async () => {
+	let consumed = false;
+	const onComplete = vi.fn();
+	const checked = vi.fn();
+	mockConsentApis([
+		{
+			mcpServerID: 'vercel',
+			name: 'Vercel',
+			authURL: `${window.location.origin}/oauth/mcp/login/mixed-completion`
+		},
+		{ mcpServerID: 'outlook', name: 'Outlook', authURL: 'https://provider.example/authorize' }
+	]);
+	worker.use(
+		http.get('*/oauth/mcp/login/mixed-completion', () =>
+			consumed ? new HttpResponse(null, { status: 400 }) : HttpResponse.json({ expiresIn: 600 })
+		),
+		http.get('/api/oauth/vmcp/:id/components/:componentID', ({ params }) => {
+			checked(params.componentID);
+			return HttpResponse.json({ authURL: '' });
+		})
+	);
+	await render(McpCompositeOauth, { compositeMcpId: 'vmcp1mixed-completion', onComplete });
+	await page.getByRole('button', { name: 'Authenticate', exact: true }).click();
+	await expect.element(page.getByLabelText('Authentication command')).toBeVisible();
+	await expect.element(page.getByRole('timer')).toHaveTextContent('Command expires in 10:00');
+	consumed = true;
+	await expect.element(page.getByLabelText('Authentication command')).not.toBeInTheDocument();
+	expect(checked).toHaveBeenCalledWith('vercel');
+	expect(checked).not.toHaveBeenCalledWith('outlook');
+	expect(onComplete).not.toHaveBeenCalled();
+	await page.getByRole('link', { name: 'Authenticate', exact: true }).click();
+	document.dispatchEvent(new Event('visibilitychange'));
+	await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+	expect(checked).toHaveBeenCalledWith('outlook');
+	await expect.element(page.getByText('All services authenticated successfully!')).toBeVisible();
+});
+
+it('automatically retries a failed component check after local login is consumed', async () => {
+	mockConsentApis([
+		{ mcpServerID: 'local-retry', name: 'Local Retry', authURL: '/oauth/mcp/login/component-retry' }
+	]);
+	let checks = 0;
+	const onComplete = vi.fn();
+	worker.use(
+		http.get('*/oauth/mcp/login/component-retry', () => new HttpResponse(null, { status: 400 })),
+		http.get('/api/oauth/vmcp/:id/components/:componentID', () => {
+			checks++;
+			return checks === 1
+				? HttpResponse.json({ message: 'Temporary authentication check failure' }, { status: 503 })
+				: HttpResponse.json({ authURL: '' });
+		})
+	);
+	await render(McpCompositeOauth, { compositeMcpId: 'vmcp1-retry', onComplete });
+	await page.getByRole('button', { name: 'Authenticate', exact: true }).click();
+	await vi.waitFor(() => expect(onComplete).toHaveBeenCalledOnce());
+	expect(checks).toBe(2);
+	await expect.element(page.getByText('All services authenticated successfully!')).toBeVisible();
 });

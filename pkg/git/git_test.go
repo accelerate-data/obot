@@ -9,7 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing/transport/client"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -23,12 +26,46 @@ func TestIsGitRepoURL(t *testing.T) {
 		url  string
 		want bool
 	}{
-		{"https://github.com/org/repo", true},
-		{"https://gitlab.com/org/repo", true},
-		{"https://example.com/org/repo.git", true},
-		{"https://self-hosted.example.com/org/repo.git", true},
-		{"https://example.com/some/raw/file.yaml", false},
-		{"https://example.com/catalog.json", false},
+		{
+			url:  "https://github.com/org/repo",
+			want: true,
+		},
+		{
+			url:  "https://gitlab.com/org/repo",
+			want: true,
+		},
+		{
+			url:  "https://bitbucket.org/org/repo",
+			want: true,
+		},
+		{
+			url:  "https://GitHub.com/org/repo",
+			want: true,
+		},
+		{
+			url:  "https://GitLab.com/org/repo",
+			want: true,
+		},
+		{
+			url:  "https://Bitbucket.org/org/repo",
+			want: true,
+		},
+		{
+			url:  "https://example.com/org/repo.git",
+			want: true,
+		},
+		{
+			url:  "https://self-hosted.example.com/org/repo.git",
+			want: true,
+		},
+		{
+			url:  "https://example.com/some/raw/file.yaml",
+			want: false,
+		},
+		{
+			url:  "https://example.com/catalog.json",
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -95,9 +132,34 @@ func TestParseGitURL(t *testing.T) {
 			wantBranch: "my-branch",
 		},
 		{
-			name:    "bitbucket without .git",
-			url:     "https://bitbucket.org/org/repo",
-			wantErr: true,
+			name:       "bitbucket without .git",
+			url:        "https://bitbucket.org/org/repo",
+			wantClone:  "https://bitbucket.org/org/repo.git",
+			wantBranch: "main",
+		},
+		{
+			name:       "bitbucket with .git",
+			url:        "https://bitbucket.org/org/repo.git",
+			wantClone:  "https://bitbucket.org/org/repo.git",
+			wantBranch: "main",
+		},
+		{
+			name:       "bitbucket with branch",
+			url:        "https://bitbucket.org/org/repo/feature/catalog",
+			wantClone:  "https://bitbucket.org/org/repo.git",
+			wantBranch: "feature/catalog",
+		},
+		{
+			name:       "bitbucket with .git and branch",
+			url:        "https://bitbucket.org/org/repo.git/feature/catalog",
+			wantClone:  "https://bitbucket.org/org/repo.git",
+			wantBranch: "feature/catalog",
+		},
+		{
+			name:       "mixed-case Bitbucket host preserves repository and branch case",
+			url:        "https://Bitbucket.org/Org/Repo/Feature/Catalog",
+			wantClone:  "https://Bitbucket.org/Org/Repo.git",
+			wantBranch: "Feature/Catalog",
 		},
 		{
 			name:    "unknown host without .git is rejected",
@@ -120,9 +182,143 @@ func TestParseGitURL(t *testing.T) {
 	}
 }
 
+func TestNormalizeRepositoryURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		want    string
+		wantErr string
+	}{
+		{
+			name: "valid GitHub HTTPS URL",
+			url:  "https://github.com/owner/repo",
+			want: "https://github.com/owner/repo",
+		},
+		{
+			name: "valid GitHub URL without scheme",
+			url:  "github.com/owner/repo",
+			want: "https://github.com/owner/repo",
+		},
+		{
+			name: "valid GitLab HTTPS URL",
+			url:  "https://gitlab.com/owner/repo",
+			want: "https://gitlab.com/owner/repo",
+		},
+		{
+			name: "mixed-case host preserves credential key",
+			url:  "Bitbucket.org/Org/Repo",
+			want: "https://Bitbucket.org/Org/Repo",
+		},
+		{
+			name: "valid Bitbucket HTTPS URL",
+			url:  "https://bitbucket.org/owner/repo",
+			want: "https://bitbucket.org/owner/repo",
+		},
+		{
+			name: "valid Bitbucket URL without scheme",
+			url:  "bitbucket.org/owner/repo",
+			want: "https://bitbucket.org/owner/repo",
+		},
+		{
+			name: "valid Bitbucket .git URL",
+			url:  "https://bitbucket.org/owner/repo.git",
+			want: "https://bitbucket.org/owner/repo.git",
+		},
+		{
+			name: "valid Bitbucket branch URL",
+			url:  "https://bitbucket.org/owner/repo/feature/skills",
+			want: "https://bitbucket.org/owner/repo/feature/skills",
+		},
+		{
+			name:    "Bitbucket owner only rejected",
+			url:     "https://bitbucket.org/owner",
+			wantErr: "owner and repository",
+		},
+		{
+			name: "valid GitHub URL with ref path",
+			url:  "https://github.com/owner/repo/main",
+			want: "https://github.com/owner/repo/main",
+		},
+		{
+			name: "valid GitLab subgroup with .git suffix",
+			url:  "https://gitlab.com/group/subgroup/repo.git/main",
+			want: "https://gitlab.com/group/subgroup/repo.git/main",
+		},
+		{
+			name: "valid with .git suffix",
+			url:  "https://example.com/owner/repo.git",
+			want: "https://example.com/owner/repo.git",
+		},
+		{
+			name:    "HTTP scheme rejected",
+			url:     "http://github.com/owner/repo",
+			wantErr: "HTTPS",
+		},
+		{
+			name:    "SSH scheme rejected",
+			url:     "ssh://github.com/owner/repo",
+			wantErr: "HTTPS",
+		},
+		{
+			name:    "non-git HTTPS URL",
+			url:     "https://example.com/some/page",
+			wantErr: "does not appear to be a git repository",
+		},
+		{
+			name:    "GitHub owner only rejected",
+			url:     "https://github.com/owner",
+			wantErr: "owner and repository",
+		},
+		{
+			name:    "GitLab owner only rejected",
+			url:     "https://gitlab.com/owner",
+			wantErr: "owner and repository",
+		},
+		{
+			name:    "embedded credentials rejected",
+			url:     "https://token@github.com/owner/repo",
+			wantErr: "must not include credentials",
+		},
+		{
+			name:    "non-GitHub host without .git rejected",
+			url:     "https://example.com/owner/repo",
+			wantErr: "does not appear to be a git repository",
+		},
+		{
+			name: "surrounding whitespace",
+			url:  "  bitbucket.org/owner/repo/feature/skills  ",
+			want: "https://bitbucket.org/owner/repo/feature/skills",
+		},
+		{
+			name:    "invalid embedded branch",
+			url:     "https://bitbucket.org/owner/repo/../main",
+			wantErr: "invalid branch name",
+		},
+		{
+			name:    "empty string",
+			url:     "",
+			wantErr: "HTTPS",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			normalized, err := NormalizeRepositoryURL(tt.url)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, normalized)
+		})
+	}
+}
+
 func TestCloneAuthAttempts(t *testing.T) {
 	tests := []struct {
 		name          string
+		host          string
 		token         string
 		fallbackToken string
 		want          []cloneAuthAttempt
@@ -131,7 +327,11 @@ func TestCloneAuthAttempts(t *testing.T) {
 			name:  "explicit token only",
 			token: "repo-token",
 			want: []cloneAuthAttempt{
-				{name: "token", token: "repo-token"},
+				{
+					name:     "token",
+					token:    "repo-token",
+					username: "x-access-token",
+				},
 			},
 		},
 		{
@@ -139,28 +339,41 @@ func TestCloneAuthAttempts(t *testing.T) {
 			token:         "repo-token",
 			fallbackToken: "fallback-token",
 			want: []cloneAuthAttempt{
-				{name: "token", token: "repo-token"},
+				{
+					name:     "token",
+					token:    "repo-token",
+					username: "x-access-token",
+				},
 			},
 		},
 		{
-			name: "anonymous only",
+			name: "Bitbucket without token stays anonymous",
+			host: "bitbucket.org",
 			want: []cloneAuthAttempt{
-				{name: "anonymous"},
+				{
+					name: "anonymous",
+				},
 			},
 		},
 		{
 			name:          "anonymous then fallback token",
 			fallbackToken: "fallback-token",
 			want: []cloneAuthAttempt{
-				{name: "anonymous"},
-				{name: "fallback token", token: "fallback-token"},
+				{
+					name: "anonymous",
+				},
+				{
+					name:     "fallback token",
+					token:    "fallback-token",
+					username: "x-access-token",
+				},
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, cloneAuthAttempts(tt.token, tt.fallbackToken))
+			assert.Equal(t, tt.want, cloneAuthAttempts(tt.host, tt.token, tt.fallbackToken))
 		})
 	}
 }
@@ -171,16 +384,51 @@ func TestValidateRef(t *testing.T) {
 		ref     string
 		wantErr bool
 	}{
-		{name: "branch", ref: "main"},
-		{name: "nested branch", ref: "feature/git-sync"},
-		{name: "tag", ref: "v1.2.3"},
-		{name: "commit sha", ref: "0123456789abcdef0123456789abcdef01234567"},
-		{name: "empty", wantErr: true},
-		{name: "path traversal", ref: "feature/../main", wantErr: true},
-		{name: "leading dash", ref: "-main", wantErr: true},
-		{name: "contains colon", ref: "main:other", wantErr: true},
-		{name: "contains whitespace", ref: "main branch", wantErr: true},
-		{name: "trimmed whitespace", ref: " main", wantErr: true},
+		{
+			name: "branch",
+			ref:  "main",
+		},
+		{
+			name: "nested branch",
+			ref:  "feature/git-sync",
+		},
+		{
+			name: "tag",
+			ref:  "v1.2.3",
+		},
+		{
+			name: "commit sha",
+			ref:  "0123456789abcdef0123456789abcdef01234567",
+		},
+		{
+			name:    "empty",
+			wantErr: true,
+		},
+		{
+			name:    "path traversal",
+			ref:     "feature/../main",
+			wantErr: true,
+		},
+		{
+			name:    "leading dash",
+			ref:     "-main",
+			wantErr: true,
+		},
+		{
+			name:    "contains colon",
+			ref:     "main:other",
+			wantErr: true,
+		},
+		{
+			name:    "contains whitespace",
+			ref:     "main branch",
+			wantErr: true,
+		},
+		{
+			name:    "trimmed whitespace",
+			ref:     " main",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -218,34 +466,270 @@ func TestCloneRefAttempts(t *testing.T) {
 }
 
 func TestRepositorySizeChecksReturnSentinel(t *testing.T) {
+	originalHTTP := http.DefaultTransport
+	originalGit := client.Protocols["https"]
+	t.Cleanup(func() {
+		http.DefaultTransport = originalHTTP
+		client.InstallProtocol("https", originalGit)
+	})
+	client.InstallProtocol("https", githttp.NewClient(&http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Error("oversized repository should be rejected before cloning")
+			return nil, context.Canceled
+		}),
+	}))
+
+	tests := []struct {
+		host string
+		body string
+	}{
+		{
+			host: "github.com",
+			body: `{"size":204800}`,
+		},
+		{
+			host: "GitHub.com",
+			body: `{"size":204800}`,
+		},
+		{
+			host: "gitlab.com",
+			body: `{"statistics":{"repository_size":209715200}}`,
+		},
+		{
+			host: "GitLab.com",
+			body: `{"statistics":{"repository_size":209715200}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(tt.body)),
+					Header:     make(http.Header),
+				}, nil
+			})
+			_, _, cleanup, err := Clone(t.Context(), "https://"+tt.host+"/example/repo.git", "token", "", 0)
+			if cleanup != nil {
+				cleanup()
+			}
+			assert.ErrorIs(t, err, errRepoTooLarge)
+		})
+	}
+}
+
+func TestRepoSizeLimitMB(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   int
+		want    int
+		wantErr bool
+	}{
+		{
+			name: "default",
+			want: 100,
+		},
+		{
+			name:  "custom",
+			value: 250,
+			want:  250,
+		},
+		{
+			name:    "negative",
+			value:   -1,
+			wantErr: true,
+		},
+		{
+			name:    "byte overflow",
+			value:   8796093022208,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			limit, err := repoSizeLimitMB(tt.value)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.want, limit)
+			}
+		})
+	}
+}
+
+// Verify Clone forwards the configured limit to both provider pre-checks:
+// the same 200 MB repository is rejected at 100 MB but reaches cloning at 250 MB.
+func TestCloneConfiguredSizeLimit(t *testing.T) {
+	originalHTTPS := client.Protocols["https"]
+	t.Cleanup(func() { client.InstallProtocol("https", originalHTTPS) })
 	originalTransport := http.DefaultTransport
 	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	t.Setenv("GITHUB_AUTH_TOKEN", "")
+	for _, host := range []string{"github.com", "gitlab.com"} {
+		t.Run(host, func(t *testing.T) {
+			cloneAttempted := false
+			http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Host == "api.github.com" || strings.HasPrefix(req.URL.Path, "/api/v4/") {
+					body := `{"size":204800,"statistics":{"repository_size":209715200}}`
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader(body)),
+						Header:     make(http.Header),
+					}, nil
+				}
+				cloneAttempted = true
+				return nil, context.Canceled
+			})
+			client.InstallProtocol("https", githttp.NewClient(&http.Client{Transport: http.DefaultTransport}))
+			_, _, _, err := Clone(t.Context(), "https://"+host+"/example/repo", "token", "", 100)
+			assert.ErrorIs(t, err, errRepoTooLarge)
+			assert.False(t, cloneAttempted)
 
-	t.Run("GitHub", func(t *testing.T) {
-		http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"size": 204800}`)),
-				Header:     make(http.Header),
-			}, nil
+			_, _, _, err = Clone(t.Context(), "https://"+host+"/example/repo", "token", "", 250)
+			assert.ErrorIs(t, err, context.Canceled)
+			assert.True(t, cloneAttempted)
 		})
+	}
+}
 
-		err := checkGitHubRepoSize(t.Context(), "example", "repo", 100, "")
-		assert.ErrorIs(t, err, errRepoTooLarge)
-	})
-
-	t.Run("GitLab", func(t *testing.T) {
-		http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       io.NopCloser(strings.NewReader(`{"statistics":{"repository_size":209715200}}`)),
-				Header:     make(http.Header),
-			}, nil
+// Exercise the credentials sent by Clone through the real go-git HTTP transport.
+func TestCloneBitbucketCancellation(t *testing.T) {
+	t.Setenv("GITHUB_AUTH_TOKEN", "")
+	originalTransport := client.Protocols["https"]
+	t.Cleanup(func() { client.InstallProtocol("https", originalTransport) })
+	stop := context.Canceled // Cancellation must stop before trying another username.
+	requests := 0
+	client.InstallProtocol("https", githttp.NewClient(&http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			assert.Equal(t, "bitbucket.org", req.URL.Host)
+			assert.Equal(t, "/org/repo.git/info/refs", req.URL.Path)
+			username, password, ok := req.BasicAuth()
+			assert.True(t, ok)
+			assert.Equal(t, "x-bitbucket-api-token-auth", username)
+			assert.Equal(t, "test-api-token", password)
+			return nil, stop
+		}),
+	}))
+	for _, repoURL := range []string{
+		"https://bitbucket.org/org/repo.git",
+		"https://bitbucket.org/org/repo",
+		"https://bitbucket.org/org/repo/feature/catalog",
+		"https://bitbucket.org/org/repo.git/feature/catalog",
+	} {
+		t.Run(repoURL, func(t *testing.T) {
+			requests = 0
+			_, _, cleanup, err := Clone(context.Background(), repoURL, "test-api-token", "", 0)
+			if cleanup != nil {
+				cleanup()
+			}
+			assert.ErrorIs(t, err, stop)
+			assert.Equal(t, 1, requests)
 		})
+	}
+}
 
-		err := checkGitLabRepoSize(t.Context(), "gitlab.com", "example/repo", 100, "token")
-		assert.ErrorIs(t, err, errRepoTooLarge)
-	})
+func TestCloneBitbucketRepositoryTokenRetry(t *testing.T) {
+	tests := []struct {
+		name          string
+		host          string
+		ref           string
+		status        int
+		rejectAll     bool
+		fallbackToken bool
+		wantUsernames []string
+	}{
+		{
+			name:          "retry unauthorized with repository token username",
+			host:          "bitbucket.org",
+			status:        http.StatusUnauthorized,
+			wantUsernames: []string{"x-bitbucket-api-token-auth", "x-token-auth", "x-access-token"},
+		},
+		{
+			name:          "mixed-case Bitbucket host uses all token usernames",
+			host:          "Bitbucket.org",
+			status:        http.StatusUnauthorized,
+			wantUsernames: []string{"x-bitbucket-api-token-auth", "x-token-auth", "x-access-token"},
+		},
+		{
+			name:          "retry forbidden with repository token username",
+			host:          "bitbucket.org",
+			status:        http.StatusForbidden,
+			wantUsernames: []string{"x-bitbucket-api-token-auth", "x-token-auth", "x-access-token"},
+		},
+		{
+			name:          "invalid token exhausts usernames and refs",
+			ref:           "v1.0.0",
+			host:          "bitbucket.org",
+			status:        http.StatusUnauthorized,
+			rejectAll:     true,
+			wantUsernames: []string{"x-bitbucket-api-token-auth", "x-bitbucket-api-token-auth", "x-token-auth", "x-token-auth", "x-access-token", "x-access-token"},
+		},
+		{
+			name:          "fallback token supports repository tokens",
+			host:          "bitbucket.org",
+			status:        http.StatusUnauthorized,
+			fallbackToken: true,
+			wantUsernames: []string{"", "x-bitbucket-api-token-auth", "x-token-auth", "x-access-token"},
+		},
+		{
+			name:          "server errors also try repository token username",
+			host:          "bitbucket.org",
+			status:        http.StatusInternalServerError,
+			wantUsernames: []string{"x-bitbucket-api-token-auth", "x-token-auth", "x-access-token"},
+		},
+		{
+			name:          "other hosts do not use Bitbucket usernames",
+			host:          "git.example.com",
+			status:        http.StatusUnauthorized,
+			wantUsernames: []string{"x-access-token"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			token := "test-repository-token"
+			t.Setenv("GITHUB_AUTH_TOKEN", "")
+			if tt.fallbackToken {
+				t.Setenv("GITHUB_AUTH_TOKEN", token)
+				token = ""
+			}
+			originalTransport := client.Protocols["https"]
+			t.Cleanup(func() { client.InstallProtocol("https", originalTransport) })
+			stop := errors.New("authenticated request reached repository")
+			var usernames []string
+			client.InstallProtocol("https", githttp.NewClient(&http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					username, password, ok := req.BasicAuth()
+					usernames = append(usernames, username)
+					assert.Equal(t, tt.host, req.URL.Host)
+					assert.Equal(t, "/org/repo.git/info/refs", req.URL.Path)
+					if username != "" {
+						assert.True(t, ok)
+						assert.Equal(t, "test-repository-token", password)
+					}
+					if username == "x-token-auth" && !tt.rejectAll {
+						return nil, stop
+					}
+					return &http.Response{
+						StatusCode: tt.status,
+						Header:     make(http.Header),
+						Body:       io.NopCloser(strings.NewReader(http.StatusText(tt.status))),
+						Request:    req,
+					}, nil
+				}),
+			}))
+			_, _, cleanup, err := Clone(t.Context(), "https://"+tt.host+"/org/repo.git", token, tt.ref, 0)
+			if cleanup != nil {
+				cleanup()
+			}
+			require.Error(t, err)
+			assert.Equal(t, tt.wantUsernames, usernames)
+			if !tt.rejectAll && strings.EqualFold(tt.host, "bitbucket.org") {
+				assert.ErrorIs(t, err, stop)
+			}
+		})
+	}
 }
 
 func TestShouldAbortRepositorySizeCheck(t *testing.T) {

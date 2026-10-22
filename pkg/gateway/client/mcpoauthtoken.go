@@ -728,6 +728,10 @@ func (c *Client) deleteChangedMCPOAuthPendingState(ctx context.Context, hashedSt
 }
 
 func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, oauthConf *oauth2.Config) error {
+	return c.CreateMCPOAuthPendingStateWithTunnel(ctx, userID, mcpID, mcpURL, "", oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL, oauthConf)
+}
+
+func (c *Client) CreateMCPOAuthPendingStateWithTunnel(ctx context.Context, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, oauthConf *oauth2.Config) error {
 	generation := ""
 	staticOAuth := false
 	if catalogEntryName != "" {
@@ -766,6 +770,7 @@ func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, 
 		MCPID:                       mcpID,
 		URL:                         mcpURL,
 		ResourceURL:                 resourceURL,
+		TunnelName:                  tunnelName,
 		CatalogEntryName:            catalogEntryName,
 		CatalogCredentialGeneration: generation,
 		OAuthAuthRequestID:          oauthAuthRequestID,

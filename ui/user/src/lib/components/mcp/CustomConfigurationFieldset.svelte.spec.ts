@@ -1,11 +1,12 @@
 import type { MCPSubField } from '$lib/services';
+import { reactive } from '../../../tests/helpers/reactive.svelte';
 import CustomConfigurationFieldset from './CustomConfigurationFieldset.svelte';
 import { describe, expect, it } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page } from 'vitest/browser';
 
 function field(overrides: Partial<MCPSubField> = {}): MCPSubField {
-	return {
+	return reactive({
 		key: '',
 		name: '',
 		description: '',
@@ -13,7 +14,7 @@ function field(overrides: Partial<MCPSubField> = {}): MCPSubField {
 		required: false,
 		sensitive: false,
 		...overrides
-	};
+	});
 }
 
 async function renderFieldset(
@@ -71,6 +72,20 @@ describe('CustomConfigurationFieldset.svelte', () => {
 			.not.toHaveAttribute('aria-invalid', 'true');
 	});
 
+	it('treats a stored static value as configured', async () => {
+		await renderFieldset({
+			data: field({ key: 'API_KEY', static: true, required: true }),
+			showRequired: true
+		});
+
+		const value = page.getByLabelText('Static Value');
+		await expect.element(value).toHaveValue('');
+		await expect.element(value).not.toHaveAttribute('aria-invalid', 'true');
+		await expect
+			.element(value)
+			.toHaveAttribute('placeholder', 'Stored value; leave blank to keep it');
+	});
+
 	it('marks an empty static Value invalid only after validation', async () => {
 		await renderFieldset({ showRequired: true });
 
@@ -102,14 +117,15 @@ describe('CustomConfigurationFieldset.svelte', () => {
 	});
 
 	it('shows an error on duplicate option values after invalid validation', async () => {
+		const data = field({
+			key: 'REGION',
+			options: [
+				{ name: 'United States', value: 'us', description: '' },
+				{ name: 'US fallback', value: 'us', description: '' }
+			]
+		});
 		await renderFieldset({
-			data: field({
-				key: 'REGION',
-				options: [
-					{ name: 'United States', value: 'us' },
-					{ name: 'US fallback', value: 'us' }
-				]
-			}),
+			data,
 			showInvalid: true
 		});
 
@@ -122,6 +138,13 @@ describe('CustomConfigurationFieldset.svelte', () => {
 		await expect
 			.element(page.getByCSS('#env-option-value-test-1-error'))
 			.toHaveTextContent('Option values must be unique.');
+
+		await page.getByCSS('#env-option-value-test-1').fill('eu');
+		expect(data.options?.[1].value).toBe('eu');
+		await expect
+			.element(page.getByCSS('#env-option-value-test-1'))
+			.not.toHaveAttribute('aria-invalid', 'true');
+		await expect.element(page.getByCSS('#env-option-value-test-1-error')).not.toBeInTheDocument();
 	});
 
 	it('omits aria-required when the fieldset is readonly', async () => {
@@ -131,7 +154,7 @@ describe('CustomConfigurationFieldset.svelte', () => {
 		});
 
 		await expect
-			.element(page.getByRole('textbox', { name: 'Key' }))
+			.element(page.getByRole('textbox', { name: 'Key', exact: false }))
 			.not.toHaveAttribute('aria-required');
 		await expect.element(page.getByLabelText('Static Value')).not.toHaveAttribute('aria-required');
 	});

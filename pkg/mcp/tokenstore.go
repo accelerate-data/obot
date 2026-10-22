@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
@@ -49,7 +50,8 @@ type storageBackedTokenSource struct {
 	tokenStorage TokenStorage
 	conf         *oauth2.Config
 	tok          *oauth2.Token
-	httpClient   *http.Client
+	// httpClient performs the refresh request to the server-supplied token endpoint.
+	httpClient *http.Client
 }
 
 func NewGlobalTokenStore(gatewayClient *gateway.Client, opts ...GlobalTokenStoreOption) GlobalTokenStore {
@@ -150,17 +152,28 @@ func (t *tokenStore) TokenSource(ctx context.Context) (oauth2.TokenSource, error
 	if config == nil || token == nil {
 		return nil, nil
 	}
-	return newStorageBackedTokenSourceWithClient(t, config, token, t.refreshHTTPClient), nil
+	// Use the server-specific client from ctx when available (including its tunnel),
+	// otherwise use the operator's configured policy for background refreshes.
+	httpClient, _ := ctx.Value(oauth2.HTTPClient).(*http.Client)
+	if httpClient == nil {
+		httpClient = t.refreshHTTPClient
+	}
+	return newStorageBackedTokenSourceWithClient(t, config, token, httpClient), nil
 }
 
-func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token) oauth2.TokenSource {
-	return newStorageBackedTokenSourceWithClient(tokenStorage, conf, tok, nil)
+func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, clients ...*http.Client) oauth2.TokenSource {
+	var httpClient *http.Client
+	if len(clients) > 0 {
+		httpClient = clients[0]
+	}
+	return newStorageBackedTokenSourceWithClient(tokenStorage, conf, tok, httpClient)
 }
 
-// newStorageBackedTokenSourceWithClient builds a token source that persists
-// refreshed tokens. httpClient carries the operator's remote-network policy and
-// rejects redirects; without it a refresh runs on http.DefaultClient.
 func newStorageBackedTokenSourceWithClient(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, httpClient *http.Client) oauth2.TokenSource {
+	if httpClient == nil {
+		httpClient = strictEgressClient
+	}
+	httpClient = safehttp.NoRedirects(httpClient)
 	return oauth2.ReuseTokenSource(tok, &storageBackedTokenSource{
 		tokenStorage: tokenStorage,
 		conf:         conf,
@@ -170,7 +183,7 @@ func newStorageBackedTokenSourceWithClient(tokenStorage TokenStorage, conf *oaut
 }
 
 func (ts *storageBackedTokenSource) Token() (*oauth2.Token, error) {
-	ctx := WithOAuthHTTPClient(context.Background(), ts.httpClient)
+	ctx := withOAuthHTTPClient(context.Background(), ts.httpClient)
 	tok, err := ts.conf.TokenSource(ctx, ts.tok).Token()
 	if err != nil {
 		return nil, err

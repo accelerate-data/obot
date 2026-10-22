@@ -10,19 +10,6 @@ import (
 var (
 	apiResources = map[string][]string{
 		types.GroupAPI: {
-			"GET    /api/hosted-agents",
-			"GET    /api/hosted-agents/{hosted_agent_id}",
-			"GET    /api/hosted-agent-instances",
-			"POST   /api/hosted-agent-instances",
-			"GET    /api/hosted-agent-instances/{hosted_agent_instance_id}",
-			"PUT    /api/hosted-agent-instances/{hosted_agent_instance_id}",
-			"DELETE /api/hosted-agent-instances/{hosted_agent_instance_id}",
-			"GET    /api/hosted-agent-instances/{hosted_agent_instance_id}/terminal",
-			"GET    /api/hosted-agent-pools",
-			"GET    /api/hosted-agent-pools/{hosted_agent_pool_id}",
-			"GET    /api/hosted-agent-pools/{hosted_agent_pool_id}/utilization",
-			"GET    /api/hosted-agent-pool-assignments",
-			"GET    /api/hosted-agent-pool-assignments/{hosted_agent_pool_assignment_id}",
 			"GET    /api/all-mcps/servers/{mcpserver_id}",
 			"GET    /api/all-mcps/servers/{mcpserver_id}/tools",
 			"GET    /api/all-mcps/servers/{mcpserver_id}/resources",
@@ -43,14 +30,9 @@ var (
 			"GET    /api/mcp-audit-logs/{mcp_id}",
 			"GET    /api/mcp-server-instances",
 			"GET    /api/mcp-server-instances/{mcp_server_instance_id}",
-			"POST   /api/mcp-server-instances",
-			"DELETE /api/mcp-server-instances/{mcp_server_instance_id}",
 			"DELETE /api/mcp-server-instances/{mcp_server_instance_id}/oauth",
 			"GET    /api/mcp-server-instances/{mcp_server_instance_id}/oauth-url",
 			"GET    /api/mcp-server-instances/{mcp_server_instance_id}/oauth-redirect",
-			"POST   /api/mcp-server-instances/{mcp_server_instance_id}/reveal",
-			"POST   /api/mcp-server-instances/{mcp_server_instance_id}/configure",
-			"POST   /api/mcp-server-instances/{mcp_server_instance_id}/deconfigure",
 			"GET    /api/vmcps",
 			"POST   /api/vmcps",
 			"GET    /api/vmcps/{vmcp_id}",
@@ -58,6 +40,8 @@ var (
 			"POST   /api/vmcps/{vmcp_id}/check-oauth",
 			"GET    /api/vmcps/{vmcp_id}/oauth-url",
 			"DELETE /api/vmcps/{vmcp_id}/oauth",
+			"GET    /api/vmcps/{vmcp_id}/oauth-status",
+			"DELETE /api/vmcps/{vmcp_id}/components/{component_id}/oauth",
 			"GET    /api/vmcps/{vmcp_id}/tools",
 			"GET    /api/vmcps/{vmcp_id}/resources",
 			"GET    /api/vmcps/{vmcp_id}/resources/{resource_uri}",
@@ -73,6 +57,7 @@ var (
 			"GET    /api/vmcp-instances",
 			"POST   /api/vmcp-instances",
 			"GET    /api/vmcp-instances/{vmcp_instance_id}",
+			"POST   /api/vmcp-instances/{vmcp_instance_id}/tester/chat",
 			"PUT    /api/vmcp-instances/{vmcp_instance_id}",
 			"DELETE /api/vmcp-instances/{vmcp_instance_id}",
 			"POST   /api/vmcp-instances/{vmcp_instance_id}/configure",
@@ -80,26 +65,9 @@ var (
 			"POST   /api/vmcp-instances/{vmcp_instance_id}/deconfigure",
 			"GET    /api/mcp-servers",
 			"GET    /api/mcp-servers/{mcpserver_id}",
-			"POST   /api/mcp-servers/{mcpserver_id}/launch",
-			"POST   /api/mcp-servers/{mcpserver_id}/check-oauth",
 			"GET    /api/mcp-servers/{mcpserver_id}/oauth-url",
-			"POST   /api/mcp-servers",
-			"DELETE /api/mcp-servers/{mcpserver_id}",
-			"DELETE /api/mcp-servers/{mcpserver_id}/oauth",
 			"GET    /api/mcp-servers/{mcpserver_id}/logs",
-			"PUT	/api/mcp-servers/{mcpserver_id}/alias",
-			"POST   /api/mcp-servers/{mcpserver_id}/update-url",
-			"POST   /api/mcp-servers/{mcpserver_id}/configure",
-			"POST   /api/mcp-servers/{mcpserver_id}/deconfigure",
-			"POST   /api/mcp-servers/{mcpserver_id}/reveal",
 			"POST   /api/mcp-servers/{mcpserver_id}/restart",
-			"POST   /api/mcp-servers/{mcpserver_id}/trigger-update",
-			"GET    /api/mcp-servers/{mcpserver_id}/tools",
-			"GET    /api/mcp-servers/{mcpserver_id}/resources",
-			"GET    /api/mcp-servers/{mcpserver_id}/resources/{resource_uri}",
-			"GET    /api/mcp-servers/{mcpserver_id}/prompts",
-			"GET    /api/mcp-servers/{mcpserver_id}/prompts/{prompt_name}",
-			"POST   /api/mcp-servers/{mcp_id}/tester/chat",
 			"GET    /api/users/{user_id}",
 			"DELETE /api/users/{user_id}",
 			"PATCH  /api/users/{user_id}",
@@ -108,15 +76,6 @@ var (
 			"GET    /api/users/{user_id}/total-token-usage",
 			"GET    /api/users/{user_id}/remaining-token-usage",
 			"GET    /api/workspaces",
-			"GET    /api/projects/{project_id}",
-			"PUT    /api/projects/{project_id}",
-			"DELETE /api/projects/{project_id}",
-			"POST   /api/projects/{project_id}/agents",
-			"GET    /api/projects/{project_id}/agents",
-			"GET    /api/projects/{project_id}/agents/{nanobot_agent_id}",
-			"PUT    /api/projects/{project_id}/agents/{nanobot_agent_id}",
-			"DELETE /api/projects/{project_id}/agents/{nanobot_agent_id}",
-			"POST   /api/projects/{project_id}/agents/{nanobot_agent_id}/launch",
 		},
 		types.GroupPowerUser: {
 			"GET    /api/workspaces/{workspace_id}",
@@ -125,6 +84,7 @@ var (
 			"DELETE /api/workspaces/{workspace_id}/entries/{entry_id}",
 			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}",
 			"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}",
+			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/reveal",
 			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers",
 			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}",
 			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/generate-tool-previews",
@@ -132,7 +92,6 @@ var (
 			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/details",
 			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/logs",
 			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/restart",
-			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/servers/{mcpserver_id}/trigger-update",
 			"GET    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
 			"POST   /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
 			"PUT    /api/workspaces/{workspace_id}/entries/{entry_id}/oauth-credentials",
@@ -142,18 +101,8 @@ var (
 		},
 		types.GroupPowerUserPlus: {
 			"GET    /api/workspaces/{workspace_id}/servers",
-			"POST   /api/workspaces/{workspace_id}/servers",
-			"DELETE /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
 			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
-			"PUT    /api/workspaces/{workspace_id}/servers/{mcp_server_id}",
-			"PUT    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/alias",
-			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/launch",
-			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/check-oauth",
 			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/oauth-url",
-			"DELETE /api/workspaces/{workspace_id}/servers/{mcp_server_id}/oauth",
-			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/configure",
-			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/deconfigure",
-			"POST   /api/workspaces/{workspace_id}/servers/{mcp_server_id}/reveal",
 			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/instances",
 			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/details",
 			"GET    /api/workspaces/{workspace_id}/servers/{mcp_server_id}/logs",
@@ -164,14 +113,6 @@ var (
 			"GET    /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
 			"PUT    /api/workspaces/{workspace_id}/access-control-rules/{access_control_rule_id}",
 		},
-		types.GroupAuthenticated: {
-			// Reaching an agent's own HTTP port. Any authenticated user may match
-			// this route; checkHostedAgentInstance then narrows it to the instance's
-			// owner. No method is given because the agent behind it serves whatever
-			// it likes.
-			"/agent-connect/{hosted_agent_instance_id}",
-			"/agent-connect/{hosted_agent_instance_id}/{rest...}",
-		},
 		types.GroupMCP: {
 			"GET    /mcp-connect/{mcp_id}",
 			"POST   /mcp-connect/{mcp_id}",
@@ -179,6 +120,10 @@ var (
 			"GET    /mcp-connect/{mcp_id}/",
 			"POST   /mcp-connect/{mcp_id}/",
 			"DELETE /mcp-connect/{mcp_id}/",
+		},
+		types.GroupClaudeEnvironment: {
+			// Runners poll component OAuth with the same current-user and MCP scope checks as connecting.
+			"GET    /api/oauth/vmcp/{mcp_id}",
 		},
 		types.GroupCompositeMCP: {
 			"GET    /mcp-connect-composite/{mcp_id}",
@@ -189,13 +134,6 @@ var (
 			"GET /api/skills/{skill_id}",
 			"GET /api/skills/{skill_id}/download",
 			"GET /api/skills/{skill_id}/preview",
-		},
-		types.GroupPublishedArtifacts: {
-			"GET    /api/published-artifacts/{artifact_id}",
-			"GET    /api/published-artifacts/{artifact_id}/download",
-			"GET    /api/published-artifacts/{artifact_id}/{artifact_version}/skill",
-			"PUT    /api/published-artifacts/{artifact_id}",
-			"DELETE /api/published-artifacts/{artifact_id}",
 		},
 		types.GroupDeviceScans: {
 			"GET    /api/devices/scans/{scan_id}",
@@ -215,19 +153,13 @@ type Resources struct {
 	VMCPComponentMCPID      string
 	VMCPID                  string
 	VMCPInstanceID          string
-	// MCPID can be the ID of an MCPServer, an MCPServerInstance, or MCPServerCatalogEntry. It is used for interaction with the MCP gateway.
-	MCPID                 string
-	WorkspaceID           string
-	NanobotAgentID        string
-	ProjectID             string
-	PublishedArtifactID   string
-	ArtifactVersion       string
-	SkillID               string
-	DeviceScanID          string
-	OAuthAuthRequestID    string
-	HostedAgentID         string
-	HostedAgentInstanceID string
-	Authorizated          ResourcesAuthorized
+	// MCPID identifies a vMCP, vMCP instance, or migrated alias. Internal requests may identify component servers or instances.
+	MCPID              string
+	WorkspaceID        string
+	SkillID            string
+	DeviceScanID       string
+	OAuthAuthRequestID string
+	Authorizated       ResourcesAuthorized
 }
 
 type ResourcesAuthorized struct {
@@ -237,12 +169,7 @@ type ResourcesAuthorized struct {
 	VMCP                  *v1.VMCP
 	VMCPInstance          *v1.VMCPInstance
 	PowerUserWorkspace    *v1.PowerUserWorkspace
-	NanobotAgent          *v1.NanobotAgent
-	Project               *v1.Project
-	PublishedArtifact     *v1.PublishedArtifact
 	Skill                 *v1.Skill
-	HostedAgent           *v1.HostedAgent
-	HostedAgentInstance   *v1.HostedAgentInstance
 }
 
 func (a *Authorizer) evaluateResources(req *http.Request, vars GetVar, user User) (bool, error) {
@@ -253,17 +180,11 @@ func (a *Authorizer) evaluateResources(req *http.Request, vars GetVar, user User
 		VMCPComponentMCPID:      vars("component_mcp_id"),
 		VMCPID:                  vars("vmcp_id"),
 		VMCPInstanceID:          vars("vmcp_instance_id"),
-		MCPID:                   vars("mcp_id"), // this can be a server ID, server instance ID, catalog entry ID, or vMCP ID
+		MCPID:                   vars("mcp_id"),
 		WorkspaceID:             vars("workspace_id"),
-		NanobotAgentID:          vars("nanobot_agent_id"),
-		ProjectID:               vars("project_id"),
-		PublishedArtifactID:     vars("artifact_id"),
-		ArtifactVersion:         vars("artifact_version"),
 		SkillID:                 vars("skill_id"),
 		DeviceScanID:            vars("scan_id"),
 		OAuthAuthRequestID:      vars("oauth_request_id"),
-		HostedAgentID:           vars("hosted_agent_id"),
-		HostedAgentInstanceID:   vars("hosted_agent_instance_id"),
 	}
 
 	if !a.checkUser(user, vars("user_id")) {
@@ -302,27 +223,7 @@ func (a *Authorizer) evaluateResources(req *http.Request, vars GetVar, user User
 		return false, err
 	}
 
-	if ok, err := a.checkProject(req, &resources, user); !ok || err != nil {
-		return false, err
-	}
-
-	if ok, err := a.checkNanobotAgent(req, &resources, user); !ok || err != nil {
-		return false, err
-	}
-
-	if ok, err := a.checkPublishedArtifact(req, &resources, user); !ok || err != nil {
-		return false, err
-	}
-
 	if ok, err := a.checkSkill(req, &resources, user); !ok || err != nil {
-		return false, err
-	}
-
-	if ok, err := a.checkHostedAgent(req, &resources, user); !ok || err != nil {
-		return false, err
-	}
-
-	if ok, err := a.checkHostedAgentInstance(req, &resources, user); !ok || err != nil {
 		return false, err
 	}
 

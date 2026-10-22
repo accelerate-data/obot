@@ -44,7 +44,7 @@ func TestContainerOAuthCallbacksStoreSeparateGrantsForTwoUsers(t *testing.T) {
 	}))
 	t.Cleanup(provider.Close)
 
-	manager := newStateManager(gateway, provider.Client())
+	manager := newStateManager(gateway, fixedTokenClient(provider.Client()))
 	config := &oauth2.Config{
 		ClientID:     "deployment-client",
 		ClientSecret: "deployment-secret",

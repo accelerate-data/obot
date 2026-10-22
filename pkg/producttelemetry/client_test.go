@@ -38,9 +38,12 @@ func testRequest() clienttypes.ProductTelemetryRequest {
 			TotalUsers:                  new(int64(42)),
 			DeployedMCPServers:          new(int64(0)),
 			CustomMCPServerEntryCount:   new(int64(4)),
+			CustomVMCPCount:             new(int64(3)),
+			VMCPInstanceCount:           new(int64(8)),
 			BuiltInMCPServers:           &servers,
 			AuthProviderType:            new("github"),
 			MCPToolCallCount:            new(int64(0)),
+			VMCPToolCallCount:           new(int64(0)),
 			SentryScanCount:             new(int64(14)),
 			SentryEnforcementEventCount: new(int64(3)),
 			ManagedSkillCount:           new(int64(27)),
@@ -62,7 +65,7 @@ func TestClientSend(t *testing.T) {
 		{
 			name:         "full report preserves null and zero metrics",
 			request:      fullRequest,
-			wantBody:     `{"installationID":"7d7d83d8-2af0-4da8-ae2d-102d8eaa70be","licenseMachineID":"ab65c9ac-c012-4567-89ab-1b520aa26584","reportedAt":"2026-08-31T00:04:12Z","distribution":"Cloud","engine":"kubernetes","currentVersion":"v0.26.0","metrics":{"totalUsers":42,"activeUsers":null,"deployedMCPServers":0,"customMCPServerEntryCount":4,"builtInMCPServers":[{"id":"github","deployments":2,"users":7}],"authProviderType":"github","mcpToolCallCount":0,"llmAuditLogCount":null,"sentryScanCount":14,"sentryEnforcementEventCount":3,"managedSkillCount":27}}`,
+			wantBody:     `{"installationID":"7d7d83d8-2af0-4da8-ae2d-102d8eaa70be","licenseMachineID":"ab65c9ac-c012-4567-89ab-1b520aa26584","reportedAt":"2026-08-31T00:04:12Z","distribution":"Cloud","engine":"kubernetes","currentVersion":"v0.26.0","metrics":{"totalUsers":42,"activeUsers":null,"deployedMCPServers":0,"customMCPServerEntryCount":4,"customVMCPCount":3,"vmcpInstanceCount":8,"builtInMCPServers":[{"id":"github","deployments":2,"users":7}],"authProviderType":"github","mcpToolCallCount":0,"vmcpToolCallCount":0,"llmAuditLogCount":null,"sentryScanCount":14,"sentryEnforcementEventCount":3,"managedSkillCount":27}}`,
 			responseBody: "ignored success body",
 		},
 		{
@@ -289,15 +292,51 @@ func TestParseRetryAfter(t *testing.T) {
 		wantDelay time.Duration
 		wantOK    bool
 	}{
-		{name: "seconds", value: " 120 ", wantDelay: 2 * time.Minute, wantOK: true},
-		{name: "seconds clamped", value: "999999999", wantDelay: maxRetryDelay, wantOK: true},
-		{name: "zero seconds", value: "0", wantOK: true},
-		{name: "HTTP date", value: now.Add(3 * time.Minute).Format(http.TimeFormat), wantDelay: 3 * time.Minute, wantOK: true},
-		{name: "HTTP date clamped", value: now.Add(24 * time.Hour).Format(http.TimeFormat), wantDelay: maxRetryDelay, wantOK: true},
-		{name: "past HTTP date", value: now.Add(-time.Minute).Format(http.TimeFormat), wantOK: true},
-		{name: "negative seconds", value: "-1"},
-		{name: "invalid", value: "later"},
-		{name: "empty"},
+		{
+			name:      "seconds",
+			value:     " 120 ",
+			wantDelay: 2 * time.Minute,
+			wantOK:    true,
+		},
+		{
+			name:      "seconds clamped",
+			value:     "999999999",
+			wantDelay: maxRetryDelay,
+			wantOK:    true,
+		},
+		{
+			name:   "zero seconds",
+			value:  "0",
+			wantOK: true,
+		},
+		{
+			name:      "HTTP date",
+			value:     now.Add(3 * time.Minute).Format(http.TimeFormat),
+			wantDelay: 3 * time.Minute,
+			wantOK:    true,
+		},
+		{
+			name:      "HTTP date clamped",
+			value:     now.Add(24 * time.Hour).Format(http.TimeFormat),
+			wantDelay: maxRetryDelay,
+			wantOK:    true,
+		},
+		{
+			name:   "past HTTP date",
+			value:  now.Add(-time.Minute).Format(http.TimeFormat),
+			wantOK: true,
+		},
+		{
+			name:  "negative seconds",
+			value: "-1",
+		},
+		{
+			name:  "invalid",
+			value: "later",
+		},
+		{
+			name: "empty",
+		},
 	}
 
 	for _, testCase := range tests {

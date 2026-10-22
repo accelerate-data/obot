@@ -1,11 +1,15 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import Layout from '$lib/components/Layout.svelte';
+	import ResponsiveDialog from '$lib/components/ResponsiveDialog.svelte';
 	import IconButton from '$lib/components/primitives/IconButton.svelte';
-	import CreateEditVMcp from '$lib/components/vmcps/CreateEditVMcp.svelte';
+	import CreateEditVMcp, {
+		type VMcpCreateDraft
+	} from '$lib/components/vmcps/CreateEditVMcp.svelte';
 	import CreateVMcpButton from '$lib/components/vmcps/CreateVMcpButton.svelte';
 	import McpServersSidebar from '$lib/components/vmcps/McpServersSidebar.svelte';
 	import VMcpActions from '$lib/components/vmcps/VMcpActions.svelte';
+	import VMcpCatalogSyncedIndicator from '$lib/components/vmcps/VMcpCatalogSyncedIndicator.svelte';
 	import VMcpCreationHint from '$lib/components/vmcps/VMcpCreationHint.svelte';
 	import VMcpDragOverlay from '$lib/components/vmcps/VMcpDragOverlay.svelte';
 	import VMcpGraph from '$lib/components/vmcps/VMcpGraph.svelte';
@@ -15,6 +19,7 @@
 	import VMcpTester from '$lib/components/vmcps/VMcpTester.svelte';
 	import VMcpToolDialogs from '$lib/components/vmcps/VMcpToolDialogs.svelte';
 	import ViewModifyCatalogEntry from '$lib/components/vmcps/ViewModifyCatalogEntry.svelte';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { CREATE_VMCP_DROP_ID, createEntryDrag } from '$lib/runes/vmcps/entryDrag.svelte';
 	import {
@@ -37,6 +42,7 @@
 		type VMCPComponent,
 		type VMCPConfigurationPolicy
 	} from '$lib/services';
+	import { MAX_TOOL_PREFIX_LENGTH, hasEditableFields } from '$lib/services/user/mcp';
 	import { vmcpRowHeight } from '$lib/services/vmcps/camera';
 	import { SHORT_DESCRIPTION_MAX_LENGTH } from '$lib/services/vmcps/constants';
 	import type { VMcpConnectOptions } from '$lib/services/vmcps/types';
@@ -44,7 +50,11 @@
 		appendComponentLabel,
 		catalogConfigurationFields,
 		catalogEntryToVMCPComponent,
+		configurationRetainingOmittedRequired,
+		isCatalogSyncedVMcp,
+		mcpServerNeedsStaticOAuthConfiguration,
 		resolveVMcpComponents,
+		vmcpComponentId,
 		vmcpManifest
 	} from '$lib/services/vmcps/utils';
 	import { errors, mcpServersAndEntries, profile, responsive, vmcpInstances } from '$lib/stores';
@@ -60,9 +70,17 @@
 		usersMap: Map<string, OrgUser>;
 		isFirstVMcp?: boolean;
 		showBackButton?: boolean;
+		workspaceId?: string;
 	}
 
-	let { vmcp, onBack, usersMap, isFirstVMcp = false, showBackButton = true }: Props = $props();
+	let {
+		vmcp,
+		onBack,
+		usersMap,
+		isFirstVMcp = false,
+		showBackButton = true,
+		workspaceId
+	}: Props = $props();
 
 	let view = $derived(
 		(page.url.searchParams.get('view') as 'graph' | 'profiles' | 'inspector' | undefined) ?? 'graph'
@@ -81,17 +99,38 @@
 	let creationHintQueued = $state(false);
 	let rightPanelWidth = $state(0);
 	let pendingEntryDrop = $state<{ vmcp?: VMCP }>();
+	let pendingConfigurableCreate: { entry: MCPCatalogEntry; component: VMCPComponent } | undefined;
+	let heldCreate:
+		| {
+				displayName: string;
+				description: string;
+				toolSearch: boolean;
+				entry: MCPCatalogEntry;
+				component: VMCPComponent;
+		  }
+		| undefined;
+	let openConfigurationAfterCreateClose = false;
 	let pendingComponentDrop = $state<{
 		target: VMCP;
 		entry: MCPCatalogEntry;
 		component: VMCPComponent;
 	}>();
+	let duplicateComponentDialog = $state<ReturnType<typeof ResponsiveDialog>>();
+	let pendingDuplicateComponent = $state<{
+		target: VMCP;
+		entry: MCPCatalogEntry;
+		component: VMCPComponent;
+		existingNames: string[];
+		existingPrefixes: string[];
+	}>();
+	let duplicateComponentName = $state('');
 	const toolFlow = createVMcpToolFlow();
+	let openedModifyToolsFor: string | undefined;
 	let selectedVMcp = $state<VMCP | undefined>(untrack(() => vmcp));
 
 	let query = $derived(page.url.searchParams.get('query') ?? '');
 	let composites = $derived(selectedVMcp ? [selectedVMcp] : []);
-	let title = $derived(selectedVMcp?.displayName ?? 'Create vMCP');
+	let title = $derived(selectedVMcp?.displayName ?? m.vmcps_create_vmcp());
 	let canCreateCatalogEntry = $derived(
 		profile.current.isAdmin?.() || profile.current.groups.includes(Group.POWERUSER)
 	);
@@ -103,7 +142,7 @@
 	let canAccessProfiles = $derived(isOwner && profile.current.hasAdminAccess?.());
 	let hasEntries = $derived(mcpServersAndEntries.current.entries.length > 0);
 	let canEdit = $derived(
-		!selectedVMcp || profile.current.isAdmin?.() || profile.current.id === selectedVMcp?.userID
+		!selectedVMcp || profile.current.isAdmin?.() || profile.current.id === selectedVMcp.userID
 	);
 	let viewType = $derived(
 		(view === 'profiles' && !canAccessProfiles) || (view === 'inspector' && !canAccessTester)
@@ -158,6 +197,58 @@
 		});
 	});
 
+	$effect(() => {
+		const target = selectedVMcp;
+		const actions = vmcpActions;
+		if (page.url.searchParams.get('connect') !== 'true' || !target?.id || !actions) return;
+
+		untrack(() =>
+			actions.openConnect(target, undefined, {
+				connectReturn: 'designer',
+				onDismissed: () => setUrlParamAndUpdateUrl(page.url, 'connect', undefined)
+			})
+		);
+	});
+
+	$effect(() => {
+		const inspectorID = page.url.searchParams.get('inspector');
+		const vmcp = selectedVMcp;
+		if (!inspectorID || vmcp?.id !== inspectorID) return;
+
+		untrack(() =>
+			vmcpActions?.openConnect(vmcp, undefined, {
+				connectReturn: 'inspector',
+				onConnected: () => {
+					setUrlParamAndUpdateUrl(page.url, 'inspector', undefined);
+					goto(`/vmcps/${vmcp.id}?view=inspector`);
+				},
+				onDismissed: () => setUrlParamAndUpdateUrl(page.url, 'inspector', undefined)
+			})
+		);
+	});
+
+	$effect(() => {
+		const componentID = page.url.searchParams.get('modify-tools');
+		if (!componentID) {
+			openedModifyToolsFor = undefined;
+			return;
+		}
+		const vmcp = selectedVMcp;
+		if (!vmcp?.id || openedModifyToolsFor === componentID) return;
+		const match = vmcp.components?.find((component) => vmcpComponentId(component) === componentID);
+		if (!canEdit || isCatalogSyncedVMcp(vmcp) || !match) {
+			setUrlParamAndUpdateUrl(page.url, 'modify-tools', undefined);
+			return;
+		}
+
+		openedModifyToolsFor = componentID;
+		untrack(() => {
+			toolFlow.editComponent(match, vmcp, {
+				onDismissed: () => setUrlParamAndUpdateUrl(page.url, 'modify-tools', undefined)
+			});
+		});
+	});
+
 	let showCreationHint = $derived(
 		creationHintQueued && !toolFlow.dialog && viewType === 'graph' && isOwner && canEdit
 	);
@@ -205,12 +296,6 @@
 		handleDroppedOnCreate(entry);
 	}
 
-	function isAddedToSelectedVMcp(entry: MCPCatalogEntry) {
-		return Boolean(
-			selectedVMcp?.components?.some((component) => component.mcpServerCatalogEntryID === entry.id)
-		);
-	}
-
 	function startCatalogEntryCreation(target?: { vmcp?: VMCP }) {
 		if (!canEdit) return;
 		pendingEntryDrop = target;
@@ -230,9 +315,55 @@
 		handleDroppedOnCreate(created);
 	}
 
+	function componentWithoutConfigurationStep(component: VMCPComponent): VMCPComponent {
+		return {
+			...component,
+			configuration: configurationRetainingOmittedRequired(component, [])
+		};
+	}
+
 	function handleDroppedOnCreate(entry: MCPCatalogEntry) {
 		if (!canEdit) return;
-		createEditVMcp?.openCreate([catalogEntryToVMCPComponent(entry)]);
+		if (mcpServerNeedsStaticOAuthConfiguration(entry)) return;
+		const component = catalogEntryToVMCPComponent(entry);
+		if (!hasEditableFields(catalogConfigurationFields(entry))) {
+			pendingConfigurableCreate = undefined;
+			createEditVMcp?.openCreate([componentWithoutConfigurationStep(component)]);
+			return;
+		}
+		pendingConfigurableCreate = { entry, component };
+		createEditVMcp?.openCreate([component]);
+	}
+
+	function handleCreateSubmit(draft: VMcpCreateDraft) {
+		const pending = pendingConfigurableCreate;
+		if (!pending) return false;
+
+		heldCreate = {
+			displayName: draft.displayName,
+			description: draft.description,
+			toolSearch: draft.toolSearch,
+			entry: pending.entry,
+			component: pending.component
+		};
+		pendingConfigurableCreate = undefined;
+		openConfigurationAfterCreateClose = true;
+		return true;
+	}
+
+	function handleCreateDialogClose() {
+		if (!openConfigurationAfterCreateClose) {
+			pendingConfigurableCreate = undefined;
+			return;
+		}
+
+		openConfigurationAfterCreateClose = false;
+		const held = heldCreate;
+		if (!held) return;
+		vmcpActions?.openConfiguration(held.entry, {
+			isShared: Boolean(profile.current.isAdmin?.()),
+			errorMessage: m.vmcps_failed_to_create()
+		});
 	}
 
 	async function addComponentToVMcp(
@@ -242,13 +373,6 @@
 	) {
 		const latest = await UserService.getVMCP(target.id);
 		const components = latest.components ?? [];
-		if (
-			components.some(
-				(existing) => existing.mcpServerCatalogEntryID === component.mcpServerCatalogEntryID
-			)
-		) {
-			return latest;
-		}
 
 		const updated = await UserService.updateVMCP(latest.id, {
 			...vmcpManifest(latest),
@@ -256,7 +380,7 @@
 				appendComponentLabel(
 					latest.displayName,
 					components.map((existing) => componentManifestField(existing, 'name')),
-					entry.manifest.name
+					component.name || entry.manifest.name
 				) ?? latest.displayName,
 			description:
 				appendComponentLabel(
@@ -269,13 +393,131 @@
 		});
 
 		selectedVMcp = updated;
-		success.add(`${entry.manifest.name} added to ${updated.displayName}.`);
-		toolFlow.offerToolSelection(entry, updated);
+		success.add(
+			m.vmcps_server_added_to({ server: entry.manifest.name ?? '', vmcp: updated.displayName })
+		);
+		toolFlow.offerToolSelection(component, updated);
 		return updated;
+	}
+
+	function uniqueComponentName(base: string, existingNames: string[]) {
+		const taken = new Set(existingNames.map((name) => name.trim()).filter(Boolean));
+		const stem = base.trim();
+		if (!taken.has(stem)) return stem;
+
+		let suffix = 2;
+		let candidate = `${stem} ${suffix}`;
+		while (taken.has(candidate)) {
+			suffix += 1;
+			candidate = `${stem} ${suffix}`;
+		}
+		return candidate;
+	}
+
+	function duplicateComponentNameError(name: string, existingNames: string[]) {
+		if (!name) return m.vmcps_component_name_required();
+		if (existingNames.some((existing) => existing.trim() === name)) {
+			return m.vmcps_component_name_taken({ name });
+		}
+	}
+
+	function componentToolPrefix(name: string) {
+		return (
+			name
+				.trim()
+				.toLowerCase()
+				.replace(/[^a-z0-9_]/g, '-') + '_'
+		);
+	}
+
+	function duplicatePrefixError(name: string, existingPrefixes: string[]) {
+		if (!name.trim()) return;
+		const prefix = componentToolPrefix(name);
+		if (existingPrefixes.some((existing) => existing.trim() === prefix)) {
+			return m.mcps_composite_prefix_duplicate({ prefix });
+		}
+	}
+
+	let duplicateNameError = $derived(
+		pendingDuplicateComponent
+			? duplicateComponentNameError(
+					duplicateComponentName.trim(),
+					pendingDuplicateComponent.existingNames
+				)
+			: undefined
+	);
+	let duplicatePrefixErrorMessage = $derived(
+		pendingDuplicateComponent
+			? duplicatePrefixError(
+					duplicateComponentName.trim(),
+					pendingDuplicateComponent.existingPrefixes
+				)
+			: undefined
+	);
+	let duplicatePrefixTooLong = $derived(
+		componentToolPrefix(duplicateComponentName).length > MAX_TOOL_PREFIX_LENGTH
+	);
+
+	function openDuplicateComponentDialog(
+		target: VMCP,
+		entry: MCPCatalogEntry,
+		component: VMCPComponent,
+		components: VMCPComponent[]
+	) {
+		const existingNames = components.map((existing) => existing.name);
+		const existingPrefixes = components
+			.map((existing) => (existing.toolPrefix ?? '').trim())
+			.filter(Boolean);
+		pendingDuplicateComponent = { target, entry, component, existingNames, existingPrefixes };
+		duplicateComponentName = uniqueComponentName(component.name, existingNames);
+		duplicateComponentDialog?.open();
+	}
+
+	function dismissDuplicateComponentDialog() {
+		pendingDuplicateComponent = undefined;
+	}
+
+	async function continueAddComponent(
+		target: VMCP,
+		entry: MCPCatalogEntry,
+		component: VMCPComponent
+	) {
+		if (!hasEditableFields(catalogConfigurationFields(entry))) {
+			componentDropPending = true;
+			await addComponentToVMcp(target, entry, componentWithoutConfigurationStep(component));
+			if (!toolFlow.dialog) componentDropPending = false;
+			return;
+		}
+
+		pendingComponentDrop = { target, entry, component };
+		componentDropPending = false;
+		vmcpActions?.openConfiguration(entry, { isShared: !target.userID });
+	}
+
+	async function confirmDuplicateComponent() {
+		const pending = pendingDuplicateComponent;
+		if (!pending || duplicateNameError || duplicatePrefixErrorMessage || duplicatePrefixTooLong)
+			return;
+
+		const component = {
+			...pending.component,
+			name: duplicateComponentName.trim(),
+			toolPrefix: componentToolPrefix(duplicateComponentName)
+		};
+		pendingDuplicateComponent = undefined;
+		duplicateComponentDialog?.close();
+
+		try {
+			await continueAddComponent(pending.target, pending.entry, component);
+		} catch {
+			componentDropPending = false;
+			errors.append(m.vmcps_failed_to_add_server_to_vmcp());
+		}
 	}
 
 	async function handleDropped(entry: MCPCatalogEntry, target: VMCP) {
 		if (!canEdit) return;
+		if (mcpServerNeedsStaticOAuthConfiguration(entry)) return;
 		const component = catalogEntryToVMCPComponent(entry);
 		componentDropPending = true;
 
@@ -288,50 +530,67 @@
 				)
 			) {
 				componentDropPending = false;
+				openDuplicateComponentDialog(latest, entry, component, components);
 				return;
 			}
 
-			if (catalogConfigurationFields(entry).length === 0) {
-				await addComponentToVMcp(latest, entry, component);
-				if (!toolFlow.dialog) componentDropPending = false;
-				return;
-			}
-
-			pendingComponentDrop = { target: latest, entry, component };
-			componentDropPending = false;
-			vmcpActions?.openConfiguration(entry);
+			await continueAddComponent(latest, entry, component);
 		} catch {
 			componentDropPending = false;
-			errors.append('Failed to add MCP server to vMCP.');
+			errors.append(m.vmcps_failed_to_add_server_to_vmcp());
 		}
+	}
+
+	function handleConfigurationDismiss() {
+		heldCreate = undefined;
+		pendingConfigurableCreate = undefined;
+		pendingComponentDrop = undefined;
 	}
 
 	async function handleConfigurationNext(
 		configuration: VMCPConfigurationPolicy[],
 		forceSingleUser: boolean
 	) {
+		const held = heldCreate;
+		if (held) {
+			await createEditVMcp?.saveCreate({
+				displayName: held.displayName,
+				description: held.description,
+				toolSearch: held.toolSearch,
+				components: [
+					{
+						...held.component,
+						configuration: configurationRetainingOmittedRequired(held.component, configuration),
+						forceSingleUser
+					}
+				]
+			});
+			heldCreate = undefined;
+			return;
+		}
+
 		const pending = pendingComponentDrop;
 		if (!pending) return;
 		componentDropPending = true;
 		try {
 			await addComponentToVMcp(pending.target, pending.entry, {
 				...pending.component,
-				configuration,
+				configuration: configurationRetainingOmittedRequired(pending.component, configuration),
 				forceSingleUser
 			});
 			pendingComponentDrop = undefined;
 			if (!toolFlow.dialog) componentDropPending = false;
 		} catch {
 			componentDropPending = false;
-			errors.append('Failed to add MCP server to vMCP.');
-			throw new Error('Failed to add MCP server to vMCP.');
+			errors.append(m.vmcps_failed_to_add_server_to_vmcp());
+			throw new Error(m.vmcps_failed_to_add_server_to_vmcp());
 		}
 	}
 
 	function handleVMcpCreated(created: VMCP) {
 		queueToolSetupForCreatedVMcp(created.id);
 		if (isFirstVMcp) queueCreationHintForCreatedVMcp(created.id);
-		goto(`/vmcps/${created.id}`);
+		goto(`/vmcps/${created.id}`, { replaceState: true });
 	}
 
 	function dismissCreationHint() {
@@ -344,7 +603,7 @@
 	}
 
 	function handleConnectVMcp(vmcp: VMCP, options?: VMcpConnectOptions) {
-		vmcpActions?.openConnect(vmcp, undefined, options);
+		vmcpActions?.openConnect(vmcp, undefined, { connectReturn: 'designer', ...options });
 	}
 
 	async function refreshTester(vmcpID: string) {
@@ -355,7 +614,7 @@
 			const [updated] = await Promise.all([UserService.getVMCP(vmcpID), vmcpInstances.refresh()]);
 			if (selectedVMcp?.id === vmcpID) selectedVMcp = updated;
 		} catch {
-			errors.append('Failed to refresh vMCP status.');
+			errors.append(m.vmcps_failed_to_refresh_status());
 		} finally {
 			refreshingTester = false;
 		}
@@ -365,14 +624,15 @@
 		setUrlParamAndUpdateUrl(page.url, 'query', value);
 	};
 
-	function leaveDesigner() {
-		onBack?.();
-		if (!onBack) goto('/vmcps');
-	}
-
 	function handleBack() {
 		if (profilesPanel?.leaveEditor()) return;
-		leaveDesigner();
+		if (onBack) {
+			onBack();
+		} else if (history.length > 1) {
+			history.back();
+		} else {
+			goto('/vmcps', { replaceState: true });
+		}
 	}
 
 	$effect(() => {
@@ -392,6 +652,12 @@
 	{showBackButton}
 	onBackButtonClick={handleBack}
 >
+	{#snippet titleContent()}
+		{title}
+		{#if selectedVMcp}
+			<VMcpCatalogSyncedIndicator vmcp={selectedVMcp} iconClass="size-5" class="size-5" />
+		{/if}
+	{/snippet}
 	<div
 		class="@container dark:from-base-300 to-base-200 relative h-full min-h-0 w-full overflow-y-auto default-scrollbar-thin bg-radial-[at_50%_50%] from-gray-50 dark:to-black"
 		aria-busy={showDesignerLoading}
@@ -400,7 +666,7 @@
 			<div
 				class="bg-base-200/70 dark:bg-black/60 absolute inset-0 z-60 flex items-center justify-center"
 				role="status"
-				aria-label="Setting up tools"
+				aria-label={m.vmcps_setting_up_tools()}
 			>
 				<Loading class="size-8" />
 			</div>
@@ -427,7 +693,7 @@
 				onUpdated={(updated) => {
 					selectedVMcp = updated;
 				}}
-				readonly={!canEdit}
+				readonly={!canEdit || isCatalogSyncedVMcp(selectedVMcp)}
 			/>
 		{:else if viewType === 'inspector'}
 			{#if selectedVMcp}
@@ -452,6 +718,7 @@
 							if (!selectedVMcp) return;
 							const vmcpID = selectedVMcp.id;
 							vmcpActions?.openEditInstanceConfiguration(target, instance, {
+								connectReturn: 'designer',
 								onConnected: () => {
 									void refreshTester(vmcpID);
 								}
@@ -471,7 +738,6 @@
 					<VMcpGraphRow
 						vmcp={item}
 						components={vmcpComponents(item)}
-						{canEdit}
 						context={ctx}
 						drag={entryDrag}
 						onEdit={canEdit ? () => createEditVMcp?.openEdit(item) : undefined}
@@ -480,34 +746,38 @@
 						openSelectInstance={vmcpActions?.openSelectInstance}
 						openDiff={vmcpActions?.openDiff}
 						openUpdateConfirm={vmcpActions?.openUpdateConfirm}
-						openEditInstanceConfiguration={vmcpActions?.openEditInstanceConfiguration}
+						openEditInstanceConfiguration={(vmcp, instance) =>
+							vmcpActions?.openEditInstanceConfiguration(vmcp, instance, {
+								connectReturn: 'designer'
+							})}
 						onUpdate={(updated) => {
 							selectedVMcp = updated;
 						}}
-						onModifyComponent={canEdit
-							? (component) => toolFlow.openComponent(component, item)
-							: undefined}
+						onSelectComponent={(component) => toolFlow.openComponent(component, item)}
+						onReauthenticateComponent={(componentID) =>
+							vmcpActions?.reauthenticateComponent(item, componentID) ?? Promise.resolve()}
 						bind:connectEl={connectButtonEl}
 						{usersMap}
+						readonly={!canEdit}
 					/>
 				{/snippet}
 				{#snippet empty()}
 					<CreateVMcpButton drag={entryDrag} />
 				{/snippet}
 				{#snippet actions()}
-					{#if selectedVMcp && canEdit}
+					{#if selectedVMcp && canEdit && !isCatalogSyncedVMcp(selectedVMcp)}
 						<div
 							class="bg-base-100/80 dark:bg-base-300/80 flex gap-1 rounded-md border border-transparent p-1 shadow-sm"
 							data-vmcp-ui
 							role="toolbar"
 							tabindex="-1"
-							aria-label="vMCP actions"
+							aria-label={m.vmcps_vmcp_actions()}
 							onpointerdown={(event) => event.stopPropagation()}
 						>
 							<IconButton
 								class="btn-sm"
 								variant="danger"
-								tooltip={{ text: 'Delete vMCP', placement: 'bottom' }}
+								tooltip={{ text: m.vmcps_delete_vmcp(), placement: 'bottom' }}
 								onclick={() => {
 									if (!selectedVMcp) return;
 									createEditVMcp?.openDelete(selectedVMcp);
@@ -529,12 +799,13 @@
 					showRightPanel = true;
 				}}
 			>
-				<Plus class="size-4" /> Add MCP Servers
+				<Plus class="size-4" />
+				{m.vmcps_add_mcp_servers()}
 			</button>
 		</div>
 	{/if}
 	{#snippet rightSidebar()}
-		{#if canEdit && viewType === 'graph' && (!responsive.isMobile || (responsive.isMobile && showRightPanel && (canCreateCatalogEntry || hasEntries)))}
+		{#if canEdit && !isCatalogSyncedVMcp(selectedVMcp) && viewType === 'graph' && (!responsive.isMobile || (responsive.isMobile && showRightPanel && (canCreateCatalogEntry || hasEntries)))}
 			<McpServersSidebar
 				bind:panelEl={rightPanelEl}
 				bind:open={showRightPanel}
@@ -557,7 +828,7 @@
 				)}
 				onclick={() => {
 					setUrlParamAndUpdateUrl(page.url, 'view', 'graph');
-				}}>Designer</button
+				}}>{m.vmcps_designer()}</button
 			>
 			{#if canAccessProfiles}
 				<button
@@ -568,8 +839,10 @@
 					)}
 					onclick={() => {
 						setUrlParamAndUpdateUrl(page.url, 'view', 'profiles');
-					}}>Profiles</button
+					}}
 				>
+					{m.vmcps_profiles()}
+				</button>
 			{/if}
 			{#if canAccessTester}
 				<button
@@ -580,7 +853,7 @@
 					)}
 					onclick={() => {
 						setUrlParamAndUpdateUrl(page.url, 'view', 'inspector');
-					}}>Inspector</button
+					}}>{m.vmcps_inspector()}</button
 				>
 			{/if}
 		</div>
@@ -589,14 +862,22 @@
 
 <VMcpDragOverlay drag={entryDrag} />
 
-<VMcpToolDialogs flow={toolFlow} />
+<VMcpToolDialogs flow={toolFlow} readonly={!canEdit || isCatalogSyncedVMcp(selectedVMcp)} />
 
-<VMcpActions bind:this={vmcpActions} onConfigurationNext={handleConfigurationNext} />
+<VMcpActions
+	bind:this={vmcpActions}
+	onConfigurationNext={handleConfigurationNext}
+	onConfigurationDismiss={handleConfigurationDismiss}
+/>
 
 <CreateEditVMcp
 	bind:this={createEditVMcp}
+	onCreate={handleCreateSubmit}
+	onClose={handleCreateDialogClose}
 	onCreated={handleVMcpCreated}
-	onDeleted={leaveDesigner}
+	onDeleted={() => {
+		goto('/vmcps', { replaceState: true });
+	}}
 	onUpdated={(updated) => {
 		selectedVMcp = updated;
 	}}
@@ -607,11 +888,73 @@
 	rightOffsetWidth={rightPanelWidth}
 	onCreated={handleCatalogEntryCreated}
 	onAddToVMcp={canEdit ? handleAddFromDetails : undefined}
-	addToVMcpLabel={selectedVMcp ? 'Add to vMCP' : 'Create vMCP'}
-	isAddedToVMcp={isAddedToSelectedVMcp}
+	addToVMcpLabel={selectedVMcp ? m.vmcps_add_to_vmcp() : m.vmcps_create_vmcp()}
+	{workspaceId}
 />
 
 <VMcpIntroduction show={isFirstVMcp && !selectedVMcp && canEdit && viewType === 'graph'} />
+
+<ResponsiveDialog
+	bind:this={duplicateComponentDialog}
+	class="md:max-w-sm"
+	title={m.vmcps_component_already_added()}
+	onClose={dismissDuplicateComponentDialog}
+>
+	<form
+		class="flex flex-col gap-4 pt-2 px-4 md:px-0"
+		onsubmit={(event) => {
+			event.preventDefault();
+			void confirmDuplicateComponent();
+		}}
+	>
+		<p class="text-sm font-light">
+			{m.vmcps_component_already_added_description({
+				name:
+					pendingDuplicateComponent?.entry.manifest.name ??
+					pendingDuplicateComponent?.component.name ??
+					''
+			})}
+		</p>
+		<div class="flex flex-col gap-1">
+			<input
+				id="duplicate-component-name"
+				class="text-input-filled"
+				aria-label={m.vmcps_component_name()}
+				bind:value={duplicateComponentName}
+				maxlength={MAX_TOOL_PREFIX_LENGTH - 1}
+				autocomplete="off"
+				required
+			/>
+			<div class="min-h-8">
+				{#if duplicateNameError}
+					<p class="text-error text-xs" role="alert">{duplicateNameError}</p>
+				{:else if duplicatePrefixErrorMessage}
+					<p class="text-error text-xs" role="alert">{duplicatePrefixErrorMessage}</p>
+				{:else if duplicatePrefixTooLong}
+					<p class="text-error text-xs" role="alert">
+						Tool prefixes must be {MAX_TOOL_PREFIX_LENGTH} characters or fewer.
+					</p>
+				{:else}
+					<p class="text-xs text-gray-500">{m.vmcps_component_name_prefix_hint()}</p>
+				{/if}
+			</div>
+		</div>
+		<div class="flex justify-end gap-2">
+			<button type="button" class="btn btn-ghost" onclick={() => duplicateComponentDialog?.close()}>
+				{m.common_cancel()}
+			</button>
+			<button
+				type="submit"
+				class="btn btn-primary"
+				disabled={Boolean(
+					duplicateNameError || duplicatePrefixErrorMessage || duplicatePrefixTooLong
+				)}
+			>
+				{m.core_continue()}
+			</button>
+		</div>
+	</form>
+</ResponsiveDialog>
 
 <svelte:head>
 	<title>Obot | {title}</title>

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -51,26 +53,16 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 			corev1.ResourceMemory: resource.MustParse("128Mi"),
 		},
 	}
-	agentSettings := *resourceSettings.DeepCopy()
-	agentSettings.NanobotWorkspaceSize = "10Gi"
-	agentSettings.NanobotAgentResources = &corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceMemory: resource.MustParse("512Mi"),
-		},
-	}
-
 	baseHash := ComputeK8sSettingsHash(
 		baseSettings,
 		nil,
 		types.RuntimeNPX,
-		false,
 		nil,
 	)
 	if got := ComputeK8sSettingsHash(
 		resourceSettings,
 		nil,
 		types.RuntimeNPX,
-		false,
 		nil,
 	); got == baseHash {
 		t.Fatalf("regular server hash = %s, want it to differ when default resources are set", got)
@@ -80,59 +72,15 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 		baseSettings,
 		nil,
 		types.RuntimeRemote,
-		false,
 		nil,
 	)
 	if got := ComputeK8sSettingsHash(
 		resourceSettings,
 		nil,
 		types.RuntimeRemote,
-		false,
 		nil,
 	); got != remoteBaseHash {
 		t.Fatalf("remote server hash = %s, want %s", got, remoteBaseHash)
-	}
-
-	agentBaseHash := ComputeK8sSettingsHash(
-		baseSettings,
-		nil,
-		types.RuntimeNPX,
-		true,
-		nil,
-	)
-	if got := ComputeK8sSettingsHash(
-		resourceSettings,
-		nil,
-		types.RuntimeNPX,
-		true,
-		nil,
-	); got != agentBaseHash {
-		t.Fatalf("agent server hash = %s, want %s before agent-only settings are set", got, agentBaseHash)
-	}
-	regularHash := ComputeK8sSettingsHash(
-		resourceSettings,
-		nil,
-		types.RuntimeNPX,
-		false,
-		nil,
-	)
-	if got := ComputeK8sSettingsHash(
-		agentSettings,
-		nil,
-		types.RuntimeNPX,
-		false,
-		nil,
-	); got != regularHash {
-		t.Fatalf("non-agent hash = %s, want agent-only settings ignored", got)
-	}
-	if got := ComputeK8sSettingsHash(
-		agentSettings,
-		nil,
-		types.RuntimeNPX,
-		true,
-		nil,
-	); got == agentBaseHash {
-		t.Fatalf("agent hash = %s, want it to differ when agent-only settings are set", got)
 	}
 
 	serverResources := &corev1.ResourceRequirements{
@@ -144,7 +92,6 @@ func TestComputeK8sSettingsHashUsesServerSpecificResources(t *testing.T) {
 		baseSettings,
 		serverResources,
 		types.RuntimeNPX,
-		false,
 		nil,
 	); got == baseHash {
 		t.Fatalf("server-specific resources hash = %s, want it to differ from default resource hash", got)
@@ -156,7 +103,6 @@ func TestComputeK8sSettingsHashUsesSettingsResourceMaximums(t *testing.T) {
 		v1.K8sSettingsSpec{},
 		nil,
 		types.RuntimeNPX,
-		false,
 		nil,
 	)
 	cappedHash := ComputeK8sSettingsHash(
@@ -166,7 +112,6 @@ func TestComputeK8sSettingsHashUsesSettingsResourceMaximums(t *testing.T) {
 		},
 		nil,
 		types.RuntimeNPX,
-		false,
 		nil,
 	)
 	if cappedHash == baseHash {
@@ -183,7 +128,7 @@ func TestMCPContainerResourcesAppliesServerOverridesWithRequestDefaults(t *testi
 			corev1.ResourceCPU: resource.MustParse("1"),
 		},
 	}
-	resources := mcpContainerResources(serverResources, types.RuntimeNPX, false, v1.K8sSettingsSpec{})
+	resources := mcpContainerResources(serverResources, types.RuntimeNPX, v1.K8sSettingsSpec{})
 
 	if got, want := resources.Requests[corev1.ResourceMemory], resource.MustParse("512Mi"); got.Cmp(want) != 0 {
 		t.Fatalf("memory request = %s, want %s", got.String(), want.String())
@@ -241,7 +186,7 @@ func TestMCPContainerResourcesAppliesServerCPURequestWithMemoryDefault(t *testin
 			corev1.ResourceCPU: resource.MustParse("250m"),
 		},
 	}
-	resources := mcpContainerResources(serverResources, types.RuntimeNPX, false, v1.K8sSettingsSpec{})
+	resources := mcpContainerResources(serverResources, types.RuntimeNPX, v1.K8sSettingsSpec{})
 
 	if got, want := resources.Requests[corev1.ResourceCPU], resource.MustParse("250m"); got.Cmp(want) != 0 {
 		t.Fatalf("cpu request = %s, want %s", got.String(), want.String())
@@ -392,6 +337,7 @@ func TestNewKubernetesBackend_ServiceFQDN(t *testing.T) {
 					ServiceNamespace: tt.serviceNamespace,
 					MCPClusterDomain: tt.clusterDomain,
 				},
+				ValidationOptions{},
 			)
 			k := backend.(*kubernetesBackend)
 			if k.serviceFQDN != tt.expectedFQDN {
@@ -399,31 +345,6 @@ func TestNewKubernetesBackend_ServiceFQDN(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestK8sObjects_AgentExcludesAuditLogConfig(t *testing.T) {
-	k := newTestKubernetesBackend(t)
-
-	objs, err := k.k8sObjects(t.Context(), ServerConfig{
-		Runtime:              types.RuntimeContainerized,
-		MCPServerName:        "nanobot-agent-server",
-		MCPServerDisplayName: "Nanobot Agent Server",
-		UserID:               "user-1",
-		OwnerUserID:          "user-2",
-		ContainerImage:       "ghcr.io/obot-platform/nanobot:latest",
-		ContainerPort:        8080,
-		ContainerPath:        "/mcp",
-		Command:              "nanobot",
-		Args:                 []string{"run"},
-		AgentName:            "agent-1",
-		AuditLogMetadata:     map[string]string{"mcpID": "server-1"},
-	})
-	if err != nil {
-		t.Fatalf("k8sObjects() error = %v", err)
-	}
-
-	configSecret := findSecret(t, objs, name.SafeConcatName("nanobot-agent-server", "mcp", "config"))
-	assertNoAuditLogEnv(t, configSecret.Data)
 }
 
 func TestK8sObjects_DoesNotCreateShimContainer(t *testing.T) {
@@ -546,19 +467,11 @@ func TestK8sObjects_UVXAndNPXUseMMMCP(t *testing.T) {
 func TestK8sObjects_ServicePorts(t *testing.T) {
 	tests := []struct {
 		name                   string
-		agentName              string
 		expectedHTTPPortTarget intstr.IntOrString
-		expectedStrategy       appsv1.DeploymentStrategyType
 	}{
 		{
 			name:                   "standard containerized server routes http service port to mcp container",
 			expectedHTTPPortTarget: intstr.FromString("mcp"),
-		},
-		{
-			name:                   "nanobot agent routes http service port to mcp container",
-			agentName:              "agent-1",
-			expectedHTTPPortTarget: intstr.FromString("mcp"),
-			expectedStrategy:       appsv1.RecreateDeploymentStrategyType,
 		},
 	}
 
@@ -576,7 +489,6 @@ func TestK8sObjects_ServicePorts(t *testing.T) {
 				ContainerPath:        "/mcp",
 				Command:              "server",
 				Args:                 []string{"run"},
-				AgentName:            tt.agentName,
 			})
 			if err != nil {
 				t.Fatalf("k8sObjects() error = %v", err)
@@ -585,11 +497,6 @@ func TestK8sObjects_ServicePorts(t *testing.T) {
 			service := findService(t, objs, "test-server")
 			assertServicePort(t, service, "http", 80, tt.expectedHTTPPortTarget)
 			assertServicePort(t, service, "mcp", 8080, intstr.FromString("mcp"))
-
-			dep := findDeployment(t, objs, "test-server")
-			if dep.Spec.Strategy.Type != tt.expectedStrategy {
-				t.Fatalf("deployment strategy = %q, want %q", dep.Spec.Strategy.Type, tt.expectedStrategy)
-			}
 		})
 	}
 }
@@ -604,14 +511,14 @@ func TestK8sObjects_MCPContainerResources(t *testing.T) {
 		wantMemoryLimit   string
 	}{
 		{
-			name: "non-agent default requests 200Mi memory",
+			name: "default requests 200Mi memory",
 			server: ServerConfig{
 				Runtime: types.RuntimeContainerized,
 			},
 			wantMemoryRequest: "200Mi",
 		},
 		{
-			name: "non-agent implicit defaults are capped by maximums",
+			name: "implicit defaults are capped by maximums",
 			server: ServerConfig{
 				Runtime: types.RuntimeContainerized,
 			},
@@ -624,51 +531,6 @@ func TestK8sObjects_MCPContainerResources(t *testing.T) {
 			},
 			wantCPURequest:    "5m",
 			wantMemoryRequest: "128Mi",
-		},
-		{
-			name: "nanobot agent default requests 400Mi memory",
-			server: ServerConfig{
-				Runtime:   types.RuntimeContainerized,
-				AgentName: "agent-1",
-			},
-			wantMemoryRequest: "400Mi",
-		},
-		{
-			name: "nanobot agent implicit defaults are capped by maximums",
-			server: ServerConfig{
-				Runtime:   types.RuntimeContainerized,
-				AgentName: "agent-1",
-			},
-			settings: &v1.K8sSettings{
-				Name: system.K8sSettingsName, Namespace: system.DefaultNamespace,
-				Spec: v1.K8sSettingsSpec{
-					MaxCPURequest:    new(resource.MustParse("5m")),
-					MaxMemoryRequest: new(resource.MustParse("256Mi")),
-				},
-			},
-			wantCPURequest:    "5m",
-			wantMemoryRequest: "256Mi",
-		},
-		{
-			name: "nanobot agent uses dedicated resources",
-			server: ServerConfig{
-				Runtime:   types.RuntimeContainerized,
-				AgentName: "agent-1",
-			},
-			settings: &v1.K8sSettings{
-				Name: system.K8sSettingsName, Namespace: system.DefaultNamespace,
-				Spec: v1.K8sSettingsSpec{
-					Resources: &corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("250Mi")},
-					},
-					NanobotAgentResources: &corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
-						Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
-					},
-				},
-			},
-			wantMemoryRequest: "512Mi",
-			wantMemoryLimit:   "1Gi",
 		},
 		{
 			name: "uvx runtime uses standard MCP resources",
@@ -755,7 +617,6 @@ func TestK8sObjectsUsesStoredMaximums(t *testing.T) {
 		settings.Spec,
 		server.Resources,
 		server.Runtime,
-		server.IsAgentServer(),
 		nil,
 	)
 	if got := deployment.Annotations["obot.ai/k8s-settings-hash"]; got != wantHash {
@@ -776,8 +637,12 @@ func TestAnalyzePodStatus(t *testing.T) {
 			name: "running mcp container remains retryable",
 			pod: corev1.Pod{
 				Status: corev1.PodStatus{
-					Phase:             corev1.PodRunning,
-					ContainerStatuses: []corev1.ContainerStatus{{Name: "mcp"}},
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "mcp",
+						},
+					},
 				},
 			},
 			wantRetryable:   true,
@@ -788,12 +653,14 @@ func TestAnalyzePodStatus(t *testing.T) {
 			pod: corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodPending,
-					ContainerStatuses: []corev1.ContainerStatus{{
-						Name: "mcp",
-						State: corev1.ContainerState{
-							Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "mcp",
+							State: corev1.ContainerState{
+								Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"},
+							},
 						},
-					}},
+					},
 				},
 			},
 			wantRetryable:   true,
@@ -805,11 +672,13 @@ func TestAnalyzePodStatus(t *testing.T) {
 			pod: corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodPending,
-					Conditions: []corev1.PodCondition{{
-						Type:   corev1.PodScheduled,
-						Status: corev1.ConditionFalse,
-						Reason: corev1.PodReasonUnschedulable,
-					}},
+					Conditions: []corev1.PodCondition{
+						{
+							Type:   corev1.PodScheduled,
+							Status: corev1.ConditionFalse,
+							Reason: corev1.PodReasonUnschedulable,
+						},
+					},
 				},
 			},
 			wantRetryable:   true,
@@ -821,12 +690,14 @@ func TestAnalyzePodStatus(t *testing.T) {
 			pod: corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodRunning,
-					ContainerStatuses: []corev1.ContainerStatus{{
-						Name: "mcp",
-						State: corev1.ContainerState{
-							Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "back-off restarting failed container"},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "mcp",
+							State: corev1.ContainerState{
+								Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "back-off restarting failed container"},
+							},
 						},
-					}},
+					},
 				},
 			},
 			wantErr:         ErrPodCrashLoopBackOff,
@@ -844,24 +715,12 @@ func TestAnalyzePodStatus(t *testing.T) {
 			wantErrContains: "pod failed",
 		},
 		{
-			name: "succeeded phase fails health check timeout for non-agent",
+			name: "succeeded phase fails health check timeout",
 			pod: corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodSucceeded,
 				},
 			},
-			wantErr:         ErrHealthCheckTimeout,
-			wantErrContains: "pod succeeded and exited",
-		},
-		{
-			name: "succeeded phase remains retryable for agent",
-			pod: corev1.Pod{
-				Status: corev1.PodStatus{
-					Phase: corev1.PodSucceeded,
-				},
-			},
-			server:          ServerConfig{AgentName: "agent-1"},
-			wantRetryable:   true,
 			wantErr:         ErrHealthCheckTimeout,
 			wantErrContains: "pod succeeded and exited",
 		},
@@ -870,13 +729,15 @@ func TestAnalyzePodStatus(t *testing.T) {
 			pod: corev1.Pod{
 				Status: corev1.PodStatus{
 					Phase: corev1.PodRunning,
-					ContainerStatuses: []corev1.ContainerStatus{{
-						Name:         "mcp",
-						RestartCount: 4,
-						State: corev1.ContainerState{
-							Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name:         "mcp",
+							RestartCount: 4,
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"},
+							},
 						},
-					}},
+					},
 				},
 			},
 			wantErr:         ErrPodCrashLoopBackOff,
@@ -1184,20 +1045,14 @@ func (f *fakeWithWatch) Watch(_ context.Context, _ kclient.ObjectList, _ ...kcli
 	return f.watcher, nil
 }
 
-func TestUpdatedMCPPodName_SucceededPodAgentRetryBehavior(t *testing.T) {
+func TestUpdatedMCPPodName_SucceededPodFailsImmediately(t *testing.T) {
 	tests := []struct {
 		name            string
-		agentName       string
 		wantErrContains string
 	}{
 		{
-			name:            "non-agent succeeded pod fails immediately",
+			name:            "succeeded pod fails immediately",
 			wantErrContains: "pod succeeded and exited",
-		},
-		{
-			name:            "agent succeeded pod remains retryable",
-			agentName:       "agent-1",
-			wantErrContains: "watch retries",
 		},
 	}
 
@@ -1250,7 +1105,6 @@ func TestUpdatedMCPPodName_SucceededPodAgentRetryBehavior(t *testing.T) {
 
 			_, err := k.updatedMCPPodName(t.Context(), "http://mcp.example.com", "test-server", ServerConfig{
 				Runtime:        types.RuntimeRemote,
-				AgentName:      tt.agentName,
 				StartupTimeout: time.Second,
 			}, "")
 			if !errors.Is(err, ErrHealthCheckTimeout) {
@@ -1334,16 +1188,19 @@ func TestUpdatedMCPPodName_ContainerStartupDeadlineExceeded(t *testing.T) {
 func TestK8sObjects_ManagedImagePullSecrets(t *testing.T) {
 	managedSecrets := []v1.ImagePullSecret{
 		{
-			Name: "managed-b", Namespace: system.DefaultNamespace,
-			Spec: v1.ImagePullSecretSpec{Enabled: true},
+			Name:      "managed-b",
+			Namespace: system.DefaultNamespace,
+			Spec:      v1.ImagePullSecretSpec{Enabled: true},
 		},
 		{
-			Name: "disabled", Namespace: system.DefaultNamespace,
-			Spec: v1.ImagePullSecretSpec{Enabled: false},
+			Name:      "disabled",
+			Namespace: system.DefaultNamespace,
+			Spec:      v1.ImagePullSecretSpec{Enabled: false},
 		},
 		{
-			Name: "managed-a", Namespace: system.DefaultNamespace,
-			Spec: v1.ImagePullSecretSpec{Enabled: true},
+			Name:      "managed-a",
+			Namespace: system.DefaultNamespace,
+			Spec:      v1.ImagePullSecretSpec{Enabled: true},
 		},
 	}
 
@@ -1376,7 +1233,6 @@ func TestK8sObjects_ManagedImagePullSecrets(t *testing.T) {
 		v1.K8sSettingsSpec{},
 		nil,
 		types.RuntimeContainerized,
-		false,
 		[]string{"managed-b", "managed-a"},
 	)
 	if dep.Annotations["obot.ai/k8s-settings-hash"] != expectedHash {
@@ -1464,6 +1320,89 @@ func TestRestartServerAddsManagedImagePullSecretsToFreshDeployment(t *testing.T)
 		t.Fatalf("Get() error = %v", err)
 	}
 	assertImagePullSecrets(t, &updated, []string{"managed"})
+}
+
+func TestRestartServerAppliesAffinityToExistingDeployment(t *testing.T) {
+	desiredAffinity := &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+				Weight: 100,
+				PodAffinityTerm: corev1.PodAffinityTerm{
+					LabelSelector: &metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{{
+							Key:      "mcp-user-id",
+							Operator: metav1.LabelSelectorOpExists,
+						}},
+					},
+					TopologyKey: "kubernetes.io/hostname",
+				},
+			}},
+		},
+	}
+
+	tests := []struct {
+		name             string
+		existingAffinity *corev1.Affinity
+	}{
+		{
+			name:             "deployment without affinity",
+			existingAffinity: nil,
+		},
+		{
+			name: "deployment with different affinity",
+			existingAffinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key:      "disktype",
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{"ssd"},
+							}},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k := newTestKubernetesBackend(t,
+				&v1.K8sSettings{
+					Name: system.K8sSettingsName, Namespace: system.DefaultNamespace,
+					Spec: v1.K8sSettingsSpec{Affinity: desiredAffinity},
+				},
+			)
+			server := testK8sServerConfig()
+
+			objs, err := k.k8sObjects(t.Context(), server)
+			if err != nil {
+				t.Fatalf("k8sObjects() error = %v", err)
+			}
+			// Simulate a deployment created before the affinity setting was configured.
+			dep := findDeployment(t, objs, server.MCPServerName)
+			dep.Spec.Template.Spec.Affinity = tt.existingAffinity
+
+			runtimeScheme := runtime.NewScheme()
+			if err := appsv1.AddToScheme(runtimeScheme); err != nil {
+				t.Fatalf("AddToScheme() error = %v", err)
+			}
+			k.client = fake.NewClientBuilder().WithScheme(runtimeScheme).WithObjects(dep).Build()
+
+			if err := k.restartServer(t.Context(), server); err != nil {
+				t.Fatalf("restartServer() error = %v", err)
+			}
+
+			var updated appsv1.Deployment
+			if err := k.client.Get(t.Context(), kclient.ObjectKey{Name: server.MCPServerName, Namespace: "obot-mcp"}, &updated); err != nil {
+				t.Fatalf("Get() error = %v", err)
+			}
+			if !affinityMatches(updated.Spec.Template.Spec.Affinity, desiredAffinity) {
+				t.Fatalf("affinity = %s, want %s", mustJSON(updated.Spec.Template.Spec.Affinity), mustJSON(desiredAffinity))
+			}
+		})
+	}
 }
 
 func TestStrategicMergePatchReplacesImagePullSecrets(t *testing.T) {
@@ -1697,13 +1636,239 @@ func assertImagePullSecrets(t *testing.T, dep *appsv1.Deployment, expected []str
 	}
 }
 
-func assertNoAuditLogEnv(t *testing.T, env map[string][]byte) {
+func TestAdditionalDeploymentRequests(t *testing.T) {
+	k := newTestKubernetesBackend(t)
+	containerized := testK8sServerConfig()
+	npx := testK8sServerConfig()
+	npx.Runtime = types.RuntimeNPX
+
+	tests := []struct {
+		name           string
+		desired        *appsv1.Deployment
+		existing       *appsv1.Deployment
+		expectedMemory string
+		expectedCPU    string
+	}{
+		{
+			name:           "new deployment needs full request",
+			desired:        testDeployment(t, k, withTestRequests(containerized, "2Gi", "1")),
+			existing:       nil,
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+		{
+			name:           "unchanged deployment needs nothing",
+			desired:        simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))),
+			existing:       withPods(simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1")))),
+			expectedMemory: "0",
+			expectedCPU:    "0",
+		},
+		{
+			name:           "unchanged npx deployment with probe needs nothing",
+			desired:        simulateServerDefaults(testDeployment(t, k, withTestRequests(npx, "2Gi", "1"))),
+			existing:       withPods(simulateServerDefaults(testDeployment(t, k, withTestRequests(npx, "2Gi", "1")))),
+			expectedMemory: "0",
+			expectedCPU:    "0",
+		},
+		{
+			name:           "unchanged deployment without pods needs full request",
+			desired:        simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))),
+			existing:       simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))),
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+		{
+			name:           "unchanged deployment with stuck rollout needs full request",
+			desired:        simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))),
+			existing:       withStuckRollout(withPods(simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))))),
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+		{
+			name:           "unchanged deployment with unobserved spec needs full request",
+			desired:        simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))),
+			existing:       withUnobservedSpec(withPods(simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1"))))),
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+		{
+			name:           "changed rolling update deployment needs full request",
+			desired:        simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "3Gi", "1"))),
+			existing:       withPods(simulateServerDefaults(testDeployment(t, k, withTestRequests(containerized, "2Gi", "1")))),
+			expectedMemory: "3Gi",
+			expectedCPU:    "1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			memory, cpu := additionalDeploymentRequests(tt.desired, tt.existing)
+			assertRequests(t, memory, cpu, tt.expectedMemory, tt.expectedCPU)
+		})
+	}
+}
+
+func TestAdditionalRequestsForDeploy(t *testing.T) {
+	npx := withTestRequests(testK8sServerConfig(), "2Gi", "1")
+	npx.Runtime = types.RuntimeNPX
+
+	tests := []struct {
+		name           string
+		existing       bool
+		dryRunErr      error
+		getErr         error
+		expectedMemory string
+		expectedCPU    string
+	}{
+		{
+			name:           "no existing deployment needs full request",
+			existing:       false,
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+		{
+			name:           "unchanged existing deployment compared with server defaults needs nothing",
+			existing:       true,
+			expectedMemory: "0",
+			expectedCPU:    "0",
+		},
+		{
+			name:           "failed dry run needs full request",
+			existing:       true,
+			dryRunErr:      errors.New("dry run failed"),
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+		{
+			name:           "failed get needs full request",
+			existing:       true,
+			getErr:         errors.New("get failed"),
+			expectedMemory: "2Gi",
+			expectedCPU:    "1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			k := newTestKubernetesBackend(t)
+			desired := testDeployment(t, k, npx)
+
+			scheme := runtime.NewScheme()
+			if err := appsv1.AddToScheme(scheme); err != nil {
+				t.Fatalf("AddToScheme() error = %v", err)
+			}
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(ctx context.Context, c kclient.WithWatch, key kclient.ObjectKey, obj kclient.Object, opts ...kclient.GetOption) error {
+					if tt.getErr != nil {
+						return tt.getErr
+					}
+					return c.Get(ctx, key, obj, opts...)
+				},
+				// The fake client doesn't apply server-side defaults, so simulate them on dry-run updates.
+				Update: func(ctx context.Context, c kclient.WithWatch, obj kclient.Object, opts ...kclient.UpdateOption) error {
+					if !slices.ContainsFunc(opts, func(o kclient.UpdateOption) bool { return o == kclient.DryRunAll }) {
+						return c.Update(ctx, obj, opts...)
+					}
+					if tt.dryRunErr != nil {
+						return tt.dryRunErr
+					}
+					dep := obj.(*appsv1.Deployment)
+					simulateServerDefaults(dep).DeepCopyInto(dep)
+					return nil
+				},
+			})
+			if tt.existing {
+				builder = builder.WithObjects(withPods(simulateServerDefaults(testDeployment(t, k, npx))))
+			}
+			k.client = builder.Build()
+
+			memory, cpu := k.additionalRequestsForDeploy(t.Context(), desired)
+			assertRequests(t, memory, cpu, tt.expectedMemory, tt.expectedCPU)
+		})
+	}
+}
+
+func testDeployment(t *testing.T, k *kubernetesBackend, server ServerConfig) *appsv1.Deployment {
 	t.Helper()
 
-	for key := range env {
-		if strings.HasPrefix(key, "NANOBOT_RUN_AUDIT_LOG_") {
-			t.Fatalf("unexpected audit log env %q present", key)
+	objs, err := k.k8sObjects(t.Context(), server)
+	if err != nil {
+		t.Fatalf("k8sObjects() error = %v", err)
+	}
+	for _, obj := range objs {
+		if dep, ok := obj.(*appsv1.Deployment); ok {
+			return dep
 		}
+	}
+	t.Fatal("deployment not found")
+	return nil
+}
+
+func withTestRequests(server ServerConfig, memory, cpu string) ServerConfig {
+	server.Resources = &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse(memory),
+			corev1.ResourceCPU:    resource.MustParse(cpu),
+		},
+	}
+	return server
+}
+
+// simulateServerDefaults mimics fields the API server fills in when a deployment is stored.
+func simulateServerDefaults(dep *appsv1.Deployment) *appsv1.Deployment {
+	dep = dep.DeepCopy()
+	if dep.Spec.Strategy.Type == "" {
+		dep.Spec.Strategy.Type = appsv1.RollingUpdateDeploymentStrategyType
+	}
+	spec := &dep.Spec.Template.Spec
+	spec.RestartPolicy = corev1.RestartPolicyAlways
+	spec.DNSPolicy = corev1.DNSClusterFirst
+	spec.TerminationGracePeriodSeconds = new(int64(30))
+	for i := range spec.Containers {
+		container := &spec.Containers[i]
+		if container.ImagePullPolicy == "" {
+			container.ImagePullPolicy = corev1.PullIfNotPresent
+		}
+		container.TerminationMessagePath = corev1.TerminationMessagePathDefault
+		if probe := container.ReadinessProbe; probe != nil {
+			probe.TimeoutSeconds = 1
+			probe.PeriodSeconds = 10
+			probe.SuccessThreshold = 1
+			probe.FailureThreshold = 3
+		}
+	}
+	return dep
+}
+
+// withPods marks the deployment as fully rolled out to its current pod template.
+func withPods(dep *appsv1.Deployment) *appsv1.Deployment {
+	dep.Generation = 1
+	dep.Status.ObservedGeneration = 1
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 1
+	return dep
+}
+
+// withStuckRollout marks the deployment as having an old pod running but no pod for its current pod template.
+func withStuckRollout(dep *appsv1.Deployment) *appsv1.Deployment {
+	dep.Status.UpdatedReplicas = 0
+	return dep
+}
+
+// withUnobservedSpec marks the deployment as having a spec the deployment controller hasn't observed yet.
+func withUnobservedSpec(dep *appsv1.Deployment) *appsv1.Deployment {
+	dep.Generation = dep.Status.ObservedGeneration + 1
+	return dep
+}
+
+func assertRequests(t *testing.T, memory, cpu resource.Quantity, expectedMemory, expectedCPU string) {
+	t.Helper()
+
+	if memory.Cmp(resource.MustParse(expectedMemory)) != 0 {
+		t.Fatalf("memory = %s, want %s", memory.String(), expectedMemory)
+	}
+	if cpu.Cmp(resource.MustParse(expectedCPU)) != 0 {
+		t.Fatalf("cpu = %s, want %s", cpu.String(), expectedCPU)
 	}
 }
 

@@ -30,7 +30,7 @@ const (
 
 // RegisterOAuthDebuggerClient registers an OAuth client for an MCP server and saves it for later debugger steps.
 func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
-	server, serverConfig, err := m.mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User.GetUID())
+	server, serverConfig, err := m.mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User)
 	if err != nil {
 		return err
 	}
@@ -63,7 +63,7 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 			return types.NewErrBadRequest("OAuth metadata does not include a dynamic client registration endpoint; a static client ID must be configured")
 		}
 
-		httpClient, err := m.mcpSessionManager.HTTPClientForServer(serverConfig, mcp.HTTPClientOptions{Timeout: 10 * time.Second, DirectConnect: true})
+		httpClient, err := m.mcpSessionManager.OAuthClientForServer(serverConfig)
 		if err != nil {
 			return err
 		}
@@ -90,11 +90,12 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 
 	conf := oauthDebuggerConfig(clientID, clientSecret, authServer.AuthorizationEndpoint, authServer.TokenEndpoint, registration.TokenEndpointAuthMethod, firstString(registration.RedirectURIs), registration.Scope, staticClient)
 	resourceURL = mcp.ResolveOAuthResourceURL(authServer.AuthorizationEndpoint, resourceURL, serverConfig.URL)
-	if err := req.GatewayClient.CreateMCPOAuthPendingState(
+	if err := req.GatewayClient.CreateMCPOAuthPendingStateWithTunnel(
 		req.Context(),
 		req.User.GetUID(),
 		server.Name,
 		serverConfig.URL,
+		serverConfig.TunnelName,
 		OAuthDebuggerPendingStateMarker,
 		"",
 		state,
@@ -113,7 +114,7 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 
 // GetOAuthDebuggerAuthorizationURL creates fresh pending OAuth state and returns the remote authorization URL.
 func (m *MCPHandler) GetOAuthDebuggerAuthorizationURL(req api.Context) error {
-	server, _, err := m.mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User.GetUID())
+	server, _, err := m.mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User)
 	if err != nil {
 		return err
 	}
@@ -149,7 +150,7 @@ func (m *MCPHandler) GetOAuthDebuggerAuthorizationURL(req api.Context) error {
 
 // ExchangeOAuthDebuggerToken exchanges the debugger authorization code and stores the token like the quick MCP OAuth flow.
 func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
-	server, serverConfig, err := m.mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User.GetUID())
+	server, serverConfig, err := m.mcpSessionManager.ServerForAction(req.Context(), req.PathValue("mcp_server_id"), req.User)
 	if err != nil {
 		return err
 	}
@@ -176,7 +177,7 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return types.NewErrNotFound("OAuth debugger authorization state not found")
 	}
 
-	httpClient, err := m.mcpSessionManager.HTTPClientForServer(serverConfig, mcp.HTTPClientOptions{Timeout: 10 * time.Second, DirectConnect: true})
+	httpClient, err := m.mcpSessionManager.OAuthClientForServer(serverConfig)
 	if err != nil {
 		return err
 	}
@@ -218,7 +219,7 @@ func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *ga
 	if len(httpClients) > 0 && httpClients[0] != nil {
 		// The exchange replays the authorization code, PKCE verifier, and client
 		// secret, so it must not follow a redirect to another origin.
-		exchangeContext = context.WithValue(ctx, oauth2.HTTPClient, safehttp.NoRedirects(httpClients[0]))
+		exchangeContext = mcp.WithOAuthHTTPClient(ctx, safehttp.NoRedirects(httpClients[0]))
 	}
 	token, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier, pendingState.ResourceURL)
 	if err != nil {

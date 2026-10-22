@@ -20,7 +20,7 @@ func TestCreateAPIKeyScopedToVMCP(t *testing.T) {
 			s, gatewayClient := newTokenRequestTestServer(t)
 			vmcp := &v1.VMCP{Name: "vmcp1test", Namespace: "default"}
 			if allowed {
-				vmcp.Spec.Manifest.Profiles = []clienttypes.VMCPProfile{{Subjects: []clienttypes.Subject{{Type: clienttypes.SubjectTypeGroup, ID: "team"}}}}
+				vmcp.Spec.Manifest.Profiles = []clienttypes.VMCPProfile{{Subjects: []clienttypes.Subject{{Type: clienttypes.SubjectTypeObotGroup, ID: "team"}}}}
 			}
 			ctx, recorder := newTokenRequestAPIContext(t, gatewayClient, http.MethodPost, "/api/api-keys", createAPIKeyRequest{
 				Name:         "vMCP key",
@@ -116,10 +116,28 @@ func TestAPIKeyListEndpointsHideRevokedKeysUnlessRequested(t *testing.T) {
 		admin        bool
 		wantKeyCount int
 	}{
-		{name: "user default", path: "/api/api-keys", wantKeyCount: 1},
-		{name: "user show revoked", path: "/api/api-keys?show_revoked=true", wantKeyCount: 2},
-		{name: "admin default", path: "/api/admin-api-keys", admin: true, wantKeyCount: 1},
-		{name: "admin show revoked", path: "/api/admin-api-keys?show_revoked=true", admin: true, wantKeyCount: 2},
+		{
+			name:         "user default",
+			path:         "/api/api-keys",
+			wantKeyCount: 1,
+		},
+		{
+			name:         "user show revoked",
+			path:         "/api/api-keys?show_revoked=true",
+			wantKeyCount: 2,
+		},
+		{
+			name:         "admin default",
+			path:         "/api/admin-api-keys",
+			admin:        true,
+			wantKeyCount: 1,
+		},
+		{
+			name:         "admin show revoked",
+			path:         "/api/admin-api-keys?show_revoked=true",
+			admin:        true,
+			wantKeyCount: 2,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, recorder := newTokenRequestAPIContext(t, gatewayClient, http.MethodGet, tt.path, nil, userInfo)

@@ -19,6 +19,9 @@ interface TooltipOptions {
 	disablePortal?: boolean;
 	el?: Element;
 	enterTransition?: 'daisy';
+	anchor?: HTMLElement;
+	offset?: number;
+	positionOffset?: { x?: number; y?: number };
 }
 
 interface Popover {
@@ -51,7 +54,10 @@ function tooltipOverlayUnchanged(
 		prev.enterTransition === merged.enterTransition &&
 		prev.strategy === merged.strategy &&
 		prev.placement === merged.placement &&
-		prev.offset === merged.offset
+		prev.offset === merged.offset &&
+		(prev.positionOffset?.x ?? 0) === (merged.positionOffset?.x ?? 0) &&
+		(prev.positionOffset?.y ?? 0) === (merged.positionOffset?.y ?? 0) &&
+		prev.anchor === merged.anchor
 	);
 }
 
@@ -245,6 +251,9 @@ export default function popover(initialOptions?: PopoverOptions): Popover {
 		if (!ready) return;
 
 		const gen = ++visibilityLayoutGen;
+		const reference = options.anchor ?? ref;
+		void (options.positionOffset?.x ?? 0);
+		void (options.positionOffset?.y ?? 0);
 
 		// Remove all dynamically added classes for proper reset
 		tooltip.classList.remove(
@@ -320,7 +329,7 @@ export default function popover(initialOptions?: PopoverOptions): Popover {
 					if (gen !== visibilityLayoutGen) return;
 					tooltip.classList.remove('tooltip-portal-daisy-host--inactive', 'opacity-0');
 					if (!shouldSkipAutoPosition()) {
-						close = autoUpdate(ref, tooltip, updatePosition);
+						close = autoUpdate(reference, tooltip, updatePosition);
 					}
 					return;
 				}
@@ -338,7 +347,7 @@ export default function popover(initialOptions?: PopoverOptions): Popover {
 				if (!shouldSkipAutoPosition()) {
 					await updatePosition();
 					if (gen !== visibilityLayoutGen) return;
-					close = autoUpdate(ref, tooltip, updatePosition);
+					close = autoUpdate(reference, tooltip, updatePosition);
 				}
 			});
 		} else {
@@ -363,7 +372,8 @@ export default function popover(initialOptions?: PopoverOptions): Popover {
 	}
 
 	async function updatePosition() {
-		if (!ref || !tooltip || shouldSkipAutoPosition()) return;
+		const reference = options.anchor ?? ref;
+		if (!reference || !tooltip || shouldSkipAutoPosition()) return;
 
 		const offsetSize = options?.offset ?? 4;
 		// Treat the open guide panel as unavailable viewport so menus don't slide under it.
@@ -375,7 +385,7 @@ export default function popover(initialOptions?: PopoverOptions): Popover {
 			left: offsetSize
 		};
 
-		const { x, y } = await computePosition(ref, tooltip, {
+		const { x, y } = await computePosition(reference, tooltip, {
 			placement: options?.placement ?? 'bottom-end',
 			middleware: [
 				flip({ padding: overflowPadding }),
@@ -385,12 +395,15 @@ export default function popover(initialOptions?: PopoverOptions): Popover {
 			...options
 		});
 
+		const shiftedX = x + (options.positionOffset?.x ?? 0);
+		const shiftedY = y + (options.positionOffset?.y ?? 0);
+
 		if (options?.assign) {
-			options.assign(x, y);
+			options.assign(shiftedX, shiftedY);
 		} else {
 			Object.assign(tooltip.style, {
-				left: `${x}px`,
-				top: `${y}px`
+				left: `${shiftedX}px`,
+				top: `${shiftedY}px`
 			});
 		}
 	}

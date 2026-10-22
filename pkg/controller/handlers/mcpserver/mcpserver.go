@@ -2,7 +2,6 @@ package mcpserver
 
 import (
 	"cmp"
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -38,7 +37,6 @@ type Handler struct {
 	defaultDenyAllEgress         bool
 	singleUserIdleShutdownDelay  time.Duration
 	multiUserIdleShutdownDelay   time.Duration
-	agentIdleShutdownDelay       time.Duration
 	baseURL                      string
 	mcpRuntimeBackend            string
 	mcpImagePullSecrets          []string
@@ -51,7 +49,7 @@ func effectiveDenyAllEgress(v *bool, domains []string, defaultWhenEmpty bool) bo
 	return defaultWhenEmpty && len(domains) == 0
 }
 
-func New(gatewayClient *gateway.Client, mcpSessionManager *mcp.SessionManager, tokenStore mcp.GlobalTokenStore, networkPolicyProviderEnabled, defaultDenyAllEgress bool, singleUserIdleShutdownDelay, multiUserIdleShutdownDelay, agentIdleShutdownDelay time.Duration, baseURL string, mcpRuntimeBackend string, mcpImagePullSecrets []string) *Handler {
+func New(gatewayClient *gateway.Client, mcpSessionManager *mcp.SessionManager, tokenStore mcp.GlobalTokenStore, networkPolicyProviderEnabled, defaultDenyAllEgress bool, singleUserIdleShutdownDelay, multiUserIdleShutdownDelay time.Duration, baseURL string, mcpRuntimeBackend string, mcpImagePullSecrets []string) *Handler {
 	return &Handler{
 		gatewayClient:                gatewayClient,
 		mcpSessionManager:            mcpSessionManager,
@@ -60,38 +58,10 @@ func New(gatewayClient *gateway.Client, mcpSessionManager *mcp.SessionManager, t
 		defaultDenyAllEgress:         defaultDenyAllEgress,
 		singleUserIdleShutdownDelay:  singleUserIdleShutdownDelay,
 		multiUserIdleShutdownDelay:   multiUserIdleShutdownDelay,
-		agentIdleShutdownDelay:       agentIdleShutdownDelay,
 		baseURL:                      baseURL,
 		mcpRuntimeBackend:            mcpRuntimeBackend,
 		mcpImagePullSecrets:          mcpImagePullSecrets,
 	}
-}
-
-func (h *Handler) DetectDrift(req router.Request, _ router.Response) error {
-	server := req.Object.(*v1.MCPServer)
-
-	if server.Spec.MCPServerCatalogEntryName == "" || server.Spec.CompositeName != "" {
-		return nil
-	}
-
-	var entry v1.MCPServerCatalogEntry
-	if err := req.Get(&entry, server.Namespace, server.Spec.MCPServerCatalogEntryName); apierrors.IsNotFound(err) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-
-	drifted, err := ConfigurationHasDrifted(req.Ctx, h.gatewayClient, server, entry.Spec.Manifest, h.defaultDenyAllEgress)
-	if err != nil {
-		return err
-	}
-
-	if server.Status.NeedsUpdate != drifted {
-		slog.Info("MCP server catalog drift status changed", "server", server.Name, "catalogEntry", server.Spec.MCPServerCatalogEntryName, "needsUpdate", drifted)
-		server.Status.NeedsUpdate = drifted
-		return req.Client.Status().Update(req.Ctx, server)
-	}
-	return nil
 }
 
 func (h *Handler) EnsureMCPNetworkPolicy(req router.Request, _ router.Response) error {
@@ -99,11 +69,6 @@ func (h *Handler) EnsureMCPNetworkPolicy(req router.Request, _ router.Response) 
 
 	if !h.networkPolicyProviderEnabled {
 		return h.deleteMCPNetworkPolicy(req, server.Namespace, server.Name)
-	}
-
-	// Don't create an MCPNetworkPolicy if this is an agent pod
-	if server.Spec.NanobotAgentID != "" {
-		return nil
 	}
 
 	var egressDomains []string
@@ -123,6 +88,11 @@ func (h *Handler) EnsureMCPNetworkPolicy(req router.Request, _ router.Response) 
 		if server.Spec.Manifest.ContainerizedConfig != nil {
 			egressDomains = server.Spec.Manifest.ContainerizedConfig.EgressDomains
 			denyAllEgress = effectiveDenyAllEgress(server.Spec.Manifest.ContainerizedConfig.DenyAllEgress, egressDomains, h.defaultDenyAllEgress)
+		}
+	case types.RuntimeOpenAPI:
+		if server.Spec.Manifest.OpenAPIConfig != nil {
+			egressDomains = server.Spec.Manifest.OpenAPIConfig.EgressDomains
+			denyAllEgress = effectiveDenyAllEgress(server.Spec.Manifest.OpenAPIConfig.DenyAllEgress, egressDomains, h.defaultDenyAllEgress)
 		}
 	default:
 		return h.deleteMCPNetworkPolicy(req, server.Namespace, server.Name)
@@ -243,7 +213,6 @@ func (h *Handler) DetectK8sSettingsDrift(req router.Request, _ router.Response) 
 		k8sSettings.Spec,
 		resources,
 		server.Spec.Manifest.Runtime,
-		server.Spec.NanobotAgentID != "",
 		imagePullSecretNames,
 	)
 	shouldSetNeedsK8sUpdate := server.Status.K8sSettingsHash != currentHash && !server.Status.NeedsK8sUpdate
@@ -255,233 +224,6 @@ func (h *Handler) DetectK8sSettingsDrift(req router.Request, _ router.Response) 
 	}
 
 	return nil
-}
-
-// ConfigurationHasDrifted compares runtime config, env, resources, and multi-user config between a server
-// and a catalog entry manifest. Static values omitted from the persisted server manifest are restored from
-// its gateway credential before comparison.
-func ConfigurationHasDrifted(ctx context.Context, gatewayClient *gateway.Client, server *v1.MCPServer, entryManifest types.MCPServerCatalogEntryManifest, defaultDenyAllEgress bool) (bool, error) {
-	staticKeys := make(map[string]struct{})
-	for _, config := range entryManifest.Config {
-		if config.Value != "" {
-			staticKeys[config.Key] = struct{}{}
-		}
-	}
-
-	serverManifest := server.Spec.Manifest
-	if len(staticKeys) > 0 {
-		credential, err := gatewayClient.RevealCredential(ctx, []string{server.CredentialContext(server.Spec.UserID)}, server.Name)
-		if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
-			return false, err
-		}
-
-		serverManifest.Config = slices.Clone(serverManifest.Config)
-		for i, env := range serverManifest.Config {
-			if _, ok := staticKeys[env.Key]; ok && env.Value == "" {
-				serverManifest.Config[i].Value = credential.Secrets[env.Key]
-			}
-		}
-	}
-
-	return configurationHasDrifted(serverManifest, entryManifest, defaultDenyAllEgress)
-}
-
-// configurationHasDrifted compares only the fields common to MCPServerManifest and
-// MCPServerCatalogEntryManifest.
-func configurationHasDrifted(serverManifest types.MCPServerManifest, entryManifest types.MCPServerCatalogEntryManifest, defaultDenyAllEgress bool) (bool, error) {
-	// Check if runtime types differ
-	if serverManifest.Runtime != entryManifest.Runtime {
-		return true, nil
-	}
-
-	// Check runtime-specific configurations
-	var drifted bool
-	switch serverManifest.Runtime {
-	case types.RuntimeUVX:
-		drifted = uvxConfigHasDrifted(serverManifest.UVXConfig, entryManifest.UVXConfig, defaultDenyAllEgress)
-	case types.RuntimeNPX:
-		drifted = npxConfigHasDrifted(serverManifest.NPXConfig, entryManifest.NPXConfig, defaultDenyAllEgress)
-	case types.RuntimeContainerized:
-		drifted = containerizedConfigHasDrifted(serverManifest.ContainerizedConfig, entryManifest.ContainerizedConfig, defaultDenyAllEgress)
-	case types.RuntimeRemote:
-		drifted = remoteConfigHasDrifted(serverManifest.RemoteConfig, entryManifest.RemoteConfig)
-	default:
-		return false, fmt.Errorf("unknown runtime type: %s", serverManifest.Runtime)
-	}
-
-	if drifted {
-		return true, nil
-	}
-
-	// Check environment. Secret binding selections are deployment configuration,
-	// not source catalog drift.
-	entryEnv := entryManifest.Config
-	serverEnv := withoutAdminManagedSecretBoundConfigFields(serverManifest.Config, entryEnv)
-	entryEnv = withoutAdminManagedSecretBoundConfigFields(entryEnv, serverManifest.Config)
-	if fieldSlicesHaveDrifted(serverEnv, entryEnv, mcpConfigMatchesCatalog) {
-		return true, nil
-	}
-
-	return resourcesHasDrifted(serverManifest.Resources, entryManifest.Resources), nil
-}
-
-func resourcesHasDrifted(serverResources, entryResources *types.MCPResourceRequirements) bool {
-	if serverResources == nil && entryResources == nil {
-		return false
-	}
-	if serverResources == nil || entryResources == nil {
-		return true
-	}
-	return !reflect.DeepEqual(serverResources, entryResources)
-}
-
-// uvxConfigHasDrifted checks if UVX configuration has drifted
-func uvxConfigHasDrifted(serverConfig, entryConfig *types.UVXRuntimeConfig, defaultDenyAllEgress bool) bool {
-	if serverConfig == nil && entryConfig == nil {
-		return false
-	}
-	if serverConfig == nil || entryConfig == nil {
-		return true
-	}
-
-	return serverConfig.Package != entryConfig.Package ||
-		serverConfig.Command != entryConfig.Command ||
-		!slices.Equal(serverConfig.Args, entryConfig.Args) ||
-		!slices.Equal(serverConfig.EgressDomains, entryConfig.EgressDomains) ||
-		effectiveDenyAllEgress(serverConfig.DenyAllEgress, serverConfig.EgressDomains, defaultDenyAllEgress) !=
-			effectiveDenyAllEgress(entryConfig.DenyAllEgress, entryConfig.EgressDomains, defaultDenyAllEgress)
-}
-
-// npxConfigHasDrifted checks if NPX configuration has drifted
-func npxConfigHasDrifted(serverConfig, entryConfig *types.NPXRuntimeConfig, defaultDenyAllEgress bool) bool {
-	if serverConfig == nil && entryConfig == nil {
-		return false
-	}
-	if serverConfig == nil || entryConfig == nil {
-		return true
-	}
-
-	return serverConfig.Package != entryConfig.Package ||
-		!slices.Equal(serverConfig.Args, entryConfig.Args) ||
-		!slices.Equal(serverConfig.EgressDomains, entryConfig.EgressDomains) ||
-		effectiveDenyAllEgress(serverConfig.DenyAllEgress, serverConfig.EgressDomains, defaultDenyAllEgress) !=
-			effectiveDenyAllEgress(entryConfig.DenyAllEgress, entryConfig.EgressDomains, defaultDenyAllEgress)
-}
-
-// containerizedConfigHasDrifted checks if containerized configuration has drifted
-func containerizedConfigHasDrifted(serverConfig, entryConfig *types.ContainerizedRuntimeConfig, defaultDenyAllEgress bool) bool {
-	if serverConfig == nil && entryConfig == nil {
-		return false
-	}
-	if serverConfig == nil || entryConfig == nil {
-		return true
-	}
-
-	return serverConfig.Image != entryConfig.Image ||
-		serverConfig.Command != entryConfig.Command ||
-		serverConfig.Port != entryConfig.Port ||
-		serverConfig.Path != entryConfig.Path ||
-		!slices.Equal(serverConfig.Args, entryConfig.Args) ||
-		!slices.Equal(serverConfig.EgressDomains, entryConfig.EgressDomains) ||
-		effectiveDenyAllEgress(serverConfig.DenyAllEgress, serverConfig.EgressDomains, defaultDenyAllEgress) !=
-			effectiveDenyAllEgress(entryConfig.DenyAllEgress, entryConfig.EgressDomains, defaultDenyAllEgress)
-}
-
-// remoteConfigHasDrifted checks if remote configuration has drifted
-func remoteConfigHasDrifted(serverConfig *types.RemoteRuntimeConfig, entryConfig *types.RemoteCatalogConfig) bool {
-	if serverConfig == nil && entryConfig == nil {
-		return false
-	}
-	if serverConfig == nil || entryConfig == nil {
-		return true
-	}
-
-	if entryConfig.Hostname != serverConfig.Hostname ||
-		entryConfig.URLTemplate != serverConfig.URLTemplate ||
-		entryConfig.TunnelName != serverConfig.TunnelName {
-		return true
-	}
-
-	// For remote runtime, we need to check if the server URL matches what the catalog entry expects
-	if entryConfig.FixedURL != "" {
-		// If catalog entry has a fixed URL, server URL should match exactly
-		if serverConfig.URL != entryConfig.FixedURL {
-			return true
-		}
-	}
-
-	return false
-}
-
-// withoutAdminManagedSecretBoundConfigFields removes env fields that exist only on
-// serverFields because an admin selected a deployment-level secret binding.
-// Catalog-owned fields are kept so pinned catalog bindings still participate in
-// drift detection.
-func withoutAdminManagedSecretBoundConfigFields(serverFields, entryFields []types.MCPConfig) []types.MCPConfig {
-	entryKeys := make(map[string]struct{}, len(entryFields))
-	for _, field := range entryFields {
-		entryKeys[field.Key] = struct{}{}
-	}
-
-	result := make([]types.MCPConfig, 0, len(serverFields))
-	for _, field := range serverFields {
-		_, entryHasField := entryKeys[field.Key]
-		if !entryHasField && (field.UserAllowed || adminAddedSecretBinding(field.SecretBinding)) {
-			continue
-		}
-		result = append(result, field)
-	}
-	return result
-}
-
-func fieldSlicesHaveDrifted[T any](serverFields, entryFields []T, matches func(T, T) bool) bool {
-	if len(serverFields) != len(entryFields) {
-		return true
-	}
-
-	used := make([]bool, len(entryFields))
-	for _, serverField := range serverFields {
-		found := false
-		for i, entryField := range entryFields {
-			if used[i] || !matches(serverField, entryField) {
-				continue
-			}
-			used[i] = true
-			found = true
-			break
-		}
-		if !found {
-			return true
-		}
-	}
-
-	return false
-}
-
-func mcpConfigMatchesCatalog(serverField, entryField types.MCPConfig) bool {
-	// Per-user access is deployment policy, not catalog schema drift.
-	serverField.UserAllowed = false
-	entryField.UserAllowed = false
-	if oneSidedAdminAddedSecretBinding(serverField.SecretBinding, entryField.SecretBinding) {
-		serverField.SecretBinding = nil
-		serverField.Value = entryField.Value
-	}
-	if oneSidedAdminAddedSecretBinding(entryField.SecretBinding, serverField.SecretBinding) {
-		entryField.SecretBinding = nil
-		entryField.Value = serverField.Value
-	}
-
-	return reflect.DeepEqual(serverField, entryField)
-}
-
-func oneSidedAdminAddedSecretBinding(left, right *types.MCPSecretBinding) bool {
-	// AdminAdded is derived metadata. Ignore it when it appears on only one side;
-	// any real binding difference on the other side remains for DeepEqual below.
-	return adminAddedSecretBinding(left) && !adminAddedSecretBinding(right)
-}
-
-func adminAddedSecretBinding(binding *types.MCPSecretBinding) bool {
-	return binding != nil && binding.AdminAdded
 }
 
 // EnsureMCPServerInstanceUserCount ensures that mcp server instance user count for multi-user MCP servers is up to date.
@@ -689,7 +431,12 @@ func (h *Handler) SyncOAuthMetadata(req router.Request, _ router.Response) error
 		return fmt.Errorf("failed to reveal credential: %w", err)
 	}
 
-	serverConfig, missingConfig, err := mcp.ServerToServerConfig(*server, server.ValidConnectURLs(h.baseURL), server.Spec.UserID, server.Name, server.Status.MCPCatalogID, cred.Secrets)
+	resolvedServer, err := mcp.ResolveServerStaticConfiguration(req.Ctx, h.gatewayClient, *server)
+	if err != nil {
+		return err
+	}
+
+	serverConfig, missingConfig, err := mcp.ServerToServerConfig(resolvedServer, server.ValidConnectURLs(h.baseURL), server.Spec.UserID, server.Name, server.Status.MCPCatalogID, cred.Secrets, h.mcpSessionManager.ValidationOptions().DevMode)
 	if err != nil {
 		return fmt.Errorf("failed to convert MCP server to server config: %w", err)
 	} else if len(missingConfig) > 0 {
@@ -783,9 +530,7 @@ func (h *Handler) ShutdownIdleServers(req router.Request, resp router.Response) 
 	idleInterval := time.Duration(mcpServer.Spec.Manifest.IdleShutdownIntervalHours) * time.Hour
 	if idleInterval == 0 {
 		idleInterval = h.singleUserIdleShutdownDelay
-		if mcpServer.Spec.NanobotAgentID != "" {
-			idleInterval = h.agentIdleShutdownDelay
-		} else if !mcpServer.Spec.IsSingleUser() {
+		if !mcpServer.Spec.IsSingleUser() {
 			idleInterval = h.multiUserIdleShutdownDelay
 		}
 	}

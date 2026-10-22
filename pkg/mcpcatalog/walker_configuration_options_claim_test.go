@@ -37,7 +37,7 @@ env:
         description: US data residency
 `), 0o600))
 
-	entries, _, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
+	entries, _, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 

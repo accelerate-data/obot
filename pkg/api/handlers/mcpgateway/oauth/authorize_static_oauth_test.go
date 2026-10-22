@@ -200,7 +200,7 @@ func newUnauthenticatedStaticOAuthCallbackServer(t *testing.T, gateway *gatewayc
 		storage,
 		"default",
 		authn.NewAuthenticator(authn.Anonymous{}),
-		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, nil, false),
+		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, false),
 		nil,
 		auditLogger,
 		limiter,
@@ -209,7 +209,7 @@ func newUnauthenticatedStaticOAuthCallbackServer(t *testing.T, gateway *gatewayc
 		false,
 		licenseProvider,
 	)
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
+	h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}}
 	server.HandleFunc("GET /oauth/mcp/callback", h.oauthCallback)
 	server.HandleFunc("GET /oauth/userinfo", func(api.Context) error {
 		return nil
@@ -256,7 +256,7 @@ func TestStaticOAuthCallbackExchangesAndDiscardsTokenBeforeNormalOAuth(t *testin
 		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil),
 		ResponseWriter: recorder,
 	}
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}}
+	h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}}
 	if err := h.oauthCallback(req); err != nil {
 		t.Fatalf("handle static OAuth callback: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestStaticOAuthCallbackBlocksPrivateTokenEndpoint(t *testing.T) {
 		ResponseWriter: recorder,
 	}
 	h := &handler{
-		oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)},
+		oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))},
 		staticOAuthHTTPClient: safehttp.NewClient(safehttp.Options{
 			BlockLoopback:  true,
 			BlockPrivateIP: true,
@@ -334,7 +334,7 @@ func TestStaticOAuthCallbackRecordsOnlySafeFailures(t *testing.T) {
 				Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+tt.query, nil),
 				ResponseWriter: recorder,
 			}
-			h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}, completionURL: "/auth/mcp-oauth/complete"}
+			h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}, completionURL: "/auth/mcp-oauth/complete"}
 			if err := h.oauthCallback(req); err != nil {
 				t.Fatalf("handle failed static OAuth callback: %v", err)
 			}
@@ -378,7 +378,7 @@ func TestStaticOAuthCallbackSuccessUsesConfiguredCompletion(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}, completionURL: "/auth/mcp-oauth/complete"}
+	h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}, completionURL: "/auth/mcp-oauth/complete"}
 	if err := h.oauthCallback(api.Context{
 		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&code=valid-code", nil),
 		ResponseWriter: recorder,
@@ -398,7 +398,7 @@ func TestStaticOAuthCallbackFailureSendsCategoryOnly(t *testing.T) {
 		t.Fatalf("create static OAuth test: %v", err)
 	}
 	recorder := httptest.NewRecorder()
-	h := &handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway)}, completionURL: "/auth/mcp-oauth/complete"}
+	h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}, completionURL: "/auth/mcp-oauth/complete"}
 	if err := h.oauthCallback(api.Context{
 		Request:        httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state="+state.CallbackState+"&error=access_denied&error_description=provider-secret-body", nil),
 		ResponseWriter: recorder,

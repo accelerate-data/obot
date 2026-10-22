@@ -10,15 +10,17 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/subjectgroups"
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 	gocache "k8s.io/client-go/tools/cache"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
-	userIndex     = "user-id"
-	groupIndex    = "group-id"
-	selectorIndex = "selector-id"
+	userIndex      = "user-id"
+	groupIndex     = "group-id"
+	obotGroupIndex = "obot-group-id"
+	selectorIndex  = "selector-id"
 )
 
 type Helper struct {
@@ -47,9 +49,10 @@ func NewHelper(ctx context.Context, backend backend.Backend, client kclient.Clie
 	}
 
 	if err := informer.AddIndexers(gocache.Indexers{
-		userIndex:     subjectIndexFunc(types.SubjectTypeUser),
-		groupIndex:    subjectIndexFunc(types.SubjectTypeGroup),
-		selectorIndex: subjectIndexFunc(types.SubjectTypeSelector),
+		userIndex:      subjectIndexFunc(types.SubjectTypeUser),
+		groupIndex:     subjectIndexFunc(types.SubjectTypeGroup),
+		obotGroupIndex: subjectIndexFunc(types.SubjectTypeObotGroup),
+		selectorIndex:  subjectIndexFunc(types.SubjectTypeSelector),
 	}); err != nil {
 		return nil, err
 	}
@@ -98,8 +101,17 @@ func (h *Helper) GetApplicablePolicies(user kuser.Info, direction types.PolicyDi
 	collect(userPolicies)
 
 	// Group-based policies
-	for groupID := range authGroupSet(user) {
+	groups, obotGroups := subjectgroups.Sets(user)
+	for groupID := range groups {
 		groupPolicies, err := h.getIndexedPolicies(groupIndex, groupID)
+		if err != nil {
+			return nil, err
+		}
+		collect(groupPolicies)
+	}
+
+	for groupID := range obotGroups {
+		groupPolicies, err := h.getIndexedPolicies(obotGroupIndex, groupID)
 		if err != nil {
 			return nil, err
 		}
@@ -141,14 +153,4 @@ func subjectIndexFunc(subjectType types.SubjectType) gocache.IndexFunc {
 
 		return keys, nil
 	}
-}
-
-// authGroupSet returns a set of auth provider groups for a given user.
-func authGroupSet(user kuser.Info) map[string]struct{} {
-	groups := user.GetExtra()["auth_provider_groups"]
-	set := make(map[string]struct{}, len(groups))
-	for _, group := range groups {
-		set[group] = struct{}{}
-	}
-	return set
 }

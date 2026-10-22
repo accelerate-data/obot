@@ -76,6 +76,46 @@ function sse(...events: Array<Record<string, unknown>>): Response {
 	});
 }
 
+describe('Chat error diagnostics', () => {
+	it('shows snapshot diagnostics without blocking valid-tool chat controls', async () => {
+		const session = new MCPTesterSession(server, { name: 'tester', version: 'test' }, mcpFetch());
+		await session.initialize();
+		const chat = new MCPTesterChat(session, server.id);
+		chat.toolSnapshot = [{ name: 'lookup', inputSchema: { type: 'object' } }];
+		chat.toolDiscoveryIssues = [
+			{ name: 'bad', index: 1, issues: [{ path: ['outputSchema', 'type'] }] }
+		];
+		render(Chat, { chat, session });
+		await expect.element(page.getByText('Malformed tools excluded: 1')).toBeVisible();
+		expect(chat.canSend).toBe(true);
+		await page.getByRole('button', { name: 'View full error' }).click();
+		await expect.element(page.getByRole('dialog', { name: 'Error details' })).toBeVisible();
+		session.close();
+	});
+
+	it('bounds a failed response and keeps retry available', async () => {
+		const session = new MCPTesterSession(server, { name: 'tester', version: 'test' }, mcpFetch());
+		await session.initialize();
+		const chat = new MCPTesterChat(session, server.id);
+		chat.timeline = [
+			{
+				id: 'failed',
+				role: 'assistant',
+				state: 'failed',
+				error: { code: 'provider_error', message: 'failure '.repeat(200), retryable: true }
+			}
+		];
+		const retry = vi.spyOn(chat, 'retry').mockResolvedValue();
+		render(Chat, { chat, session });
+		expect(page.getByRole('alert').element().textContent?.length).toBeLessThan(500);
+		await page.getByRole('button', { name: 'Retry response' }).click();
+		expect(retry).toHaveBeenCalled();
+		await page.getByRole('button', { name: 'View full error' }).click();
+		await expect.element(page.getByLabelText('Full error')).toBeVisible();
+		session.close();
+	});
+});
+
 async function renderChatWithToolCalls() {
 	const session = new MCPTesterSession(
 		server,
@@ -133,6 +173,39 @@ function transcriptCalls() {
 }
 
 describe('Chat', () => {
+	it.each(['Help me test this MCP Server', 'What tools are available from this MCP Server?'])(
+		'sends the suggested prompt %s',
+		async (prompt) => {
+			const session = new MCPTesterSession(
+				server,
+				{ name: 'obot-mcp-tester', version: 'test' },
+				mcpFetch()
+			);
+			await session.initialize();
+			vi.spyOn(session, 'snapshotChatTools').mockResolvedValue([]);
+			const chatFetch = vi.fn<typeof fetch>(async () =>
+				sse({ type: 'assistant_message_start' }, { type: 'completion', reason: 'stop' })
+			);
+			const chat = new MCPTesterChat(session, server.id, chatFetch);
+			render(Chat, { chat, session });
+
+			const suggestions = page.getByRole('group', { name: 'Suggested messages' });
+			const composer = page.getByRole('textbox', { name: 'Message' });
+			expect(
+				suggestions.element().compareDocumentPosition(composer.element()) &
+					Node.DOCUMENT_POSITION_FOLLOWING
+			).toBeTruthy();
+
+			await page.getByRole('button', { name: prompt }).click();
+			await vi.waitFor(() => expect(chatFetch).toHaveBeenCalledTimes(1));
+			expect(chat.messages.at(-1)?.content).toEqual([{ type: 'text', text: prompt }]);
+			await expect.element(page.getByRole('article', { name: 'User message' })).toBeVisible();
+			await expect.element(page.getByRole('button', { name: prompt })).not.toBeInTheDocument();
+
+			session.close();
+		}
+	);
+
 	it('renders the assistant response in its own bordered card with markdown styling', async () => {
 		const session = await renderChatWithResponse();
 		const article = page.getByRole('article', { name: 'Assistant message' });

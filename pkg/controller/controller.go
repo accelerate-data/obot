@@ -9,6 +9,8 @@ import (
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/controller/data"
 	"github.com/obot-platform/obot/pkg/controller/handlers/adminworkspace"
+	"github.com/obot-platform/obot/pkg/controller/handlers/agentinstance"
+	"github.com/obot-platform/obot/pkg/controller/handlers/catalogmigration"
 	"github.com/obot-platform/obot/pkg/controller/handlers/compositemigration"
 	"github.com/obot-platform/obot/pkg/controller/handlers/deployment"
 	"github.com/obot-platform/obot/pkg/controller/handlers/mcpcatalog"
@@ -16,7 +18,7 @@ import (
 	"github.com/obot-platform/obot/pkg/controller/handlers/modelinfosource"
 	"github.com/obot-platform/obot/pkg/controller/handlers/provider"
 	"github.com/obot-platform/obot/pkg/controller/handlers/providerconfigurationchange"
-	"github.com/obot-platform/obot/pkg/controller/handlers/secret"
+	"github.com/obot-platform/obot/pkg/controller/handlers/secretbinding"
 	"github.com/obot-platform/obot/pkg/controller/handlers/tunnelpeer"
 	"github.com/obot-platform/obot/pkg/localauth"
 	"github.com/obot-platform/obot/pkg/mcp"
@@ -59,12 +61,18 @@ func New(services *services.Services) (*Controller, error) {
 }
 
 func (c *Controller) PreStart(ctx context.Context) error {
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, "remove_hosted_agent_runtime", func() error {
+		if err := deleteHostedAgentRuntime(ctx, c.services.LocalK8sClient, c.services.MCPServerNamespace); err != nil {
+			return err
+		}
+		return c.services.GatewayClient.DeleteHostedAgentRecords(ctx)
+	}); err != nil {
+		return fmt.Errorf("failed to remove legacy Hosted Agents: %w", err)
+	}
+
 	if err := data.Data(ctx, c.services.StorageClient, data.Defaults{
-		SkillRepoURL:           c.services.DefaultSkillRepoURL,
-		SkillRepoRef:           c.services.DefaultSkillRepoRef,
-		HostedAgentsCatalogURL: c.services.DefaultHostedAgentsCatalogURL,
-		HostedAgentsCatalogRef: c.services.DefaultHostedAgentsCatalogRef,
-		AllowLocalRepos:        c.services.DevMode,
+		SkillRepoURL: c.services.DefaultSkillRepoURL,
+		SkillRepoRef: c.services.DefaultSkillRepoRef,
 	}); err != nil {
 		return fmt.Errorf("failed to apply data: %w", err)
 	}
@@ -75,10 +83,6 @@ func (c *Controller) PreStart(ctx context.Context) error {
 
 	if err := ensureDefaultUserRoleSetting(ctx, c.services.StorageClient); err != nil {
 		return fmt.Errorf("failed to ensure default user role setting: %w", err)
-	}
-
-	if err := ensureHostedAgentPoolDefaults(ctx, c.services.StorageClient); err != nil {
-		return fmt.Errorf("failed to ensure hosted agent pool defaults: %w", err)
 	}
 
 	resourceMaximums, err := c.services.MCPSessionManager.StartupKubernetesResourceMaximums(ctx, c.services.StorageClient)
@@ -96,10 +100,6 @@ func (c *Controller) PreStart(ctx context.Context) error {
 		return fmt.Errorf("failed to add catalog ID to access control rules: %w", err)
 	}
 
-	if err := migratePublishedArtifactVisibility(ctx, c.services.StorageClient); err != nil {
-		return fmt.Errorf("failed to migrate published artifact visibility: %w", err)
-	}
-
 	if err := migrateAuditLogExportSourceTypes(ctx, c.services.StorageClient); err != nil {
 		return fmt.Errorf("failed to migrate audit-log export source types: %w", err)
 	}
@@ -113,8 +113,10 @@ func (c *Controller) PreStart(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure admin workspaces: %w", err)
 	}
 
-	if err := c.ensureObotMCPServer(ctx); err != nil {
-		return fmt.Errorf("failed to ensure obot MCP server: %w", err)
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, obotAgentRemovalMigrationName, func() error {
+		return deleteObotAgentResources(ctx, c.services.StorageClient, c.services.GatewayClient)
+	}); err != nil {
+		return fmt.Errorf("failed to delete Obot Agent resources: %w", err)
 	}
 
 	if err := c.reconcileServiceAccountKeys(ctx); err != nil {
@@ -125,139 +127,63 @@ func (c *Controller) PreStart(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure auth providers and model providers: %w", err)
 	}
 
-	if err := compositemigration.New(c.services.GatewayClient).MigrateAll(ctx, c.services.StorageClient); err != nil {
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, "everything_acr_admin_obot_group", func() error {
+		return migrateEverythingAccessControlRuleAdminGroup(ctx, c.services.StorageClient)
+	}); err != nil {
+		return fmt.Errorf("failed to migrate everything access control rule admin group: %w", err)
+	}
+
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, compositemigration.MigrationName, func() error {
+		return compositemigration.New(c.services.GatewayClient).MigrateAll(ctx, c.services.StorageClient)
+	}); err != nil {
 		return fmt.Errorf("failed to migrate composite MCP servers: %w", err)
+	}
+
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, catalogmigration.MigrationName, func() error {
+		return catalogmigration.New(c.services.GatewayClient, c.syncCatalogForMigration).MigrateAll(ctx, c.services.StorageClient)
+	}); err != nil {
+		return fmt.Errorf("failed to migrate standalone MCP servers: %w", err)
+	}
+	if err := catalogmigration.Cleanup(ctx, c.services.StorageClient); err != nil {
+		return fmt.Errorf("failed to clean up legacy MCP servers: %w", err)
+	}
+
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, "vmcp_default_admin_obot_groups", func() error {
+		return migrateVMCPDefaultAdminGroups(ctx, c.services.StorageClient)
+	}); err != nil {
+		return fmt.Errorf("failed to migrate vMCP default admin groups: %w", err)
+	}
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, vmcpEverythingAdminGroupsMigrationName, func() error {
+		return migrateVMCPEverythingAdminGroups(ctx, c.services.StorageClient)
+	}); err != nil {
+		return fmt.Errorf("failed to migrate vMCP everything admin groups: %w", err)
+	}
+
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, catalogEntryStaticConfigurationMigrationName, func() error {
+		return migrateCatalogEntryStaticConfiguration(ctx, c.services.StorageClient, c.services.GatewayClient)
+	}); err != nil {
+		return fmt.Errorf("failed to migrate catalog entry static configuration: %w", err)
+	}
+
+	if err := c.services.GatewayClient.MigrateKinmIfNotRun(ctx, vmcpSourceDigestMigrationName, func() error {
+		return migrateVMCPSourceDigests(ctx, c.services.StorageClient)
+	}); err != nil {
+		return fmt.Errorf("failed to migrate vMCP component source digests: %w", err)
 	}
 
 	return nil
 }
 
-func (c *Controller) ensureObotMCPServer(ctx context.Context) error {
-	agentsEnabled, err := c.services.AgentsEnabled(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to resolve agents feature: %w", err)
+// syncCatalogForMigration syncs a catalog before the vMCP migration snapshots
+// its entries. The default catalog's source is migrated first; otherwise this
+// would sync the old source and the post-start migration would sync it again.
+func (c *Controller) syncCatalogForMigration(ctx context.Context, key kclient.ObjectKey) error {
+	if key.Namespace == system.DefaultNamespace && key.Name == system.DefaultCatalog {
+		if err := c.mcpCatalogHandler.SetUpDefaultMCPCatalog(ctx, c.services.StorageClient); err != nil {
+			return err
+		}
 	}
-
-	internalURL := c.services.MCPSessionManager.TransformObotHostname(c.services.ServerURL)
-	return reconcileObotMCPServer(ctx, c.services.StorageClient, agentsEnabled, internalURL, c.services.MCPServerSearchImage)
-}
-
-func reconcileObotMCPServer(ctx context.Context, storageClient kclient.Client, agentsEnabled bool, internalURL, image string) error {
-	var existing v1.SystemMCPServer
-	err := storageClient.Get(ctx, kclient.ObjectKey{
-		Namespace: system.DefaultNamespace,
-		Name:      system.ObotMCPServerName,
-	}, &existing)
-	if err == nil {
-		// Reconcile all critical fields to ensure the server is correctly configured
-		var needsUpdate bool
-
-		if agentsEnabled && existing.Spec.Manifest.Enabled != nil {
-			existing.Spec.Manifest.Enabled = nil
-			needsUpdate = true
-		} else if !agentsEnabled && (existing.Spec.Manifest.Enabled == nil || *existing.Spec.Manifest.Enabled) {
-			existing.Spec.Manifest.Enabled = new(false)
-			needsUpdate = true
-		}
-
-		if existing.Spec.Manifest.Runtime != types.RuntimeContainerized {
-			existing.Spec.Manifest.Runtime = types.RuntimeContainerized
-			needsUpdate = true
-		}
-
-		expectedConfig := &types.ContainerizedRuntimeConfig{
-			Image:       image,
-			Port:        8080,
-			Path:        "/mcp",
-			HealthzPath: "/healthz",
-		}
-		if existing.Spec.Manifest.ContainerizedConfig == nil {
-			existing.Spec.Manifest.ContainerizedConfig = expectedConfig
-			needsUpdate = true
-		} else {
-			if existing.Spec.Manifest.ContainerizedConfig.Image != expectedConfig.Image {
-				existing.Spec.Manifest.ContainerizedConfig.Image = expectedConfig.Image
-				needsUpdate = true
-			}
-			if existing.Spec.Manifest.ContainerizedConfig.Port != expectedConfig.Port {
-				existing.Spec.Manifest.ContainerizedConfig.Port = expectedConfig.Port
-				needsUpdate = true
-			}
-			if existing.Spec.Manifest.ContainerizedConfig.Path != expectedConfig.Path {
-				existing.Spec.Manifest.ContainerizedConfig.Path = expectedConfig.Path
-				needsUpdate = true
-			}
-			if existing.Spec.Manifest.ContainerizedConfig.HealthzPath != expectedConfig.HealthzPath {
-				existing.Spec.Manifest.ContainerizedConfig.HealthzPath = expectedConfig.HealthzPath
-				needsUpdate = true
-			}
-		}
-
-		// Check OBOT_URL env var
-		var foundOBOTURLEntry bool
-		for i, env := range existing.Spec.Manifest.Config {
-			if env.Key == "OBOT_URL" {
-				foundOBOTURLEntry = true
-				if env.Value != internalURL {
-					existing.Spec.Manifest.Config[i].Value = internalURL
-					needsUpdate = true
-				}
-			}
-		}
-		if !foundOBOTURLEntry {
-			existing.Spec.Manifest.Config = append(existing.Spec.Manifest.Config, types.MCPConfig{
-				Name:     "OBOT_URL",
-				Key:      "OBOT_URL",
-				Required: true,
-				Value:    internalURL,
-				Usage:    types.Env,
-			})
-			needsUpdate = true
-		}
-
-		if needsUpdate {
-			slog.Info("Updating obot MCP server", "image", image)
-			return storageClient.Update(ctx, &existing)
-		}
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	// Create the SystemMCPServer
-	slog.Info("Creating obot MCP server", "image", image)
-	var enabled *bool
-	if !agentsEnabled {
-		enabled = new(false)
-	}
-	server := &v1.SystemMCPServer{
-		Name:       system.ObotMCPServerName,
-		Namespace:  system.DefaultNamespace,
-		Finalizers: []string{v1.SystemMCPServerFinalizer},
-		Spec: v1.SystemMCPServerSpec{
-			Manifest: types.SystemMCPServerManifest{
-				Name:             "Obot MCP Server",
-				ShortDescription: "MCP server for discovering and searching available MCP servers",
-				Enabled:          enabled,
-				Runtime:          types.RuntimeContainerized,
-				ContainerizedConfig: &types.ContainerizedRuntimeConfig{
-					Image: image,
-					Port:  8080,
-					Path:  "/mcp",
-				},
-				Config: []types.MCPConfig{{
-					Name:     "OBOT_URL",
-					Key:      "OBOT_URL",
-					Required: true,
-					Value:    internalURL,
-					Usage:    types.Env,
-				}},
-			},
-		},
-	}
-
-	return storageClient.Create(ctx, server)
+	return c.mcpCatalogHandler.SyncNow(ctx, c.services.StorageClient, key)
 }
 
 func (c *Controller) PostStart(ctx context.Context, client kclient.Client) {
@@ -265,6 +191,10 @@ func (c *Controller) PostStart(ctx context.Context, client kclient.Client) {
 	// notifications, and a peer that was not sending them leaves the cache up to a
 	// poll interval behind. Have every watch list again before acting on it.
 	c.services.StorageDB.Refresh()
+	if c.services.Substrate != nil {
+		handler := &agentinstance.Handler{Substrate: c.services.Substrate, Gateway: c.services.GatewayClient}
+		go handler.RunMaintenance(ctx, client)
+	}
 
 	if err := providerconfigurationchange.CleanupOrphanedStagedCredentials(
 		ctx,
@@ -432,38 +362,6 @@ func ensureDefaultUserRoleSetting(ctx context.Context, client kclient.Client) er
 	return client.Update(ctx, &defaultRoleSetting)
 }
 
-func ensureHostedAgentPoolDefaults(ctx context.Context, client kclient.Client) error {
-	const gibibyte = int64(1024 * 1024 * 1024)
-
-	var defaults v1.HostedAgentPoolDefaults
-	key := kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: "default"}
-	if err := client.Get(ctx, key, &defaults); err == nil {
-		// Defaults are administrator-owned after creation.
-		return nil
-	} else if !apierrors.IsNotFound(err) {
-		return err
-	}
-
-	return client.Create(ctx, &v1.HostedAgentPoolDefaults{
-		Name:      key.Name,
-		Namespace: key.Namespace,
-		Spec: v1.HostedAgentPoolDefaultsSpec{
-			Manifest: types.HostedAgentPoolDefaultsManifest{
-				Capacity: types.HostedAgentResourceQuantity{
-					CPUVCPUs:     1,
-					MemoryBytes:  4 * gibibyte,
-					StorageBytes: 20 * gibibyte,
-				},
-				// Seeded explicitly rather than left to the fallback, so an
-				// administrator opening the defaults sees the number that is
-				// actually in force. With the capacity above this gives each
-				// sandbox 250m CPU and 1GiB guaranteed.
-				MaxSandboxes: 4,
-			},
-		},
-	})
-}
-
 // ensureK8sSettings ensures the K8sSettings resource exists with proper configuration.
 // podSchedulingSettings: affinity, tolerations, resources, runtimeClassName - can be managed via Helm OR UI.
 //
@@ -497,8 +395,6 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 			k8sSettings.Spec.Tolerations = podSchedulingSettings.Tolerations
 			k8sSettings.Spec.Resources = podSchedulingSettings.Resources
 			k8sSettings.Spec.RuntimeClassName = podSchedulingSettings.RuntimeClassName
-			k8sSettings.Spec.StorageClassName = podSchedulingSettings.StorageClassName
-			k8sSettings.Spec.NanobotWorkspaceSize = podSchedulingSettings.NanobotWorkspaceSize
 		}
 		if maximumsSetViaHelm {
 			setK8sSettingsMaximums(&k8sSettings.Spec, podSchedulingSettings)
@@ -525,16 +421,12 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 			!affinityEqual(k8sSettings.Spec.Affinity, podSchedulingSettings.Affinity) ||
 			!tolerationsEqual(k8sSettings.Spec.Tolerations, podSchedulingSettings.Tolerations) ||
 			!resourcesEqual(k8sSettings.Spec.Resources, podSchedulingSettings.Resources) ||
-			!classNameEqual(k8sSettings.Spec.RuntimeClassName, podSchedulingSettings.RuntimeClassName) ||
-			!classNameEqual(k8sSettings.Spec.StorageClassName, podSchedulingSettings.StorageClassName) ||
-			!workspaceSizeEqual(k8sSettings.Spec.NanobotWorkspaceSize, podSchedulingSettings.NanobotWorkspaceSize) {
+			!classNameEqual(k8sSettings.Spec.RuntimeClassName, podSchedulingSettings.RuntimeClassName) {
 			k8sSettings.Spec.SetViaHelm = true
 			k8sSettings.Spec.Affinity = podSchedulingSettings.Affinity
 			k8sSettings.Spec.Tolerations = podSchedulingSettings.Tolerations
 			k8sSettings.Spec.Resources = podSchedulingSettings.Resources
 			k8sSettings.Spec.RuntimeClassName = podSchedulingSettings.RuntimeClassName
-			k8sSettings.Spec.StorageClassName = podSchedulingSettings.StorageClassName
-			k8sSettings.Spec.NanobotWorkspaceSize = podSchedulingSettings.NanobotWorkspaceSize
 			needsUpdate = true
 		}
 	} else if k8sSettings.Spec.SetViaHelm {
@@ -545,8 +437,6 @@ func ensureK8sSettings(ctx context.Context, client kclient.Client, podScheduling
 		k8sSettings.Spec.Tolerations = nil
 		k8sSettings.Spec.Resources = nil
 		k8sSettings.Spec.RuntimeClassName = nil
-		k8sSettings.Spec.StorageClassName = nil
-		k8sSettings.Spec.NanobotWorkspaceSize = ""
 		needsUpdate = true
 	}
 
@@ -626,9 +516,7 @@ func hasHelmPodSchedulingSettings(settings *v1.K8sSettingsSpec) bool {
 		return false
 	}
 	return settings.SetViaHelm || settings.Affinity != nil || len(settings.Tolerations) > 0 ||
-		settings.Resources != nil || settings.NanobotAgentResources != nil ||
-		settings.RuntimeClassName != nil || settings.StorageClassName != nil ||
-		settings.NanobotWorkspaceSize != ""
+		settings.Resources != nil || settings.RuntimeClassName != nil
 }
 
 func resourceMaximumsEqual(a, b v1.K8sSettingsSpec) bool {
@@ -660,10 +548,6 @@ func classNameEqual(a, b *string) bool {
 		return false
 	}
 	return *a == *b
-}
-
-func workspaceSizeEqual(a, b string) bool {
-	return a == b
 }
 
 func psaSettingsEqual(a, b *v1.PodSecurityAdmissionSettings) bool {
@@ -701,9 +585,6 @@ func ensureAppPreferences(ctx context.Context, client kclient.Client) error {
 
 // setupLocalK8sRoutes sets up routes for the local Kubernetes router
 func (c *Controller) setupLocalK8sRoutes() {
-	// The local router now also exists when only hosted agents run on
-	// Kubernetes, so these are gated on the MCP backend rather than on the
-	// router: every one of them reconciles MCP state from cluster objects.
 	if c.services.LocalRouter != nil && mcp.IsKubernetesBackend(c.services.MCPRuntimeBackend) {
 		deploymentHandler := deployment.New(
 			c.services.MCPServerNamespace,
@@ -714,16 +595,27 @@ func (c *Controller) setupLocalK8sRoutes() {
 		c.services.LocalRouter.Type(&appsv1.Deployment{}).IncludeRemoved().HandlerFunc(deploymentHandler.UpdateMCPServerStatus)
 		c.services.LocalRouter.Type(&appsv1.Deployment{}).HandlerFunc(deploymentHandler.CleanupOldIDs)
 
-		secretHandler := secret.New(c.services.MCPServerNamespace, c.services.GatewayClient)
-		c.services.LocalRouter.Type(&corev1.Secret{}).Namespace(c.services.MCPServerNamespace).HandlerFunc(secretHandler.UpdateNanobotAgentCreds)
 		// Reconcile delete/update events for the provider token secret immediately,
 		// instead of waiting for the periodic service-account key rotation loop.
 		c.services.LocalRouter.Type(&corev1.Secret{}).Namespace(c.services.ServiceNamespace).Name(serviceaccounts.NetworkPolicySecretName).IncludeRemoved().HandlerFunc(c.reconcileServiceAccountSecretChange)
+		// Secrets bound to MCP server config live in the obot namespace. Recheck the
+		// servers bound to one when it changes, so their status stays current.
+		c.services.LocalRouter.Type(&corev1.Secret{}).Namespace(c.services.ObotNamespace).IncludeRemoved().HandlerFunc(c.secretBindingHandler().SyncMCPServersForSecret)
 	}
 	if c.services.K8SEveryReplicaRouter != nil {
 		peerHandler := tunnelpeer.New(c.services.TunnelManager.ID, c.services.TunnelManager)
 		c.services.K8SEveryReplicaRouter.Type(&corev1.Service{}).Namespace(c.services.TunnelManager.ServiceNamespace).Name(c.services.TunnelManager.ServiceName).HandlerFunc(peerHandler.Reconcile)
 	}
+}
+
+// secretBindingHandler returns the handler that records which MCP server secret
+// bindings cannot be resolved. It reads Secrets from the local router's cache.
+func (c *Controller) secretBindingHandler() *secretbinding.Handler {
+	var secretClient kclient.Client
+	if c.services.LocalRouter != nil && mcp.IsKubernetesBackend(c.services.MCPRuntimeBackend) {
+		secretClient = c.services.LocalRouter.Backend()
+	}
+	return secretbinding.New(c.services.Router.Backend(), secretClient, c.services.ObotNamespace, c.services.MCPSecretBindingAllowedLabel)
 }
 
 // ensureLocalAuthProvider creates or updates the AuthProvider resource for the built-in local

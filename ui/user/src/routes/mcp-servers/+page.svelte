@@ -5,12 +5,14 @@
 	import TabLayout from '$lib/components/TabLayout.svelte';
 	import McpServerEntryForm from '$lib/components/admin/McpServerEntryForm.svelte';
 	import McpServerGitSync from '$lib/components/admin/McpServerGitSync.svelte';
+	import MessagePoliciesView from '$lib/components/admin/MessagePoliciesView.svelte';
 	import SelectServerType from '$lib/components/mcp/SelectServerType.svelte';
 	import {
 		DEFAULT_MCP_CATALOG_ID,
 		MCP_ACCESS_POLICY_FIELD_IDS,
 		MCP_FILTERS_FIELD_IDS
 	} from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import {
 		AdminService,
@@ -20,7 +22,8 @@
 		type MCPCatalog,
 		type OrgUser
 	} from '$lib/services';
-	import { mcpServersAndEntries, profile } from '$lib/stores';
+	import type { OpenAPIImportDraft } from '$lib/services/openapi';
+	import { mcpServersAndEntries, profile, version } from '$lib/stores';
 	import {
 		clearUrlParams,
 		getTableUrlParamsFilters,
@@ -48,9 +51,11 @@
 		'deployments',
 		'filters',
 		'tunnels',
+		'ai-judge-policies',
 		'access-policies'
 	] as const;
-	const serverTypes: LaunchServerType[] = ['hosted', 'multi', 'remote'];
+	const serverTypes: LaunchServerType[] = ['hosted', 'multi', 'remote', 'openapi'];
+	let initialOpenAPIImport = $state<OpenAPIImportDraft>();
 
 	const { data } = $props();
 	const { workspaceId } = $derived(data);
@@ -69,6 +74,7 @@
 	let syncInterval = $state<ReturnType<typeof setInterval>>();
 
 	let hasAdminAccess = $derived(profile.current.hasAdminAccess?.());
+	let messagePoliciesEnabled = $derived(version.current.messagePoliciesEnabled === true);
 	let isAdminReadonly = $derived(profile.current.isAdminReadonly?.());
 	let isPowerUser = $derived(profile.current.groups.includes(Group.POWERUSER));
 	let isPowerUserPlus = $derived(profile.current.groups.includes(Group.POWERUSER_PLUS));
@@ -92,42 +98,101 @@
 	let creating = $derived.by(() => {
 		if (!page.url.searchParams.has('new')) return false;
 		const isNewEntry = selectedView === 'entries' && !!newServerType;
+		if (
+			isNewEntry &&
+			newServerType === 'openapi' &&
+			(!profile.current.isAdmin?.() || !initialOpenAPIImport)
+		) {
+			return false;
+		}
 		if (isPowerUser && isNewEntry) return true;
 		if (isPowerUserPlus && (isNewEntry || selectedView === 'access-policies')) return true;
 		if (hasAdminAccess && !isAdminReadonly) {
-			return isNewEntry || ['access-policies', 'filters', 'tunnels'].includes(selectedView);
+			const adminCreateViews = [
+				'access-policies',
+				'filters',
+				'tunnels',
+				...(messagePoliciesEnabled ? ['ai-judge-policies'] : [])
+			];
+			return isNewEntry || adminCreateViews.includes(selectedView);
 		}
 		return false;
 	});
 	let layoutTitle = $derived.by(() => {
-		if (!creating) return 'MCP Servers';
+		if (!creating) return m.nav_mcp_servers();
 		switch (selectedView) {
 			case 'entries':
-				return 'Add MCP Server';
+				return m.mcps_add_mcp_server();
 			case 'filters':
-				return 'Create Filter';
+				return m.mcps_filters_create_filter();
 			case 'tunnels':
-				return 'Create MCP Tunnel';
+				return m.mcps_tunnels_create_mcp_tunnel();
+			case 'ai-judge-policies':
+				return m.mcps_create_ai_judge_policy();
 			case 'access-policies':
-				return 'Create MCP Access Policy';
+				return m.mcps_create_mcp_access_policy();
 			default:
-				return 'MCP Servers';
+				return m.nav_mcp_servers();
 		}
 	});
 	let views = $derived([
 		...(hasAdminAccess || isPowerUser
-			? [{ label: 'Servers', value: 'servers', content: servers }]
+			? [
+					{
+						label: m.mcps_servers_tab(),
+						value: 'servers',
+						content: servers,
+						tooltip: m.mcps_servers_tab_tooltip()
+					}
+				]
 			: []),
 		...(hasAdminAccess
 			? [
-					{ label: 'Sources', value: 'sources', content: sources },
-					{ label: 'Deployments', value: 'deployments', content: deployments },
-					{ label: 'Filters', value: 'filters', content: filters },
-					{ label: 'Tunnels', value: 'tunnels', content: tunnels }
+					{
+						label: m.mcps_sources_tab(),
+						value: 'sources',
+						content: sources,
+						tooltip: m.mcps_sources_tab_tooltip()
+					},
+					{
+						label: m.mcps_deployments_tab(),
+						value: 'deployments',
+						content: deployments,
+						tooltip: m.mcps_deployments_tab_tooltip()
+					},
+					{
+						label: m.core_filters_title(),
+						value: 'filters',
+						content: filters,
+						tooltip: m.mcps_filters_tab_tooltip()
+					},
+					{
+						label: m.mcps_tunnels_tab(),
+						value: 'tunnels',
+						content: tunnels,
+						tooltip: m.mcps_tunnels_tab_tooltip()
+					}
 				]
 			: []),
 		...(isPowerUserPlus || hasAdminAccess
-			? [{ label: 'Access Policies', value: 'access-policies', content: accessPolicy }]
+			? [
+					{
+						label: m.mcps_access_policies_tab(),
+						value: 'access-policies',
+						content: accessPolicy,
+						tooltip: m.mcps_access_policies_tab_tooltip()
+					}
+				]
+			: []),
+		...(hasAdminAccess && messagePoliciesEnabled
+			? [
+					{
+						label: m.mcps_ai_judge_policies_tab(),
+						value: 'ai-judge-policies',
+						content: messagePolicies,
+						tooltip: m.mcps_ai_judge_policies_tab_tooltip()
+					}
+				]
 			: [])
 	]);
 
@@ -191,12 +256,14 @@
 		}
 	}
 
-	function selectServerType(type: LaunchServerType) {
+	function selectServerType(type: LaunchServerType, openAPIImport?: OpenAPIImportDraft) {
 		selectServerTypeDialog?.close();
+		initialOpenAPIImport = type === 'openapi' ? openAPIImport : undefined;
 		openCreate('entries', type);
 	}
 
 	function closeCreateScreen() {
+		initialOpenAPIImport = undefined;
 		goto(`${page.url.pathname}?view=${selectedView}`);
 	}
 
@@ -205,6 +272,7 @@
 	}
 
 	function handleEntryCreated(id: string, _isMultiUserEntry: boolean, message?: string) {
+		initialOpenAPIImport = undefined;
 		goto(getCreatedEntryUrl(id, newServerType, message), { replaceState: true });
 	}
 
@@ -223,6 +291,7 @@
 	<Layout title={layoutTitle} showBackButton onBackButtonClick={closeCreateScreen}>
 		{#if selectedView === 'entries'}
 			<McpServerEntryForm
+				{initialOpenAPIImport}
 				entity={hasAdminAccess ? 'catalog' : 'workspace'}
 				id={hasAdminAccess ? defaultCatalogId : (workspaceId ?? '')}
 				type={newServerType}
@@ -234,13 +303,15 @@
 			{@render filters()}
 		{:else if selectedView === 'tunnels'}
 			{@render tunnels()}
+		{:else if selectedView === 'ai-judge-policies'}
+			{@render messagePolicies()}
 		{:else if selectedView === 'access-policies'}
 			{@render accessPolicy()}
 		{/if}
 	</Layout>
 {:else}
 	<TabLayout
-		title="MCP Servers"
+		title={m.nav_mcp_servers()}
 		defaultView="servers"
 		rightNavActions={navActions}
 		{views}
@@ -255,15 +326,16 @@
 			id="add-catalog-entry-button"
 			onclick={() => selectServerTypeDialog?.open()}
 		>
-			<Plus class="size-4" /> Add MCP Server
+			<Plus class="size-4" />
+			{m.mcps_add_mcp_server()}
 		</button>
 	{:else if view === 'sources' && hasAdminAccess && !isAdminReadonly}
 		<button class="btn btn-secondary flex items-center gap-1 text-sm" onclick={sync}>
 			{#if syncing}
-				<Loading class="size-4" /> Syncing...
+				<Loading class="size-4" /> {m.mcps_syncing()}
 			{:else}
 				<RefreshCcw class="size-4" />
-				Sync
+				{m.mcps_sync()}
 			{/if}
 		</button>
 		<button
@@ -271,7 +343,8 @@
 			class="btn btn-primary btn-block w-full text-sm md:w-52"
 			onclick={() => sourceDialog?.open()}
 		>
-			<Plus class="size-4" /> Add Source URL
+			<Plus class="size-4" />
+			{m.mcps_add_source_url()}
 		</button>
 	{:else if view === 'filters' && !isAdminReadonly}
 		{#if filtersLoading}
@@ -282,11 +355,12 @@
 			placement="bottom"
 			classes={{ popover: 'z-50' }}
 			id={MCP_FILTERS_FIELD_IDS.addFilterBtn}
-			ariaLabel="Add New Filter"
+			ariaLabel={m.mcps_add_new_filter()}
 		>
 			{#snippet icon()}
 				<span class="flex items-center justify-center gap-1">
-					<Plus class="size-4" /> Add New Filter
+					<Plus class="size-4" />
+					{m.mcps_add_new_filter()}
 				</span>
 			{/snippet}
 			<button
@@ -294,7 +368,7 @@
 				class="menu-button"
 				onclick={() => openCreate('filters')}
 			>
-				Create Custom
+				{m.mcps_create_custom()}
 			</button>
 			<button
 				id={MCP_FILTERS_FIELD_IDS.createBuiltInBtn}
@@ -302,7 +376,7 @@
 				disabled={data.systemCatalogEntries.length === 0}
 				onclick={() => filtersTab?.openBuiltInPicker()}
 			>
-				Create From Built-in
+				{m.mcps_create_from_built_in()}
 			</button>
 		</DotDotDot>
 	{:else if view === 'tunnels' && !isAdminReadonly}
@@ -311,7 +385,15 @@
 			onclick={() => openCreate('tunnels')}
 		>
 			<Plus class="size-4" />
-			Create MCP Tunnel
+			{m.mcps_tunnels_create_mcp_tunnel()}
+		</button>
+	{:else if view === 'ai-judge-policies' && messagePoliciesEnabled && !isAdminReadonly}
+		<button
+			class="btn btn-primary flex items-center gap-1 text-sm"
+			onclick={() => openCreate('ai-judge-policies')}
+		>
+			<Plus class="size-4" />
+			{m.mcps_add_ai_judge_policy()}
 		</button>
 	{:else if view === 'access-policies' && !isAdminReadonly}
 		<button
@@ -319,7 +401,8 @@
 			class="btn btn-primary flex items-center gap-1 text-sm"
 			onclick={() => openCreate('access-policies')}
 		>
-			<Plus class="size-4" /> Add Access Policy
+			<Plus class="size-4" />
+			{m.mcps_access_policies_add_access_policy()}
 		</button>
 	{/if}
 {/snippet}
@@ -372,6 +455,14 @@
 	<TunnelsView mcpTunnels={data.mcpTunnels} tunnelConnections={data.tunnelConnections} />
 {/snippet}
 
+{#snippet messagePolicies()}
+	<MessagePoliciesView
+		messagePolicies={data.messagePolicies ?? []}
+		policyDirection="tool-calls"
+		creating={creating && selectedView === 'ai-judge-policies'}
+	/>
+{/snippet}
+
 {#snippet accessPolicy()}
 	<McpPoliciesView
 		accessControlRules={data.accessControlRules}
@@ -383,9 +474,9 @@
 {#snippet displayNoData()}
 	<div class="my-12 flex w-md flex-col items-center gap-4 self-center text-center">
 		<Server class="text-muted-content size-24 opacity-25" />
-		<h4 class="text-muted-content text-lg font-semibold">No created MCP Servers</h4>
+		<h4 class="text-muted-content text-lg font-semibold">{m.mcps_no_created_servers()}</h4>
 		<p class="text-muted-content text-sm font-light">
-			Looks like you don't have any MCP servers created yet.
+			{m.mcps_no_created_servers_description()}
 		</p>
 	</div>
 {/snippet}

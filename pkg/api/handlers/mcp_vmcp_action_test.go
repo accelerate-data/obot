@@ -23,10 +23,13 @@ import (
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
+	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/rest"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -154,6 +157,122 @@ func TestClearOAuthCredentialsVMCPUsesDeclaredRemoteComponents(t *testing.T) {
 	assert.Equal(t, []string{system.DefaultNamespace + "/" + component.Name}, trigger.keys)
 }
 
+func TestClearOAuthCredentialsVMCPComponentOnlyClearsThatComponent(t *testing.T) {
+	const (
+		vmcpID      = "vmcp1clear-component-oauth"
+		userID      = "user-clear-component-oauth"
+		componentID = "component-a"
+		otherID     = "component-b"
+	)
+	vmcp, instance, component, unrelated := vmcpActionObjects(vmcpID, userID, componentID, false)
+	otherComponent := vmcp.Spec.Manifest.Components[0]
+	otherComponent.ID = otherID
+	otherComponent.Name = otherID
+	otherComponent.MCPServerCatalogEntryID = "entry-b"
+	vmcp.Spec.Manifest.Components = append(vmcp.Spec.Manifest.Components, otherComponent)
+	other := component.DeepCopy()
+	other.Name = "ms1component-b"
+	other.Spec.VMCPComponentID = otherID
+	other.Spec.Manifest.Name = otherID
+	other.Spec.Manifest.RemoteConfig = &types.RemoteRuntimeConfig{URL: "https://other.example.com/mcp"}
+	syncedVMCPInstance(instance, vmcp)
+	manager, storage, gatewayClient := newVMCPActionSessionManager(t, vmcp, instance, component, other, unrelated)
+
+	for _, server := range []*v1.MCPServer{component, other} {
+		require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(t.Context(), userID, server.Name, server.Spec.Manifest.RemoteConfig.URL, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "token-" + server.Name}))
+	}
+
+	clearComponent := func(componentID string) (*recordingMCPServerTrigger, error) {
+		trigger := &recordingMCPServerTrigger{}
+		req := httptest.NewRequest(http.MethodDelete, "/api/vmcps/"+vmcpID+"/components/"+componentID+"/oauth", nil)
+		req.SetPathValue("vmcp_id", vmcpID)
+		req.SetPathValue("component_id", componentID)
+		recorder := httptest.NewRecorder()
+		err := (&MCPHandler{
+			mcpSessionManager: manager,
+			controllerBackend: trigger,
+		}).ClearOAuthCredentials(api.Context{
+			ResponseWriter: recorder,
+			Request:        req,
+			Storage:        storage,
+			GatewayClient:  gatewayClient,
+			User:           testUser(userID),
+		})
+		if err == nil {
+			assert.Equal(t, http.StatusNoContent, recorder.Code)
+		}
+		return trigger, err
+	}
+
+	authenticatedComponents := func() []string {
+		req := httptest.NewRequest(http.MethodGet, "/api/vmcps/"+vmcpID+"/oauth-status", nil)
+		req.SetPathValue("vmcp_id", vmcpID)
+		recorder := httptest.NewRecorder()
+		require.NoError(t, (&MCPHandler{mcpSessionManager: manager}).GetVMCPOAuthStatus(api.Context{
+			ResponseWriter: recorder,
+			Request:        req,
+			Storage:        storage,
+			GatewayClient:  gatewayClient,
+			User:           testUser(userID),
+		}))
+		var status vmcpOAuthStatus
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &status))
+		return status.AuthenticatedComponents
+	}
+	assert.ElementsMatch(t, []string{componentID, otherID}, authenticatedComponents())
+
+	trigger, err := clearComponent(otherID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{componentID}, authenticatedComponents())
+	assert.Equal(t, []string{system.DefaultNamespace + "/" + other.Name}, trigger.keys)
+
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), userID, other.Name, other.Spec.Manifest.RemoteConfig.URL)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	token, err := gatewayClient.GetMCPOAuthToken(t.Context(), userID, component.Name, component.Spec.Manifest.RemoteConfig.URL)
+	require.NoError(t, err)
+	assert.Equal(t, "token-"+component.Name, token.AccessToken)
+
+	_, err = clearComponent("missing")
+	var httpErr *types.ErrHTTP
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusNotFound, httpErr.Code)
+}
+
+func TestClearOAuthCredentialsVMCPComponentClearsTokenFromPreviousURL(t *testing.T) {
+	const (
+		vmcpID      = "vmcp1clear-moved-oauth"
+		userID      = "user-clear-moved-oauth"
+		componentID = "component-a"
+	)
+	vmcp, instance, component, unrelated := vmcpActionObjects(vmcpID, userID, componentID, false)
+	manager, storage, gatewayClient := newVMCPActionSessionManager(t, vmcp, instance, component, unrelated)
+
+	// The user authenticated before the component's URL changed. Token lookups
+	// still fall back to this token, so the reset must remove it too.
+	require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(t.Context(), userID, component.Name, "https://old.example.com/mcp", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "old-token"}))
+	_, err := gatewayClient.GetMCPOAuthToken(t.Context(), userID, component.Name, component.Spec.Manifest.RemoteConfig.URL)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/vmcps/"+vmcpID+"/components/"+componentID+"/oauth", nil)
+	req.SetPathValue("vmcp_id", vmcpID)
+	req.SetPathValue("component_id", componentID)
+	recorder := httptest.NewRecorder()
+	require.NoError(t, (&MCPHandler{
+		mcpSessionManager: manager,
+		controllerBackend: &recordingMCPServerTrigger{},
+	}).ClearOAuthCredentials(api.Context{
+		ResponseWriter: recorder,
+		Request:        req,
+		Storage:        storage,
+		GatewayClient:  gatewayClient,
+		User:           testUser(userID),
+	}))
+	assert.Equal(t, http.StatusNoContent, recorder.Code)
+
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), userID, component.Name, component.Spec.Manifest.RemoteConfig.URL)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
 func TestAggregateComponentServersForActionVMCPUsesServerConfigComponents(t *testing.T) {
 	declared := &v1.MCPServer{
 		ObjectMeta: objectMetaForVMCPActionTest("ms1declared"),
@@ -215,6 +334,10 @@ func vmcpActionObjects(vmcpID, userID, componentID string, staticOAuth bool) (*v
 					MCPCatalogID:            system.DefaultCatalog,
 					MCPServerCatalogEntryID: "entry-a",
 				}},
+				Profiles: []types.VMCPProfile{{
+					Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+					Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+				}},
 			},
 		},
 	}
@@ -256,7 +379,16 @@ func vmcpActionObjects(vmcpID, userID, componentID string, staticOAuth bool) (*v
 			},
 		},
 	}
-	return vmcp, instance, component, unrelated
+	return vmcp, syncedVMCPInstance(instance, vmcp), component, unrelated
+}
+
+// syncedVMCPInstance records the configuration check the VMCPInstance controller
+// performs for an instance without saved configuration. Call it again after
+// changing the vMCP's components.
+func syncedVMCPInstance(instance *v1.VMCPInstance, vmcp *v1.VMCP) *v1.VMCPInstance {
+	enabled := vmcpconfig.EnabledComponents(&kuser.DefaultInfo{UID: instance.Spec.UserID}, *vmcp, vmcpconfig.ComponentsForInstance(*vmcp, *instance))
+	instance.Status.ConfigurationCheckHash = vmcpconfig.ConfigurationCheckHash(enabled, "")
+	return instance
 }
 
 func (r *recordingMCPServerTrigger) Trigger(_ context.Context, _ schema.GroupVersionKind, key string, _ time.Duration) error {
@@ -269,6 +401,7 @@ func newVMCPActionSessionManager(t *testing.T, objects ...kclient.Object) (*mcp.
 
 	storageClient := &vmcpActionInitialEventsClient{WithWatch: clientfake.NewClientBuilder().
 		WithScheme(storagescheme.Scheme).
+		WithStatusSubresource(&v1.MCPServerInstance{}).
 		WithIndex(&v1.MCPServerInstance{}, "spec.vmcpInstanceID", func(obj kclient.Object) []string { return []string{obj.(*v1.MCPServerInstance).Spec.VMCPInstanceID} }).
 		WithIndex(&v1.MCPServer{}, "spec.vmcpID", func(obj kclient.Object) []string { return []string{obj.(*v1.MCPServer).Spec.VMCPID} }).
 		WithIndex(&v1.VMCPInstance{}, "spec.userID", func(obj kclient.Object) []string {
@@ -297,6 +430,7 @@ func newVMCPActionSessionManager(t *testing.T, objects ...kclient.Object) (*mcp.
 
 	manager, err := mcp.NewSessionManager(
 		t.Context(),
+		false,
 		false,
 		nil,
 		nil,
@@ -390,6 +524,7 @@ func TestSharedVMCPConnectionsPreserveSameUserConfiguration(t *testing.T) {
 	// The server owner's credential context differs from the connecting user's.
 	server.Spec.UserID = ""
 	server.Spec.Manifest.Config = []types.MCPConfig{header}
+	syncedVMCPInstance(first, vmcp)
 	second := first.DeepCopy()
 	second.Name = "vmcpi1second"
 	manager, storage, credentials := newVMCPActionSessionManager(t, vmcp, first, second, server)
@@ -416,12 +551,12 @@ func TestSharedVMCPConnectionsPreserveSameUserConfiguration(t *testing.T) {
 	var previousScope string
 	for _, i := range []int{0, 1, 0} {
 		instance := []*v1.VMCPInstance{first, second}[i]
-		cfg, err := manager.ServerConfigForVMCP(t.Context(), instance.Name, instance.Spec.UserID)
+		cfg, err := manager.ServerConfigForVMCP(t.Context(), instance.Name, &kuser.DefaultInfo{UID: instance.Spec.UserID})
 		require.NoError(t, err)
 		require.Equal(t, instance.Name, cfg.MCPServerName)
 		require.Equal(t, connections[i].Name, cfg.Components[0].ConnectID())
 		require.Equal(t, system.LocalMCPConnectURL(connections[i].Name, 8080), mcp.MMMCPConfig(cfg, nil).Servers[0].URL)
-		id, resolved, componentConfig, err := manager.ServerForActionWithConnectID(t.Context(), connections[i].Name, instance.Spec.UserID)
+		id, resolved, componentConfig, err := manager.ServerForActionWithConnectID(t.Context(), connections[i].Name, &kuser.DefaultInfo{UID: instance.Spec.UserID})
 		require.NoError(t, err)
 		require.Equal(t, connections[i].Name, id)
 		require.Equal(t, server.Name, resolved.Name)
@@ -432,7 +567,7 @@ func TestSharedVMCPConnectionsPreserveSameUserConfiguration(t *testing.T) {
 		}
 		previousScope = componentConfig.Scope
 	}
-	_, _, _, err := manager.ServerForActionWithConnectID(t.Context(), connections[0].Name, "other")
+	_, _, _, err := manager.ServerForActionWithConnectID(t.Context(), connections[0].Name, &kuser.DefaultInfo{UID: "other"})
 	require.Error(t, err)
 
 	// Revoking the policy must remove projected secrets, including values cached in Config.

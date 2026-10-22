@@ -112,12 +112,12 @@ func startObotApplication() (*obotApplication, error) {
 
 func integrationServerConfig(httpPort, storagePort int, workDir string) services.Config {
 	config := services.Config{
+		GitMaxRepoSizeMB:                  100,
 		HTTPListenPort:                    httpPort,
 		DevMode:                           true,
 		ElectionFile:                      filepath.Join(workDir, "election"),
 		MCPOAuthClientExpiration:          "30d",
 		DisableUpdateCheck:                true,
-		MCPServerSearchImage:              "ghcr.io/obot-platform/obot-mcp-server:v0.2.0",
 		StorageListenPort:                 storagePort,
 		DSN:                               "sqlite://file:" + filepath.Join(workDir, "obot.db") + "?_journal=WAL&_busy_timeout=30000",
 		DailyUserInputTokenLimit:          -1,
@@ -126,11 +126,10 @@ func integrationServerConfig(httpPort, storagePort int, workDir string) services
 		AuthenticatedRateLimit:            200,
 		AuditLogsMode:                     "off",
 		MCPRuntimeBackend:                 "docker",
-		MCPBaseImage:                      "ghcr.io/obot-platform/mcp-images/stdio-wrapper:v0.26.0",
+		MCPBaseImage:                      "ghcr.io/obot-platform/mcp-images/stdio-wrapper:v0.26.2",
 		MCPSecretBindingAllowedLabel:      "obot.obot.ai/allow-secret-binding",
 		SingleUserIdleServerShutdownHours: -1,
 		MultiUserIdleServerShutdownHours:  -1,
-		IdleAgentShutdownHours:            -1,
 		MCPAuditLogPersistIntervalSeconds: 5,
 		MCPAuditLogsPersistBatchSize:      1000,
 	}

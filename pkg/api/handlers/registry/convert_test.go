@@ -4,27 +4,25 @@ import (
 	"testing"
 
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 )
 
-func TestConvertMCPServerCatalogEntryToRegistryRemoteFixedURLHasRemote(t *testing.T) {
+func TestConvertMCPServerCatalogEntryToRegistryRemoteFixedURLRequiresVMCP(t *testing.T) {
 	entry := registryTestCatalogEntry(types.RemoteCatalogConfig{
 		FixedURL: "https://api.example.com/mcp",
 	})
 
-	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher())
+	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got.Meta.Obot != nil && got.Meta.Obot.ConfigurationRequired {
-		t.Fatalf("expected fixed URL entry to be directly connectable, got obot meta %#v", got.Meta.Obot)
+	if got.Meta.Obot == nil || !got.Meta.Obot.ConfigurationRequired {
+		t.Fatalf("expected fixed URL entry to require a vMCP, got obot meta %#v", got.Meta.Obot)
 	}
-	if len(got.Server.Remotes) != 1 {
-		t.Fatalf("remote count = %d, want 1", len(got.Server.Remotes))
-	}
-	if got.Server.Remotes[0].URL != "https://obot.example.com/mcp-connect/remote-entry" {
-		t.Fatalf("remote URL = %q, want mcp-connect URL", got.Server.Remotes[0].URL)
+	if len(got.Server.Remotes) != 0 {
+		t.Fatalf("remote count = %d, want 0", len(got.Server.Remotes))
 	}
 }
 
@@ -33,7 +31,7 @@ func TestConvertMCPServerCatalogEntryToRegistryRemoteHostnameRequiresConfigurati
 		Hostname: "api.example.com",
 	})
 
-	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher())
+	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +49,7 @@ func TestConvertMCPServerCatalogEntryToRegistryRemoteURLTemplateRequiresConfigur
 		URLTemplate: "https://${WORKSPACE}.example.com/mcp",
 	})
 
-	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher())
+	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +68,7 @@ func TestConvertMCPServerCatalogEntryToRegistryRemoteStaticOAuthRequiresConfigur
 		StaticOAuthRequired: true,
 	})
 
-	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher())
+	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,16 +81,16 @@ func TestConvertMCPServerCatalogEntryToRegistryRemoteStaticOAuthRequiresConfigur
 	}
 
 	entry.Status.OAuthCredentialConfigured = true
-	got, err = ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher())
+	got, err = ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got.Meta.Obot != nil && got.Meta.Obot.ConfigurationRequired {
-		t.Fatalf("expected configured static OAuth entry to be directly connectable, got obot meta %#v", got.Meta.Obot)
+	if got.Meta.Obot == nil || !got.Meta.Obot.ConfigurationRequired {
+		t.Fatalf("expected configured static OAuth entry to require a vMCP, got obot meta %#v", got.Meta.Obot)
 	}
-	if len(got.Server.Remotes) != 1 {
-		t.Fatalf("remote count = %d, want 1", len(got.Server.Remotes))
+	if len(got.Server.Remotes) != 0 {
+		t.Fatalf("remote count = %d, want 0", len(got.Server.Remotes))
 	}
 }
 
@@ -112,7 +110,7 @@ func TestConvertMCPServerToRegistryNeedsURLRequiresConfiguration(t *testing.T) {
 		},
 	}
 
-	got, err := ConvertMCPServerToRegistry(t.Context(), server, nil, "https://obot.example.com", server.Name, "com.example.obot", "user-1", newMimeFetcher())
+	got, err := ConvertMCPServerToRegistry(t.Context(), server, nil, "https://obot.example.com", server.Name, "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,6 +120,47 @@ func TestConvertMCPServerToRegistryNeedsURLRequiresConfiguration(t *testing.T) {
 	}
 	if len(got.Server.Remotes) != 0 {
 		t.Fatalf("expected no remotes for server needing URL, got %#v", got.Server.Remotes)
+	}
+}
+
+func TestConvertMCPServerToRegistryConfiguredServersRequireVMCP(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		userID string
+	}{
+		{
+			name: "shared",
+		},
+		{
+			name:   "personal",
+			userID: "user-1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := v1.MCPServer{
+				Name: "ms1configured",
+				Spec: v1.MCPServerSpec{
+					UserID: tc.userID,
+					Manifest: types.MCPServerManifest{
+						Name:    "Configured server",
+						Runtime: types.RuntimeRemote,
+						RemoteConfig: &types.RemoteRuntimeConfig{
+							URL: "https://api.example.com/mcp",
+						},
+					},
+				},
+			}
+			got, err := ConvertMCPServerToRegistry(t.Context(), server, nil, "https://obot.example.com", server.Name, "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Meta.Obot == nil || !got.Meta.Obot.ConfigurationRequired {
+				t.Fatalf("expected configured server to require a vMCP, got obot meta %#v", got.Meta.Obot)
+			}
+			if len(got.Server.Remotes) != 0 {
+				t.Fatalf("expected no direct connection URLs, got remotes %#v", got.Server.Remotes)
+			}
+		})
 	}
 }
 
@@ -141,5 +180,39 @@ func registryTestCatalogEntry(remoteConfig types.RemoteCatalogConfig) v1.MCPServ
 				},
 			},
 		},
+	}
+}
+
+func TestLocalhostCallbackCatalogEntryHasNoDirectRemote(t *testing.T) {
+	entry := registryTestCatalogEntry(types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp"})
+	entry.Spec.Manifest.RemoteConfig.LocalhostCallbackEnabled = true
+	got, err := ConvertMCPServerCatalogEntryToRegistry(t.Context(), entry, "https://obot.example.com", "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Meta.Obot == nil || !got.Meta.Obot.ConfigurationRequired {
+		t.Fatalf("expected vMCP connection to be required, got %#v", got.Meta.Obot)
+	}
+	if len(got.Server.Remotes) != 0 {
+		t.Fatalf("expected no direct remote, got %#v", got.Server.Remotes)
+	}
+}
+
+func TestLocalhostCallbackServerHasNoDirectRemote(t *testing.T) {
+	server := v1.MCPServer{}
+	server.Spec.Manifest.Runtime = types.RuntimeRemote
+	server.Spec.Manifest.RemoteConfig = &types.RemoteRuntimeConfig{
+		URL:                      "https://example.com/mcp",
+		LocalhostCallbackEnabled: true,
+	}
+	got, err := ConvertMCPServerToRegistry(t.Context(), server, nil, "https://obot.example.com", server.Name, "com.example.obot", newMimeFetcher(mcp.RemoteMCPURLValidationConfig{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Meta.Obot == nil || !got.Meta.Obot.ConfigurationRequired {
+		t.Fatalf("expected vMCP connection to be required, got %#v", got.Meta.Obot)
+	}
+	if len(got.Server.Remotes) != 0 {
+		t.Fatalf("expected no direct remote, got %#v", got.Server.Remotes)
 	}
 }

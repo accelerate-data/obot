@@ -61,27 +61,52 @@ func TestDeleteUnauthorized(t *testing.T) {
 			deleted: true,
 		},
 		{
-			name:     "user matches second profile",
-			subjects: []types.Subject{{Type: types.SubjectTypeUser, ID: "1"}},
+			name: "user matches second profile",
+			subjects: []types.Subject{
+				{
+					Type: types.SubjectTypeUser,
+					ID:   "1",
+				},
+			},
 		},
 		{
-			name:     "wildcard matches",
-			subjects: []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			name: "wildcard matches",
+			subjects: []types.Subject{
+				{
+					Type: types.SubjectTypeSelector,
+					ID:   "*",
+				},
+			},
 		},
 		{
-			name:     "obot group matches",
-			subjects: []types.Subject{{Type: types.SubjectTypeGroup, ID: "team"}},
-			extra:    map[string][]string{"obot_groups": {"team"}},
+			name: "obot group matches",
+			subjects: []types.Subject{
+				{
+					Type: types.SubjectTypeObotGroup,
+					ID:   "team",
+				},
+			},
+			extra: map[string][]string{"obot_groups": {"team"}},
 		},
 		{
-			name:     "provider group matches",
-			subjects: []types.Subject{{Type: types.SubjectTypeGroup, ID: "team"}},
-			extra:    map[string][]string{"auth_provider_groups": {"team"}},
+			name: "provider group matches",
+			subjects: []types.Subject{
+				{
+					Type: types.SubjectTypeGroup,
+					ID:   "team",
+				},
+			},
+			extra: map[string][]string{"auth_provider_groups": {"team"}},
 		},
 		{
-			name:     "group membership lost",
-			subjects: []types.Subject{{Type: types.SubjectTypeGroup, ID: "team"}},
-			deleted:  true,
+			name: "group membership lost",
+			subjects: []types.Subject{
+				{
+					Type: types.SubjectTypeGroup,
+					ID:   "team",
+				},
+			},
+			deleted: true,
 		},
 		{
 			name:     "personal VMCP needs no profiles",
@@ -164,7 +189,7 @@ func TestReconcileToolSelection(t *testing.T) {
 	}
 	vmcp := &v1.VMCP{Name: "vmcp1test", Namespace: "default", Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
 		Components: []types.VMCPComponent{{ID: "everything", Name: "everything"}},
-		Profiles:   []types.VMCPProfile{{Subjects: []types.Subject{{Type: types.SubjectTypeGroup, ID: "team"}}, Permissions: types.VMCPProfilePermissions{AllowedComponents: map[string]types.VMCPComponentSet{"everything": {AllowedTools: []string{"echo"}}}}}},
+		Profiles:   []types.VMCPProfile{{Subjects: []types.Subject{{Type: types.SubjectTypeObotGroup, ID: "team"}}, Permissions: types.VMCPProfilePermissions{AllowedComponents: map[string]types.VMCPComponentSet{"everything": {AllowedTools: []string{"echo"}}}}}},
 	}}}
 	instance := &v1.VMCPInstance{Name: "vmcpi1test", Namespace: "default", Spec: v1.VMCPInstanceSpec{
 		UserID:   "1",
@@ -270,6 +295,17 @@ func TestReconcileToolSelectionDropsInvalidSelectionWithAllowAllComponents(t *te
 	}
 }
 
+func allowAllProfiles() []types.VMCPProfile {
+	return []types.VMCPProfile{{
+		Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+		Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+	}}
+}
+
+func staticUserInfo(u kuser.Info) func(context.Context, uint) (kuser.Info, error) {
+	return func(context.Context, uint) (kuser.Info, error) { return u, nil }
+}
+
 func TestSyncUserConfigurationHash(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := v1.AddToScheme(scheme); err != nil {
@@ -296,6 +332,7 @@ func TestSyncUserConfigurationHash(t *testing.T) {
 						},
 					},
 				},
+				Profiles: allowAllProfiles(),
 			},
 		},
 	}
@@ -306,17 +343,18 @@ func TestSyncUserConfigurationHash(t *testing.T) {
 			Manifest: types.VMCPInstanceManifest{
 				VMCPID: vmcp.Name,
 			},
-			UserID: "user-1",
+			UserID: "1",
 		},
 	}
-	client := fake.NewClientBuilder().
+	client := withUserChangeWatches(t, fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&v1.VMCPInstance{}).
-		WithObjects(vmcp, instance).
+		WithObjects(vmcp, instance), instance.Spec.UserID).
 		Build()
 	userKey := vmcpconfig.ConfigurationKey("component-one", "HEADER")
 	reveals := 0
 	handler := &Handler{
+		userInfo: staticUserInfo(&kuser.DefaultInfo{UID: "1"}),
 		revealCredential: func(_ context.Context, contexts []string, name string) (gatewaytypes.Credential, error) {
 			reveals++
 			if len(contexts) != 1 || contexts[0] != vmcpconfig.InstanceConfigurationCredentialContext(instance.Name) {
@@ -393,14 +431,16 @@ func TestSyncUserConfigurationHashUsesEmptyConfigurationWhenCredentialIsMissing(
 			Manifest: types.VMCPInstanceManifest{
 				VMCPID: vmcp.Name,
 			},
+			UserID: "1",
 		},
 	}
-	client := fake.NewClientBuilder().
+	client := withUserChangeWatches(t, fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&v1.VMCPInstance{}).
-		WithObjects(vmcp, instance).
+		WithObjects(vmcp, instance), instance.Spec.UserID).
 		Build()
 	handler := &Handler{
+		userInfo: staticUserInfo(&kuser.DefaultInfo{UID: "1"}),
 		revealCredential: func(_ context.Context, contexts []string, name string) (gatewaytypes.Credential, error) {
 			return gatewaytypes.Credential{}, gateway.CredentialNotFoundError{
 				Contexts: contexts,
@@ -677,7 +717,7 @@ func TestDedicatedComponentHeadersUseCredentials(t *testing.T) {
 			require.True(t, component.CatalogEntry.Manifest.Config[0].UserAllowed, "must not mutate the snapshot")
 			check := func(server v1.MCPServer) {
 				t.Helper()
-				config, missing, err := mcp.ServerToServerConfig(server, nil, "1", "", "", map[string]string{"Authorization": tc.value})
+				config, missing, err := mcp.ServerToServerConfig(server, nil, "1", "", "", map[string]string{"Authorization": tc.value}, false)
 				require.NoError(t, err)
 				require.Empty(t, missing)
 				require.Empty(t, config.PassthroughHeaderNames)

@@ -5,6 +5,7 @@
 	 * the whole screen on mobile and a customizable max width on desktop. (default is 2xl)
 	 */
 	import { dialogAnimation } from '$lib/actions/dialogAnimation';
+	import { m } from '$lib/i18n';
 	import { responsive } from '$lib/stores';
 	import IconButton from './primitives/IconButton.svelte';
 	import { X } from '@lucide/svelte';
@@ -30,7 +31,9 @@
 		children: Snippet;
 		animate?: ResponsiveDialogAnimate;
 		hideClose?: boolean;
+		closeButtonLabel?: string;
 		disableClickOutside?: boolean;
+		disableEscape?: boolean;
 		disableMobileStyles?: boolean;
 		/**
 		 * Width in px of a panel on the right edge of the viewport that should stay visible and
@@ -52,7 +55,9 @@
 		classes,
 		animate,
 		hideClose,
+		closeButtonLabel,
 		disableClickOutside,
+		disableEscape,
 		disableMobileStyles,
 		rightPanelWidth
 	}: Props = $props();
@@ -84,10 +89,14 @@
 
 <dialog
 	bind:this={dialog}
+	aria-label={title}
 	class="dialog"
 	style={inset}
 	data-non-modal={rightPanelWidth ? 'true' : undefined}
 	use:dialogAnimation={{ type: animate }}
+	oncancel={(event) => {
+		if (disableEscape) event.preventDefault();
+	}}
 	onclose={() => {
 		// Handle native dialog close (e.g., Escape key)
 		onClose?.();
@@ -128,6 +137,7 @@
 						</span>
 						{#if !hideClose}
 							<IconButton
+								aria-label={closeButtonLabel}
 								class={twMerge(
 									'btn-sm dialog-close-btn',
 									responsive.isMobile && !disableMobileStyles && 'mobile',
@@ -159,7 +169,7 @@
 				}
 			}}
 		>
-			close
+			{m.common_close()}
 		</button>
 	</form>
 </dialog>

@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,10 +28,6 @@ var (
 	envVarRegex = regexp.MustCompile(`\${([^}]+)}`)
 )
 
-type Config struct {
-	MCPServers map[string]ServerConfig `json:"mcpServers"`
-}
-
 type ServerConfig struct {
 	Runtime types.Runtime `json:"runtime"`
 
@@ -43,11 +38,13 @@ type ServerConfig struct {
 	Files   []File   `json:"files"`
 
 	// Remote configuration.
-	URL                     string   `json:"url"`
-	TunnelName              string   `json:"tunnelName,omitempty"`
-	Headers                 []string `json:"headers"`
-	PassthroughHeaderNames  []string `json:"passthroughHeaderNames"`
-	PassthroughHeaderValues []string `json:"passthroughHeaderValues"`
+	LocalhostCallbackEnabled bool     `json:"localhostCallbackEnabled,omitempty"`
+	LocalhostCallbackPath    string   `json:"localhostCallbackPath,omitempty"`
+	URL                      string   `json:"url"`
+	TunnelName               string   `json:"tunnelName,omitempty"`
+	Headers                  []string `json:"headers"`
+	PassthroughHeaderNames   []string `json:"passthroughHeaderNames"`
+	PassthroughHeaderValues  []string `json:"passthroughHeaderValues"`
 
 	// Containerized configuration.
 	ContainerImage string `json:"containerImage"`
@@ -58,6 +55,7 @@ type ServerConfig struct {
 	// vMCP configuration.
 	Components []ComponentServer `json:"components"`
 	ConfigHash string            `json:"configHash"`
+	ToolSearch bool              `json:"toolSearch,omitempty"`
 
 	Scope                string `json:"scope"`
 	UserID               string `json:"userID"`
@@ -68,7 +66,6 @@ type ServerConfig struct {
 	MCPCatalogName       string `json:"mcpCatalogName"`
 	MCPCatalogEntryName  string `json:"mcpCatalogEntryName"`
 	MCPServerDisplayName string `json:"mcpServerDisplayName"`
-	AgentName            string `json:"agentName"`
 	ComponentMCPServer   bool   `json:"componentMCPServer"`
 	SystemMCPServer      bool   `json:"systemMCPServer"`
 
@@ -105,8 +102,17 @@ func (c ComponentServer) ConnectID() string {
 	return c.Name
 }
 
-func (s ServerConfig) IsAgentServer() bool {
-	return s.AgentName != ""
+// isHTTPContainerRuntime reports whether the runtime serves MCP over HTTP
+// from its own image. NPX and UVX use the shared MMMCP command wrapper instead.
+func isHTTPContainerRuntime(runtime types.Runtime) bool {
+	return runtime == types.RuntimeContainerized || runtime == types.RuntimeOpenAPI
+}
+
+func (s ServerConfig) hostedConnectionHeaders() []string {
+	if s.Runtime == types.RuntimeOpenAPI {
+		return s.Headers
+	}
+	return nil
 }
 
 func CoreResourceRequirements(resources *types.MCPResourceRequirements) (*corev1.ResourceRequirements, error) {
@@ -308,6 +314,8 @@ func configureRemoteRuntime(serverConfig *ServerConfig, remoteConfig *types.Remo
 	}
 
 	serverConfig.URL = remoteConfig.URL
+	serverConfig.LocalhostCallbackEnabled = remoteConfig.LocalhostCallbackEnabled
+	serverConfig.LocalhostCallbackPath = remoteConfig.LocalhostCallbackPath
 	serverConfig.TunnelName = remoteConfig.TunnelName
 	serverConfig.Headers = make([]string, 0, len(config))
 
@@ -334,6 +342,14 @@ func configureRemoteRuntime(serverConfig *ServerConfig, remoteConfig *types.Remo
 			serverConfig.URL = expanded
 		}
 	}
+	missingRequiredNames = append(missingRequiredNames, configureHeaders(serverConfig, config, credEnv)...)
+	return missingRequiredNames, nil
+}
+
+// configureHeaders resolves server-owned credentials into HTTP headers. Per-user
+// credentials are attached separately by serverInstanceHeaders on each request.
+func configureHeaders(serverConfig *ServerConfig, config []types.MCPConfig, credEnv map[string]string) []string {
+	var missingRequiredNames []string
 	for _, header := range config {
 		if header.Usage != types.Header || header.UserAllowed {
 			continue
@@ -358,10 +374,12 @@ func configureRemoteRuntime(serverConfig *ServerConfig, remoteConfig *types.Remo
 		serverConfig.Headers = append(serverConfig.Headers, fmt.Sprintf("%s=%s", header.Key, val))
 	}
 
-	return missingRequiredNames, nil
+	return missingRequiredNames
 }
 
-func ServerToServerConfig(mcpServer v1.MCPServer, audiences []string, userID, scope, mcpCatalogName string, credEnv map[string]string) (ServerConfig, []string, error) {
+// ServerToServerConfig resolves a manifest into runtime configuration.
+// Hosted runtime images are selected by the deployment backend.
+func ServerToServerConfig(mcpServer v1.MCPServer, audiences []string, userID, scope, mcpCatalogName string, credEnv map[string]string, devMode bool) (ServerConfig, []string, error) {
 	fixedConfig := slices.DeleteFunc(slices.Clone(mcpServer.Spec.Manifest.Config), func(config types.MCPConfig) bool {
 		return config.UserAllowed
 	})
@@ -433,7 +451,6 @@ func ServerToServerConfig(mcpServer v1.MCPServer, audiences []string, userID, sc
 		Audiences:              audiences,
 		PassthroughHeaderNames: passthroughHeaderNames,
 		ComponentMCPServer:     mcpServer.Spec.VMCPComponentID != "",
-		AgentName:              mcpServer.Spec.NanobotAgentID,
 		StartupTimeout:         startupTimeout,
 		Resources:              resources,
 	}
@@ -446,7 +463,6 @@ func ServerToServerConfig(mcpServer v1.MCPServer, audiences []string, userID, sc
 			"powerUserWorkspaceID":      powerUserWorkspaceID,
 			"mcpServerDisplayName":      displayName,
 			"userID":                    userID,
-			AuditLogIgnore:              strconv.FormatBool(mcpServer.Spec.NanobotAgentID != ""),
 		}
 	} else {
 		// Tell the audit logger to not store audit logs for component MCP servers
@@ -459,6 +475,11 @@ func ServerToServerConfig(mcpServer v1.MCPServer, audiences []string, userID, sc
 
 	// Handle runtime-specific configuration
 	switch mcpServer.Spec.Manifest.Runtime {
+	case types.RuntimeOpenAPI:
+		missingRequiredNames, err = configureOpenAPIRuntime(&serverConfig, mcpServer.Spec.Manifest.OpenAPIConfig, mcpServer.Spec.Manifest.Config, runtimeCredEnv, devMode)
+		if err != nil {
+			return serverConfig, missingRequiredNames, err
+		}
 	case types.RuntimeUVX:
 		if err := configureUVXRuntime(&serverConfig, mcpServer.Spec.Manifest.UVXConfig, runtimeCredEnv, fileEnvVars); err != nil {
 			return serverConfig, missingRequiredNames, err

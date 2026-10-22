@@ -25,6 +25,7 @@ func TestMigratedConfigurationAndFixedValueRotation(t *testing.T) {
 	vmcp := &v1.VMCP{Name: "vmcp1migration", Namespace: "default", Spec: v1.VMCPSpec{
 		Manifest:                           types.VMCPManifest{Components: []types.VMCPComponent{component}},
 		StaticConfigurationHash:            "original",
+		StaticConfigurationCredentialName:  "configuration-revision",
 		ComponentStaticConfigurationHashes: map[string]string{component.ID: "original"},
 	}}
 	legacy := *component.DeepCopy()
@@ -40,7 +41,7 @@ func TestMigratedConfigurationAndFixedValueRotation(t *testing.T) {
 	gw := newTestGatewayClient(t)
 	key := vmcpconfig.ConfigurationKey(component.ID, "TOKEN")
 	require.NoError(t, gw.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: vmcpconfig.StaticConfigurationCredentialContext(vmcp.Name), Name: vmcpconfig.ConfigurationCredentialName(), Secrets: map[string]string{key: "admin"},
+		Context: vmcpconfig.StaticConfigurationCredentialContext(vmcp.Name), Name: vmcpconfig.StaticConfigurationCredentialName(vmcp), Secrets: map[string]string{key: "admin"},
 	}))
 	require.NoError(t, gw.UpsertCredential(t.Context(), gatewaytypes.Credential{
 		Context: vmcpconfig.InstanceConfigurationCredentialContext(instance.Name), Name: vmcpconfig.ConfigurationCredentialName(), Secrets: map[string]string{key: "legacy-override"},
@@ -65,7 +66,7 @@ func TestVMCPOAuthCredentialStatusWithoutCatalogSource(t *testing.T) {
 	vmcp := &v1.VMCP{Name: "vmcp1oauth", Namespace: "default", Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
 		Components: []types.VMCPComponent{{ID: "one", OAuthCredentialID: ref}},
 	}}}
-	server := &v1.MCPServer{Name: "ms1oauth", Namespace: "default", Spec: v1.MCPServerSpec{VMCPID: vmcp.Name, VMCPComponentID: "one"}}
+	server := &v1.MCPServer{Name: "ms1oauth", Namespace: "default", Spec: v1.MCPServerSpec{VMCPID: vmcp.Name, VMCPComponentID: "one", Manifest: types.MCPServerManifest{RemoteConfig: &types.RemoteRuntimeConfig{URL: "https://example.com/mcp"}}}}
 	storage := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(vmcp, server).WithStatusSubresource(server).Build()
 	gw := newTestGatewayClient(t)
 	handler := &Handler{gatewayClient: gw}
@@ -75,7 +76,7 @@ func TestVMCPOAuthCredentialStatusWithoutCatalogSource(t *testing.T) {
 		vmcp.Spec.Manifest.Components[0].OAuthCredentialID = ref
 		require.NoError(t, storage.Update(t.Context(), vmcp))
 		if configured {
-			if err := gw.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: ref, Name: system.StaticOAuthCredentialName, Secrets: map[string]string{"CLIENT_ID": "client"}}); err != nil {
+			if err := gw.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: ref, Name: system.StaticOAuthCredentialName, Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret", "GENERATION": "proved", "MCP_URL": "https://example.com/mcp"}}); err != nil {
 				t.Fatal(err)
 			}
 		} else {
@@ -100,14 +101,14 @@ func TestVMCPOAuthCredentialStatusRechecksSourceRevision(t *testing.T) {
 	vmcp := &v1.VMCP{Name: "vmcp1oauth", Namespace: entry.Namespace, Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
 		Components: []types.VMCPComponent{{ID: "one", MCPServerCatalogEntryID: entry.Name, OAuthCredentialID: ref}},
 	}}}
-	server := &v1.MCPServer{Name: "ms1oauth", Namespace: entry.Namespace, Spec: v1.MCPServerSpec{VMCPID: vmcp.Name, VMCPComponentID: "one"}}
+	server := &v1.MCPServer{Name: "ms1oauth", Namespace: entry.Namespace, Spec: v1.MCPServerSpec{VMCPID: vmcp.Name, VMCPComponentID: "one", Manifest: types.MCPServerManifest{RemoteConfig: &types.RemoteRuntimeConfig{URL: "https://example.com/mcp"}}}}
 	storage := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(entry, vmcp, server).WithStatusSubresource(server).Build()
 	gw := newTestGatewayClient(t)
 	handler := &Handler{gatewayClient: gw}
 	req := router.Request{Ctx: t.Context(), Client: storage, Object: server}
 	require.NoError(t, handler.SyncOAuthCredentialStatus(req, nil))
 	require.False(t, server.Status.OAuthCredentialConfigured)
-	require.NoError(t, gw.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: ref, Name: system.StaticOAuthCredentialName, Secrets: map[string]string{"CLIENT_ID": "client"}}))
+	require.NoError(t, gw.UpsertCredential(t.Context(), gatewaytypes.Credential{Context: ref, Name: system.StaticOAuthCredentialName, Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret", "GENERATION": "proved", "MCP_URL": "https://example.com/mcp"}}))
 	entry.Annotations[v1.OAuthCredentialRevisionAnnotation] = "two"
 	require.NoError(t, storage.Update(t.Context(), entry))
 	require.NoError(t, handler.SyncOAuthCredentialStatus(req, nil))

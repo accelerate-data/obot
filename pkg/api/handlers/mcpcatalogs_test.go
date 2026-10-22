@@ -37,8 +37,10 @@ func TestAcceptCatalogEntryOwnership(t *testing.T) {
 			Detached:  true,
 			SourceURL: "https://github.com/obot-platform/mcp-catalog",
 			Manifest: types.MCPServerCatalogEntryManifest{
-				EntryKey:    "context7",
-				UpgradeNote: "Review configuration changes before upgrading.",
+				EntryKey:       "context7",
+				UpgradeNote:    "Review configuration changes before upgrading.",
+				MinObotVersion: "v0.20.0",
+				MaxObotVersion: "v0.21.0",
 			},
 		},
 	}
@@ -49,6 +51,8 @@ func TestAcceptCatalogEntryOwnership(t *testing.T) {
 	assert.Empty(t, entry.Spec.SourceURL)
 	assert.Empty(t, entry.Spec.Manifest.EntryKey)
 	assert.Empty(t, entry.Spec.Manifest.UpgradeNote)
+	assert.Empty(t, entry.Spec.Manifest.MinObotVersion)
+	assert.Empty(t, entry.Spec.Manifest.MaxObotVersion)
 	assert.False(t, entry.Spec.Detached)
 	assert.Equal(t, "true", entry.Annotations["example.com/keep"])
 }
@@ -74,10 +78,13 @@ func TestMCPCatalogHandlerGetEntryCapacity(t *testing.T) {
 			name:             "returns capacity for matching deployments",
 			entryCatalogName: "catalog-1",
 			entryRuntime:     types.RuntimeContainerized,
-			servers: []v1.MCPServer{{
-				Name: "server-1", Namespace: system.DefaultNamespace,
-				Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"},
-			}},
+			servers: []v1.MCPServer{
+				{
+					Name:      "server-1",
+					Namespace: system.DefaultNamespace,
+					Spec:      v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"},
+				},
+			},
 			providerInfo:    types.MCPCapacityInfo{Source: types.CapacitySourceDeployments, ActiveDeployments: 1},
 			wantServerNames: []string{"server-1"},
 			wantResponse:    types.MCPCapacityInfo{Source: types.CapacitySourceDeployments, ActiveDeployments: 1},
@@ -87,8 +94,16 @@ func TestMCPCatalogHandlerGetEntryCapacity(t *testing.T) {
 			entryCatalogName: "catalog-1",
 			entryRuntime:     types.RuntimeContainerized,
 			servers: []v1.MCPServer{
-				{Name: "template-server", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1", Template: true}},
-				{Name: "server-1", Namespace: system.DefaultNamespace, Spec: v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"}},
+				{
+					Name:      "template-server",
+					Namespace: system.DefaultNamespace,
+					Spec:      v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1", Template: true},
+				},
+				{
+					Name:      "server-1",
+					Namespace: system.DefaultNamespace,
+					Spec:      v1.MCPServerSpec{MCPServerCatalogEntryName: "entry-1"},
+				},
 			},
 			providerInfo:    types.MCPCapacityInfo{ActiveDeployments: 1},
 			wantServerNames: []string{"server-1"},

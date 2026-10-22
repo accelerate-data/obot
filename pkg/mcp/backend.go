@@ -52,7 +52,8 @@ var (
 )
 
 type backend interface {
-	// ensureServerDeployment will deploy a server if it is not already deployed, and return the updated ServerConfig
+	// ensureServerDeployment validates before deployment, skips validation on cache hits,
+	// and returns the updated ServerConfig.
 	ensureServerDeployment(ctx context.Context, serverConfig ServerConfig) (ServerConfig, error)
 	// deployServer will deploy a server if it is not already deployed, and will not wait or do any readiness checks
 	deployServer(ctx context.Context, server ServerConfig) error
@@ -308,9 +309,11 @@ func MMMCPConfig(server ServerConfig, env map[string][]byte) *mmmcpconfig.Config
 	}
 
 	if server.Runtime == types.RuntimeVMCP {
-		passthroughHeaders := make([]string, 0, len(server.PassthroughHeaderNames)+1)
-		passthroughHeaders = append(passthroughHeaders, "Authorization")
-		passthroughHeaders = append(passthroughHeaders, server.PassthroughHeaderNames...)
+		config.ToolSearch = server.ToolSearch
+		// Component connections are authenticated by the gateway's composite OAuth
+		// handler, not the frontend Authorization header: pooled sessions replay
+		// the headers of the request that opened them long after it expires.
+		passthroughHeaders := slices.Clone(server.PassthroughHeaderNames)
 
 		servers := make([]mmmcpconfig.Server, 0, len(server.Components))
 		for _, component := range server.Components {

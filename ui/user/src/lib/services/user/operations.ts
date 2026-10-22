@@ -1,5 +1,6 @@
 import { BOOTSTRAP_USER_ID } from '$lib/constants';
 import { HttpError } from '$lib/errors';
+import { m } from '$lib/i18n';
 import { Group } from '$lib/services/admin/types';
 import { buildQueryString } from '$lib/url';
 import type {
@@ -28,7 +29,6 @@ import {
 	type Fetcher,
 	type PaginatedResponse
 } from '../http';
-import type { Skill } from '../nanobot/types';
 import { AUDIT_LOG_FILTER_OPTIONS_LIMIT } from './constants';
 import {
 	type AppNotification,
@@ -39,6 +39,11 @@ import {
 	type McpAuditLogUsageFilters,
 	type McpAuditLogUsageStats,
 	type BootstrapStatus,
+	type ClaudeConfig,
+	type ClaudeEnvironment,
+	type ClaudeEnvironmentPayload,
+	type ClaudeOrganizationAccount,
+	type ClaudeSession,
 	type DefaultModelAlias,
 	type DeviceCodeVerificationResponse,
 	type DeviceScan,
@@ -68,7 +73,8 @@ import {
 	type VMCPComponent,
 	type VMCPInstance,
 	type VMCPManifest,
-	type VMCPConfiguration
+	type VMCPConfiguration,
+	type Skill
 } from './types';
 
 type ItemsResponse<T> = { items: T[] | null };
@@ -108,8 +114,19 @@ export async function getMCPServerOrVMCP(
 	id: string,
 	opts?: { fetch?: Fetcher; signal?: AbortSignal }
 ): Promise<MCPCatalogServer | VMCP> {
+	// Resolve metadata without changing the connection used for authentication.
+	if (id.startsWith('vmcpi1')) {
+		const instance = await getVMCPInstance(id, opts);
+		return getVMCP(instance.vmcpID, opts);
+	}
+
 	const path = id.startsWith('vmcp1') ? `/vmcps/${id}` : `/mcp-servers/${id}`;
-	return (await doGet(path, opts)) as MCPCatalogServer | VMCP;
+	const parent = (await doGet(path, opts)) as MCPCatalogServer | VMCP;
+	if ('vmcpID' in parent && parent.vmcpID) {
+		return getVMCP(parent.vmcpID, opts);
+	}
+
+	return parent;
 }
 
 export async function createVMCP(
@@ -184,7 +201,7 @@ export async function listVMCPInstances(opts?: {
 
 export async function getVMCPInstance(
 	id: string,
-	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean; signal?: AbortSignal }
 ): Promise<VMCPInstance> {
 	return (await doGet(`/vmcp-instances/${id}`, opts)) as VMCPInstance;
 }
@@ -630,6 +647,25 @@ export async function clearMcpServerOAuth(
 	await doDelete(`${mcpActionPath(id)}/oauth`, opts);
 }
 
+export async function clearVMCPComponentOAuth(
+	vmcpID: string,
+	componentID: string,
+	opts?: { signal?: AbortSignal }
+): Promise<void> {
+	await doDelete(`/vmcps/${vmcpID}/components/${componentID}/oauth`, opts);
+}
+
+// Lists the IDs of the vMCP components the current user has authenticated with OAuth.
+export async function getVMCPOAuthStatus(
+	vmcpID: string,
+	opts?: { signal?: AbortSignal; dontLogErrors?: boolean }
+): Promise<string[]> {
+	const response = (await doGet(`/vmcps/${vmcpID}/oauth-status`, opts)) as {
+		authenticatedComponents?: string[];
+	};
+	return response.authenticatedComponents ?? [];
+}
+
 // 412 means oauth is needed
 export async function getMcpServerOauthURL(
 	id: string,
@@ -648,44 +684,12 @@ export async function getMcpServerOauthURL(
 	}
 }
 
-export async function isMcpServerOauthNeeded(
-	id: string,
-	opts?: { signal?: AbortSignal }
-): Promise<boolean> {
-	try {
-		await doPost(`${mcpActionPath(id)}/check-oauth`, {
-			dontLogErrors: true,
-			signal: opts?.signal
-		});
-	} catch (err) {
-		if (err instanceof HttpError && err.statusCode === 412) {
-			return true;
-		}
-	}
-	return false;
-}
-
 export async function restartMcpServer(id: string, opts?: { fetch?: Fetcher }): Promise<void> {
 	await doPost(`/mcp-servers/${id}/restart`, {}, opts);
 }
 
 export async function restartK8sDeployment(mcpServerId: string, opts?: { fetch?: Fetcher }) {
 	await doPost(`/mcp-servers/${mcpServerId}/restart`, {}, opts);
-}
-
-export async function triggerMcpServerUpdate(mcpServerId: string): Promise<MCPCatalogServer> {
-	return (await doPost(`/mcp-servers/${mcpServerId}/trigger-update`, {})) as MCPCatalogServer;
-}
-
-export async function triggerWorkspaceMcpServerUpdate(
-	workspaceID: string,
-	entryID: string,
-	mcpServerId: string
-): Promise<MCPCatalogServer> {
-	return (await doPost(
-		`/workspaces/${workspaceID}/entries/${entryID}/servers/${mcpServerId}/trigger-update`,
-		{}
-	)) as MCPCatalogServer;
 }
 
 export async function validateSingleOrRemoteMcpServerLaunched(mcpServerId: string): Promise<{
@@ -875,9 +879,6 @@ export async function getProfile(opts?: { fetch?: Fetcher }): Promise<Profile> {
 	obj.isBootstrapUser = () => {
 		return obj.username === BOOTSTRAP_USER_ID;
 	};
-	obj.canImpersonate = () => {
-		return obj.groups.includes(Group.USER_IMPERSONATION) && obj.groups.includes(Group.ADMIN);
-	};
 	obj.loaded = true;
 	return obj;
 }
@@ -905,7 +906,10 @@ export async function getUser(
 
 // Version
 
-export async function getVersion(opts?: { fetch?: Fetcher }): Promise<Version> {
+export async function getVersion(opts?: {
+	fetch?: Fetcher;
+	dontLogErrors?: boolean;
+}): Promise<Version> {
 	const version = (await doGet('/version', opts)) as Version;
 	return version;
 }
@@ -1027,6 +1031,17 @@ export async function createWorkspaceMCPCatalogEntry(
 		...response,
 		isCatalogEntry: true
 	};
+}
+
+export async function revealWorkspaceMCPCatalogEntry(
+	workspaceID: string,
+	entryID: string,
+	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
+): Promise<Record<string, string>> {
+	return (await doPost(`/workspaces/${workspaceID}/entries/${entryID}/reveal`, {}, opts)) as Record<
+		string,
+		string
+	>;
 }
 
 export async function updateWorkspaceMCPCatalogEntry(
@@ -1234,6 +1249,7 @@ export async function getWorkspaceCatalogEntryServerK8sDetails(
 // Composite MCP OAuth helpers
 export type PendingCompositeAuth = {
 	catalogEntryID?: string;
+	componentID?: string;
 	mcpServerID: string;
 	name?: string;
 	icon?: string;
@@ -1553,7 +1569,7 @@ export async function fetchWorkspaceIDForProfile(
 	const workspaces = await listWorkspaces(opts);
 	const workspaceID = workspaces.find((w) => w.userID === currentProfileID)?.id ?? null;
 	if (!workspaceID) {
-		throw new HttpError(404, 'Workspace not found.');
+		throw new HttpError(404, m.core_workspace_not_found());
 	}
 	return workspaceID;
 }
@@ -1574,6 +1590,10 @@ export async function listSkills(opts?: {
 	return response.items ?? [];
 }
 
+export async function getSkill(id: string, opts?: { fetch?: Fetcher }): Promise<Skill> {
+	return (await doGet(`/skills/${encodeURIComponent(id)}`, opts)) as Skill;
+}
+
 export async function downloadSkill(
 	id: string,
 	opts?: { fetch?: Fetcher; dontLogErrors?: boolean }
@@ -1582,4 +1602,87 @@ export async function downloadSkill(
 		...opts,
 		blob: true
 	})) as Blob;
+}
+
+// Claude
+
+export async function getClaudeConfig(opts?: { fetch?: Fetcher }): Promise<ClaudeConfig> {
+	return (await doGet('/claude-environments', opts)) as ClaudeConfig;
+}
+
+export async function createClaudeEnvironment(
+	environment: ClaudeEnvironmentPayload,
+	opts?: { fetch?: Fetcher }
+): Promise<ClaudeEnvironment> {
+	return (await doPost('/claude-environments', environment, opts)) as ClaudeEnvironment;
+}
+
+export async function updateClaudeEnvironment(
+	id: string,
+	environment: ClaudeEnvironmentPayload,
+	opts?: { fetch?: Fetcher }
+): Promise<ClaudeEnvironment> {
+	return (await doPut(`/claude-environments/${id}`, environment, opts)) as ClaudeEnvironment;
+}
+
+export async function deleteClaudeEnvironment(
+	id: string,
+	opts?: { fetch?: Fetcher }
+): Promise<void> {
+	await doDelete(`/claude-environments/${id}`, opts);
+}
+
+export async function updateClaudeEnvironmentTag(
+	id: string,
+	enabled: boolean,
+	opts?: { fetch?: Fetcher }
+): Promise<void> {
+	await doPut(`/claude-environments/${id}/claude-tag`, { enabled }, opts);
+}
+
+export async function listClaudeSessions(opts?: {
+	all?: boolean;
+	dontLogErrors?: boolean;
+	fetch?: Fetcher;
+}): Promise<ClaudeSession[]> {
+	const response = (await doGet(opts?.all ? '/claude-sessions?all=true' : '/claude-sessions', {
+		dontLogErrors: opts?.dontLogErrors,
+		fetch: opts?.fetch
+	})) as ItemsResponse<ClaudeSession>;
+	return response.items ?? [];
+}
+
+export async function suspendClaudeSession(
+	name: string,
+	opts?: { fetch?: Fetcher }
+): Promise<void> {
+	await doPost(`/claude-sessions/${encodeURIComponent(name)}/suspend`, {}, opts);
+}
+
+export async function deleteClaudeSession(name: string, opts?: { fetch?: Fetcher }): Promise<void> {
+	await doDelete(`/claude-sessions/${encodeURIComponent(name)}`, opts);
+}
+
+export async function listClaudeOrganizationAccounts(
+	organization: string,
+	opts?: { fetch?: Fetcher }
+): Promise<ClaudeOrganizationAccount[]> {
+	const response = (await doGet(
+		`/claude-organizations/${encodeURIComponent(organization)}/accounts`,
+		opts
+	)) as ItemsResponse<ClaudeOrganizationAccount>;
+	return response.items ?? [];
+}
+
+export async function updateClaudeOrganizationAccounts(
+	organization: string,
+	items: ClaudeOrganizationAccount[],
+	opts?: { fetch?: Fetcher }
+): Promise<ClaudeOrganizationAccount[]> {
+	const response = (await doPut(
+		`/claude-organizations/${encodeURIComponent(organization)}/accounts`,
+		{ items },
+		opts
+	)) as ItemsResponse<ClaudeOrganizationAccount>;
+	return response.items ?? [];
 }

@@ -1,3 +1,7 @@
+---
+displayed_sidebar: sidebar
+---
+
 # FAQ
 
 ## Onboarding & Setup
@@ -6,9 +10,9 @@
 
 Docker is suitable for local testing and small-scale deployments. For production, especially in enterprise settings, Kubernetes is recommended for high availability, resource management, and upgrades.
 
-### Why can’t I see the User Management section?
+### Why can’t I see user management controls? {#why-cant-i-see-the-user-management-section}
 
-User Management is only visible when authentication is enabled. Make sure you start Obot with `OBOT_SERVER_ENABLE_AUTHENTICATION=true`. If you don't see the bootstrap token prompt, the environment variable may not be set correctly. Follow the [installation guide](./installation/enabling-authentication.md).
+User management controls are under **Identity & Access**. Administrative controls require an Admin or Owner account; enable authentication before configuring user access. Make sure you start Obot with `OBOT_SERVER_ENABLE_AUTHENTICATION=true`. If you don't see the bootstrap token prompt, the environment variable may not be set correctly. Follow the [installation guide](./security/authentication.md).
 
 ### How do I assign roles to users before they log in?
 
@@ -16,7 +20,11 @@ Currently, users must log in at least once before roles can be assigned. To pre-
 
 ### What are the differences between the open source and enterprise versions of Obot?
 
-All editions use the same container image. The default edition includes all model providers without registration, plus Local, GitHub, and Google authentication. Entra, Okta, JumpCloud, and Auth0 authentication require free Community registration or an Enterprise license. Enterprise adds unlimited users and devices and enterprise support. See [Obot Editions](./enterprise/overview.md).
+There isn't an open source version separate from an enterprise version. Obot is fully open source under the MIT License, and every self-hosted edition, including Obot Enterprise, runs the same code from the same container image. The license key decides what applies. Obot Community is free, supports up to 100 users and 100 devices, and includes all model providers plus Local, GitHub, and Google authentication. Registering Obot Community is free and adds Entra, Okta, JumpCloud, and Auth0 authentication. Obot Enterprise removes the user and device limits and adds enterprise support. See [Editions and licensing](./enterprise/overview.md).
+
+### What happens if Obot can't validate its license?
+
+If the license service can't be reached, Obot keeps using the entitlements from the last successful check, with no time limit, until the license service answers again. If the license is rejected, for example because it expired, Obot falls back to the limits of unregistered Obot Community at the next check. See [License compliance](./enterprise/overview.md#license-compliance).
 
 ## Integration & Troubleshooting
 

@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -27,9 +29,16 @@ const (
 	// user to approve Vibedata's access to an MCP server, both for dynamically
 	// registered clients and in the hosted Client ID Metadata Document.
 	vibedataOAuthClientName = "Vibedata"
+	obotOAuthClientName     = vibedataOAuthClientName
+	figmaMCPURL             = "https://mcp.figma.com/mcp"
+	figmaOAuthClientName    = "Claude Code"
 	// obotOAuthCheckMCPClientName identifies the OAuth check to the MCP server
 	// itself, in the initialize request's clientInfo. Providers never see it.
 	obotOAuthCheckMCPClientName = "Obot MCP OAuth"
+)
+
+var (
+	errStaticOAuthCredentialsNotConfigured = errors.New("static OAuth credentials are not configured")
 )
 
 type MCPOAuthHandlerFactory struct {
@@ -48,6 +57,7 @@ type mcpOAuthHandler struct {
 	stateMgr           *stateManager
 	mcpID              string
 	mcpURL             string
+	tunnelName         string
 	userID             string
 	oauthAuthRequestID string
 	urlChan            chan string
@@ -55,6 +65,8 @@ type mcpOAuthHandler struct {
 	// catalogEntryName is the name of the catalog entry to fetch static OAuth credentials for.
 	catalogEntryName  string
 	credentialContext string
+	redirectURL       string
+	localLogin        bool
 }
 
 func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManager, client kclient.Client, gatewayClient *client.Client, globalTokenStore mcp.GlobalTokenStore, secretBindingAllowedLabel string, forceDynamicClient bool) *MCPOAuthHandlerFactory {
@@ -62,7 +74,7 @@ func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManage
 		baseURL:                   baseURL,
 		mcpSessionManager:         sessionManager,
 		client:                    client,
-		stateMgr:                  newStateManager(gatewayClient, mcp.NewOAuthExchangeClient(sessionManager.RemoteMCPURLValidationConfig())),
+		stateMgr:                  newStateManager(gatewayClient, tokenExchangeClient(sessionManager)),
 		tokenStore:                globalTokenStore,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
 	}
@@ -72,6 +84,20 @@ func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManage
 	}
 
 	return f
+}
+
+// tokenExchangeClient returns the function the OAuth callback uses to build the client for
+// exchanging a code at the remote server's token endpoint: through the server's tunnel when
+// it has one, and otherwise with the admin's egress policy.
+func tokenExchangeClient(sessionManager *mcp.SessionManager) tokenClientFunc {
+	if sessionManager == nil {
+		return func(string) (*http.Client, error) {
+			return mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfig{}), nil
+		}
+	}
+	return func(tunnelName string) (*http.Client, error) {
+		return sessionManager.OAuthClientForServer(mcp.ServerConfig{TunnelName: tunnelName})
+	}
 }
 
 func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.MCPServer, mcpServerConfig mcp.ServerConfig, userID, mcpID, oauthAppAuthRequestID string) (string, error) {
@@ -113,7 +139,7 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 					limit <- struct{}{}
 				}()
 
-				_, componentConfig, err := f.mcpSessionManager.ServerForAction(req.Context(), mcpServerConfig.Components[i].ConnectID(), req.User.GetUID())
+				_, componentConfig, err := f.mcpSessionManager.ServerForAction(req.Context(), mcpServerConfig.Components[i].ConnectID(), req.User)
 				if err != nil {
 					return
 				}
@@ -151,7 +177,7 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 		if needsOAuth {
 			// At least one component requires OAuth.
 			slog.Info("Aggregate MCP server requires component OAuth authentication", "mcpID", mcpID)
-			return compositeConsentURL(f.baseURL, mcpID, mcpServer.Spec.VMCPID, oauthAppAuthRequestID), nil
+			return compositeConsentURL(f.baseURL, mcpID, oauthAppAuthRequestID), nil
 		}
 
 		// No component requires OAuth
@@ -199,7 +225,8 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 	}
 
 	// Remote server, check for OAuth directly
-	oauthHandler := f.newMCPOAuthHandler(req.GatewayClient, userID, mcpID, mcpServerConfig.URL, oauthAppAuthRequestID, mcpServerConfig.MCPCatalogEntryName)
+	oauthHandler := f.newMCPOAuthHandler(req.GatewayClient, userID, mcpID, mcpServerConfig.URL, mcpServerConfig.TunnelName, oauthAppAuthRequestID, mcpServerConfig.MCPCatalogEntryName)
+	oauthHandler.localLogin = mcpServerConfig.LocalhostCallbackEnabled
 	if mcpServer.Spec.VMCPID != "" || mcpServer.Spec.VMCPInstanceID != "" {
 		credentialContext, _, err := vmcpconfig.ServerOAuthCredentialReference(req.Context(), f.client, mcpServer)
 		if err != nil {
@@ -207,11 +234,23 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 		}
 		oauthHandler.credentialContext = credentialContext
 	}
+	if remote := mcpServer.Spec.Manifest.RemoteConfig; remote != nil && remote.StaticOAuthRequired {
+		if _, _, err := oauthHandler.Lookup(req.Context()); err != nil {
+			if errors.Is(err, errStaticOAuthCredentialsNotConfigured) {
+				return "", types.NewErrBadRequest("MCP server %s requires administrator static OAuth configuration", mcpServer.Name)
+			}
+			return "", fmt.Errorf("check static OAuth credentials for MCP server %s: %w", mcpServer.Name, err)
+		}
+	}
 	staticOAuthPending, err := f.staticOAuthPending(req.Context(), mcpServer, oauthHandler)
 	if err != nil {
 		return "", err
 	}
-	oauthClientName, err := f.downstreamOAuthClientName(req, oauthAppAuthRequestID)
+	oauthHandler.redirectURL, err = f.upstreamRedirectURL(req, mcpServerConfig, oauthAppAuthRequestID)
+	if err != nil {
+		return "", err
+	}
+	oauthClientName, err := f.oauthClientNameForServer(req, mcpServerConfig.URL, oauthAppAuthRequestID)
 	if err != nil {
 		return "", err
 	}
@@ -235,24 +274,23 @@ func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.M
 		if err != nil || !staticOAuthPending {
 			return "", err
 		}
-		return f.staticOAuthURL(req.Context(), mcpServerConfig, oauthHandler)
+		u, err := f.staticOAuthURL(req.Context(), mcpServerConfig, oauthHandler)
+		if err != nil {
+			return "", err
+		}
+		return f.localLoginURL(u, mcpServerConfig)
 	case <-req.Context().Done():
 		return "", fmt.Errorf("failed to check for MCP server OAuth: %w", req.Context().Err())
 	case u := <-oauthHandler.URLChan():
 		slog.Info("Remote MCP server requires OAuth authentication", "mcpID", mcpID)
-		return u, nil
+		return f.localLoginURL(u, mcpServerConfig)
 	}
 }
 
-func compositeConsentURL(baseURL, connectID, vmcpID, authRequestID string) string {
+func compositeConsentURL(baseURL, connectID, authRequestID string) string {
 	query := url.Values{}
 	if authRequestID != "" {
 		query.Set("oauth_auth_request", authRequestID)
-	}
-	// The UI loads metadata by canonical ID, but authenticates the original
-	// connection so migrated users with multiple instances keep their selection.
-	if vmcpID != "" && vmcpID != connectID {
-		query.Set("vmcp_id", vmcpID)
 	}
 	result := fmt.Sprintf("%s/auth/mcp/composite/%s", baseURL, connectID)
 	if len(query) > 0 {
@@ -285,6 +323,14 @@ func (f *MCPOAuthHandlerFactory) componentServersForAuth(req api.Context, mcpSer
 	}
 
 	return nil, nil
+}
+
+func (f *MCPOAuthHandlerFactory) oauthClientNameForServer(req api.Context, serverURL, oauthAuthRequestID string) (string, error) {
+	if serverURL == figmaMCPURL {
+		return figmaOAuthClientName, nil
+	}
+
+	return f.downstreamOAuthClientName(req, oauthAuthRequestID)
 }
 
 func (f *MCPOAuthHandlerFactory) downstreamOAuthClientName(req api.Context, oauthAuthRequestID string) (string, error) {
@@ -325,13 +371,16 @@ func (f *MCPOAuthHandlerFactory) staticOAuthPending(ctx context.Context, mcpServ
 }
 
 func (f *MCPOAuthHandlerFactory) staticOAuthURL(ctx context.Context, serverConfig mcp.ServerConfig, oauthHandler *mcpOAuthHandler) (string, error) {
+	callbackURL := oauthHandler.redirectURL
+	if callbackURL == "" {
+		callbackURL = system.MCPOAuthCallbackURL(f.baseURL)
+	}
 	metadata, err := f.mcpSessionManager.GetOAuthMetadata(ctx, serverConfig,
-		"Obot MCP Gateway", system.MCPOAuthCallbackURL(f.baseURL), true)
+		"Obot MCP Gateway", callbackURL, true)
 	if err != nil {
 		return "", fmt.Errorf("failed to discover OAuth metadata for static OAuth server: %w", err)
 	}
 
-	callbackURL := system.MCPOAuthCallbackURL(f.baseURL)
 	authorizationServer, registration, err := staticOAuthMetadata(metadata, callbackURL)
 	if err != nil {
 		return "", err
@@ -392,7 +441,8 @@ func staticOAuthMetadata(metadata mcp.OAuthMetadata, redirectURL string) (mcp.Au
 func (f *MCPOAuthHandlerFactory) oauthCheckClientOption(oauthClientName string, tokenStorage mcp.TokenStorage, oauthHandler *mcpOAuthHandler) mcp.ClientOption {
 	return mcp.ClientOption{
 		OAuthClientName:               cmp.Or(oauthClientName, vibedataOAuthClientName),
-		OAuthClientIDMetadataDocument: f.cimdDocumentURL,
+		OAuthRedirectURL:              oauthHandler.redirectURL,
+		OAuthClientIDMetadataDocument: f.clientMetadataForRedirect(oauthHandler.redirectURL),
 		ClientName:                    obotOAuthCheckMCPClientName,
 		TokenStorage:                  tokenStorage,
 		CallbackHandler:               oauthHandler,
@@ -400,13 +450,14 @@ func (f *MCPOAuthHandlerFactory) oauthCheckClientOption(oauthClientName string, 
 	}
 }
 
-func (f *MCPOAuthHandlerFactory) newMCPOAuthHandler(gatewayClient *client.Client, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName string) *mcpOAuthHandler {
+func (f *MCPOAuthHandlerFactory) newMCPOAuthHandler(gatewayClient *client.Client, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName string) *mcpOAuthHandler {
 	return &mcpOAuthHandler{
 		gatewayClient:      gatewayClient,
 		stateMgr:           f.stateMgr,
 		userID:             userID,
 		mcpID:              mcpID,
 		mcpURL:             mcpURL,
+		tunnelName:         tunnelName,
 		oauthAuthRequestID: oauthAuthRequestID,
 		catalogEntryName:   catalogEntryName,
 		urlChan:            make(chan string, 1),
@@ -430,13 +481,17 @@ func (m *mcpOAuthHandler) HandleAuthURL(ctx context.Context, _ string, authURL s
 
 func (m *mcpOAuthHandler) NewState(ctx context.Context, conf *oauth2.Config, resourceURL, verifier string) (string, <-chan mcp.CallbackPayload, error) {
 	state := strings.ToLower(rand.Text())
+	// Mark this pending state explicitly: hosted Obot may itself run on localhost.
+	if m.localLogin {
+		state = localLoginStatePrefix + state
+	}
 
 	// The channel is required by the nanobot CallbackHandler interface but is not used
 	// in the Obot flow. The auth URL is handled via HandleAuthURL/URLChan, and the
 	// callback arrives via a separate HTTP endpoint (oauthCallback) which looks up
 	// the pending state from the DB directly.
 	ch := make(chan mcp.CallbackPayload)
-	return state, ch, m.stateMgr.store(ctx, m.userID, m.mcpID, m.mcpURL, m.oauthAuthRequestID, m.catalogEntryName, state, verifier, resourceURL, conf)
+	return state, ch, m.stateMgr.storeWithTunnel(ctx, m.userID, m.mcpID, m.mcpURL, m.tunnelName, m.oauthAuthRequestID, m.catalogEntryName, state, verifier, resourceURL, conf)
 }
 
 func (m *mcpOAuthHandler) Lookup(ctx context.Context) (string, string, error) {
@@ -447,6 +502,9 @@ func (m *mcpOAuthHandler) Lookup(ctx context.Context) (string, string, error) {
 	}
 	if credentialContext != "" {
 		cred, err := m.gatewayClient.RevealCredential(ctx, []string{credentialContext}, system.StaticOAuthCredentialName)
+		if err != nil && !errors.As(err, &client.CredentialNotFoundError{}) {
+			return "", "", fmt.Errorf("failed to retrieve static OAuth credentials for MCP server %q: %w", m.mcpID, err)
+		}
 		if err == nil {
 			clientID := cred.Secrets["CLIENT_ID"]
 			clientSecret := cred.Secrets["CLIENT_SECRET"]
@@ -456,5 +514,5 @@ func (m *mcpOAuthHandler) Lookup(ctx context.Context) (string, string, error) {
 		}
 	}
 
-	return "", "", fmt.Errorf("no credentials found for MCP server %s", m.mcpID)
+	return "", "", fmt.Errorf("%w for MCP server %s", errStaticOAuthCredentialsNotConfigured, m.mcpID)
 }

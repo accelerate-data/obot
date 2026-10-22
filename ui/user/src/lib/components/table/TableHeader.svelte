@@ -1,6 +1,7 @@
 <script lang="ts">
 	import popover from '$lib/actions/popover.svelte';
 	import { tooltip } from '$lib/actions/tooltip.svelte';
+	import { m } from '$lib/i18n';
 	import Select from '../Select.svelte';
 	import { ArrowDown, ArrowUp, CircleQuestionMark, Funnel } from '@lucide/svelte';
 	import { twMerge } from 'tailwind-merge';
@@ -19,6 +20,7 @@
 		sortable?: boolean;
 		style?: string;
 		presetFilters?: (string | number)[];
+		formatOption?: (value: string | number) => string;
 		disablePortal?: boolean;
 	}
 	let {
@@ -35,6 +37,7 @@
 		sortable,
 		style,
 		presetFilters,
+		formatOption,
 		disablePortal
 	}: Props = $props();
 
@@ -55,7 +58,7 @@
 
 <th
 	class={twMerge(
-		'text-md group text-muted-content px-4 py-2 text-left font-medium capitalize',
+		'text-md group text-muted-content px-4 py-2 text-left font-medium',
 		pointerOnTHeader && 'cursor-pointer',
 		headerClass
 	)}
@@ -65,18 +68,22 @@
 	<span class="flex grow items-center justify-between gap-4">
 		{#if filterable}
 			<button
-				class="flex grow items-center gap-1 capitalize text-nowrap"
+				class="flex grow items-center gap-1 text-nowrap"
 				use:tooltip={{
-					text: `Filter by ${headerTitle ?? property}`,
-					classes: ['z-60'],
+					text: m.core_filter_by({ name: headerTitle ?? property }),
+					classes: headerTitle ? ['z-60'] : ['z-60', 'capitalize'],
 					placement: 'top-start'
 				}}
 				use:ref
 				onclick={() => toggle()}
 			>
-				{headerTitle ?? property}
+				{#if headerTitle}
+					{headerTitle}
+				{:else}
+					<span class="capitalize">{property}</span>
+				{/if}
 				{#if headerTooltip}
-					<div use:tooltip={{ text: headerTooltip, classes: ['w-64', 'break-normal', 'z-[60]'] }}>
+					<div use:tooltip={{ text: headerTooltip, classes: ['w-64', 'break-normal', 'z-70'] }}>
 						<CircleQuestionMark class="text-muted-content size-3.5" />
 					</div>
 				{/if}
@@ -94,7 +101,11 @@
 			</button>
 		{:else}
 			<span class="flex items-center gap-1 text-nowrap">
-				{headerTitle ?? property}
+				{#if headerTitle}
+					{headerTitle}
+				{:else}
+					<span class="capitalize">{property}</span>
+				{/if}
 				{#if headerTooltip}
 					<div use:tooltip={{ text: headerTooltip, classes: ['w-64', 'break-normal', 'z-[60]'] }}>
 						<CircleQuestionMark class="text-muted-content size-3.5" />
@@ -132,7 +143,7 @@
 					root: 'flex grow'
 				}}
 				options={filterOptions?.filter(Boolean).map((option) => ({
-					label: option.toString(),
+					label: formatOption?.(option) ?? option.toString(),
 					id: option.toString()
 				})) ?? []}
 				onClear={(option) => {
@@ -153,7 +164,7 @@
 				multiple
 				selected={selectedFilterValues.join(',')}
 				searchInDropdown
-				placeholder={`Filter by ${headerTitle ?? property}...`}
+				placeholder={m.core_filter_by_placeholder({ name: headerTitle ?? property })}
 			/>
 		</div>
 	{/if}

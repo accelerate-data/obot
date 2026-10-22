@@ -1,12 +1,14 @@
 <script lang="ts">
 	import JsonPreview from '$lib/components/JsonPreview.svelte';
+	import { m } from '$lib/i18n';
 	import type {
 		DirectOperationResult,
 		DirectOperationStatus
 	} from '$lib/services/mcp/tester.svelte';
 	import CornerCopyButton from './CornerCopyButton.svelte';
 	import McpContent from './McpContent.svelte';
-	import { Ban, CircleCheck, CircleAlert, Clock3, TriangleAlert } from '@lucide/svelte';
+	import TesterError from './TesterError.svelte';
+	import { Ban, CircleCheck, Clock3, TriangleAlert } from '@lucide/svelte';
 
 	interface Props {
 		result: DirectOperationResult<unknown>;
@@ -22,50 +24,70 @@
 	function label(status: DirectOperationStatus): string {
 		switch (status) {
 			case 'success':
-				return 'Succeeded';
+				return m.mcps_tester_call_succeeded();
 			case 'mcp-error':
-				return 'MCP error result';
+				return m.mcps_tester_status_mcp_error();
 			case 'denied':
-				return 'Denied';
+				return m.mcps_tester_status_denied();
 			case 'timeout':
-				return 'Timed out';
+				return m.mcps_tester_status_timeout();
 			case 'cancelled':
-				return 'Cancelled';
+				return m.mcps_tester_call_cancelled();
 			default:
-				return 'Request failed';
+				return m.mcps_tester_status_request_failed();
 		}
 	}
 </script>
 
-<section class="space-y-4" aria-label="Operation result">
-	<div
-		class={`flex flex-wrap items-center gap-2 rounded-lg p-3 text-sm ${
-			result.status === 'success'
-				? 'bg-success/10'
-				: ['timeout', 'cancelled'].includes(result.status)
-					? 'bg-warning/10'
-					: 'bg-error/10'
-		}`}
-		role={result.status === 'success' ? 'status' : 'alert'}
-	>
-		{#if result.status === 'success'}
-			<CircleCheck class="size-4 text-success" aria-hidden="true" />
-		{:else if result.status === 'cancelled'}
-			<Ban class="size-4 text-warning" aria-hidden="true" />
-		{:else if result.status === 'timeout'}
-			<Clock3 class="size-4 text-warning" aria-hidden="true" />
-		{:else if result.status === 'mcp-error'}
-			<CircleAlert class="size-4 text-error" aria-hidden="true" />
-		{:else}
-			<TriangleAlert class="size-4 text-error" aria-hidden="true" />
-		{/if}
-		<strong>{label(result.status)}</strong>
-		<span class="text-muted-content">{Math.round(result.durationMs)} ms</span>
-		{#if result.message}<span>{result.message}</span>{/if}
-	</div>
+<section class="space-y-4" aria-label={m.mcps_tester_operation_result()}>
+	{#if result.status !== 'success' && (result.message || result.status === 'mcp-error')}
+		<TesterError
+			title={label(result.status)}
+			message={result.message ?? rawJSON ?? m.mcps_tester_status_mcp_error()}
+			details={result.details ?? result.value}
+			severity={result.status === 'cancelled' || result.status === 'timeout' ? 'warning' : 'error'}
+		>
+			{#snippet icon()}
+				{#if result.status === 'cancelled'}
+					<Ban class="size-4 text-warning" aria-hidden="true" />
+				{:else if result.status === 'timeout'}
+					<Clock3 class="size-4 text-warning" aria-hidden="true" />
+				{/if}
+			{/snippet}
+			{#snippet actions()}
+				<span class="self-center text-sm text-muted-content"
+					>{Math.round(result.durationMs)} ms</span
+				>
+			{/snippet}
+		</TesterError>
+	{:else}
+		<div
+			class={`flex flex-wrap items-center gap-2 rounded-lg p-3 text-sm ${
+				result.status === 'success'
+					? 'bg-success/10'
+					: ['timeout', 'cancelled'].includes(result.status)
+						? 'bg-warning/10'
+						: 'bg-error/10'
+			}`}
+			role={result.status === 'success' ? 'status' : 'alert'}
+		>
+			{#if result.status === 'success'}
+				<CircleCheck class="size-4 text-success" aria-hidden="true" />
+			{:else if result.status === 'cancelled'}
+				<Ban class="size-4 text-warning" aria-hidden="true" />
+			{:else if result.status === 'timeout'}
+				<Clock3 class="size-4 text-warning" aria-hidden="true" />
+			{:else}
+				<TriangleAlert class="size-4 text-error" aria-hidden="true" />
+			{/if}
+			<strong>{label(result.status)}</strong>
+			{#if result.message}<span>{result.message}</span>{/if}
+			<span class="text-muted-content">{Math.round(result.durationMs)} ms</span>
+		</div>
+	{/if}
 
 	{#if content.length}
-		<div class="space-y-3" aria-label="Rendered content">
+		<div class="space-y-3" aria-label={m.mcps_tester_rendered_content()}>
 			{#each content as item, index (index)}
 				<McpContent content={item} collapseLongText />
 			{/each}
@@ -74,12 +96,12 @@
 
 	{#if structuredContent !== undefined}
 		<div>
-			<h4 class="mb-2 text-sm font-medium">Structured content</h4>
+			<h4 class="mb-2 text-sm font-medium">{m.mcps_tester_structured_content()}</h4>
 			<CornerCopyButton
 				text={JSON.stringify(structuredContent, null, 2)}
-				label="Copy structured JSON"
+				label={m.mcps_tester_copy_structured_json()}
 			>
-				<JsonPreview value={structuredContent} ariaLabel="Structured MCP content" />
+				<JsonPreview value={structuredContent} ariaLabel={m.mcps_tester_structured_mcp_content()} />
 			</CornerCopyButton>
 		</div>
 	{/if}
@@ -97,11 +119,15 @@
 				}
 			}}
 		>
-			<summary class="cursor-pointer text-sm font-medium">Raw response</summary>
+			<summary class="cursor-pointer text-sm font-medium">{m.mcps_tester_raw_response()}</summary>
 			<div class="mt-2">
 				<!-- Offset so the copy icon sits beside the preview's maximize button. -->
-				<CornerCopyButton text={rawJSON} label="Copy raw JSON" offset="2.25rem">
-					<JsonPreview value={result.value} ariaLabel="Raw MCP response" maximizable />
+				<CornerCopyButton text={rawJSON} label={m.mcps_tester_copy_raw_json()} offset="2.25rem">
+					<JsonPreview
+						value={result.value}
+						ariaLabel={m.mcps_tester_raw_mcp_response()}
+						maximizable
+					/>
 				</CornerCopyButton>
 			</div>
 		</details>

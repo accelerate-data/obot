@@ -1,6 +1,7 @@
 <script lang="ts" generics="T extends { id: string | number }">
 	import { tooltip } from '$lib/actions/tooltip.svelte';
 	import { PAGE_TRANSITION_DURATION } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import DotDotDot from '../DotDotDot.svelte';
 	import IconButton from '../primitives/IconButton.svelte';
 	import TableColumnFilter from './TableColumnFilter.svelte';
@@ -34,10 +35,17 @@
 		headerClasses?: { property: string; class: string }[];
 		fields: string[];
 		data: T[];
+		filterData?: T[];
+		manualSorting?: boolean;
 		onClickRow?: (row: T, isCtrlClick: boolean) => void;
 		onFilter?: (property: string, values: string[]) => void;
 		onClearAllFilters?: () => void;
 		onRenderColumn?: Snippet<[string, T]>;
+		/** Display text for a raw cell value; filtering, sorting, and URL filters keep the raw value. */
+		displayValue?: (property: string, value: unknown) => string;
+		/** Filter token for a row. Defaults to the cell value. `displayValue` labels that token. */
+		filterValue?: (property: string, row: T) => unknown;
+		sortValue?: (property: string, row: T) => unknown;
 		onRenderSubrowContent?: Snippet<[T]>;
 		onSort?: InitSortFn;
 		setRowClasses?: (row: T) => string;
@@ -67,15 +75,20 @@
 		headers,
 		headerClasses,
 		data,
+		filterData,
+		manualSorting = false,
 		fields,
 		onClickRow,
 		onClearAllFilters,
 		onFilter,
 		onRenderColumn,
+		displayValue,
+		filterValue,
+		sortValue,
 		onRenderSubrowContent,
 		onSort,
 		pageSize,
-		noDataMessage = 'No data',
+		noDataMessage = m.core_no_data(),
 		setRowClasses,
 		sortable,
 		filterable,
@@ -116,17 +129,24 @@
 	);
 
 	let filteredBy = $derived<Record<string, (string | number)[]> | undefined>(filters);
+
+	function readFilterValue(property: string, row: T) {
+		const custom = filterValue?.(property, row);
+		if (custom !== undefined) return custom;
+		return row[property as keyof T];
+	}
+
 	let filterValues = $derived.by(() => {
 		if (!filterable) return {};
 
-		return data.reduce(
+		return (filterData ?? data).reduce(
 			(acc, item) => {
 				for (const property of filterable) {
 					if (!acc[property]) {
 						acc[property] = new Set();
 					}
 
-					const value = item[property as keyof T];
+					const value = readFilterValue(property, item);
 					if (Array.isArray(value)) {
 						value.forEach((v) => {
 							if (typeof v === 'string' || typeof v === 'number') {
@@ -173,7 +193,7 @@
 	let tableData = $derived.by(() => {
 		let updatedTableData = data;
 
-		if (sortedBy) {
+		if (sortedBy && (!manualSorting || sortedBy.property === 'selectable')) {
 			updatedTableData = [...data].sort((a, b) => {
 				if (tableSelectActions && validateSelect && sortedBy?.property === 'selectable') {
 					const aSelectable = validateSelect(a);
@@ -186,8 +206,8 @@
 				}
 
 				// Then sort by the specified property
-				let aValue = a[sortedBy!.property as keyof T];
-				let bValue = b[sortedBy!.property as keyof T];
+				let aValue = sortValue?.(sortedBy!.property, a) ?? a[sortedBy!.property as keyof T];
+				let bValue = sortValue?.(sortedBy!.property, b) ?? b[sortedBy!.property as keyof T];
 
 				// Handle undefined/null values - treat as largest value (end for asc, beginning for desc)
 				if (aValue == null && bValue == null) return 0;
@@ -242,7 +262,7 @@
 								return validateSelect ? validateSelect(d) : true;
 							}
 
-							const value = d[property as keyof T];
+							const value = readFilterValue(property, d);
 							if (Array.isArray(value)) {
 								return value.some((v) => filteredBy?.[property]?.includes(v.toString().trim()));
 							} else if (typeof value === 'string' || typeof value === 'number') {
@@ -291,12 +311,16 @@
 		visibleItems.filter((d) => (validateSelect ? validateSelect(d) : true)).length
 	);
 
+	export function clearSelect(id: string) {
+		delete selected[id];
+	}
+
 	export function clearSelectAll() {
 		selected = {};
 	}
 
 	function getColumnMinWidth(width: number, index: number, columnCount: number): number {
-		if (index === 0 && tableSelectActions) return 57;
+		if (index === 0 && tableSelectActions) return validateSelect ? 76 : 57;
 		if (actions && index === columnCount - 1) return Math.max(width, ACTIONS_MIN_WIDTH);
 		// if filterable fields are present, add width to account for filter button
 		return Math.max(width * 0.3, 100) + (filterableFields.size > 0 ? 36 : 0);
@@ -565,7 +589,10 @@
 			<div class="flex w-full items-center">
 				<div class="shrink-0 p-2">{@render selectAll()}</div>
 				<div class="text-muted-content px-4 py-2 text-left text-sm font-semibold">
-					{Object.keys(selected).length} of {totalSelectable} selected
+					{m.core_n_of_total_selected({
+						count: Object.keys(selected).length,
+						total: totalSelectable
+					})}
 				</div>
 				<div class="flex grow items-center justify-end">
 					{@render tableSelectActions(selected)}
@@ -693,7 +720,7 @@
 {#if tableData.length === 0}
 	<div class="my-2 flex flex-col items-center justify-center gap-2">
 		{#if Object.keys(filteredBy || {}).length > 0}
-			<p class="text-muted-content text-sm font-light">No results found.</p>
+			<p class="text-muted-content text-sm font-light">{m.core_no_results_found()}</p>
 			<button
 				class="btn btn-sm btn-secondary"
 				onclick={() => {
@@ -701,7 +728,7 @@
 					onClearAllFilters?.();
 				}}
 			>
-				Clear All Filters
+				{m.core_clear_all_filters()}
 			</button>
 		{:else}
 			<p class="text-muted-content text-sm font-light">{noDataMessage}</p>
@@ -716,11 +743,12 @@
 			disabled={page === 0}
 			onclick={() => page--}
 		>
-			<ChevronsLeft class="size-4" /> Previous
+			<ChevronsLeft class="size-4" />
+			{m.core_previous()}
 		</button>
 
 		<p class="text-muted-content text-xs">
-			{page + 1} of {Math.ceil(total / pageSize)}
+			{m.core_page_of({ page: page + 1, total: Math.ceil(total / pageSize) })}
 		</p>
 
 		<button
@@ -728,7 +756,8 @@
 			disabled={page === Math.floor(total / pageSize)}
 			onclick={() => page++}
 		>
-			Next <ChevronsRight class="size-4" />
+			{m.core_next()}
+			<ChevronsRight class="size-4" />
 		</button>
 	</div>
 {/if}
@@ -777,7 +806,7 @@
 						onSort?.('selectable', 'asc');
 					}}
 				>
-					Sort By Selectable Items
+					{m.core_sort_by_selectable_items()}
 				</button>
 				<button
 					class="menu-button"
@@ -795,9 +824,9 @@
 					}}
 				>
 					{#if filteredBy?.['selectable']}
-						Show All Items
+						{m.core_show_all_items()}
 					{:else}
-						Show Only Selectable Items
+						{m.core_show_only_selectable_items()}
 					{/if}
 				</button>
 			</DotDotDot>
@@ -835,6 +864,7 @@
 					activeSort={sortedBy?.property === property}
 					order={sortedBy?.order}
 					presetFilters={filteredBy?.[property]}
+					formatOption={displayValue ? (value) => displayValue(property, value) : undefined}
 					{disablePortal}
 				/>
 			{/each}
@@ -898,7 +928,7 @@
 					</IconButton>
 				</td>
 			{:else}
-				<td class="p-2" use:tooltip={disabledSelectMessage || 'This item is not selectable'}>
+				<td class="p-2" use:tooltip={disabledSelectMessage || m.core_item_not_selectable()}>
 					<IconButton class="opacity-30" disabled>
 						<Square class="size-5" />
 					</IconButton>
@@ -920,6 +950,8 @@
 				>
 					{#if onRenderColumn}
 						{@render onRenderColumn(fieldName, d)}
+					{:else if displayValue}
+						{displayValue(fieldName, d[fieldName as keyof T])}
 					{:else}
 						{d[fieldName as keyof T]}
 					{/if}

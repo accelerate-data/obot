@@ -7,6 +7,7 @@
 	export type FilterInput = {
 		label: string;
 		multiple?: boolean;
+		textInput?: boolean;
 		tooltip?: string;
 		property: string;
 		selected?: string | number | null;
@@ -19,6 +20,7 @@
 <script lang="ts">
 	import InfoTooltip from '$lib/components/InfoTooltip.svelte';
 	import Select, { type SelectProps } from '$lib/components/Select.svelte';
+	import { m } from '$lib/i18n';
 	import { parseMultiValue } from '$lib/multiValue';
 	import { flip } from 'svelte/animate';
 	import { slide } from 'svelte/transition';
@@ -62,7 +64,7 @@
 			shouldShowResetButton
 				? {
 						id: 'reset',
-						label: 'Reset',
+						label: m.core_reset_page(),
 						onclick: () => onReset?.(),
 						class: 'text-primary opacity-80 hover:opacity-90 active:opacity-100'
 					}
@@ -70,9 +72,10 @@
 			shouldShowClearButton
 				? {
 						id: 'clear',
-						label: ['Clear', parseMultiValue(value).length > 1 ? 'All' : '']
-							.filter(Boolean)
-							.join(' '),
+						label:
+							!filter.textInput && parseMultiValue(value).length > 1
+								? m.core_clear_all()
+								: m.core_clear(),
 						onclick: () => onClearAll?.(),
 						class: 'opacity-50 hover:opacity-80 active:opacity-100'
 					}
@@ -89,13 +92,13 @@
 <div
 	class={twMerge(
 		'mb-2 flex flex-col gap-1',
-		(filter.disabled || !options.length) && 'pointer-events-none opacity-50'
+		(filter.disabled || (!filter.textInput && !options.length)) && 'pointer-events-none opacity-50'
 	)}
 >
 	<div class="flex items-center justify-between">
 		<div class="flex items-center gap-1">
-			<label for={filter.property} class="text-md font-light capitalize">
-				By {filter.label}
+			<label for={`filter-${filter.property}`} class="text-md font-light capitalize">
+				{m.audit_usage_exports_filter_by_label({ label: filter.label })}
 			</label>
 			{#if filter.tooltip}
 				<InfoTooltip text={filter.tooltip} popoverWidth="fit" />
@@ -117,22 +120,34 @@
 		</flex>
 	</div>
 
-	<Select
-		id={`filter-${filter.property}`}
-		class="dark:border-base-400 bg-base-200 dark:bg-base-100 border border-transparent shadow-inner"
-		classes={{
-			root: 'w-full',
-			clear: 'hover:bg-base-400 bg-transparent'
-		}}
-		{options}
-		bind:selected={
-			() => value,
-			(v) => {
-				filter.selected = v;
+	{#if filter.textInput}
+		<input
+			id={`filter-${filter.property}`}
+			type="text"
+			class="input input-bordered w-full"
+			{value}
+			disabled={filter.disabled}
+			oninput={(event) => {
+				filter.selected = event.currentTarget.value;
+			}}
+		/>
+	{:else}
+		<Select
+			id={`filter-${filter.property}`}
+			classes={{
+				root: 'w-full',
+				clear: 'hover:bg-base-400 bg-transparent'
+			}}
+			{options}
+			bind:selected={
+				() => value,
+				(v) => {
+					filter.selected = v;
+				}
 			}
-		}
-		multiple={filter.multiple ?? true}
-		valueFormat={filter.property === 'mcp_server' ? 'json' : 'comma-separated'}
-		{onSelect}
-	/>
+			multiple={filter.multiple ?? true}
+			valueFormat={filter.property === 'mcp_server' ? 'json' : 'comma-separated'}
+			{onSelect}
+		/>
+	{/if}
 </div>

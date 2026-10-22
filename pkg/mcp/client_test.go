@@ -10,7 +10,65 @@ import (
 
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/obot-platform/mmmcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 )
+
+func TestRemoteMCPAndOpenAPINetworkPoliciesMatch(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		url    string
+		config RemoteMCPURLValidationConfig
+	}{
+		{
+			name: "loopback blocked",
+			url:  "http://127.0.0.1",
+		},
+		{
+			name: "localhost blocked",
+			url:  "http://localhost",
+		},
+		{
+			name:   "loopback allowed",
+			url:    "http://127.0.0.1",
+			config: RemoteMCPURLValidationConfig{AllowLocalhostMCP: true},
+		},
+		{
+			name: "private blocked",
+			url:  "http://10.0.0.1",
+		},
+		{
+			name:   "private allowed",
+			url:    "http://10.0.0.1",
+			config: RemoteMCPURLValidationConfig{AllowPrivateIPMCP: true},
+		},
+		{
+			name: "link local blocked",
+			url:  "http://169.254.1.1",
+		},
+		{
+			name:   "link local allowed",
+			url:    "http://169.254.1.1",
+			config: RemoteMCPURLValidationConfig{AllowLinkLocalMCP: true},
+		},
+		{
+			name: "unspecified blocked",
+			url:  "http://0.0.0.0",
+		},
+		{
+			name:   "unspecified allowed",
+			url:    "http://0.0.0.0",
+			config: RemoteMCPURLValidationConfig{AllowLocalhostMCP: true},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			remoteErr := ValidateRemoteMCPURL(t.Context(), test.url, test.config)
+			openAPIErr := safehttp.ValidateURL(t.Context(), test.url, test.config.SafeHTTPOptions())
+			if (remoteErr == nil) != (openAPIErr == nil) {
+				t.Fatalf("remote URL error = %v, OpenAPI URL error = %v", remoteErr, openAPIErr)
+			}
+		})
+	}
+}
 
 func TestAuthorizationErrorSurvivesSDKWrapping(t *testing.T) {
 	const challenge = `Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"`
@@ -136,7 +194,7 @@ func TestOAuthHandlerForClientUsesConfiguredClientIDMetadataDocument(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			sm := &SessionManager{baseURL: "https://obot.example.com"}
-			handler := sm.oauthHandlerForClient(http.DefaultClient, "test-server", ClientOption{
+			handler := sm.oauthHandlerForClient(http.DefaultClient, "test-server", "", ClientOption{
 				ClientName:                    "test-client",
 				TokenStorage:                  &recordingTokenStorage{},
 				OAuthClientIDMetadataDocument: tt.document,
@@ -183,7 +241,7 @@ func TestOAuthHandlerForClientRegistersUnderTheClientNameProvidersShow(t *testin
 			defer server.Close()
 
 			sm := &SessionManager{baseURL: "https://obot.example.com"}
-			handler := sm.oauthHandlerForClient(server.Client(), "test-server", ClientOption{
+			handler := sm.oauthHandlerForClient(server.Client(), "test-server", "", ClientOption{
 				OAuthClientName: tt.oauthClientName,
 				ClientName:      "client-name",
 				TokenStorage:    &recordingTokenStorage{},
@@ -369,6 +427,21 @@ func TestValidateRemoteMCPURL(t *testing.T) {
 			wantErr: "localhost URL",
 		},
 		{
+			name:    "rejects unspecified IPv4",
+			rawURL:  "http://0.0.0.0:8080/mcp",
+			wantErr: "localhost URL",
+		},
+		{
+			name:    "rejects unspecified IPv6",
+			rawURL:  "http://[::]:8080/mcp",
+			wantErr: "localhost URL",
+		},
+		{
+			name:              "allows unspecified when localhost is configured",
+			rawURL:            "http://0.0.0.0:8080/mcp",
+			allowLocalhostMCP: true,
+		},
+		{
 			name:              "allows loopback when configured",
 			rawURL:            "http://127.0.0.1:8080/mcp",
 			allowLocalhostMCP: true,
@@ -409,6 +482,17 @@ func TestValidateRemoteMCPURL(t *testing.T) {
 			rawURL:            "http://[fe80::1]/mcp",
 			allowPrivateIPMCP: true,
 			wantErr:           "link-local address",
+		},
+		{
+			name:              "rejects zone-scoped IPv6 link-local",
+			rawURL:            "http://[fe80::1%25zz0]/mcp",
+			allowPrivateIPMCP: true,
+			wantErr:           "link-local address",
+		},
+		{
+			name:    "rejects zone-scoped IPv6 loopback",
+			rawURL:  "http://[::1%25zz0]/mcp",
+			wantErr: "localhost URL",
 		},
 		{
 			name:              "allows link-local when configured",

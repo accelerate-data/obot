@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { ADMIN_SESSION_STORAGE } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import {
 		AdminService,
@@ -16,6 +17,7 @@
 		type OrgUser,
 		type MCPCatalogEntryServerManifest
 	} from '$lib/services';
+	import type { OpenAPIImportDraft } from '$lib/services/openapi';
 	import {
 		getMCPDisplayName,
 		getManifestConfiguration,
@@ -23,7 +25,9 @@
 		getSource,
 		isMultiUserCatalogEntry,
 		isDeprecatedMCPServer,
-		isMultiUserServer
+		isMultiUserServer,
+		getMcpValueLabel,
+		isMcpLoginURL
 	} from '$lib/services/user/mcp';
 	import { profile } from '$lib/stores';
 	import { success } from '$lib/stores/success';
@@ -34,6 +38,7 @@
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
 	import Select from '../Select.svelte';
 	import CatalogConfigureForm, { type LaunchFormData } from '../mcp/CatalogConfigureForm.svelte';
+	import McpLogin from '../mcp/McpLogin.svelte';
 	import McpServerDetails from '../mcp/McpServerDetails.svelte';
 	import McpServerInfo from '../mcp/McpServerInfo.svelte';
 	import McpServerTools from '../mcp/McpServerTools.svelte';
@@ -69,7 +74,11 @@
 		entry?: MCPCatalogEntry | MCPCatalogServer;
 		server?: MCPCatalogServer;
 		type?: LaunchServerType;
+		initialOpenAPIImport?: OpenAPIImportDraft;
 		readonly?: boolean;
+		disableAddFromTools?: boolean;
+		disableAddFromToolsLabel?: string;
+		onAddFromTools?: () => void;
 		onCancel?: () => void;
 		onSubmit?: (id: string, isMultiUserEntry: boolean, message?: string) => void;
 		hasExistingConfigured?: boolean;
@@ -88,7 +97,11 @@
 		id,
 		entity = 'catalog',
 		type,
+		initialOpenAPIImport,
 		readonly,
+		disableAddFromTools,
+		disableAddFromToolsLabel,
+		onAddFromTools,
 		onCancel,
 		onSubmit,
 		hasExistingConfigured,
@@ -163,6 +176,13 @@
 	let error = $state<string>();
 	let showButtonInlineError = $state(false);
 	let showUpdateExistingDeploymentsConfirm = $state(false);
+	let showUpdateExistingVmcps = $state(false);
+	let showUpdateExistingConfirm = $derived(
+		showUpdateExistingDeploymentsConfirm || showUpdateExistingVmcps
+	);
+	let hasBothUpdateActions = $derived(
+		showUpdateExistingDeploymentsConfirm && showUpdateExistingVmcps
+	);
 	let selectedDeploymentsToView = $state<MCPCatalogServer[]>([]);
 
 	let serverInstancesLoading = $state(false);
@@ -182,7 +202,7 @@
 		resolvedConfiguredServers?.length ?? resolvedConfiguredInstances?.length ?? 0
 	);
 	let needsDeploymentsUpdate = $derived(
-		resolvedConfiguredServers?.some((s) => s.needsUpdate || s.needsK8sUpdate) ??
+		resolvedConfiguredServers?.some((s) => s.needsK8sUpdate) ??
 			resolvedConfiguredInstances?.some((i) => !i.configured)
 	);
 	let ownedDeployments = $derived(
@@ -202,14 +222,18 @@
 			entry.lastUpdated &&
 			new Date(entry.toolPreviewsLastGenerated) < new Date(entry.lastUpdated)
 	);
+	let hasStaticOauth = $derived(
+		entry &&
+			'isCatalogEntry' in entry &&
+			entry.manifest?.runtime === 'remote' &&
+			entry.manifest?.remoteConfig?.staticOAuthRequired
+	);
 	let requiresStaticOauth = $derived(
-		staticOauthStatus
-			? !staticOauthStatus.configured
-			: entry &&
-					'isCatalogEntry' in entry &&
-					entry.manifest?.runtime === 'remote' &&
-					entry.manifest?.remoteConfig?.staticOAuthRequired &&
-					!entry.oauthCredentialConfigured
+		hasStaticOauth &&
+			!(
+				staticOauthStatus?.configured ??
+				(entry && 'isCatalogEntry' in entry ? entry.oauthCredentialConfigured : false)
+			)
 	);
 	let previewToolsOverride = $state<MCPCatalogEntryServerManifest['toolPreview']>();
 
@@ -217,32 +241,36 @@
 		const availableTabs =
 			entry && !server
 				? [
-						{ label: 'Overview', view: 'overview' },
+						{ label: m.mcps_catalog_tab_overview(), view: 'overview' },
 						// Basic users who just connected don't see Configuration.
 						// Catalog entry-deployed multi-user servers also hide it: the configuration is
 						// owned by the upstream catalog entry, not the deployment.
 						...(trueOwner &&
 						(!isCatalogEntryDeployedMultiUserServer(entry) || allowMultiUserServerConfigurationEdit)
-							? [{ label: 'Configuration', view: 'configuration' }]
+							? [{ label: m.mcps_catalog_config_heading(), view: 'configuration' }]
 							: []),
-						...(belongsToUser ? [{ label: 'Server Details', view: 'server-instances' }] : []),
-						{ label: 'Tools', view: 'tools' },
+						...(belongsToUser
+							? [{ label: m.mcps_catalog_tab_server_details(), view: 'server-instances' }]
+							: []),
+						{ label: m.mcps_tester_tools(), view: 'tools' },
 						...(isAtLeastPowerUserPlus && trueOwner
-							? [{ label: 'Access Policies', view: 'access-control' }]
+							? [{ label: m.mcps_access_policies_tab(), view: 'access-control' }]
 							: []),
 						...(profile.current?.hasAdminAccess?.()
-							? [
-									{ label: 'Filters', view: 'filters' },
-									{ label: 'Troubleshooting', view: 'troubleshooting' }
-								]
+							? [{ label: m.core_filters_title(), view: 'filters' }]
+							: []),
+						...(profile.current?.hasAdminAccess?.() && entry.manifest?.runtime === 'remote'
+							? [{ label: m.mcps_catalog_tab_troubleshooting(), view: 'troubleshooting' }]
 							: [])
 					]
 				: [
-						{ label: 'Overview', view: 'overview' },
-						...(belongsToUser ? [{ label: 'Server Details', view: 'server-instances' }] : []),
-						{ label: 'Tools', view: 'tools' },
+						{ label: m.mcps_catalog_tab_overview(), view: 'overview' },
+						...(belongsToUser
+							? [{ label: m.mcps_catalog_tab_server_details(), view: 'server-instances' }]
+							: []),
+						{ label: m.mcps_tester_tools(), view: 'tools' },
 						...(profile.current?.hasAdminAccess?.() && entry?.manifest?.runtime === 'remote'
-							? [{ label: 'Troubleshooting', view: 'troubleshooting' }]
+							? [{ label: m.mcps_catalog_tab_troubleshooting(), view: 'troubleshooting' }]
 							: [])
 					];
 		return limitViews
@@ -425,7 +453,7 @@
 
 	async function handleVisibilityChange() {
 		if (!entry || !id) return;
-		if (document.visibilityState !== 'visible') return;
+		if (document.visibilityState !== 'visible' || isMcpLoginURL(oauthURL ?? '')) return;
 
 		document.removeEventListener('visibilitychange', handleVisibilityChange);
 		handleLaunchTemporaryInstance();
@@ -478,7 +506,7 @@
 				configDialog?.close();
 			}
 		} catch (err) {
-			const errMessage = err instanceof Error ? err.message : 'An unknown error occurred';
+			const errMessage = err instanceof Error ? err.message : m.mcps_unknown_error();
 			if (errMessage.includes('MCP server requires OAuth authentication')) {
 				const oauthResponse =
 					entity === 'workspace'
@@ -497,7 +525,7 @@
 					handleTemporaryInstanceOauth(oauthResponse);
 				}
 			} else {
-				error = err instanceof Error ? err.message : 'An unknown error occurred';
+				error = err instanceof Error ? err.message : m.mcps_unknown_error();
 				showButtonInlineError = showInlineError;
 			}
 		} finally {
@@ -580,6 +608,21 @@
 		}
 	}
 
+	function closeUpdateExistingConfirm() {
+		showUpdateExistingDeploymentsConfirm = false;
+		showUpdateExistingVmcps = false;
+	}
+
+	function goToUpdateDeployments() {
+		closeUpdateExistingConfirm();
+		handleSelectionChange('server-instances');
+	}
+
+	function goToUpdateVmcps() {
+		closeUpdateExistingConfirm();
+		goto(`/vmcps?components=${entry?.id}`);
+	}
+
 	async function reloadConfiguredServers() {
 		if (!id || !entry || !('isCatalogEntry' in entry)) return;
 		serverInstancesLoading = true;
@@ -611,8 +654,13 @@
 					.then((response) => {
 						resolvedConfiguredServers = response.filter((s) => !s.deleted);
 						refreshToolsDisplay();
-						if (response.length > 0 && response.some((instance) => instance)) {
-							showUpdateExistingDeploymentsConfirm = true;
+
+						if (response.length > 0) {
+							const belongsToVmcps = response.filter(
+								(s) => !s.deleted && !!(s.vmcpComponentID || s.vmcpID || s.vmcpInstanceID)
+							);
+							showUpdateExistingVmcps = belongsToVmcps.length > 0;
+							showUpdateExistingDeploymentsConfirm = response.length > belongsToVmcps.length;
 						}
 					})
 					.catch(() => {});
@@ -647,7 +695,7 @@
 					{/if}
 				</h1>
 				<div class="pill-rounded">
-					{getServerTypeLabel(entry)}
+					{getMcpValueLabel(getServerTypeLabel(entry))}
 				</div>
 				{#if source}
 					{#if source.sourceType === 'git'}
@@ -662,7 +710,7 @@
 						</a>
 					{:else}
 						<div class="pill-rounded">
-							{source.source}
+							{getMcpValueLabel(source.source)}
 						</div>
 					{/if}
 				{/if}
@@ -670,7 +718,7 @@
 			{#if belongsToUser && !readonly && !connectOnly}
 				<IconButton
 					variant="danger2"
-					tooltip={{ text: 'Delete Server' }}
+					tooltip={{ text: m.mcps_catalog_delete_server() }}
 					onclick={() => {
 						deleteServer = true;
 					}}
@@ -681,23 +729,37 @@
 		</div>
 	{/if}
 
-	{#if requiresStaticOauth}
-		<div class="flex items-center gap-3 rounded-lg border border-warning bg-warning/10 p-4">
-			<Info class="size-5 shrink-0 text-warning" />
+	{#if hasStaticOauth}
+		{@const oauthCredentialsLabel = requiresStaticOauth
+			? m.mcps_catalog_configure_oauth_credentials()
+			: m.mcps_catalog_manage_oauth_credentials()}
+		<div
+			class="flex items-center gap-3 rounded-lg border p-4 {requiresStaticOauth
+				? 'border-warning bg-warning/10'
+				: 'border-base-300'}"
+		>
+			<Info class="size-5 shrink-0 {requiresStaticOauth ? 'text-warning' : ''}" />
 			<div class="flex-1">
-				<p class="text-sm font-medium">Requires Oauth Config</p>
+				<p class="text-sm font-medium">
+					{requiresStaticOauth
+						? m.mcps_catalog_requires_oauth_config()
+						: m.mcps_catalog_oauth_credentials_configured()}
+				</p>
 				<p class="text-muted-foreground mt-1 text-xs">
-					This MCP server is missing static client ID and secret credentials. Click the button to
-					get started.
+					{requiresStaticOauth
+						? m.mcps_catalog_oauth_missing_static_description()
+						: m.mcps_catalog_oauth_manage_static_description()}
 				</p>
 			</div>
 			<button
+				type="button"
 				class="btn btn-secondary flex items-center gap-1.5 font-normal"
+				aria-label={oauthCredentialsLabel}
 				onclick={handleConfigureOAuth}
 				disabled={!canConfigureOAuthCredentials}
 			>
 				<Settings class="size-4" />
-				Configure OAuth Credentials
+				{oauthCredentialsLabel}
 			</button>
 		</div>
 	{/if}
@@ -767,33 +829,17 @@
 
 		{#if selected === 'overview' && entry}
 			<div class="pb-8">
-				{#if !('isCatalogEntry' in entry) && entry.needsUpdate}
-					<div class="notification-info mb-3 p-3 text-sm font-light">
-						<div class="flex items-center gap-3">
-							<CircleFadingArrowUp class="size-6" />
-							<p>
-								The configuration for this server's catalog entry has changed and can be applied to
-								this server.
-							</p>
-						</div>
-					</div>
-				{/if}
 				{#if hasExistingConfigured}
 					<div class="notification-info mb-3 p-3 text-sm font-light">
 						<div class="flex items-center gap-3">
 							<Info class="size-6" />
 							<p>
-								It looks like you already have an existing server instance available. It is
-								recommended to only create another one if you need to instantiate another one with
-								different configurations.
+								{m.mcps_catalog_existing_instance_notice()}
 							</p>
 						</div>
 					</div>
 				{/if}
-				<McpServerInfo
-					{entry}
-					descriptionPlaceholder="Add a description for this MCP server in the Configuration tab"
-				/>
+				<McpServerInfo {entry} descriptionPlaceholder={m.mcps_catalog_description_placeholder()} />
 			</div>
 		{:else if selected === 'configuration'}
 			{@render configurationView()}
@@ -831,6 +877,7 @@
 		<CatalogServerForm
 			{entry}
 			{type}
+			{initialOpenAPIImport}
 			readonly={configurationReadonly}
 			{id}
 			{entity}
@@ -843,12 +890,12 @@
 			{#snippet readonlyMessage()}
 				{#if entry && 'sourceURL' in entry && !!entry.sourceURL && !entry.detached}
 					<p>
-						This catalog entry comes from an external Git Source URL <span
-							class="text-muted-content text-xs">({entry.sourceURL.split('/').pop()})</span
-						> and cannot be edited.
+						{m.mcps_catalog_git_source_readonly_prefix()}
+						<span class="text-muted-content text-xs">({entry.sourceURL.split('/').pop()})</span>
+						{m.mcps_catalog_git_source_readonly_suffix()}
 					</p>
 				{:else}
-					<p>This catalog entry is non-editable.</p>
+					<p>{m.mcps_catalog_entry_non_editable()}</p>
 				{/if}
 			{/snippet}
 		</CatalogServerForm>
@@ -867,8 +914,8 @@
 				data={serverRules}
 				fields={['displayName', 'resources']}
 				headers={[
-					{ title: 'Rule', property: 'displayName' },
-					{ title: 'Accessible To', property: 'resources' }
+					{ title: m.mcps_col_rule(), property: 'displayName' },
+					{ title: m.mcps_catalog_col_accessible_to(), property: 'resources' }
 				]}
 				onClickRow={(d, isCtrlClick) => {
 					if (!entry) return;
@@ -900,10 +947,16 @@
 							{ totalUsers: 0, totalGroups: 0 }
 						) ?? { totalUsers: 0, totalGroups: 0 }}
 						{#if hasEveryone}
-							Everyone
+							{m.mcps_catalog_everyone()}
 						{:else}
-							{@const userCount = `${totalUsers} user${totalUsers === 1 ? '' : 's'}`}
-							{@const groupCount = `${totalGroups} group${totalGroups === 1 ? '' : 's'}`}
+							{@const userCount =
+								totalUsers === 1
+									? m.mcps_catalog_users_count_one({ count: totalUsers })
+									: m.mcps_catalog_users_count_other({ count: totalUsers })}
+							{@const groupCount =
+								totalGroups === 1
+									? m.mcps_catalog_groups_count_one({ count: totalGroups })
+									: m.mcps_catalog_groups_count_other({ count: totalGroups })}
 							{#if totalUsers > 0 && totalGroups > 0}
 								{userCount}, {groupCount}
 							{:else if totalUsers > 0}
@@ -920,9 +973,11 @@
 		{:else}
 			<div class="mt-12 flex w-md flex-col items-center gap-4 self-center text-center">
 				<GlobeLock class="text-muted-content size-24 opacity-50" />
-				<h4 class="text-muted-content text-lg font-semibold">No MCP access policies</h4>
+				<h4 class="text-muted-content text-lg font-semibold">
+					{m.mcps_catalog_no_mcp_access_policies()}
+				</h4>
 				<p class="text-muted-content text-sm font-light">
-					This server is not tied to any access policies.
+					{m.mcps_catalog_server_no_access_policies()}
 				</p>
 			</div>
 		{/if}
@@ -942,9 +997,9 @@
 					data={serverFilters}
 					fields={['name', 'url', 'selectors']}
 					headers={[
-						{ title: 'Name', property: 'name' },
-						{ title: 'Webhook URL', property: 'url' },
-						{ title: 'Selectors', property: 'selectors' }
+						{ title: m.core_name(), property: 'name' },
+						{ title: m.mcps_filters_webhook_url(), property: 'url' },
+						{ title: m.mcps_catalog_col_selectors(), property: 'selectors' }
 					]}
 					onClickRow={(d, isCtrlClick) => {
 						setLastVisitedMcpServer();
@@ -959,7 +1014,11 @@
 							{d.url || '-'}
 						{:else if property === 'selectors'}
 							{@const count = d.selectors?.length || 0}
-							{count > 0 ? `${count} selector${count > 1 ? 's' : ''}` : '-'}
+							{count > 0
+								? count > 1
+									? m.mcps_catalog_selectors_count_other({ count })
+									: m.mcps_catalog_selectors_count_one({ count })
+								: '-'}
 						{:else}
 							{d[property as keyof typeof d]}
 						{/if}
@@ -968,9 +1027,11 @@
 			{:else}
 				<div class="mt-12 flex w-md flex-col items-center gap-4 self-center text-center">
 					<ListFilter class="text-muted-content size-24 opacity-50" />
-					<h4 class="text-muted-content text-lg font-semibold">No filters configured</h4>
+					<h4 class="text-muted-content text-lg font-semibold">
+						{m.mcps_catalog_no_filters_configured()}
+					</h4>
 					<p class="text-muted-content text-sm font-light">
-						This server is not referenced by any filters.
+						{m.mcps_catalog_server_no_filters()}
 					</p>
 				</div>
 			{/if}
@@ -978,9 +1039,11 @@
 	{:else}
 		<div class="mt-12 flex w-md flex-col items-center gap-4 self-center text-center">
 			<ListFilter class="text-muted-content size-24 opacity-50" />
-			<h4 class="text-muted-content text-lg font-semibold">No filters available</h4>
+			<h4 class="text-muted-content text-lg font-semibold">
+				{m.mcps_catalog_no_filters_available()}
+			</h4>
 			<p class="text-muted-content text-sm font-light">
-				No filters have been configured in the system.
+				{m.mcps_catalog_no_filters_in_system()}
 			</p>
 		</div>
 	{/if}
@@ -1008,7 +1071,7 @@
 								'tab-button text-nowrap',
 								deploymentToDisplayTools === undefined && 'tab-active'
 							)}
-							onclick={() => (deploymentToDisplayTools = undefined)}>Preview</button
+							onclick={() => (deploymentToDisplayTools = undefined)}>{m.core_preview()}</button
 						>
 					{/if}
 
@@ -1032,7 +1095,7 @@
 							</button>
 							<button
 								type="button"
-								aria-label="Close {deploymentLabel} tab"
+								aria-label={m.mcps_catalog_close_tab_named({ name: deploymentLabel })}
 								onclick={() => {
 									selectedDeploymentsToView = selectedDeploymentsToView.filter(
 										(d) => d.id !== deployment.id
@@ -1074,14 +1137,14 @@
 					}}
 					searchInDropdown
 					buttonReadOnly
-					buttonTitle="Include Deployment(s)"
+					buttonTitle={m.mcps_catalog_include_deployments()}
 					displayCount={selectedDeploymentsToView.length > 0}
 				/>
 			</div>
 		{/if}
 		{#if showRegenerateToolsButton}
 			<button class="btn btn-primary mb-4 text-sm" onclick={handleInitTemporaryInstance}>
-				Regenerate Tools & Capabilities
+				{m.mcps_catalog_regenerate_tools()}
 			</button>
 		{/if}
 		{#if entry}
@@ -1092,59 +1155,79 @@
 				previewOverride={previewToolsOverride}
 			>
 				{#snippet noToolsContent()}
-					<div
-						class="mt-12 flex w-lg max-w-full flex-col items-center gap-4 self-center text-center"
-					>
-						<Wrench class="text-muted-content size-24 opacity-50" />
-						{#if !entry || (entry && (readonly || server || deploymentToDisplayTools || connectOnly))}
-							<h4 class="text-muted-content text-lg font-semibold">No tools</h4>
-							<p class="text-muted-content text-sm font-light">
-								Looks like this MCP server doesn't have any tools available currently.
+					{#if onAddFromTools}
+						<div class="mt-8 paper max-w-sm self-center items-center justify-items-center">
+							<div class="rounded-full bg-primary/10 p-2 w-fit">
+								<Wrench class="text-primary size-6" />
+							</div>
+							<h4 class="text-lg font-semibold">{m.mcps_catalog_tool_info_unavailable()}</h4>
+							<p class="text-sm font-light text-center">
+								{m.mcps_catalog_connect_for_tools()}
 							</p>
-						{:else if !readonly && !connectOnly}
-							<h4 class="text-muted-content text-lg font-semibold">No tools</h4>
-							{#if !isMultiTenant}
-								<button
-									class="btn btn-primary flex items-center gap-1 text-sm"
-									onclick={handleInitTemporaryInstance}
-									disabled={saving}
-								>
-									{#if saving}
-										<Loading class="size-4" />
-									{:else}
-										Populate Tool Preview
-									{/if}
-								</button>
-							{/if}
-							{#if !error}
-								<p class="text-muted-content text-sm font-light">
-									{#if isMultiTenant}
-										Tools will populate when a server is deployed for the catalog entry.
-									{:else if type === 'remote'}
-										Click above to connect to the remote MCP server to populate capabilities and
-										tools for preview.
-									{:else}
-										Click above to set up a temporary instance that will populate capabilities and
-										tools for preview. Otherwise, tools will populate when the user first deploys a
-										server for the catalog entry.
-									{/if}
-								</p>
-							{/if}
-						{/if}
-					</div>
-					{#if error && showButtonInlineError}
-						<div class="mt-4 w-full">
-							{@render errorSnippet()}
+							<button
+								class="btn btn-primary w-full flex items-center gap-1 text-sm"
+								onclick={onAddFromTools}
+								disabled={disableAddFromTools}
+							>
+								{disableAddFromTools ? disableAddFromToolsLabel : m.mcps_catalog_add_to_vmcp()}
+							</button>
 						</div>
+					{:else}
+						<div
+							class="mt-12 flex w-lg max-w-full flex-col items-center gap-4 self-center text-center"
+						>
+							<Wrench class="text-muted-content size-24 opacity-50" />
+							{#if !entry || (entry && (readonly || server || deploymentToDisplayTools || connectOnly))}
+								<h4 class="text-muted-content text-lg font-semibold">
+									{m.mcps_catalog_no_tools()}
+								</h4>
+								<p class="text-muted-content text-sm font-light">
+									{m.mcps_catalog_no_tools_available()}
+								</p>
+							{:else if !readonly && !connectOnly}
+								<h4 class="text-muted-content text-lg font-semibold">
+									{m.mcps_catalog_no_tools()}
+								</h4>
+								{#if !isMultiTenant}
+									<button
+										class="btn btn-primary flex items-center gap-1 text-sm"
+										onclick={handleInitTemporaryInstance}
+										disabled={saving}
+									>
+										{#if saving}
+											<Loading class="size-4" />
+										{:else}
+											{m.mcps_catalog_populate_tool_preview()}
+										{/if}
+									</button>
+								{/if}
+								{#if !error}
+									<p class="text-muted-content text-sm font-light">
+										{#if isMultiTenant}
+											{m.mcps_catalog_tools_populate_multi()}
+										{:else if type === 'remote'}
+											{m.mcps_catalog_tools_populate_remote()}
+										{:else}
+											{m.mcps_catalog_tools_populate_temporary()}
+										{/if}
+									</p>
+								{/if}
+							{/if}
+						</div>
+						{#if error && showButtonInlineError}
+							<div class="mt-4 w-full">
+								{@render errorSnippet()}
+							</div>
+						{/if}
 					{/if}
 				{/snippet}
 			</McpServerTools>
 		{:else}
 			<div class="mt-12 flex w-md flex-col items-center gap-4 self-center text-center">
 				<Wrench class="text-muted-content size-24 opacity-50" />
-				<h4 class="text-muted-content text-lg font-semibold">No tools</h4>
+				<h4 class="text-muted-content text-lg font-semibold">{m.mcps_catalog_no_tools()}</h4>
 				<p class="text-muted-content text-sm font-light">
-					Looks like this MCP server doesn't have any tools available currently.
+					{m.mcps_catalog_no_tools_available()}
 				</p>
 			</div>
 		{/if}
@@ -1152,18 +1235,13 @@
 {/snippet}
 
 {#snippet troubleshootingView()}
-	<McpServerEntryTroubleshooting
-		entityId={id}
-		{entity}
-		{entry}
-		{server}
-		servers={ownedDeployments}
-		onRefresh={reloadConfiguredServers}
-	/>
+	<McpServerEntryTroubleshooting {entry} {server} servers={ownedDeployments} />
 {/snippet}
 
 <Confirm
-	msg={`Delete ${entry?.manifest?.name || 'this server'}?`}
+	msg={entry?.manifest?.name
+		? m.core_delete_named_component({ name: entry.manifest.name })
+		: m.mcps_catalog_delete_this_server()}
 	show={deleteServer}
 	onsuccess={async () => {
 		if (!id || !entry) return;
@@ -1190,8 +1268,8 @@
 
 <Confirm
 	msg={deleteResourceFromRule?.resourceId === '*'
-		? 'Remove Everything from this rule?'
-		: 'Remove this MCP server from this rule?'}
+		? m.mcps_catalog_remove_everything_from_rule()
+		: m.mcps_catalog_remove_server_from_rule()}
 	show={Boolean(deleteResourceFromRule)}
 	onsuccess={async () => {
 		if (!deleteResourceFromRule) {
@@ -1227,7 +1305,7 @@
 	icon={entry?.manifest?.icon}
 	name={entry?.manifest?.name}
 	onSave={handleLaunchTemporaryInstance}
-	submitText="Launch"
+	submitText={m.mcps_catalog_launch()}
 	loading={saving}
 	isNew={false}
 	deprecated={isDeprecatedMCPServer(entry)}
@@ -1235,7 +1313,9 @@
 
 <ResponsiveDialog
 	bind:this={oauthDialog}
-	title="Authentication Required"
+	title={oauthURL && isMcpLoginURL(oauthURL)
+		? m.mcps_login_tools_title({ name: getMCPDisplayName(entry) })
+		: m.mcps_catalog_authentication_required()}
 	class="w-md"
 	onClose={() => {
 		// Clean up when dialog closes
@@ -1245,7 +1325,16 @@
 	{#if error}
 		{@render errorSnippet()}
 	{/if}
-	{#if saving}
+	{#if oauthURL && isMcpLoginURL(oauthURL)}
+		<McpLogin
+			url={oauthURL}
+			serverName={getMCPDisplayName(entry)}
+			purpose="tools"
+			showTitle={false}
+			loading={saving}
+			onComplete={() => handleLaunchTemporaryInstance()}
+		/>
+	{:else if saving}
 		<div class="flex w-full justify-center">
 			<Loading class="size-6" />
 		</div>
@@ -1255,7 +1344,7 @@
 			href={oauthURL}
 			rel="external noopener noreferrer"
 			target="_blank"
-			class="btn btn-primary text-center">Authenticate</a
+			class="btn btn-primary text-center">{m.mcps_catalog_authenticate()}</a
 		>
 	{/if}
 </ResponsiveDialog>
@@ -1343,7 +1432,7 @@
 	<div class="notification-error flex items-center gap-2">
 		<CircleAlert class="size-6 shrink-0 text-error" />
 		<p class="flex flex-col text-left text-sm font-light">
-			<span class="font-semibold">Error with launching temporary instance:</span>
+			<span class="font-semibold">{m.mcps_catalog_error_launching_temp_instance()}</span>
 			<span>
 				{error}
 			</span>
@@ -1352,30 +1441,73 @@
 {/snippet}
 
 <Confirm
-	title="Update Deployments"
-	msg="Update existing deployments now?"
-	show={showUpdateExistingDeploymentsConfirm}
-	onsuccess={() => {
-		showUpdateExistingDeploymentsConfirm = false;
-		handleSelectionChange('server-instances');
-	}}
-	oncancel={() => {
-		showUpdateExistingDeploymentsConfirm = false;
-	}}
-	cancelText="Skip"
-	submitText="Go to Server Details"
+	title={hasBothUpdateActions
+		? m.mcps_catalog_updates_required()
+		: showUpdateExistingDeploymentsConfirm
+			? m.mcps_catalog_update_deployments()
+			: m.mcps_catalog_update_vmcps()}
+	msg={hasBothUpdateActions
+		? m.mcps_catalog_existing_deployments_and_vmcps_need_update()
+		: showUpdateExistingDeploymentsConfirm
+			? m.mcps_catalog_update_existing_deployments_now()
+			: m.mcps_catalog_update_existing_vmcps_now()}
+	show={showUpdateExistingConfirm}
+	onsuccess={hasBothUpdateActions
+		? undefined
+		: showUpdateExistingDeploymentsConfirm
+			? goToUpdateDeployments
+			: goToUpdateVmcps}
+	oncancel={closeUpdateExistingConfirm}
+	cancelText={m.mcps_skip()}
+	submitText={showUpdateExistingDeploymentsConfirm
+		? m.mcps_catalog_go_to_server_details()
+		: m.mcps_catalog_go_to_vmcps()}
+	hideCancelButton={hasBothUpdateActions}
 	type="info"
 >
 	{#snippet note()}
-		<p class="text-sm font-light">
-			There are existing deployment(s) of this MCP server that need to be updated. Would you like to
-			take care of this now?
-		</p>
+		{#if hasBothUpdateActions}
+			<p class="text-sm font-light">
+				{m.mcps_catalog_update_both_note()}
+			</p>
 
-		{#if profile.current.hasAdminAccess?.()}
-			<p class="text-xs font-light mt-2 text-muted-content">
-				Deployments can also be updated at a later time through the "Server Details" tab or through
-				the MCP Management "Deployments" page.
+			{#if profile.current.hasAdminAccess?.()}
+				<p class="text-xs font-light mt-2 text-muted-content">
+					{m.mcps_catalog_update_later_note()}
+				</p>
+			{/if}
+
+			<div
+				class="mt-4 flex w-full flex-col items-center justify-center gap-2 md:flex-row md:justify-end"
+			>
+				<button
+					type="button"
+					onclick={goToUpdateDeployments}
+					class="btn btn-primary flex flex-1 justify-center p-2 w-full"
+				>
+					{m.mcps_catalog_go_to_server_details()}
+				</button>
+				<button
+					type="button"
+					onclick={goToUpdateVmcps}
+					class="btn btn-primary flex flex-1 justify-center p-2 w-full"
+				>
+					{m.mcps_catalog_go_to_vmcps()}
+				</button>
+			</div>
+		{:else if showUpdateExistingDeploymentsConfirm}
+			<p class="text-sm font-light">
+				{m.mcps_catalog_update_deployments_note()}
+			</p>
+
+			{#if profile.current.hasAdminAccess?.()}
+				<p class="text-xs font-light mt-2 text-muted-content">
+					{m.mcps_catalog_update_later_note()}
+				</p>
+			{/if}
+		{:else}
+			<p class="text-sm font-light">
+				{m.mcps_catalog_update_vmcps_note()}
 			</p>
 		{/if}
 	{/snippet}

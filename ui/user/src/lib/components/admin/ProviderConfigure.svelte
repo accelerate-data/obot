@@ -1,14 +1,47 @@
+<script module lang="ts">
+	import { resolve } from '$app/paths';
+
+	// A notice shown below a configuration parameter.
+	export interface ParameterNotice {
+		kind: 'info' | 'warning';
+		text: string;
+	}
+
+	// A choice between setting a provider up without a group of parameters and with them, such as
+	// provisioning users through SCIM instead of fetching them with API credentials.
+	export interface ParameterChoice {
+		title: string;
+		// The parameters that only the `with` option provides. They are required when it is selected,
+		// and never submitted otherwise.
+		parameters: string[];
+		without: ParameterChoiceOption;
+		with: ParameterChoiceOption;
+		// Set when the choice is already made and cannot be changed in this form. Only that option is
+		// shown.
+		made?: 'with' | 'without';
+		// A link shown after the description, such as to where the choice is managed.
+		link?: { path: Parameters<typeof resolve>[0]; label: string };
+	}
+
+	export interface ParameterChoiceOption {
+		label: string;
+		description: string;
+	}
+</script>
+
 <script lang="ts">
 	import Toggle from '$lib/components/Toggle.svelte';
 	import { MultiValueInput } from '$lib/components/ui/multi-value-input';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import type { BaseProvider, ProviderParameter } from '$lib/services/admin/types';
 	import { darkMode, profile } from '$lib/stores';
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
 	import type { ResponsiveDialogAnimate } from '../ResponsiveDialog.svelte';
 	import SensitiveInput from '../SensitiveInput.svelte';
-	import { CircleAlert } from '@lucide/svelte';
+	import { CircleAlert, Info, TriangleAlert } from '@lucide/svelte';
 	import type { Snippet } from 'svelte';
+	import { slide } from 'svelte/transition';
 	import { twMerge } from 'tailwind-merge';
 
 	interface Props {
@@ -27,6 +60,13 @@
 		body?: Snippet;
 		// Receives the dialog's own submit so a custom footer can drive the form it replaces.
 		footer?: Snippet<[() => void]>;
+		// Returns a notice to show below a parameter, given the form's current values, such as a
+		// warning about the consequences of a changed value.
+		parameterNotice?: (
+			parameter: ProviderParameter,
+			form: Record<string, string>
+		) => ParameterNotice | undefined;
+		parameterChoice?: ParameterChoice;
 	}
 
 	const {
@@ -41,22 +81,38 @@
 		title,
 		steps,
 		body,
-		footer
+		footer,
+		parameterNotice,
+		parameterChoice
 	}: Props = $props();
+	const uid = $props.id();
 	let dialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let form = $state<Record<string, string>>({});
 	let showRequired = $state(false);
+	// Whether the `with` option of parameterChoice is selected.
+	let choiceProvides = $state(false);
+	let errorElement = $state<HTMLElement>();
+
+	// The error sits at the top of a form that scrolls, and the button that submits it sits below,
+	// so a refusal would otherwise appear out of sight of whoever just submitted.
+	$effect(() => {
+		if (!error) return;
+		errorElement?.scrollIntoView({
+			block: 'nearest',
+			behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'
+		});
+	});
 
 	const isAzureOpenAIProvider = $derived(provider && provider.id === 'azure-openai-model-provider');
 
 	const collection = $derived.by(() => {
 		if (isAzureOpenAIProvider)
 			return {
-				title: 'Authentication Method',
+				title: m.models_providers_authentication_method(),
 				items: [
 					{
 						id: 'OBOT_AZURE_OPENAI_MODEL_PROVIDER_API_KEY',
-						name: 'API Key'
+						name: m.models_providers_api_key()
 					},
 					{
 						id: 'OBOT_AZURE_OPENAI_MODEL_PROVIDER_ENDPOINT',
@@ -130,13 +186,15 @@
 			return requiredParamsIds.map((id) => asObject?.[id]).filter(Boolean) as ProviderParameter[];
 		}
 
-		return (provider?.requiredConfigurationParameters?.filter((p) => !p.hidden) ??
-			[]) as ProviderParameter[];
+		return (provider?.requiredConfigurationParameters?.filter(
+			(p) => !p.hidden && !isChoiceParameter(p)
+		) ?? []) as ProviderParameter[];
 	});
 
 	const optionalConfigurationParameters = $derived.by(() => {
-		const optionalParams = (provider?.optionalConfigurationParameters?.filter((p) => !p.hidden) ??
-			[]) as ProviderParameter[];
+		const optionalParams = (provider?.optionalConfigurationParameters?.filter(
+			(p) => !p.hidden && !isChoiceParameter(p)
+		) ?? []) as ProviderParameter[];
 
 		if (isAzureOpenAIProvider) {
 			// Only show the API version parameter as optional
@@ -153,6 +211,30 @@
 
 		return optionalParams;
 	});
+
+	function isChoiceParameter(param: ProviderParameter): boolean {
+		return parameterChoice?.parameters.includes(param.name) ?? false;
+	}
+
+	// The parameters of parameterChoice, in its order, wherever the provider lists them.
+	const choiceParameters = $derived.by(() => {
+		if (!parameterChoice) return [];
+		const allParams = [
+			...(provider?.requiredConfigurationParameters ?? []),
+			...(provider?.optionalConfigurationParameters ?? [])
+		];
+		return parameterChoice.parameters
+			.map((name) => allParams.find((p) => p.name === name))
+			.filter((p): p is ProviderParameter => Boolean(p) && !p?.hidden);
+	});
+
+	// The parameters that must be filled in: the choice's parameters count while its `with` option is
+	// selected.
+	const submittedRequiredParameters = $derived(
+		choiceProvides
+			? [...requiredConfigurationParameters, ...choiceParameters]
+			: requiredConfigurationParameters
+	);
 
 	function initParamValue(param: ProviderParameter): string {
 		let value = values?.[param.name] ? values?.[param.name] : '';
@@ -178,6 +260,9 @@
 				form[param.name] = initParamValue(param);
 			}
 		}
+		choiceProvides = parameterChoice?.made
+			? parameterChoice.made === 'with'
+			: (parameterChoice?.parameters.some((name) => Boolean(values?.[name]?.trim())) ?? false);
 	}
 
 	function onClose() {
@@ -221,16 +306,16 @@
 	async function configure() {
 		showRequired = false;
 
-		const requiredFieldsNotFilled = requiredConfigurationParameters.filter(
-			(p) => !form[p.name].length
-		);
+		const requiredFieldsNotFilled = submittedRequiredParameters.filter((p) => !form[p.name].trim());
 
 		if (requiredFieldsNotFilled.length > 0) {
 			showRequired = true;
 			return;
 		}
 
-		const allParams = [...requiredConfigurationParameters, ...optionalConfigurationParameters];
+		// The parameters of an unselected choice keep what was typed into them, so that selecting it
+		// again restores them, but they are not submitted.
+		const allParams = [...submittedRequiredParameters, ...optionalConfigurationParameters];
 
 		// Dynamically remove non necessary parameters for Azure OpenAI provider
 		// For Azure OpenAI the server does not expect both authentication methods to be sent
@@ -267,6 +352,26 @@
 	]);
 </script>
 
+{#snippet noticeFor(parameter: ProviderParameter)}
+	{@const notice = parameterNotice?.(parameter, form)}
+	{#if notice}
+		<div
+			class={twMerge(
+				'mt-1 flex items-start gap-2 p-2 text-xs font-light',
+				notice.kind === 'warning' ? 'notification-alert' : 'notification-info'
+			)}
+			role={notice.kind === 'warning' ? 'alert' : 'note'}
+		>
+			{#if notice.kind === 'warning'}
+				<TriangleAlert class="mt-0.5 size-4 shrink-0" />
+			{:else}
+				<Info class="mt-0.5 size-4 shrink-0" />
+			{/if}
+			<span>{notice.text}</span>
+		</div>
+	{/if}
+{/snippet}
+
 {#snippet booleanToggle(parameter: ProviderParameter)}
 	<li class="flex flex-col gap-1">
 		<span>{parameter.friendlyName}</span>
@@ -282,6 +387,82 @@
 			}}
 		/>
 	</li>
+{/snippet}
+
+{#snippet parameterField(parameter: ProviderParameter, required: boolean)}
+	{@const error = required && showRequired && !form[parameter.name].trim()}
+	{#if booleanInputs.has(parameter.name)}
+		{@render booleanToggle(parameter)}
+	{:else}
+		<li class="flex flex-col gap-1">
+			<label for={parameter.name} class:text-error={error}>{parameter.friendlyName}</label>
+			{#if parameter.description}
+				<span class="text-gray text-xs">{parameter.description}</span>
+			{/if}
+			{#if parameter.sensitive}
+				<SensitiveInput
+					{error}
+					name={parameter.name}
+					bind:value={form[parameter.name]}
+					disabled={readonly}
+					textarea={parameter.multiline}
+					growable={parameter.multiline}
+				/>
+			{:else if multipValuesInputs.has(parameter.name)}
+				<MultiValueInput
+					bind:value={form[parameter.name]}
+					id={parameter.name}
+					labels={parameter.name === 'OBOT_AUTH_PROVIDER_EMAIL_DOMAINS'
+						? { '*': m.models_providers_all_domains() }
+						: {}}
+					class={['text-input-filled', error && 'error'].filter(Boolean).join(' ')}
+					placeholder={m.models_providers_hit_enter_to_insert()}
+					disabled={readonly}
+				/>
+			{:else if parameter.multiline}
+				<textarea
+					id={parameter.name}
+					bind:value={form[parameter.name]}
+					class:error
+					class="text-input-filled min-h-[120px] resize-y"
+					disabled={readonly}
+					rows="5"></textarea>
+			{:else}
+				<input
+					type="text"
+					id={parameter.name}
+					bind:value={form[parameter.name]}
+					class:error
+					class="text-input-filled"
+					disabled={readonly}
+				/>
+			{/if}
+			{@render noticeFor(parameter)}
+		</li>
+	{/if}
+{/snippet}
+
+{#snippet choiceOption(option: ParameterChoiceOption, provides: boolean)}
+	<!-- A transparent native radio over its label gives the choice its keyboard behavior. -->
+	<label
+		class={twMerge(
+			'tab relative has-focus-visible:outline-primary has-focus-visible:outline-2',
+			choiceProvides === provides && 'tab-active bg-primary text-white hover:text-white'
+		)}
+	>
+		<input
+			type="radio"
+			class="absolute inset-0 cursor-pointer appearance-none opacity-0 disabled:cursor-default"
+			name={`${uid}-choice`}
+			checked={choiceProvides === provides}
+			disabled={readonly}
+			onchange={() => {
+				choiceProvides = provides;
+				showRequired = false;
+			}}
+		/>
+		{option.label}
+	</label>
 {/snippet}
 
 <ResponsiveDialog
@@ -303,7 +484,7 @@
 			{:else}
 				<img src={provider?.icon} alt={provider?.name} class="bg-base-200 size-9 rounded-md p-1" />
 			{/if}
-			{title ?? `Set Up ${provider?.name}`}
+			{title ?? m.models_providers_set_up_named({ name: provider?.name ?? '' })}
 		</div>
 	{/snippet}
 	{#if provider}
@@ -327,14 +508,17 @@
 				disabled={readonly}
 			/>
 			{#if error}
-				<div class="notification-error flex min-w-0 items-start gap-2 overflow-hidden">
+				<div
+					bind:this={errorElement}
+					class="notification-error flex min-w-0 shrink-0 items-start gap-2 overflow-hidden"
+					role="alert"
+				>
 					<CircleAlert class="mt-0.5 size-6 shrink-0 text-error" />
 					<p class="min-w-0 flex flex-col text-sm font-light">
-						<span class="font-semibold">An error occurred!</span>
-						<span class="max-h-28 overflow-auto wrap-break-word pr-1">
-							Your configuration could not be saved because it failed validation: <b
-								class="break-all font-semibold">{error}</b
-							>
+						<span class="font-semibold">{m.models_providers_an_error_occurred()}</span>
+						<span class="max-h-28 overflow-auto wrap-break-word whitespace-pre-line pr-1">
+							{m.models_providers_config_failed_validation()}
+							<b class="break-all font-semibold">{error}</b>
 						</span>
 					</p>
 				</div>
@@ -345,8 +529,7 @@
 
 			{#if provider.id === 'generic-oauth-auth-provider'}
 				<div class="notification-info p-3 text-sm font-light">
-					Changing the issuer changes the identity trust boundary. Re-confirm account linking only
-					when you trust the new issuer to own the email addresses it returns.
+					{m.identity_access_auth_providers_generic_issuer_warning()}
 				</div>
 			{/if}
 
@@ -378,118 +561,74 @@
 						</div>
 					{/if}
 
-					<h4 class="text-lg font-semibold">Required Configuration</h4>
+					<h4 class="text-lg font-semibold">{m.models_providers_required_configuration()}</h4>
 
 					<ul class="flex flex-col gap-4">
 						{#each requiredConfigurationParameters as parameter (parameter.name)}
 							{#if parameter.name in form}
-								{@const error = !form[parameter.name].length && showRequired}
-								{#if booleanInputs.has(parameter.name)}
-									{@render booleanToggle(parameter)}
-								{:else}
-									<li class="flex flex-col gap-1">
-										<label for={parameter.name} class:text-error={error}
-											>{parameter.friendlyName}</label
-										>
-										{#if parameter.description}
-											<span class="text-gray text-xs">{parameter.description}</span>
-										{/if}
-										{#if parameter.sensitive}
-											<SensitiveInput
-												{error}
-												name={parameter.name}
-												bind:value={form[parameter.name]}
-												disabled={readonly}
-												textarea={parameter.multiline}
-												growable={parameter.multiline}
-											/>
-										{:else if multipValuesInputs.has(parameter.name)}
-											<MultiValueInput
-												bind:value={form[parameter.name]}
-												id={parameter.name}
-												labels={parameter.name === 'OBOT_AUTH_PROVIDER_EMAIL_DOMAINS'
-													? { '*': 'All domains' }
-													: {}}
-												class={['text-input-filled', error && 'error'].filter(Boolean).join(' ')}
-												placeholder={`Hit "Enter" to insert`.toString()}
-												disabled={readonly}
-											/>
-										{:else if parameter.multiline}
-											<textarea
-												id={parameter.name}
-												bind:value={form[parameter.name]}
-												class:error
-												class="text-input-filled min-h-[120px] resize-y"
-												disabled={readonly}
-												rows="5"
-											></textarea>
-										{:else}
-											<input
-												type="text"
-												id={parameter.name}
-												bind:value={form[parameter.name]}
-												class:error
-												class="text-input-filled"
-												disabled={readonly}
-											/>
-										{/if}
-									</li>
-								{/if}
+								{@render parameterField(parameter, true)}
 							{/if}
 						{/each}
 					</ul>
 				</div>
 			{/if}
 
+			<!-- A made choice is shown even without parameters of its own, so that the way the provider
+			works stays visible. -->
+			{#if parameterChoice && (choiceParameters.length > 0 || parameterChoice.made)}
+				{@const option = choiceProvides ? parameterChoice.with : parameterChoice.without}
+				<!-- Outlined rather than filled, so that the choice and the fields it brings in read as one
+				section, apart from the filled inputs around them. -->
+				<div class="border-base-300 dark:border-base-400 flex flex-col gap-3 rounded-lg border p-3">
+					{#if parameterChoice.made}
+						<!-- Inline with its title, and not filled like a selected tab, so that it reads as a
+						value rather than as a switch with one option. -->
+						<p class="flex flex-wrap items-center gap-2 text-sm">
+							<span class="font-semibold">{parameterChoice.title}</span>
+							<span class="badge badge-soft badge-primary badge-sm">{option.label}</span>
+						</p>
+					{:else}
+						<div class="flex flex-wrap items-center justify-between gap-2">
+							<p id={`${uid}-choice-title`} class="text-sm font-semibold">
+								{parameterChoice.title}
+							</p>
+							<div
+								role="radiogroup"
+								aria-labelledby={`${uid}-choice-title`}
+								class="tabs tabs-box tabs-sm"
+							>
+								{@render choiceOption(parameterChoice.without, false)}
+								{@render choiceOption(parameterChoice.with, true)}
+							</div>
+						</div>
+					{/if}
+					<span class="text-gray text-xs">
+						{option.description}
+						{#if parameterChoice.link}
+							<a class="text-link" href={resolve(parameterChoice.link.path)}>
+								{parameterChoice.link.label}
+							</a>
+						{/if}
+					</span>
+					{#if choiceProvides}
+						<ul class="flex flex-col gap-4" in:slide={{ axis: 'y' }}>
+							{#each choiceParameters as parameter (parameter.name)}
+								{#if parameter.name in form}
+									{@render parameterField(parameter, true)}
+								{/if}
+							{/each}
+						</ul>
+					{/if}
+				</div>
+			{/if}
+
 			{#if optionalConfigurationParameters.length > 0}
 				<div class="flex flex-col gap-2">
-					<h4 class="text-lg font-semibold">Optional Configuration</h4>
+					<h4 class="text-lg font-semibold">{m.models_providers_optional_configuration()}</h4>
 					<ul class="flex flex-col gap-4">
 						{#each optionalConfigurationParameters as parameter (parameter.name)}
 							{#if parameter.name in form}
-								{#if booleanInputs.has(parameter.name)}
-									{@render booleanToggle(parameter)}
-								{:else}
-									<li class="flex flex-col gap-1">
-										<label for={parameter.name}>{parameter.friendlyName}</label>
-										{#if parameter.description}
-											<span class="text-gray text-xs">{parameter.description}</span>
-										{/if}
-										{#if parameter.sensitive}
-											<SensitiveInput
-												name={parameter.name}
-												bind:value={form[parameter.name]}
-												disabled={readonly}
-												textarea={parameter.multiline}
-												growable={parameter.multiline}
-											/>
-										{:else if multipValuesInputs.has(parameter.name)}
-											<MultiValueInput
-												bind:value={form[parameter.name]}
-												id={parameter.name}
-												class="text-input-filled"
-												placeholder={`Hit "Enter" to insert`.toString()}
-												disabled={readonly}
-											/>
-										{:else if parameter.multiline}
-											<textarea
-												id={parameter.name}
-												bind:value={form[parameter.name]}
-												class="text-input-filled min-h-[120px] resize-y"
-												disabled={readonly}
-												rows="5"
-											></textarea>
-										{:else}
-											<input
-												type="text"
-												id={parameter.name}
-												bind:value={form[parameter.name]}
-												class="text-input-filled"
-												disabled={readonly}
-											/>
-										{/if}
-									</li>
-								{/if}
+								{@render parameterField(parameter, false)}
 							{/if}
 						{/each}
 					</ul>
@@ -513,7 +652,7 @@
 					{#if loading}
 						<Loading class="size-4" />
 					{:else}
-						Confirm
+						{m.core_confirm()}
 					{/if}
 				</button>
 			</div>

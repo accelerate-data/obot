@@ -3,12 +3,46 @@ package db
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/hash"
 	"gorm.io/gorm"
 )
+
+// backfillIdentityFirstSignIn marks every existing identity as signed in. It runs once, when the column is
+// added: until then, only a sign-in created an identity. Identities created later start without the marker
+// unless they sign in.
+//
+// Existing users need no backfill. The lifecycle columns are added as enabled: no disabled time and an empty
+// disable reason.
+func backfillIdentityFirstSignIn(tx *gorm.DB) error {
+	return tx.Model(&types.Identity{}).
+		Where("first_sign_in_at IS NULL").
+		UpdateColumn("first_sign_in_at", time.Now()).Error
+}
+
+// Retire sandbox credentials before removing their binding, so they cannot
+// authenticate as ordinary user keys after the hosted agent feature is removed.
+func retireHostedAgentAPIKeys(tx *gorm.DB) error {
+	if !tx.Migrator().HasColumn(&types.APIKey{}, "hosted_agent_instance_id") {
+		return nil
+	}
+
+	if err := tx.Exec("UPDATE api_keys SET revoked_at = CURRENT_TIMESTAMP WHERE hosted_agent_instance_id IS NOT NULL AND hosted_agent_instance_id <> '' AND revoked_at IS NULL").Error; err != nil {
+		return err
+	}
+
+	const index = "idx_api_keys_hosted_agent_instance_id"
+	if tx.Migrator().HasIndex(&types.APIKey{}, index) {
+		if err := tx.Migrator().DropIndex(&types.APIKey{}, index); err != nil {
+			return err
+		}
+	}
+
+	return tx.Migrator().DropColumn(&types.APIKey{}, "hosted_agent_instance_id")
+}
 
 // migrateRunTokenActivityInputOutput renames legacy token usage columns.
 func migrateRunTokenActivityInputOutput(tx *gorm.DB) error {

@@ -20,7 +20,7 @@ func TestWalkCatalogFilesSkipsSymlinksAndIgnoredFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".ignoreobotcatalogs"), []byte("ignored.yaml\n"), 0o600))
 	require.NoError(t, os.Symlink(validPath, filepath.Join(dir, "linked.yaml")))
 
-	files, _, err := WalkCatalogFiles(dir)
+	files, err := WalkCatalogFiles(dir)
 	require.NoError(t, err)
 	var paths []string
 	for path, err := range files {
@@ -50,9 +50,8 @@ func TestWalkCatalogFilesSkipsHiddenDirectories(t *testing.T) {
 
 			t.Chdir(dir)
 			for _, root := range []string{dir, "."} {
-				files, usingPatterns, err := WalkCatalogFiles(root)
+				files, err := WalkCatalogFiles(root)
 				require.NoError(t, err)
-				require.Equal(t, customPatterns, usingPatterns)
 
 				var paths []string
 				for path, err := range files {
@@ -143,7 +142,7 @@ func TestWalkCatalogFilesPatternSemantics(t *testing.T) {
 			}
 			require.NoError(t, os.WriteFile(filepath.Join(dir, ".ignoreobotcatalogs"), []byte(tt.ignores), 0o600))
 
-			files, _, err := WalkCatalogFiles(dir)
+			files, err := WalkCatalogFiles(dir)
 			require.NoError(t, err)
 
 			var paths []string
@@ -167,9 +166,8 @@ func TestWalkCatalogFilesFallsBackWhenPatternFilesCannotBeRead(t *testing.T) {
 	require.NoError(t, os.Mkdir(filepath.Join(dir, ".obotcatalogs"), 0o700))
 	require.NoError(t, os.Mkdir(filepath.Join(dir, ".ignoreobotcatalogs"), 0o700))
 
-	files, usingObotCatalogsFile, err := WalkCatalogFiles(dir)
+	files, err := WalkCatalogFiles(dir)
 	require.NoError(t, err)
-	require.False(t, usingObotCatalogsFile)
 
 	var paths []string
 	for path, err := range files {
@@ -185,9 +183,8 @@ func TestWalkCatalogFilesFallsBackWhenPatternLineIsTooLong(t *testing.T) {
 	require.NoError(t, os.WriteFile(validPath, []byte("name: Valid\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".obotcatalogs"), []byte(strings.Repeat("x", bufio.MaxScanTokenSize+1)), 0o600))
 
-	files, usingObotCatalogsFile, err := WalkCatalogFiles(dir)
+	files, err := WalkCatalogFiles(dir)
 	require.NoError(t, err)
-	require.True(t, usingObotCatalogsFile)
 
 	var paths []string
 	for path, err := range files {
@@ -197,23 +194,24 @@ func TestWalkCatalogFilesFallsBackWhenPatternLineIsTooLong(t *testing.T) {
 	require.Equal(t, []string{validPath}, paths)
 }
 
-func TestDecodeCatalogFileStrictness(t *testing.T) {
+func TestDecodeCatalogFileAllowsUnknownFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "entry.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(`name: First
-name: Second
+unknownField: true
 runtime: npx
 npxConfig:
   package: test
 `), 0o600))
 
-	entries, isArray, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, false)
+	entries, isArray, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path)
 	require.NoError(t, err)
 	require.False(t, isArray)
 	require.Len(t, entries, 1)
-	require.Equal(t, "Second", entries[0].Name)
+	require.Equal(t, "First", entries[0].Name)
 
-	_, _, err = DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
-	require.ErrorContains(t, err, `key "name" already set`)
+	require.NoError(t, os.WriteFile(path, []byte("name: First\nname: Second\n"), 0o600))
+	_, _, err = DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path)
+	require.Error(t, err)
 }
 
 func TestNormalizeManifest(t *testing.T) {
@@ -279,7 +277,7 @@ multiUserConfig:
       prefix: "Bearer "
 `), 0o600))
 
-	entries, isArray, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
+	entries, isArray, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path)
 	require.NoError(t, err)
 	require.False(t, isArray)
 	require.Len(t, entries, 1)
@@ -323,7 +321,7 @@ remoteConfig:
       prefix: 'Bearer '
 `), 0o600))
 
-	entries, _, err := DecodeCatalogFile[types.SystemMCPServerCatalogEntryManifest](path, true)
+	entries, _, err := DecodeCatalogFile[types.SystemMCPServerCatalogEntryManifest](path)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.Equal(t, []types.MCPConfig{
@@ -348,7 +346,7 @@ config:
     sensitive: true
 `), 0o600))
 
-	entries, _, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path, true)
+	entries, _, err := DecodeCatalogFile[types.MCPServerCatalogEntryManifest](path)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	require.Equal(t, []types.MCPConfig{

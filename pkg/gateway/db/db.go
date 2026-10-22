@@ -9,6 +9,12 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	// migrationLockID is the Postgres advisory lock that serializes the gateway migrations
+	// across Obot replicas.
+	migrationLockID int64 = 0x6f626f7467776d // "obotgwm"
+)
+
 type DB struct {
 	gormDB      *gorm.DB
 	sqlDB       *sql.DB
@@ -36,6 +42,16 @@ func (db *DB) AutoMigrate() (err error) {
 			tx.Commit()
 		}
 	}()
+
+	// Replicas that start together would all run the migrations at once, and Postgres
+	// doesn't make creating the same table concurrently safe: all but one fail with a
+	// duplicate key on pg_type_typname_nsp_index. The lock makes them take turns, and
+	// commit or rollback releases it.
+	if db.gormDB.Name() == "postgres" {
+		if err = tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLockID).Error; err != nil {
+			return fmt.Errorf("failed to lock the gateway migrations: %w", err)
+		}
+	}
 
 	if err = tx.AutoMigrate(&types.Migration{}); err != nil {
 		return fmt.Errorf("failed to migrate migration table: %w", err)
@@ -134,6 +150,7 @@ func (db *DB) AutoMigrate() (err error) {
 		types.AuthToken{},
 		types.TokenRequest{},
 		types.LLMAuditLog{},
+		types.EgressAuditLog{},
 		types.User{},
 		types.Identity{},
 		types.Group{},
@@ -162,11 +179,26 @@ func (db *DB) AutoMigrate() (err error) {
 		types.DeviceEnrollmentKey{},
 		types.Device{},
 		types.Credential{},
+		types.ClaudeOrganizationAccount{},
+		types.ClaudeEnvironment{},
+		types.ClaudeWorkOrder{},
 		types.LocalAuthUser{},
 		types.LocalAuthSession{},
 		types.EnforcementDecisionLog{},
+		types.UserLifecycleEvent{},
+		types.SCIMConnection{},
+		types.SCIMUserBinding{},
+		types.SCIMGroupBinding{},
+		types.SCIMPendingGroupDeletion{},
+		types.SCIMGroupSubjectCleanup{},
+		types.SCIMReferenceWrite{},
+		types.SCIMRequestFailure{},
 	); err != nil {
 		return fmt.Errorf("failed to auto migrate gateway types: %w", err)
+	}
+
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "identity_first_sign_in_backfill", backfillIdentityFirstSignIn); err != nil {
+		return fmt.Errorf("failed to backfill identity sign-in times: %w", err)
 	}
 
 	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "mcp_audit_log_source_type_backfill", migrateMCPAuditLogSourceType); err != nil {
@@ -175,6 +207,18 @@ func (db *DB) AutoMigrate() (err error) {
 
 	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "drop_legacy_local_agent_audit_log_columns", dropLegacyLocalAgentAuditLogColumns); err != nil {
 		return fmt.Errorf("failed to drop legacy local-agent audit log columns: %w", err)
+	}
+
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "remove_user_impersonation_role", removeUserImpersonationRole); err != nil {
+		return fmt.Errorf("failed to remove the user impersonation role: %w", err)
+	}
+
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "drop_published_artifact_scope_columns", dropPublishedArtifactScopeColumns); err != nil {
+		return fmt.Errorf("failed to drop the published artifact scope columns: %w", err)
+	}
+
+	if err = migrateIfEntryNotFoundInMigrationsTable(tx, "retire_hosted_agent_api_keys", retireHostedAgentAPIKeys); err != nil {
+		return fmt.Errorf("failed to retire hosted agent API keys: %w", err)
 	}
 
 	// MIGRATION: replace mcp_server_instance with mcp_id as the new primary key.

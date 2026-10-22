@@ -1,5 +1,6 @@
 <script lang="ts" generics="T">
 	import { page } from '$app/state';
+	import { m } from '$lib/i18n';
 	import { parseMultiValue } from '$lib/multiValue';
 	import { goto } from '$lib/url';
 	import { X } from '@lucide/svelte';
@@ -11,13 +12,15 @@
 		getFilterDisplayLabel: (filterKey: keyof T) => string;
 		getFilterValue: (filterKey: keyof T, value: string | number) => string;
 		isFilterClearable?: (filterKey: keyof T) => boolean;
+		isMultiValueFilter?: (filterKey: keyof T) => boolean;
 	}
 
 	const {
 		pillsSearchParamFilters,
 		getFilterDisplayLabel,
 		getFilterValue,
-		isFilterClearable
+		isFilterClearable,
+		isMultiValueFilter = () => true
 	}: Props<T> = $props();
 	const entries = $derived(
 		Object.entries(pillsSearchParamFilters) as [keyof T, string | undefined | null][]
@@ -32,7 +35,11 @@
 	>
 		{#each entries as [filterKey, filterValues] (filterKey)}
 			{@const displayLabel = getFilterDisplayLabel(filterKey)}
-			{@const values = parseMultiValue(filterValues)}
+			{@const values = isMultiValueFilter(filterKey)
+				? parseMultiValue(filterValues)
+				: filterValues == null
+					? []
+					: [filterValues]}
 			{@const isClearable = isFilterClearable?.(filterKey) ?? true}
 
 			<div class="filter-primary" animate:flip={{ duration: 100 }}>
@@ -47,7 +54,7 @@
 								<span>{getFilterValue(filterKey, value)}</span>
 							</span>
 
-							<span class="mx-1 font-bold last:hidden">OR</span>
+							<span class="mx-1 font-bold last:hidden">{m.core_filter_or()}</span>
 						{:else}
 							<span class="font-light">{getFilterValue(filterKey, value)}</span>
 						{/if}
@@ -56,7 +63,7 @@
 
 				{#if isClearable}
 					<button
-						aria-label={`Remove ${displayLabel} filter`}
+						aria-label={m.core_remove_filter({ label: displayLabel })}
 						onclick={() => {
 							const url = new URL(page.url);
 							url.searchParams.set(filterKey.toString(), '');

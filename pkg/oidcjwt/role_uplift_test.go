@@ -40,7 +40,6 @@ func TestRoleUpliftAddsRequestTimeAdminWithoutOwner(t *testing.T) {
 	assert.Contains(t, groups, types.GroupMCP)
 	assert.Contains(t, groups, types.GroupLLM)
 	assert.Contains(t, groups, types.GroupSkills)
-	assert.Contains(t, groups, types.GroupPublishedArtifacts)
 	assert.Contains(t, groups, types.GroupAuthenticated)
 	assert.NotContains(t, groups, types.GroupOwner)
 }

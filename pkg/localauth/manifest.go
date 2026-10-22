@@ -24,15 +24,15 @@ func AuthProvider() *v1.AuthProvider {
 		Spec: v1.AuthProviderSpec{
 			AuthProviderManifest: types.AuthProviderManifest{
 				CommonProviderMetadata: types.CommonProviderMetadata{
-					Name:        "Local",
+					Name:        "${local_provider_name}",
 					Icon:        icon,
 					IconDark:    iconDark,
-					Description: "Authenticate users with an email address and password stored in Obot. No external identity provider required.",
+					Description: "${local_provider_description}",
 					RequiredConfigurationParameters: []types.ProviderConfigurationParameter{
 						{
 							Name:         EmailDomainsEnvVar,
-							FriendlyName: "Allowed Email Domains",
-							Description:  "Comma-separated list of email domains that local users may have. Use * to allow any domain.",
+							FriendlyName: "${local_provider_domains_name}",
+							Description:  "${local_provider_domains_description}",
 						},
 					},
 				},

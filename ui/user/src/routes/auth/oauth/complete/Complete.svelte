@@ -1,5 +1,7 @@
 <script lang="ts">
-	import Logo from '$lib/components/Logo.svelte';
+	import BetaLogo from '$lib/components/navbar/BetaLogo.svelte';
+	import { m } from '$lib/i18n';
+	import { CircleCheckBig } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
 	type Props = {
@@ -37,28 +39,86 @@
 </script>
 
 <svelte:head>
-	<title>Authentication Complete</title>
+	<title>{m.auth_oauth_complete_title()}</title>
 </svelte:head>
 
 <main
 	id="main-content"
-	class="bg-base-200 dark:bg-base-100 flex min-h-screen items-center justify-center p-6"
+	class="flex flex-col gap-3 min-h-screen items-center justify-center p-6 dark:from-base-300 bg-radial-[at_50%_50%] from-gray-50 dark:to-black"
 >
-	<section class="text-center">
-		<Logo class="mx-auto mb-4 size-56" />
-		<h1 class="text-base-content mb-4 text-5xl font-bold">Authentication Complete</h1>
+	<section class="paper pt-4 md:w-md w-sm items-center justify-center border-base-400 gap-0">
+		<BetaLogo />
 
-		<p class="text-muted-content text-base">
-			{#if !redirectURL}
-				You can now close this window.
-			{:else if redirecting}
-				Redirecting...
-			{:else}
-				You will be redirected in {secondsRemaining}
-				{secondsRemaining === 1 ? 'second' : 'seconds'},
-				<button class="link" type="button" onclick={redirectNow}>click here</button>
-				to redirect now.
-			{/if}
-		</p>
+		<div class="flex flex-col items-center justify-center pt-6 pb-6">
+			<span class="oauth-complete-circle mb-2">
+				<CircleCheckBig class="size-18 text-success" />
+			</span>
+
+			<h1 class="text-base-content text-2xl font-semibold">
+				{m.auth_oauth_complete_title()}
+			</h1>
+
+			<p class="text-muted-content text-base font-light">
+				{#if !redirectURL}
+					{m.auth_oauth_complete_close()}
+				{:else if redirecting}
+					{m.auth_oauth_complete_redirecting()}
+				{:else}
+					{secondsRemaining === 1
+						? m.auth_oauth_complete_redirect_in_one({ seconds: secondsRemaining })
+						: m.auth_oauth_complete_redirect_in_other({ seconds: secondsRemaining })}
+					<button class="link" type="button" onclick={redirectNow}
+						>{m.auth_oauth_complete_click_here()}</button
+					>
+					{m.auth_oauth_complete_redirect_now()}
+				{/if}
+			</p>
+		</div>
 	</section>
 </main>
+
+<style>
+	/* The arc is authored clockwise from the right side up to the top gap, so a
+	   negative offset draws one loop from the top, counterclockwise. */
+	.oauth-complete-circle :global(path:nth-child(1)) {
+		--len: 54.37;
+		stroke-dasharray: var(--len);
+		stroke-dashoffset: -54.37;
+		animation: oauth-complete-circle-draw 0.7s cubic-bezier(0.65, 0, 0.35, 1) forwards;
+	}
+
+	.oauth-complete-circle :global(path:nth-child(2)) {
+		--check-length: 18.38;
+		--check-gap: 22.38;
+		stroke-dasharray: 0 var(--check-gap);
+		stroke-dashoffset: 2;
+		animation: oauth-complete-check-draw 0.42s cubic-bezier(0.65, 0, 0.35, 1) 0.7s forwards;
+	}
+
+	@keyframes oauth-complete-circle-draw {
+		to {
+			stroke-dashoffset: 0;
+		}
+	}
+
+	@keyframes oauth-complete-check-draw {
+		from {
+			stroke-dasharray: 0 var(--check-gap);
+			stroke-dashoffset: 2;
+		}
+
+		to {
+			stroke-dasharray: var(--check-length) var(--check-length);
+			stroke-dashoffset: 0;
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.oauth-complete-circle :global(path:nth-child(1)),
+		.oauth-complete-circle :global(path:nth-child(2)) {
+			animation: none;
+			stroke-dasharray: none;
+			stroke-dashoffset: 0;
+		}
+	}
+</style>

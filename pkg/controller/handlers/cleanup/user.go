@@ -1,12 +1,10 @@
 package cleanup
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
-	"sort"
 	"strconv"
 
 	"github.com/obot-platform/nah/pkg/router"
@@ -15,13 +13,8 @@ import (
 	gclient "github.com/obot-platform/obot/pkg/gateway/client"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
-)
-
-const (
-	hostedAgentPoolCleanupAnnotation = "obot.obot.ai/user-delete-hosted-agent-pools"
 )
 
 type UserCleanup struct {
@@ -40,14 +33,6 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 	userDelete := req.Object.(*v1.UserDelete)
 	userID := strconv.FormatUint(uint64(userDelete.Spec.UserID), 10)
 	slog.Info("Starting user cleanup", "userID", userID)
-
-	complete, err := cleanupHostedAgents(req, userDelete, userID)
-	if err != nil {
-		return err
-	}
-	if !complete {
-		return nil
-	}
 
 	// Delete identities first so that the user can login again.
 	identities, err := u.gatewayClient.FindIdentitiesForUser(req.Ctx, userDelete.Spec.UserID)
@@ -68,26 +53,17 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 	}
 	slog.Info("Removed user identities during cleanup", "userID", userID, "identities", len(identities))
 
-	var projects v1.ProjectList
-	if err := req.List(&projects, &kclient.ListOptions{
-		Namespace: req.Namespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.userID": userID,
-		}),
-	}); err != nil {
+	var agents v1.AgentInstanceList
+	if err := req.List(&agents, &kclient.ListOptions{Namespace: req.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.userID", userID)}); err != nil {
 		return err
 	}
-
-	for _, project := range projects.Items {
-		if err := req.Delete(&project); err != nil {
+	for _, agent := range agents.Items {
+		if err := req.Delete(&agent); err != nil {
 			return err
 		}
 	}
-	slog.Info("Deleted projects during user cleanup", "userID", userID, "projects", len(projects.Items))
 
-	// Revoke any API keys the user created. Nanobot-agent keys are handled by the
-	// NanobotAgent delete flow above; this sweeps user-created keys plus anything
-	// the nanobot path missed.
+	// Revoke any API keys the user created.
 	apiKeys, err := u.gatewayClient.ListAPIKeys(req.Ctx, userDelete.Spec.UserID)
 	if err != nil {
 		return fmt.Errorf("failed to list API keys for user %d: %w", userDelete.Spec.UserID, err)
@@ -154,11 +130,9 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 	var deletedServers int
 	for _, server := range servers.Items {
 		// Skip multi-user servers in the default MCPCatalog — they should persist after user deletion.
-		// Also skip servers that are associated with an agent because we need the credential to stick
-		// around so we can revoke the API key.
-		// Finally, skip servers associated to vMCP components because those will be deleted when the above
+		// Also skip servers associated to vMCP components because those will be deleted when the above
 		// objects are deleted.
-		if server.Spec.MCPCatalogID == system.DefaultCatalog || server.Spec.NanobotAgentID != "" || server.Spec.VMCPComponentID != "" {
+		if server.Spec.MCPCatalogID == system.DefaultCatalog || server.Spec.VMCPComponentID != "" {
 			continue
 		}
 		if err := req.Delete(&server); err != nil {
@@ -241,124 +215,4 @@ func (u *UserCleanup) Cleanup(req router.Request, _ router.Response) error {
 	// If everything is cleaned up successfully, then delete this object because we don't need it.
 	slog.Info("Completed user cleanup", "userID", userID)
 	return req.Delete(userDelete)
-}
-
-// cleanupHostedAgents orders deletion so backend finalizers have all of the
-// references they need: instances, assignments, then exclusively owned
-// pools. Pool IDs are checkpointed on UserDelete metadata before
-// assignments are removed, allowing cleanup to wait across reconciliations
-// until asynchronous pool deletion has actually completed.
-func cleanupHostedAgents(req router.Request, userDelete *v1.UserDelete, userID string) (bool, error) {
-	var instances v1.HostedAgentInstanceList
-	if err := req.List(&instances, &kclient.ListOptions{
-		Namespace: req.Namespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.userID": userID,
-		}),
-	}); err != nil {
-		return false, err
-	}
-	if len(instances.Items) > 0 {
-		for i := range instances.Items {
-			if err := req.Delete(&instances.Items[i]); err != nil && !apierrors.IsNotFound(err) {
-				return false, err
-			}
-		}
-		slog.Info("Waiting for hosted agent instance cleanup", "userID", userID, "instances", len(instances.Items))
-		return false, nil
-	}
-
-	poolIDs, err := savedPoolIDs(userDelete)
-	if err != nil {
-		return false, err
-	}
-	var assignments v1.HostedAgentPoolAssignmentList
-	if err := req.List(&assignments, &kclient.ListOptions{
-		Namespace: req.Namespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.userID": userID,
-		}),
-	}); err != nil {
-		return false, err
-	}
-
-	changed := false
-	for _, assignment := range assignments.Items {
-		if !slices.Contains(poolIDs, assignment.Spec.Manifest.PoolID) {
-			poolIDs = append(poolIDs, assignment.Spec.Manifest.PoolID)
-			changed = true
-		}
-	}
-	if changed {
-		sort.Strings(poolIDs)
-		data, err := json.Marshal(poolIDs)
-		if err != nil {
-			return false, fmt.Errorf("marshal hosted agent pool cleanup checkpoint: %w", err)
-		}
-		if userDelete.Annotations == nil {
-			userDelete.Annotations = map[string]string{}
-		}
-		userDelete.Annotations[hostedAgentPoolCleanupAnnotation] = string(data)
-		if err := req.Client.Update(req.Ctx, userDelete); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-
-	if len(assignments.Items) > 0 {
-		for i := range assignments.Items {
-			if err := req.Delete(&assignments.Items[i]); err != nil && !apierrors.IsNotFound(err) {
-				return false, err
-			}
-		}
-		slog.Info("Waiting for hosted agent pool assignment cleanup", "userID", userID, "assignments", len(assignments.Items))
-		return false, nil
-	}
-
-	waiting := false
-	for _, poolID := range poolIDs {
-		var remainingAssignments v1.HostedAgentPoolAssignmentList
-		if err := req.List(&remainingAssignments, &kclient.ListOptions{
-			Namespace: req.Namespace,
-			FieldSelector: fields.SelectorFromSet(map[string]string{
-				"spec.poolID": poolID,
-			}),
-		}); err != nil {
-			return false, err
-		}
-		if len(remainingAssignments.Items) > 0 {
-			// Another user still references this pool. Ownership is
-			// shared, so this user's deletion must leave it intact.
-			continue
-		}
-
-		var pool v1.HostedAgentPool
-		if err := req.Get(&pool, req.Namespace, poolID); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return false, err
-		}
-		waiting = true
-		if err := req.Delete(&pool); err != nil && !apierrors.IsNotFound(err) {
-			return false, err
-		}
-	}
-	if waiting {
-		slog.Info("Waiting for hosted agent pool cleanup", "userID", userID, "pools", len(poolIDs))
-		return false, nil
-	}
-	return true, nil
-}
-
-func savedPoolIDs(userDelete *v1.UserDelete) ([]string, error) {
-	value := userDelete.Annotations[hostedAgentPoolCleanupAnnotation]
-	if value == "" {
-		return nil, nil
-	}
-	var result []string
-	if err := json.Unmarshal([]byte(value), &result); err != nil {
-		return nil, fmt.Errorf("parse hosted agent pool cleanup checkpoint: %w", err)
-	}
-	return result, nil
 }

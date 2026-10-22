@@ -28,6 +28,8 @@ type Client struct {
 }
 
 type ClientOption struct {
+	// OAuthRedirectURL overrides the hosted callback for a validated loopback flow.
+	OAuthRedirectURL string
 	// OAuthClientName overrides ClientName only for dynamic client registration.
 	OAuthClientName string
 	// OAuthClientIDMetadataDocument is empty when CIMD must not be used.
@@ -172,7 +174,17 @@ func (sm *SessionManager) loadSession(ctx context.Context, server ServerConfig, 
 	}
 	httpClient = withSafeProtocolErrors(httpClient)
 
-	oauthHandler := sm.oauthHandlerForClient(httpClient, server.MCPServerName, clientOpts)
+	// A tunneled server is reached through a bridge URL on Obot's own host, but its OAuth
+	// metadata names its real URL, so validate the metadata against the server's URL.
+	resourceCheckURL := url
+	if directConnect {
+		resourceCheckURL = server.URL
+	}
+	oauthClient, err := sm.OAuthClientForServer(server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OAuth client: %w", err)
+	}
+	oauthHandler := sm.oauthHandlerForClient(oauthClient, server.MCPServerName, resourceCheckURL, clientOpts)
 
 	session, err := c.Connect(ctx, &gomcp.StreamableClientTransport{
 		Endpoint:             url,
@@ -208,7 +220,7 @@ func (sm *SessionManager) loadSession(ctx context.Context, server ServerConfig, 
 	return result, nil
 }
 
-func (sm *SessionManager) oauthHandlerForClient(httpClient *http.Client, serverName string, clientOpts ClientOption) auth.OAuthHandler {
+func (sm *SessionManager) oauthHandlerForClient(oauthClient *http.Client, serverName, serverURL string, clientOpts ClientOption) auth.OAuthHandler {
 	if clientOpts.TokenStorage == nil {
 		return authorizationErrorOAuthHandler{}
 	}
@@ -218,13 +230,14 @@ func (sm *SessionManager) oauthHandlerForClient(httpClient *http.Client, serverN
 		oauthClientName = clientOpts.ClientName
 	}
 	return newOAuth(
-		httpClient,
+		oauthClient,
 		clientOpts.CallbackHandler,
 		clientOpts.ClientLookup,
 		clientOpts.TokenStorage,
 		serverName,
+		serverURL,
 		oauthClientName,
-		sm.baseURL+"/oauth/mcp/callback",
+		cmp.Or(clientOpts.OAuthRedirectURL, sm.baseURL+"/oauth/mcp/callback"),
 		clientOpts.OAuthClientIDMetadataDocument,
 	)
 }

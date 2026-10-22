@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { popover } from '$lib/actions';
 	import { tooltip } from '$lib/actions/tooltip.svelte';
+	import { m } from '$lib/i18n';
 	import Select from '../Select.svelte';
 	import { Columns3Cog } from '@lucide/svelte';
 
@@ -53,17 +54,17 @@
 <button
 	use:ref
 	class="flex items-center p-3"
-	use:tooltip={{ disablePortal, text: 'Filter columns', classes: ['z-60'] }}
+	use:tooltip={{ disablePortal, text: m.core_filter_columns(), classes: ['z-60'] }}
 	onclick={() => toggle()}
 >
 	<Columns3Cog class="size-4 shrink-0" />
 </button>
 <div use:tooltipRef={{ disablePortal }} class="popover w-xs rounded-xs">
 	<Select
-		class="rounded-xs border border-transparent font-normal shadow-inner"
+		class="rounded-xs border border-transparent font-normal shadow-inner dark:bg-base-200 bg-base-100"
 		classes={{
 			root: 'flex grow',
-			option: 'font-normal dark:bg-base-300 bg-base-100'
+			option: 'font-normal dark:bg-base-200 bg-base-100'
 		}}
 		options={fields.map((f) => ({
 			label: getFieldLabel(f),
@@ -91,8 +92,8 @@
 		}}
 		multiple
 		selected={fields.filter((_f, index) => !hiddenFieldIndices.has(index)).join(',')}
-		placeholder="Filter columns..."
+		placeholder={m.core_filter_columns_placeholder()}
 		onClearAll={showReset ? onReset : undefined}
-		clearAllLabel="Reset"
+		clearAllLabel={m.core_reset_shared()}
 	/>
 </div>

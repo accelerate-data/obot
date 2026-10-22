@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { SEEN_SPLASH_DIALOG_KEY } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { markSeenTimestamp } from '$lib/localstate';
 	import { AdminService, Group } from '$lib/services';
@@ -23,7 +24,7 @@
 	const isOnProductAnalyticsSettings = $derived(
 		page.url.pathname === '/admin/product-analytics' ||
 			(page.url.pathname === '/admin/platform' &&
-				page.url.searchParams.get('view') === 'product-analytics')
+				['product-analytics', 'settings'].includes(page.url.searchParams.get('view') ?? ''))
 	);
 	const needsProductAnalyticsConsent = $derived(
 		profile.current.groups.includes(Group.ADMIN) &&
@@ -73,34 +74,29 @@
 <div class="flex w-full items-center justify-center">
 	<Logo class="size-18" />
 </div>
-<h2 class="mb-8 text-center text-2xl font-semibold">Welcome to Obot!</h2>
+<h2 class="mb-6 text-center text-2xl font-semibold">{m.auth_setup_welcome_to_obot()}</h2>
 
 <div class="w-fit self-center px-4">
 	{#if !version.current.authEnabled}
 		<p class="mb-4">
-			<span class="text-muted-content">Auth is disabled.</span>
+			<span class="text-muted-content">{m.auth_setup_auth_disabled()}</span>
 			<a
 				href="https://docs.obot.ai/installation/enabling-authentication"
 				rel="external noopener noreferrer"
 				target="_blank"
-				class="text-link">Learn more</a
+				class="text-link">{m.auth_setup_learn_more()}</a
 			>
 		</p>
 	{/if}
-	<p>By continuing, you agree to the following:</p>
-
-	<div class="flex items-center gap-2 pt-4 text-sm">
-		<div class="mx-2">&#8226;</div>
-		<span>
-			I agree to Obot's
-			<a
-				href="https://obot.ai/eul"
-				rel="external noopener noreferrer"
-				target="_blank"
-				class="text-link">EULA</a
-			>
-		</span>
-	</div>
+	<p>
+		{m.auth_setup_agree_eula_prefix()}
+		<a
+			href="https://obot.ai/eul"
+			rel="external noopener noreferrer"
+			target="_blank"
+			class="text-link">EULA</a
+		>{m.auth_setup_agree_eula_suffix()}
+	</p>
 	{#if needsProductAnalyticsConsent}
 		<div class="flex items-start gap-2 pt-4 text-sm">
 			<input
@@ -110,18 +106,17 @@
 				bind:checked={shareProductUsage}
 				disabled={loading}
 			/>
-			<span class="italic">
-				<label for="share-product-usage">
-					I agree to share my product usage data to help improve Obot (optional)
-				</label>
+			<label for="share-product-usage" class="leading-tight">
+				{m.auth_setup_share_usage_data()}
 				<br />
+				<span class="text-muted-content">{m.auth_setup_share_usage_help()}</span>
 				<a
 					href="https://docs.obot.ai/configuration/product-analytics"
 					rel="external noopener noreferrer"
 					target="_blank"
-					class="text-link">Learn more</a
+					class="text-link">{m.auth_setup_learn_more()}</a
 				>
-			</span>
+			</label>
 		</div>
 	{/if}
 </div>
@@ -134,6 +129,6 @@
 	{#if loading}
 		<Loading class="size-4" />
 	{:else}
-		Continue
+		{m.core_continue()}
 	{/if}
 </button>

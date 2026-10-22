@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { page } from '$app/state';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import type {
 		MCPServerOAuthCredentialStatus,
@@ -6,6 +8,7 @@
 		MCPServerOAuthCredentialTestResult,
 		MCPServerOAuthCredentialTestStart
 	} from '$lib/services/admin/types';
+	import { goto } from '$lib/url';
 	import { poll } from '$lib/utils';
 	import Confirm from '../Confirm.svelte';
 	import CopyField from '../CopyField.svelte';
@@ -61,6 +64,8 @@
 	let error = $state<string>();
 	let showDeleteConfirm = $state(false);
 	let showRequired = $state(false);
+	let showReturnConfirm = $state(false);
+	let returnPath = $state<string>();
 	let credentialTest = $state(idleStaticOAuthCredentialTest());
 	let testGeneration = 0;
 	let testPopup: Window | null = null;
@@ -113,15 +118,15 @@
 	function credentialTestFailureMessage(category?: string): string {
 		switch (category) {
 			case 'authorization_denied':
-				return 'Authorization was denied. Test the credentials again to continue.';
+				return m.mcps_oauth_static_oauth_authorization_denied();
 			case 'invalid_callback':
-				return 'The OAuth callback was invalid. Check the provider callback URL and test again.';
+				return m.mcps_oauth_static_oauth_invalid_callback();
 			case 'token_exchange_failed':
-				return 'The provider rejected the client credentials. Check them and test again.';
+				return m.mcps_oauth_static_oauth_credentials_rejected();
 			case 'expired':
-				return 'The credential test expired. Test the credentials again to continue.';
+				return m.mcps_oauth_static_oauth_test_expired();
 			default:
-				return 'The OAuth credential test failed. Test the credentials again to continue.';
+				return m.mcps_oauth_static_oauth_test_failed();
 		}
 	}
 
@@ -135,7 +140,7 @@
 
 		const popup = window.open('', '_blank');
 		if (!popup) {
-			error = 'Allow pop-ups for Obot to test the OAuth credentials.';
+			error = m.mcps_oauth_static_oauth_allow_popups();
 			return;
 		}
 		popup.opener = null;
@@ -151,7 +156,7 @@
 			});
 			if (generation !== testGeneration) return;
 			const oauthURL = safeStaticOAuthAuthorizationURL(started.oauthURL);
-			if (!oauthURL) throw new Error('The OAuth provider returned an unsafe authorization URL.');
+			if (!oauthURL) throw new Error(m.mcps_oauth_static_oauth_unsafe_url());
 			popup.location.href = oauthURL;
 
 			await poll(
@@ -161,7 +166,7 @@
 					if (result.status === 'pending') {
 						if (!popup.closed) return false;
 						credentialTest = failStaticOAuthCredentialTest(credentialTest, 'popup_closed');
-						error = 'The authorization window was closed before the test finished.';
+						error = m.mcps_oauth_static_oauth_popup_closed();
 						return true;
 					}
 					if (result.status === 'succeeded') {
@@ -235,7 +240,7 @@
 			return;
 		}
 		if (!canSaveStaticOAuthCredentials(credentialTest, form.clientID, form.clientSecret)) {
-			error = 'Test these OAuth credentials successfully before saving.';
+			error = m.mcps_oauth_static_oauth_test_before_save();
 			return;
 		}
 
@@ -251,11 +256,56 @@
 				proof
 			});
 			dialog?.close();
+			offerReturnToPreviousPage();
 		} catch (err) {
-			error = err instanceof Error ? err.message : 'Failed to save OAuth credentials';
+			error = err instanceof Error ? err.message : m.mcps_oauth_static_oauth_save_failed();
 		} finally {
 			loading = false;
 		}
+	}
+
+	function safeReturnPath(value: string | null) {
+		if (!value) return;
+		let url: URL;
+		try {
+			url = new URL(value, page.url.origin);
+		} catch {
+			return;
+		}
+		if (url.origin !== page.url.origin) {
+			return;
+		}
+		return `${url.pathname}${url.search}${url.hash}`;
+	}
+
+	function offerReturnToPreviousPage() {
+		const destination = safeReturnPath(page.url.searchParams.get('oauth-redirect'));
+		if (!destination) return;
+		const currentURL = new URL(page.url);
+		currentURL.searchParams.delete('oauth-redirect');
+		goto(currentURL, { replaceState: true, noScroll: true, keepFocus: true });
+		returnPath = destination;
+		showReturnConfirm = true;
+	}
+
+	function returnPrompt(path: string) {
+		const url = new URL(path, page.url.origin);
+		if (url.searchParams.has('modify-tools')) {
+			return m.mcps_oauth_static_oauth_return_tools();
+		}
+		if (url.searchParams.has('inspector')) {
+			return m.mcps_oauth_static_oauth_return_inspector();
+		}
+		if (url.searchParams.has('connect')) {
+			return m.mcps_oauth_static_oauth_return_connect();
+		}
+		return m.mcps_oauth_static_oauth_return_default();
+	}
+
+	function confirmReturn() {
+		const destination = returnPath;
+		showReturnConfirm = false;
+		if (destination) goto(destination);
 	}
 
 	async function handleDelete() {
@@ -264,7 +314,7 @@
 		if (!expectedGeneration) {
 			showDeleteConfirm = false;
 			dialog?.open();
-			error = 'Reload the OAuth application status before clearing credentials.';
+			error = m.mcps_oauth_static_oauth_reload_status();
 			return;
 		}
 		loading = true;
@@ -275,7 +325,7 @@
 		} catch (err) {
 			showDeleteConfirm = false;
 			dialog?.open();
-			error = err instanceof Error ? err.message : 'Failed to delete OAuth credentials';
+			error = err instanceof Error ? err.message : m.mcps_oauth_static_oauth_delete_failed();
 		} finally {
 			loading = false;
 		}
@@ -296,7 +346,7 @@
 	bind:this={dialog}
 	{onOpen}
 	{onClose}
-	title="Configure Static OAuth"
+	title={m.mcps_oauth_static_oauth_title()}
 	classes={{ header: 'p-4 pb-0', content: 'p-0' }}
 >
 	<form
@@ -317,19 +367,19 @@
 
 		{#if oauthStatus?.configured}
 			<p class="text-muted-content text-sm font-light">
-				Test replacement credentials before saving. The active app and user grants remain usable
-				unless the tested replacement is saved successfully.
+				{m.mcps_oauth_static_oauth_configured_description()}
 			</p>
 		{:else}
 			<p class="text-muted-content text-sm font-light">
-				This remote MCP server requires OAuth configuration. Provide the client credentials from
-				your OAuth provider, then test them before saving.
+				{m.mcps_oauth_static_oauth_required_description()}
 			</p>
 		{/if}
 
 		<div class="flex flex-col gap-4">
 			<div class="flex flex-col gap-1">
-				<label for="clientID" class:text-error={showRequired && !form.clientID}> Client ID </label>
+				<label for="clientID" class:text-error={showRequired && !form.clientID}>
+					{m.mcps_oauth_static_oauth_client_id()}
+				</label>
 				<input
 					type="text"
 					id="clientID"
@@ -344,7 +394,7 @@
 
 			<div class="flex flex-col gap-1">
 				<label for="clientSecret" class:text-error={showRequired && !form.clientSecret}>
-					Client Secret
+					{m.mcps_oauth_static_oauth_client_secret()}
 				</label>
 				<SensitiveInput
 					name="clientSecret"
@@ -359,7 +409,7 @@
 			{#if oauthStatus?.callbackURL}
 				<CopyField
 					id="static-oauth-callback-url"
-					label="OAuth callback URL"
+					label={m.mcps_oauth_static_oauth_callback_url()}
 					value={oauthStatus.callbackURL}
 					variant="code"
 				/>
@@ -368,7 +418,7 @@
 			{#if credentialTest.status === 'succeeded'}
 				<div class="bg-success/10 text-success flex items-center gap-2 rounded-md p-3 text-sm">
 					<CircleCheckBig class="size-5 shrink-0" />
-					Credentials tested successfully. You can save them.
+					{m.mcps_oauth_static_oauth_test_success()}
 				</div>
 			{/if}
 		</div>
@@ -386,7 +436,7 @@
 				disabled={loading}
 			>
 				<Trash2 class="size-4" />
-				Clear Credentials
+				{m.mcps_oauth_static_oauth_clear_credentials()}
 			</button>
 		{:else}
 			<div></div>
@@ -395,11 +445,11 @@
 		<div class="flex flex-wrap gap-2">
 			{#if showSkip && !oauthStatus?.configured}
 				<button type="button" class="btn btn-secondary" onclick={handleSkip} disabled={loading}>
-					Skip
+					{m.mcps_skip()}
 				</button>
 			{/if}
 			<button type="button" class="btn btn-secondary" onclick={handleCancel} disabled={loading}>
-				Cancel
+				{m.common_cancel()}
 			</button>
 			<button
 				type="button"
@@ -411,7 +461,7 @@
 					<Loading class="size-4" />
 				{:else}
 					<ExternalLink class="size-4" />
-					Test Credentials
+					{m.mcps_oauth_static_oauth_test_credentials()}
 				{/if}
 			</button>
 			<button
@@ -425,7 +475,9 @@
 				{#if loading}
 					<Loading class="size-4" />
 				{:else}
-					{oauthStatus?.configured ? 'Replace Credentials' : 'Save'}
+					{oauthStatus?.configured
+						? m.mcps_oauth_static_oauth_replace_credentials()
+						: m.core_save()}
 				{/if}
 			</button>
 		</div>
@@ -434,11 +486,23 @@
 
 <Confirm
 	show={showDeleteConfirm}
-	msg="Are you sure you want to clear the OAuth credentials? All deployments remain, but all Users must reconnect after new credentials are configured."
+	msg={m.mcps_oauth_static_oauth_clear_confirm()}
 	onsuccess={handleDelete}
 	oncancel={() => {
 		showDeleteConfirm = false;
 		dialog?.open();
 	}}
 	{loading}
+/>
+
+<Confirm
+	title={m.mcps_oauth_static_oauth_return_title()}
+	msg={returnPath ? returnPrompt(returnPath) : m.mcps_oauth_static_oauth_return_fallback()}
+	note={m.mcps_oauth_static_oauth_return_note()}
+	show={showReturnConfirm}
+	onsuccess={confirmReturn}
+	oncancel={() => (showReturnConfirm = false)}
+	submitText={m.mcps_oauth_static_oauth_return_go_back()}
+	cancelText={m.mcps_skip()}
+	type="info"
 />

@@ -86,7 +86,7 @@ func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthReadRoutes(t *testing.T) {
 			UserID: "owner-uid",
 		},
 	}).Build()
-	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
+	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, false)
 	apiUser := &user.DefaultInfo{
 		Name:   "owner",
 		UID:    "owner-uid",

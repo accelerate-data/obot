@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
@@ -103,7 +104,7 @@ func (a *Authorizer) checkVMCP(req *http.Request, resources *Resources, u User) 
 	// Launch and per-user OAuth actions consume the vMCP; they do not manage its definition.
 	if req.Method == http.MethodGet ||
 		(req.Method == http.MethodPost && (req.URL.Path == "/api/vmcps/"+resources.VMCPID+"/launch" || req.URL.Path == "/api/vmcps/"+resources.VMCPID+"/check-oauth")) ||
-		(req.Method == http.MethodDelete && req.URL.Path == "/api/vmcps/"+resources.VMCPID+"/oauth") {
+		(req.Method == http.MethodDelete && (req.URL.Path == "/api/vmcps/"+resources.VMCPID+"/oauth" || isVMCPComponentOAuthPath(req.URL.Path, resources.VMCPID))) {
 		if UserCanReadVMCP(u, &vmcp) {
 			resources.Authorizated.VMCP = &vmcp
 			return true, nil
@@ -117,6 +118,17 @@ func (a *Authorizer) checkVMCP(req *http.Request, resources *Resources, u User) 
 	return false, nil
 }
 
+// isVMCPComponentOAuthPath reports whether path is the per-user OAuth reset
+// for one component of the vMCP: /api/vmcps/{vmcp_id}/components/{component_id}/oauth.
+func isVMCPComponentOAuthPath(path, vmcpID string) bool {
+	componentID, ok := strings.CutPrefix(path, "/api/vmcps/"+vmcpID+"/components/")
+	if !ok {
+		return false
+	}
+	componentID, ok = strings.CutSuffix(componentID, "/oauth")
+	return ok && componentID != "" && !strings.Contains(componentID, "/")
+}
+
 func (a *Authorizer) checkVMCPInstance(req *http.Request, resources *Resources, u User) (bool, error) {
 	if resources.VMCPInstanceID == "" {
 		return true, nil
@@ -125,6 +137,10 @@ func (a *Authorizer) checkVMCPInstance(req *http.Request, resources *Resources, 
 	var instance v1.VMCPInstance
 	if err := a.get(req.Context(), router.Key(system.DefaultNamespace, resources.VMCPInstanceID), &instance); err != nil {
 		return false, err
+	}
+
+	if req.Method == http.MethodPost && req.URL.Path == "/api/vmcp-instances/"+resources.VMCPInstanceID+"/tester/chat" {
+		return userCanConnectToMCP(req.Context(), a.uncached, a.acrHelper, u, resources.VMCPInstanceID, resources)
 	}
 
 	if IsVMCPAdministrator(u) {

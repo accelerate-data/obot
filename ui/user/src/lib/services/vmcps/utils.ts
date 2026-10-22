@@ -1,19 +1,21 @@
 import { DEFAULT_MCP_CATALOG_ID } from '$lib/constants';
+import { m } from '$lib/i18n';
 import type {
 	MCPCatalogEntry,
 	MCPCatalogServer,
 	VMCPComponent,
+	VMCPComponentStatus,
 	MCPConfig,
 	OrgUser,
 	VMCP,
 	VMCPInstance,
-	VMCPManifest,
-	VMCPProfile
+	VMCPManifest
 } from '$lib/services';
 import { profile } from '$lib/stores';
+import { goto, replaceState } from '$lib/url';
 import { getUserDisplayName } from '$lib/utils';
 import { AiClient } from '../user/constants';
-import { getManifestConfiguration } from '../user/mcp';
+import { getLocalhostCallbackPaths, getManifestConfiguration } from '../user/mcp';
 import {
 	COMPONENT_LABEL_SEPARATOR,
 	MCP_SERVER_POPULARITY_ORDER,
@@ -24,9 +26,12 @@ import type {
 	Point,
 	RectLike,
 	VMcpComponentView,
+	VMcpFilterContext,
 	VMcpFilterOption,
 	VMcpFilters,
-	VMcpSortBy
+	VMcpSortBy,
+	VMcpSortDirection,
+	VMcpStatusFilter
 } from './types';
 
 export function joinComponentLabels(parts: Array<string | undefined>) {
@@ -63,15 +68,52 @@ export function appendComponentLabel(
 export type VMcpFormData = {
 	displayName: string;
 	description: string;
+	toolSearch: boolean;
 };
 
 export const initVMcp = (): VMcpFormData => ({
 	displayName: '',
-	description: ''
+	description: '',
+	toolSearch: false
 });
+
+// Catalog-synced vMCPs are managed by their source catalog and cannot be
+// updated or deleted through the API.
+export function isCatalogSyncedVMcp(vmcp?: VMCP) {
+	return Boolean(vmcp?.sourceURL);
+}
 
 export function vmcpNeedsUpdate(vmcp: VMCP) {
 	return vmcp.status?.components?.some((component) => component.needsUpdate) ?? false;
+}
+
+export function mcpServerNeedsStaticOAuthConfiguration(entry: MCPCatalogEntry): boolean {
+	return Boolean(
+		entry.manifest.runtime === 'remote' &&
+		entry.manifest.remoteConfig?.staticOAuthRequired &&
+		!entry.oauthCredentialConfigured
+	);
+}
+
+export function vmcpMissingStaticOAuthComponent(vmcp: VMCP): VMCPComponent | undefined {
+	return vmcp.components?.find(
+		(component) =>
+			component.catalogEntry?.manifest?.remoteConfig?.staticOAuthRequired &&
+			vmcp.status?.components?.some(
+				(status) =>
+					status.name === component.name &&
+					status.error === 'static OAuth credentials are not configured'
+			)
+	);
+}
+
+export function vmcpNeedsAdminConfiguration(vmcp: VMCP): boolean {
+	return Boolean(
+		vmcpMissingStaticOAuthComponent(vmcp) ||
+		vmcp.status?.components?.some((status) =>
+			status.error?.startsWith('missing required administrator configuration:')
+		)
+	);
 }
 
 export function vmcpHasUserAllowedConfiguration(vmcp: VMCP) {
@@ -86,11 +128,47 @@ export function vmcpInstanceNeedsUserConfiguration(instance?: VMCPInstance) {
 	return Boolean(instance?.status?.missingRequiredConfiguration?.length);
 }
 
+export function vmcpUserInstances(
+	vmcp: VMCP,
+	instances: VMCPInstance[],
+	userId: string
+): VMCPInstance[] {
+	return instances.filter(
+		(instance) => instance.vmcpID === vmcp.id && instance.userID === userId && !instance.deleted
+	);
+}
+
+export function vmcpMatchesStatusFilter(
+	vmcp: VMCP,
+	status: VMcpStatusFilter,
+	instances: VMCPInstance[],
+	userId: string
+): boolean {
+	const myInstances = vmcpUserInstances(vmcp, instances, userId);
+	switch (status) {
+		case 'needs-update':
+			return vmcpNeedsUpdate(vmcp);
+		case 'not-configured':
+			return myInstances.some((instance) => vmcpInstanceNeedsUserConfiguration(instance));
+		case 'connected':
+			return myInstances.length > 0;
+		case 'not-connected':
+			return myInstances.length === 0;
+	}
+}
+
 export function vmcpOutdatedComponents(vmcp: VMCP): VMCPComponent[] {
 	const statuses = vmcp.status?.components ?? [];
 	return (vmcp.components ?? []).filter((component) =>
 		statuses.some((status) => status.name === component.name && status.needsUpdate)
 	);
+}
+
+export function vmcpComponentStatus(
+	vmcp: VMCP,
+	component: VMCPComponent
+): VMCPComponentStatus | undefined {
+	return vmcp.status?.components?.find((status) => status.name === component.name);
 }
 
 export function vmcpUpdateConfigurationTargets(
@@ -99,6 +177,9 @@ export function vmcpUpdateConfigurationTargets(
 ): { component: VMCPComponent; entry: MCPCatalogEntry }[] {
 	const byId = new Map(entries.map((entry) => [entry.id, entry]));
 	return vmcpOutdatedComponents(vmcp).flatMap((component) => {
+		// Updating only releases connections' older snapshots of a current component,
+		// so its configuration is already up to date.
+		if (vmcpComponentStatus(vmcp, component)?.connectionSnapshot) return [];
 		const entry = byId.get(component.mcpServerCatalogEntryID);
 		if (!entry || catalogConfigurationFields(entry).length === 0) return [];
 		return [{ component, entry }];
@@ -111,7 +192,7 @@ export function configurationWithRevealedValues(
 ): VMCPComponent['configuration'] {
 	if (!configuration || !revealed) return configuration;
 	return configuration.map((policy) => {
-		if (policy.policy !== 'fixed') return policy;
+		if (policy.policy !== 'fixed' || policy.secretBinding) return policy;
 		const value = revealed[policy.key];
 		return value ? { ...policy, value } : policy;
 	});
@@ -131,15 +212,51 @@ export function configurationForSnapshotUpdate(
 	const retained = (component.configuration ?? []).flatMap((policy) => {
 		if (nextKeys.has(policy.key)) return [];
 		const field = snapshotFields.find((candidate) => candidate.key === policy.key);
-		if (!field?.required || field.value || field.secretBinding) return [];
-		return [{ key: policy.key, policy: policy.policy }];
+		if (!field?.required || field.value || field.static || field.secretBinding) return [];
+		return [
+			{
+				key: policy.key,
+				policy: policy.policy,
+				...(policy.secretBinding ? { secretBinding: policy.secretBinding } : {})
+			}
+		];
+	});
+	return retained.length === 0 ? next : [...next, ...retained];
+}
+
+const REDACTED_CONFIGURATION_VALUE = '******';
+
+function suppliedConfigurationValue(value?: string) {
+	if (!value || value === REDACTED_CONFIGURATION_VALUE) return undefined;
+	return value;
+}
+
+export function configurationRetainingOmittedRequired(
+	component: VMCPComponent,
+	next: NonNullable<VMCPComponent['configuration']>
+): NonNullable<VMCPComponent['configuration']> {
+	const nextKeys = new Set(next.map((policy) => policy.key));
+	const seeded = new Map((component.configuration ?? []).map((policy) => [policy.key, policy]));
+	const retained = catalogConfigurationFields(component.catalogEntry).flatMap((field) => {
+		if (nextKeys.has(field.key) || !field.required || field.static || field.secretBinding) {
+			return [];
+		}
+		const policy = seeded.get(field.key);
+		const type =
+			policy?.policy === 'fixed' || policy?.policy === 'userAllowed' ? policy.policy : 'fixed';
+		const value =
+			type === 'fixed'
+				? (suppliedConfigurationValue(field.value) ?? suppliedConfigurationValue(policy?.value))
+				: undefined;
+		return [{ key: field.key, policy: type, ...(value ? { value } : {}) }];
 	});
 	return retained.length === 0 ? next : [...next, ...retained];
 }
 
 export function vmcpComponentDiffServers(
 	component: VMCPComponent,
-	updatedEntry?: MCPCatalogEntry
+	updatedEntry?: MCPCatalogEntry,
+	status?: VMCPComponentStatus
 ): {
 	fromServer?: MCPCatalogServer;
 	toServer?: MCPCatalogEntry;
@@ -148,16 +265,41 @@ export function vmcpComponentDiffServers(
 		return {};
 	}
 
+	// A current component needs an update only for connections that retain an older snapshot.
+	const deployed = status?.connectionSnapshot ?? component.catalogEntry;
 	return {
 		fromServer: {
 			id: component.mcpServerCatalogEntryID,
-			manifest: component.catalogEntry.manifest
+			manifest: stripInformationalManifestFields(deployed.manifest)
 		} as MCPCatalogServer,
-		toServer: updatedEntry
+		toServer: {
+			...updatedEntry,
+			manifest: stripInformationalManifestFields(updatedEntry.manifest)
+		}
 	};
 }
 
+// Snapshots never store tool previews, and neither previews nor informational
+// catalog fields mark a component as needing an update, so the diff omits them.
+function stripInformationalManifestFields<T extends object>(manifest: T): T {
+	const stripped = { ...manifest } as Record<string, unknown>;
+	for (const field of [
+		'toolPreview',
+		'metadata',
+		'shortDescription',
+		'description',
+		'icon',
+		'upgradeNote',
+		'minObotVersion',
+		'maxObotVersion'
+	]) {
+		delete stripped[field];
+	}
+	return stripped as T;
+}
+
 export function vmcpConnectURL(vmcp: VMCP) {
+	if (!vmcp.status?.ready) return undefined;
 	const link = vmcp.links?.connectURL || vmcp.links?.['mcp-connect'];
 	if (link) return link;
 	const origin = typeof window !== 'undefined' ? window.location.origin : '';
@@ -169,6 +311,7 @@ export function vmcpManifest(vmcp: VMCP): VMCPManifest {
 		displayName: vmcp.displayName,
 		description: vmcp.description,
 		icon: vmcp.icon,
+		toolSearch: vmcp.toolSearch,
 		components: vmcp.components ?? [],
 		profiles: vmcp.profiles
 	};
@@ -180,13 +323,22 @@ export function catalogEntryToVMCPComponent(entry: MCPCatalogEntry): VMCPCompone
 		mcpCatalogID: DEFAULT_MCP_CATALOG_ID,
 		mcpServerCatalogEntryID: entry.id,
 		configuration: catalogConfigurationFields(entry)
-			.filter((field) => field.required)
+			.filter((field) => field.required && !field.static)
 			.map((field) => ({ key: field.key, policy: 'fixed', value: field.value })),
 		catalogEntry: {
 			manifest: entry.manifest,
 			unsupportedTools: entry.unsupportedTools
 		}
 	};
+}
+
+export function hasVMcpComponentConfiguration(entry: {
+	manifest: MCPCatalogEntry['manifest'];
+}): boolean {
+	const editable = catalogConfigurationFields(entry).some(
+		(field) => !field.value && !field.static && !field.secretBinding
+	);
+	return editable || entry.manifest.runtime !== 'remote';
 }
 
 export function catalogConfigurationFields(entry: {
@@ -225,6 +377,43 @@ export function vmcpInstancePath(vmcpID: string, instanceID: string) {
 
 export function vmcpInstanceAuditLogsPath(vmcpID: string, userID: string) {
 	return `/audit-logs?mcp_id=${encodeURIComponent(vmcpID)}&actor=${encodeURIComponent(userID)}`;
+}
+
+export type OAuthReturnParam = {
+	key: string;
+	value: string;
+};
+
+export function oauthReturnPath(pageURL: URL, returnParam?: OAuthReturnParam) {
+	if (!returnParam?.key || !returnParam.value) return;
+	const returnURL = new URL(pageURL);
+	returnURL.searchParams.set(returnParam.key, returnParam.value);
+	return `${returnURL.pathname}${returnURL.search}${returnURL.hash}`;
+}
+
+export function configureOAuthPath(entryID: string, pageURL: URL, returnParam?: OAuthReturnParam) {
+	const params = new URLSearchParams({ 'configure-oauth': 'true' });
+	const redirect = oauthReturnPath(pageURL, returnParam);
+	if (redirect) params.set('oauth-redirect', redirect);
+	return `/mcp-servers/c/${encodeURIComponent(entryID)}?${params.toString()}` as const;
+}
+
+export function handleConfigureOAuth(
+	event: MouseEvent,
+	entryID: string | undefined,
+	pageURL: URL,
+	returnParam?: OAuthReturnParam
+) {
+	if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+		return;
+	}
+	if (!entryID) return;
+	event.preventDefault();
+	if (returnParam?.key && returnParam.value) {
+		pageURL.searchParams.set(returnParam.key, returnParam.value);
+		replaceState(pageURL, {});
+	}
+	goto(configureOAuthPath(entryID, pageURL, returnParam));
 }
 
 export function vmcpComponentCatalogEntryPath(
@@ -337,20 +526,56 @@ function matchesVMcpQuery(vmcp: VMCP, query: string, owners: Map<string, OrgUser
 	return queryMatchScore(vmcp, query, owners) > 0;
 }
 
-export function matchesVMcpFilters(vmcp: VMCP, filters: VMcpFilters, owners: Map<string, OrgUser>) {
+export function matchesVMcpFilters(
+	vmcp: VMCP,
+	filters: VMcpFilters,
+	owners: Map<string, OrgUser>,
+	context?: VMcpFilterContext
+) {
 	const query = (filters.query ?? '').trim();
 	const componentIds = parseSelectedFilterIds(filters.components ?? '');
-	if (!query && componentIds.length === 0) return true;
+	const statusIds = parseSelectedFilterIds(filters.status ?? '');
+	const creatorIds = parseSelectedFilterIds(filters.creators ?? '');
+	if (!query && componentIds.length === 0 && statusIds.length === 0 && creatorIds.length === 0) {
+		return true;
+	}
 	const matchesComponents =
 		componentIds.length === 0 || componentIds.some((id) => componentServerIds(vmcp).includes(id));
-	return matchesVMcpQuery(vmcp, query, owners) && matchesComponents;
+	const matchesStatus =
+		statusIds.length === 0 ||
+		Boolean(
+			context?.userId &&
+			statusIds.some((status) =>
+				vmcpMatchesStatusFilter(
+					vmcp,
+					status as VMcpStatusFilter,
+					context.instances ?? [],
+					context.userId!
+				)
+			)
+		);
+	const matchesCreators =
+		creatorIds.length === 0 ||
+		Boolean(vmcp.creatorUserID && creatorIds.includes(vmcp.creatorUserID));
+	return (
+		matchesVMcpQuery(vmcp, query, owners) && matchesComponents && matchesStatus && matchesCreators
+	);
 }
 
-export function filterVMcps(vmcps: VMCP[], filters: VMcpFilters, owners: Map<string, OrgUser>) {
+export function filterVMcps(
+	vmcps: VMCP[],
+	filters: VMcpFilters,
+	owners: Map<string, OrgUser>,
+	context?: VMcpFilterContext
+) {
 	const query = (filters.query ?? '').trim();
 	const componentIds = parseSelectedFilterIds(filters.components ?? '');
-	if (!query && componentIds.length === 0) return vmcps;
-	return vmcps.filter((vmcp) => matchesVMcpFilters(vmcp, filters, owners));
+	const statusIds = parseSelectedFilterIds(filters.status ?? '');
+	const creatorIds = parseSelectedFilterIds(filters.creators ?? '');
+	if (!query && componentIds.length === 0 && statusIds.length === 0 && creatorIds.length === 0) {
+		return vmcps;
+	}
+	return vmcps.filter((vmcp) => matchesVMcpFilters(vmcp, filters, owners, context));
 }
 
 export function buildVMcpComponentFilterOptions(
@@ -373,6 +598,21 @@ export function buildVMcpComponentFilterOptions(
 	return sortFilterOptions(options);
 }
 
+export function buildVMcpCreatorFilterOptions(
+	vmcps: VMCP[],
+	users: Map<string, OrgUser>
+): VMcpFilterOption[] {
+	const options: VMcpFilterOption[] = [];
+	const seen = new Set<string>();
+	for (const vmcp of vmcps) {
+		const id = vmcp.creatorUserID;
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		options.push({ id, label: getUserDisplayName(users, id) });
+	}
+	return sortFilterOptions(options);
+}
+
 function compareNames(a: VMCP, b: VMCP) {
 	return (a.displayName ?? '').localeCompare(b.displayName ?? '', undefined, {
 		sensitivity: 'base'
@@ -383,19 +623,21 @@ export function sortVMcps(
 	vmcps: VMCP[],
 	sortBy: VMcpSortBy,
 	query?: string,
-	owners?: Map<string, OrgUser>
+	owners?: Map<string, OrgUser>,
+	direction: VMcpSortDirection = 'asc'
 ) {
 	const trimmedQuery = (query ?? '').trim();
 	const rankByQuery = Boolean(trimmedQuery);
 	const scoreOf = (vmcp: VMCP) => queryMatchScore(vmcp, trimmedQuery, owners);
+	const directed = direction === 'desc' ? -1 : 1;
 	const compare = (a: VMCP, b: VMCP) => {
 		if (sortBy === 'created') {
-			return (b.created ?? '').localeCompare(a.created ?? '') || compareNames(a, b);
+			return directed * (a.created ?? '').localeCompare(b.created ?? '') || compareNames(a, b);
 		}
 		if (sortBy === 'componentServers') {
-			return componentServerCount(b) - componentServerCount(a) || compareNames(a, b);
+			return directed * (componentServerCount(a) - componentServerCount(b)) || compareNames(a, b);
 		}
-		return compareNames(a, b);
+		return directed * compareNames(a, b);
 	};
 	return [...vmcps].sort((a, b) => compareWithQueryMatch(a, b, scoreOf, compare, rankByQuery));
 }
@@ -403,10 +645,10 @@ export function sortVMcps(
 export type McpServerSortBy = 'nameAsc' | 'nameDesc' | 'created' | 'popularity';
 
 export const MCP_SERVER_SORT_OPTIONS: Array<{ id: McpServerSortBy; label: string }> = [
-	{ id: 'nameAsc', label: 'Alphabetical (A-Z)' },
-	{ id: 'nameDesc', label: 'Alphabetical (Z-A)' },
-	{ id: 'created', label: 'Created Date' },
-	{ id: 'popularity', label: 'Most Popular' }
+	{ id: 'nameAsc', label: m.vmcps_sort_alphabetical_asc() },
+	{ id: 'nameDesc', label: m.vmcps_sort_alphabetical_desc() },
+	{ id: 'created', label: m.vmcps_sort_created_date() },
+	{ id: 'popularity', label: m.vmcps_sort_most_popular() }
 ];
 
 function normalizeServerName(name: string) {
@@ -554,13 +796,13 @@ export function buildWirePath(from: Point, to: Point, phase = 0) {
 	return points.join(' ');
 }
 
-export function resolveVMcpComponents(vmcp: VMCP): VMcpComponentView[] {
+export function resolveVMcpComponents(vmcp: Pick<VMCP, 'components'>): VMcpComponentView[] {
 	return (vmcp.components ?? []).map((component, index) => {
 		const manifest = component.catalogEntry?.manifest;
 		const id = vmcpComponentId(component) || `component-${index}`;
 		return {
 			key: id,
-			name: component.name || manifest?.name || id || 'Unknown server',
+			name: component.name || manifest?.name || id || m.vmcps_unknown_server(),
 			icon: manifest?.icon,
 			description: manifest?.shortDescription || manifest?.description,
 			id,
@@ -579,17 +821,29 @@ function mcpConfigKey(name: string, id: string, used: Set<string>) {
 	return key;
 }
 
-function httpMcpServers(vmcps: VMCP[]) {
+export function vmcpLocalhostCallbackPaths(vmcp: VMCP): string[] {
+	if (vmcp.localhostCallbackPaths) return vmcp.localhostCallbackPaths;
+	return [
+		...new Set(
+			(vmcp.components ?? []).flatMap((component) =>
+				getLocalhostCallbackPaths(component.catalogEntry?.manifest?.remoteConfig)
+			)
+		)
+	];
+}
+
+export function vmcpRequiresLocalhostCallback(vmcp: VMCP) {
+	return vmcpLocalhostCallbackPaths(vmcp).length > 0;
+}
+
+function connectionMcpServers(vmcps: VMCP[]) {
 	const used = new Set<string>();
 	const servers: Record<string, { type: 'http'; url: string }> = {};
 	for (const vmcp of vmcps) {
 		const url = vmcpConnectURL(vmcp);
 		if ((vmcp.components ?? []).length === 0) continue;
 		if (!url) continue;
-		servers[mcpConfigKey(vmcp.displayName || vmcp.id, vmcp.id, used)] = {
-			type: 'http',
-			url
-		};
+		servers[mcpConfigKey(vmcp.displayName || vmcp.id, vmcp.id, used)] = { type: 'http', url };
 	}
 	return servers;
 }
@@ -604,12 +858,12 @@ export function buildConnectAllSnippets(
 	vmcps: VMCP[],
 	admin: boolean
 ): { id: string; label: string; value: string }[] {
-	const servers = httpMcpServers(vmcps);
+	const servers = connectionMcpServers(vmcps);
 	if (clientId === AiClient.Codex) {
 		const value = Object.entries(servers)
 			.map(
 				([name, server]) =>
-					`[mcp_servers.${toTomlQuotedKey(name)}]\nurl = ${JSON.stringify(server.url)}`
+					`[mcp_servers.${toTomlQuotedKey(name)}]\n` + `url = ${JSON.stringify(server.url)}`
 			)
 			.join('\n\n');
 		return [{ id: 'codex-config-toml', label: 'config.toml', value }];
@@ -671,20 +925,29 @@ export function getToolCounts(componentServers: VMcpComponentView[]) {
 	return { enabled, total, approximate };
 }
 
-export function getProfilesDisplayText(profiles?: VMCPProfile[]) {
-	if (!profiles) return '';
-
-	const names = profiles.map((profile) => profile.name);
+export function getDisplayListText(names: string[], maxLength: number = 5) {
 	if (names.length <= 1) return names[0] ?? '';
-
-	const rest = names.slice(0, names.length > 5 ? 4 : -1);
-	const last = names.length > 5 ? `${names.length - 4} others` : names.at(-1);
-	return `${rest.join(', ')} and ${last}`;
+	const rest = names.slice(0, names.length > maxLength ? maxLength - 1 : -1);
+	const last =
+		names.length > maxLength
+			? m.vmcps_list_n_others({ count: names.length - (maxLength - 1) })
+			: (names.at(-1) ?? '');
+	return m.vmcps_list_and({ rest: rest.join(', '), last });
 }
 
-export function getVMcpCreator(vmcp: VMCP, usersMap: Map<string, OrgUser>) {
+export function getVMcpCreator(
+	vmcp: VMCP,
+	usersMap: Map<string, OrgUser>,
+	includePrefix = true,
+	excludeMe = false
+) {
+	let creator = '';
 	if (vmcp.creatorUserID) {
-		return `Created by ${vmcp.creatorUserID === profile.current.id ? 'me' : getUserDisplayName(usersMap, vmcp.creatorUserID)}`;
+		creator =
+			vmcp.creatorUserID === profile.current.id && !excludeMe
+				? m.vmcps_creator_me()
+				: getUserDisplayName(usersMap, vmcp.creatorUserID);
 	}
-	return ' ';
+
+	return includePrefix && creator ? m.vmcps_created_by_named({ name: creator }) : creator;
 }

@@ -21,27 +21,18 @@ func MCPOAuthCredentialName(mcpServerName string) string {
 }
 
 func MCPConnectURL(serverURL, id string) string {
-	return mcpConnectURL(serverURL, "mcp-connect", id)
+	return fmt.Sprintf("%s/mcp-connect/%s", strings.TrimRight(serverURL, "/"), strings.TrimLeft(id, "/"))
+}
+
+// LocalServerURL returns the address at which Obot reaches its own HTTP listener.
+// Unlike the configured hostname, it does not depend on an ingress or load balancer
+// that may only map the public port for traffic from outside Obot's host.
+func LocalServerURL(httpListenPort int) string {
+	return fmt.Sprintf("http://localhost:%d", httpListenPort)
 }
 
 func LocalMCPConnectURL(id string, httpListenPort int) string {
-	return MCPConnectURL(fmt.Sprintf("http://localhost:%d", httpListenPort), id)
-}
-
-func MCPConnectCompositeURL(id string, httpListenPort int) string {
-	return mcpConnectURL(fmt.Sprintf("http://localhost:%d", httpListenPort), "mcp-connect-composite", id)
-}
-
-func mcpConnectURL(serverURL, path, id string) string {
-	return fmt.Sprintf("%s/%s/%s",
-		strings.TrimRight(serverURL, "/"),
-		strings.Trim(path, "/"),
-		strings.TrimLeft(id, "/"),
-	)
-}
-
-func NanobotAgentConnectURL(serverURL, id string) string {
-	return MCPConnectURL(serverURL, MCPServerPrefix+id)
+	return MCPConnectURL(LocalServerURL(httpListenPort), id)
 }
 
 func MCPOAuthCallbackURL(serverURL string) string {

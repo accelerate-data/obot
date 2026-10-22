@@ -32,12 +32,12 @@ func TestListToolsThroughSharedVMCPComponentConnection(t *testing.T) {
 			}},
 		}},
 	}
-	instance := &v1.VMCPInstance{
+	instance := syncedVMCPInstance(&v1.VMCPInstance{
 		Name: "vmcpi1one", Namespace: system.DefaultNamespace,
 		Spec: v1.VMCPInstanceSpec{
 			UserID: "7", Manifest: types.VMCPInstanceManifest{VMCPID: parent.Name},
 		},
-	}
+	}, parent)
 	backing := &v1.MCPServer{
 		Name: "ms1shared", Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerSpec{
@@ -48,13 +48,13 @@ func TestListToolsThroughSharedVMCPComponentConnection(t *testing.T) {
 			},
 		},
 	}
-	connection := &v1.MCPServerInstance{
+	connection := syncedVMCPConnection(t, &v1.MCPServerInstance{
 		Name: "msi1one", Namespace: system.DefaultNamespace,
 		Spec: v1.MCPServerInstanceSpec{
 			UserID: "7", VMCPInstanceID: instance.Name,
 			VMCPComponentID: "one", MCPServerName: backing.Name,
 		},
-	}
+	}, parent, instance)
 	storage := newVMCPTestStorage(parent, instance, backing, connection)
 	services, err := sservices.New(sservices.Config{DSN: "sqlite://:memory:"})
 	require.NoError(t, err)
@@ -97,7 +97,7 @@ func TestListToolsThroughSharedVMCPComponentConnection(t *testing.T) {
 		remoteURLValidationConfig: RemoteMCPURLValidationConfig{AllowLocalhostMCP: true},
 	}
 	t.Cleanup(sm.Close)
-	server, config, err := sm.ServerForAction(t.Context(), connection.Name, "7")
+	server, config, err := sm.ServerForAction(t.Context(), connection.Name, &user.DefaultInfo{UID: "7"})
 	require.NoError(t, err)
 	require.Equal(t, backing.Name, server.Name)
 	require.Equal(t, backing.Name, config.MCPServerName)
@@ -106,4 +106,34 @@ func TestListToolsThroughSharedVMCPComponentConnection(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tools, 1)
 	require.Equal(t, "hello", tools[0].Name)
+
+	// Actions on the shared server itself use the caller's connection, because the gateway rejects the server's ID.
+	server, config, err = sm.ServerForAction(t.Context(), backing.Name, &user.DefaultInfo{UID: "7"})
+	require.NoError(t, err)
+	require.Equal(t, backing.Name, server.Name)
+	require.Equal(t, connection.Name, config.MCPServerInstanceID)
+	tools, err = sm.ListTools(t.Context(), config)
+	require.NoError(t, err)
+	require.Len(t, tools, 1)
+
+	_, _, err = sm.ServerForAction(t.Context(), backing.Name, &user.DefaultInfo{UID: "8"})
+	require.ErrorContains(t, err, "connect to vMCP")
+
+	admin := &user.DefaultInfo{UID: "7", Extra: map[string][]string{"obot_groups": types.RoleAdmin.Groups()}}
+	// The caller supplies the full identity; building the config needs no user lookup.
+	sm.gatewayClient = nil
+	parent.Spec.Manifest.Profiles[0].Subjects = []types.Subject{{Type: types.SubjectTypeObotGroup, ID: types.GroupAdmin}}
+	require.NoError(t, storage.Update(t.Context(), parent))
+	aggregate, err := sm.serverConfigForVMCP(t.Context(), parent, instance, admin)
+	require.NoError(t, err)
+	require.Len(t, aggregate.Components, 1)
+	require.False(t, aggregate.Components[0].DisableTools, "Obot admins must retain their profile's tools")
+
+	admin.Extra["obot_groups"] = types.RoleBasic.Groups()
+	// The VMCPInstance controller rechecks the instance when the user's role changes.
+	syncedVMCPInstanceForUser(instance, parent, admin)
+	require.NoError(t, storage.Update(t.Context(), instance))
+	aggregate, err = sm.serverConfigForVMCP(t.Context(), parent, instance, admin)
+	require.NoError(t, err)
+	require.Empty(t, aggregate.Components, "losing the admin role must revoke its tools")
 }

@@ -44,10 +44,7 @@ func TestImportDirectoryProducesImmutableDatabaseBundle(t *testing.T) {
 	if version := loader.Manifest().ObotSentryVersion; version != "1.2.3" {
 		t.Fatalf("obot-sentry version = %q", version)
 	}
-	c, err := loader.Find("intune", "windows")
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := intuneConfiguration(t, loader)
 	var download bytes.Buffer
 	if err := loader.Zip(&download, c, completedValues(t, loader), false); err != nil {
 		t.Fatal(err)
@@ -106,9 +103,23 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func TestImportRejectsUnsafeArchiveEntries(t *testing.T) {
 	tests := []tar.Header{
-		{Name: "../manifest.json", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg},
-		{Name: "/manifest.json", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg},
-		{Name: "root/link", Linkname: "root/manifest.json", Typeflag: tar.TypeSymlink},
+		{
+			Name:     "../manifest.json",
+			Mode:     0o644,
+			Size:     2,
+			Typeflag: tar.TypeReg,
+		},
+		{
+			Name:     "/manifest.json",
+			Mode:     0o644,
+			Size:     2,
+			Typeflag: tar.TypeReg,
+		},
+		{
+			Name:     "root/link",
+			Linkname: "root/manifest.json",
+			Typeflag: tar.TypeSymlink,
+		},
 	}
 	for _, header := range tests {
 		t.Run(strings.ReplaceAll(header.Name, "/", "_"), func(t *testing.T) {

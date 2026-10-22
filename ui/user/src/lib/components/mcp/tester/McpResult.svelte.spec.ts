@@ -1,4 +1,5 @@
 import McpResult from './McpResult.svelte';
+import { EditorView } from '@codemirror/view';
 import { describe, expect, it } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page, userEvent } from 'vitest/browser';
@@ -20,21 +21,60 @@ function renderScrollableResult(height = 460) {
 }
 
 describe('McpResult', () => {
-	it.each([460, 240])('scrolls the expanded raw response into a %i px pane', async (height) => {
-		const pane = renderScrollableResult(height);
-		const raw = page.getByLabelText('Raw MCP response');
-		await expect.element(raw).not.toBeVisible();
-		const before = pane.scrollTop;
-		await page.getByText('Raw response', { exact: true }).click();
-		await expect.element(raw).toBeVisible();
-		await expect.poll(() => pane.scrollTop).toBeGreaterThan(before);
-		await expect
-			.poll(() => {
-				const bounds = raw.element().getBoundingClientRect();
-				const viewport = pane.getBoundingClientRect();
-				return Math.min(bounds.bottom, viewport.bottom) - Math.max(bounds.top, viewport.top);
-			})
-			.toBeGreaterThan(Math.min(height - 40, 380));
+	it.each([
+		{ status: 'cancelled' as const, title: 'Cancelled', icon: 'ban' },
+		{ status: 'timeout' as const, title: 'Timed out', icon: 'clock-3' }
+	])(
+		'keeps $status results styled as warnings with full details available',
+		async ({ status, title, icon }) => {
+			render(McpResult, {
+				result: {
+					status,
+					durationMs: 10,
+					message: 'Operation stopped',
+					details: { reason: status }
+				}
+			});
+			await expect
+				.element(page.getByRole('status').getByRole('heading', { name: title }))
+				.toBeVisible();
+			expect(page.getByRole('status').element().classList.contains('notification-alert')).toBe(
+				true
+			);
+			await expect.element(page.getByRole('alert')).not.toBeInTheDocument();
+			await expect.element(page.getByCSS(`svg.lucide-${icon}`)).toBeVisible();
+			await page.getByRole('button', { name: 'View full error' }).click();
+			await expect.element(page.getByLabelText('Full error')).toBeVisible();
+		}
+	);
+
+	it('previews the returned tool error rather than only its status', async () => {
+		render(McpResult, {
+			result: {
+				status: 'mcp-error',
+				durationMs: 10,
+				value: { isError: true, content: [{ type: 'text', text: 'Rate limit exceeded' }] }
+			}
+		});
+		await expect.element(page.getByRole('alert').getByText(/Rate limit exceeded/)).toBeVisible();
+		await expect.element(page.getByRole('button', { name: 'View full error' })).toBeVisible();
+	});
+
+	it('shows protocol error details in the shared dialog', async () => {
+		render(McpResult, {
+			result: {
+				status: 'transport-error',
+				durationMs: 10,
+				message: 'Invalid parameters',
+				details: { code: -32602, data: { path: ['query'] } }
+			}
+		});
+		await page.getByRole('button', { name: 'View full error' }).click();
+		await expect.element(page.getByLabelText('Full error')).toBeVisible();
+		const errorText = EditorView.findFromDOM(
+			page.getByLabelText('Full error').element() as HTMLElement
+		)?.state.doc.toString();
+		expect(JSON.parse(errorText ?? '')).toEqual({ code: -32602, data: { path: ['query'] } });
 	});
 
 	it('also reveals the raw response when opened with the keyboard', async () => {

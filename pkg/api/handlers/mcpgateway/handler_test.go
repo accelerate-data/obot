@@ -2,23 +2,117 @@ package mcpgateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	gomcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/obot-platform/mmmcp"
 	mmmcpconfig "github.com/obot-platform/mmmcp/config"
+	"github.com/obot-platform/mmmcp/toolsearch"
+	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	obotmcp "github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/safehttp"
 	"golang.org/x/oauth2"
 )
+
+func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
+	var called atomic.Bool
+	server := gomcp.NewServer(&gomcp.Implementation{Name: "component", Version: "test"}, nil)
+	server.AddTool(&gomcp.Tool{Name: "echo", Description: "Echo a message", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, _ *gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
+		called.Store(true)
+		return &gomcp.CallToolResult{Content: []gomcp.Content{&gomcp.TextContent{Text: "called"}}}, nil
+	})
+	upstream := httptest.NewServer(gomcp.NewStreamableHTTPHandler(func(*http.Request) *gomcp.Server { return server }, nil))
+	defer upstream.Close()
+
+	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer handler.Close()
+
+	cfg := obotmcp.MMMCPConfig(obotmcp.ServerConfig{
+		Runtime:    types.RuntimeVMCP,
+		ToolSearch: true,
+		Components: []obotmcp.ComponentServer{{
+			DisplayName: "component",
+			URL:         upstream.URL,
+		}},
+	}, nil)
+	frontend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handler.composite.HTTPHandler().ServeHTTP(w, r.WithContext(mmmcp.ContextWithConfig(r.Context(), cfg)))
+	}))
+	defer frontend.Close()
+
+	client := gomcp.NewClient(&gomcp.Implementation{Name: "test", Version: "1"}, nil)
+	session, err := client.Connect(t.Context(), &gomcp.StreamableClientTransport{Endpoint: frontend.URL, DisableStandaloneSSE: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer session.Close()
+
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil || len(listed.Tools) != 2 {
+		t.Fatalf("listed tools = %#v, error = %v", listed, err)
+	}
+
+	listedNames := map[string]bool{}
+	for _, tool := range listed.Tools {
+		listedNames[tool.Name] = true
+	}
+
+	if !listedNames["search_tools"] || !listedNames["call_tool"] {
+		t.Fatalf("unexpected search-mode tools: %v", listedNames)
+	}
+
+	if _, err := session.CallTool(t.Context(), &gomcp.CallToolParams{Name: "echo"}); err == nil {
+		t.Fatal("direct component call succeeded in search mode")
+	}
+
+	if called.Load() {
+		t.Fatal("direct call reached the component")
+	}
+
+	result, err := session.CallTool(t.Context(), &gomcp.CallToolParams{
+		Name:      toolsearch.SearchToolName,
+		Arguments: map[string]any{"query": "echo"},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("search result = %#v, error = %v", result, err)
+	}
+
+	var found toolsearch.Results
+	if err := json.Unmarshal([]byte(result.Content[0].(*gomcp.TextContent).Text), &found); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(found.Tools) != 1 || found.Tools[0].Tool.InputSchema == nil {
+		t.Fatalf("search results = %#v", found)
+	}
+
+	result, err = session.CallTool(t.Context(), &gomcp.CallToolParams{
+		Name: toolsearch.CallToolName,
+		Arguments: map[string]any{
+			"name":     found.Tools[0].Reference.Name,
+			"revision": found.Tools[0].Revision,
+		},
+	})
+	if err != nil || result.IsError || !called.Load() {
+		t.Fatalf("generic invocation = %#v, error = %v, component called = %t", result, err, called.Load())
+	}
+}
 
 func TestCompositeUpstreamClientIdentity(t *testing.T) {
 	identities := make(chan gomcp.Implementation, 2)
@@ -31,7 +125,7 @@ func TestCompositeUpstreamClientIdentity(t *testing.T) {
 	})
 	upstream := httptest.NewServer(gomcp.NewStreamableHTTPHandler(func(*http.Request) *gomcp.Server { return server }, nil))
 	defer upstream.Close()
-	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil)
+	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,8 +136,14 @@ func TestCompositeUpstreamClientIdentity(t *testing.T) {
 	}))
 	defer frontend.Close()
 	for _, want := range []gomcp.Implementation{
-		{Name: "first-client", Version: "1.2.3"},
-		{Name: "second-client", Version: "4.5.6"},
+		{
+			Name:    "first-client",
+			Version: "1.2.3",
+		},
+		{
+			Name:    "second-client",
+			Version: "4.5.6",
+		},
 	} {
 		client := gomcp.NewClient(&want, nil)
 		session, err := client.Connect(t.Context(), &gomcp.StreamableClientTransport{Endpoint: frontend.URL, DisableStandaloneSSE: true}, nil)
@@ -234,10 +334,120 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 	}
 }
 
+func TestProxyForwardedHeaders(t *testing.T) {
+	tests := []struct {
+		name        string
+		inboundHost string
+		wantHost    string
+		wantProto   string
+	}{
+		{
+			name:        "loopback",
+			inboundHost: "localhost:8080",
+		},
+		{
+			name:        "uppercase loopback",
+			inboundHost: "LOCALHOST:8080",
+		},
+		{
+			name:        "loopback IPv4",
+			inboundHost: "127.0.0.2:8080",
+		},
+		{
+			name:        "loopback IPv6",
+			inboundHost: "[::1]:8080",
+		},
+		{
+			name:        "loopback IPv4-mapped IPv6",
+			inboundHost: "[::ffff:127.0.0.1]:8080",
+		},
+		{
+			name:        "loopback without port",
+			inboundHost: "localhost",
+		},
+		{
+			name:        "loopback IPv4 without port",
+			inboundHost: "127.0.0.2",
+		},
+		{
+			name:        "loopback IPv6 without port",
+			inboundHost: "[::1]",
+		},
+		{
+			name:        "loopback IPv4-mapped IPv6 without port",
+			inboundHost: "[::ffff:127.0.0.1]",
+		},
+		{
+			name:        "loopback with trailing dot",
+			inboundHost: "localhost.:8080",
+		},
+		{
+			name:        "public host",
+			inboundHost: "obot.example.com",
+			wantHost:    "obot.example.com",
+			wantProto:   "https",
+		},
+		{
+			name:        "public host starting with localhost",
+			inboundHost: "localhost.example.com",
+			wantHost:    "localhost.example.com",
+			wantProto:   "https",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			receivedHeaders := make(chan http.Header, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				receivedHeaders <- req.Header.Clone()
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer upstream.Close()
+
+			upstreamURL, err := url.Parse(upstream.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			proxy := httptest.NewServer(&httputil.ReverseProxy{
+				Rewrite: func(req *httputil.ProxyRequest) {
+					rewriteProxyRequest(req, upstreamURL)
+				},
+			})
+			defer proxy.Close()
+
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, proxy.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Host = tt.inboundHost
+
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+
+			got := <-receivedHeaders
+			if got.Get("X-Forwarded-Host") != tt.wantHost {
+				t.Fatalf("X-Forwarded-Host = %q, want %q", got.Get("X-Forwarded-Host"), tt.wantHost)
+			}
+			if got.Get("X-Forwarded-Proto") != tt.wantProto {
+				t.Fatalf("X-Forwarded-Proto = %q, want %q", got.Get("X-Forwarded-Proto"), tt.wantProto)
+			}
+			if got.Get("X-Forwarded-For") == "" {
+				t.Fatal("X-Forwarded-For is missing")
+			}
+		})
+	}
+}
+
 func TestMCPJSONRPCErrorPropagatesThroughTransport(t *testing.T) {
 	deploymentErr := errors.New("MCP server is not healthy: container repeatedly crashed (exit code 1, 4 restarts)")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if !writeMCPJSONRPCError(w, req, deploymentErr) {
+		if response := mcpJSONRPCErrorResponse(req, deploymentErr); response != nil {
+			response.write(w, nil)
+		} else {
 			http.Error(w, deploymentErr.Error(), http.StatusInternalServerError)
 		}
 	}))
@@ -291,5 +501,70 @@ func TestCompositeSessionKeyUsesResolvedServerName(t *testing.T) {
 	}
 	if compositeSessionKey(firstAlias) == compositeSessionKey(obotmcp.ServerConfig{MCPServerName: "other-composite"}) {
 		t.Fatal("different MCP server names shared an affinity key")
+	}
+}
+
+func TestGenericToolCallErrorLeavesUnsupportedRequestsToCaller(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		method string
+		body   string
+	}{
+		{
+			name:   "notification",
+			method: http.MethodPost,
+			body:   `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		},
+		{
+			name:   "malformed request",
+			method: http.MethodPost,
+			body:   `{`,
+		},
+		{
+			name:   "get",
+			method: http.MethodGet,
+			body:   `{"jsonrpc":"2.0","id":1,"method":"ping"}`,
+		},
+		{
+			name:   "empty body",
+			method: http.MethodPost,
+		},
+		{
+			name:   "oversized body",
+			method: http.MethodPost,
+			body:   strings.Repeat(" ", maxJSONRPCErrorRequestBody+1),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(tt.method, "/mcp-connect/vmcp", strings.NewReader(tt.body))
+			if handleGenericToolCallError(api.Context{Request: req, ResponseWriter: w}, nil, errors.New("discovery failed")) {
+				t.Fatal("unsupported request was handled")
+			}
+			if w.Body.Len() != 0 || len(w.Header()) != 0 || w.Flushed {
+				t.Fatalf("fallback wrote a response: headers=%v body=%q", w.Header(), w.Body.String())
+			}
+		})
+	}
+}
+
+func TestMCPTextResponsePreservesHTTPErrorBehavior(t *testing.T) {
+	const message = "rejected request"
+	previousHeaders := http.Header{
+		"Content-Type":     {"application/json"},
+		"Content-Length":   {"999"},
+		"Content-Encoding": {"gzip"},
+		"X-Request-Id":     {"request-1"},
+	}
+	want := httptest.NewRecorder()
+	got := httptest.NewRecorder()
+	for key, values := range previousHeaders {
+		want.Header()[key] = append([]string(nil), values...)
+		got.Header()[key] = append([]string(nil), values...)
+	}
+	http.Error(want, message, http.StatusBadRequest)
+	mcpTextResponse(http.StatusBadRequest, message).write(got, nil)
+	if got.Code != want.Code || got.Body.String() != want.Body.String() || !reflect.DeepEqual(got.Header(), want.Header()) {
+		t.Fatalf("response differs from http.Error: got=%d %v %q want=%d %v %q", got.Code, got.Header(), got.Body.String(), want.Code, want.Header(), want.Body.String())
 	}
 }

@@ -137,24 +137,6 @@ func successfulStaticOAuthCredentialProofFor(t *testing.T, gateway *gatewayclien
 	return result.Proof
 }
 
-// seedStaticOAuthCredential stores a ready credential directly, standing in
-// for a previously committed Save.
-func seedStaticOAuthCredential(t *testing.T, gateway *gatewayclient.Client, entryName, clientID, mcpURL, generation string) {
-	t.Helper()
-	if err := gateway.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: system.MCPOAuthCredentialName(entryName),
-		Name:    system.StaticOAuthCredentialName,
-		Secrets: map[string]string{
-			"CLIENT_ID":     clientID,
-			"CLIENT_SECRET": clientID + "-secret",
-			"MCP_URL":       mcpURL,
-			"GENERATION":    generation,
-		},
-	}); err != nil {
-		t.Fatalf("seed static OAuth credential: %v", err)
-	}
-}
-
 func seedCatalogOwnedOAuthToken(t *testing.T, db *gorm.DB, userID, mcpID, mcpURL, entryName, accessToken string) {
 	t.Helper()
 	if err := db.WithContext(t.Context()).Create(&gatewaytypes.MCPOAuthToken{

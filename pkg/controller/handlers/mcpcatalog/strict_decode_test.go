@@ -25,9 +25,8 @@ func TestReadCatalogManifestsStrict(t *testing.T) {
 			content: "- name: Test\n",
 		},
 		{
-			name:    "unknown field",
+			name:    "unknown field is forward compatible",
 			content: "- name: Test\n  unknownField: true\n",
-			wantErr: true,
 		},
 		{
 			name:    "legacy env field is migrated",
@@ -52,7 +51,7 @@ func TestReadCatalogManifestsStrict(t *testing.T) {
 		},
 		{
 			name:    "mixed list is skipped as a whole",
-			content: "- name: Valid\n- name: Invalid\n  unknownField: true\n",
+			content: "- name: Valid\n- name: Invalid\n  name: Duplicate\n",
 			wantErr: true,
 		},
 	} {
@@ -64,7 +63,7 @@ func TestReadCatalogManifestsStrict(t *testing.T) {
 			}))
 			defer server.Close()
 			for _, source := range []string{file, server.URL} {
-				entries, err := readCatalogManifests[types.MCPServerCatalogEntryManifest](t.Context(), server.Client(), source, "")
+				entries, err := readCatalogManifests[types.MCPServerCatalogEntryManifest](t.Context(), server.Client(), source, "", 100)
 				if test.wantErr {
 					require.Error(t, err)
 					require.Empty(t, entries)
@@ -77,7 +76,7 @@ func TestReadCatalogManifestsStrict(t *testing.T) {
 	}
 }
 
-func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testing.T) {
+func TestReadMCPCatalogRetainsPartialResultsWithDuplicateFields(t *testing.T) {
 	for _, explicit := range []bool{false, true} {
 		t.Run(fmt.Sprintf("explicit selection=%t", explicit), func(t *testing.T) {
 			dir := t.TempDir()
@@ -86,9 +85,8 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 			}
 
 			writeParseTestManifest(t, dir, "Valid", "original")
-			// The legacy schema fields are accepted now, so a strict schema error
-			// must come from a genuinely unknown field.
-			require.NoError(t, os.WriteFile(filepath.Join(dir, "schema-error.yaml"), []byte("name: Legacy\nunknownField: true\n"), 0o600))
+			// Duplicate fields remain invalid while unknown fields are forward compatible.
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "schema-error.yaml"), []byte("name: Legacy\nname: Duplicate\n"), 0o600))
 			corruptParseTestManifest(t, writeParseTestManifest(t, dir, "Broken", "original"))
 
 			var logs bytes.Buffer
@@ -96,9 +94,9 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
 			t.Cleanup(func() { slog.SetDefault(previous) })
 
-			// Both schema and syntax errors must survive every reader layer
+			// Both duplicate-key and syntax errors must survive every reader layer
 			// alongside valid entries, so sync can identify an incomplete source.
-			entries, err := readCatalogManifests[types.MCPServerCatalogEntryManifest](t.Context(), http.DefaultClient, dir, "")
+			entries, err := readCatalogManifests[types.MCPServerCatalogEntryManifest](t.Context(), http.DefaultClient, dir, "", 100)
 			require.ErrorContains(t, err, "schema-error.yaml")
 			require.ErrorContains(t, err, "Broken.yaml")
 			require.Len(t, entries, 1)
@@ -108,7 +106,7 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 			require.Contains(t, logs.String(), "schema-error.yaml")
 			require.Contains(t, logs.String(), "Broken.yaml")
 
-			objects, err := (&Handler{}).readMCPCatalog(t.Context(), "default", dir, "")
+			objects, _, err := (&Handler{}).readMCPCatalog(t.Context(), "default", dir, "")
 			require.ErrorContains(t, err, "schema-error.yaml")
 			require.ErrorContains(t, err, "Broken.yaml")
 			require.Len(t, objects, 1)
@@ -116,7 +114,7 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 	}
 }
 
-func TestReadMCPCatalogSkipsGitHubWorkflows(t *testing.T) {
+func TestReadMCPCatalogStrictReaderSkipsGitHubWorkflows(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "valid.yaml"), []byte(`name: Valid
 entryKey: valid
@@ -133,7 +131,7 @@ npxConfig:
 	require.NoError(t, os.WriteFile(filepath.Join(workflowDir, "ci.yml"), []byte("name: Validate catalog\non: push\njobs: {}\n"), 0o600))
 
 	h := &Handler{}
-	objects, err := h.readMCPCatalog(t.Context(), "default", dir, "")
+	objects, _, err := h.readMCPCatalog(t.Context(), "default", dir, "")
 	require.NoError(t, err)
 	require.Len(t, objects, 1)
 }

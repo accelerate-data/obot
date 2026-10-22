@@ -10,14 +10,13 @@ export interface TooltipOptions {
 	disablePortal?: boolean;
 	classes?: string[];
 	placement?: Placement;
+	anchor?: HTMLElement;
+	offset?: number;
+	positionOffset?: { x?: number; y?: number };
 }
 
 function resolveDataTheme(trigger: HTMLElement): string {
-	return (
-		trigger.closest('[data-theme]')?.getAttribute('data-theme') ??
-		document.querySelector<HTMLElement>('.nanobot[data-theme]')?.getAttribute('data-theme') ??
-		'nanobotlight'
-	);
+	return trigger.closest('[data-theme]')?.getAttribute('data-theme') ?? 'nanobotlight';
 }
 
 const HOST_CLASS = 'tooltip-portal-daisy-host';
@@ -80,7 +79,7 @@ export function tooltip(node: HTMLElement, opts: TooltipOptions | string | undef
 	};
 
 	function applyLookClasses(el: HTMLElement, o: TooltipOptions | string | undefined) {
-		el.classList.remove(HOST_CLASS, 'tooltip-portal-daisy', 'tooltip', 'text-left');
+		el.classList.remove(HOST_CLASS, 'tooltip-portal-daisy', 'tooltip', 'text-left', 'tooltip-hint');
 		const extra = typeof o === 'object' ? (o.classes ?? []) : [];
 		el.classList.add(HOST_CLASS, ...extra);
 	}
@@ -91,6 +90,8 @@ export function tooltip(node: HTMLElement, opts: TooltipOptions | string | undef
 		o: TooltipOptions | string | undefined
 	) {
 		host.setAttribute('data-theme', resolveDataTheme(trigger));
+		host.toggleAttribute('data-interactive', typeof o === 'object' && !!o.interactive);
+
 		const placement = typeof o === 'object' ? o.placement : undefined;
 		host.setAttribute('data-placement', placementAttr(placement));
 	}
@@ -146,7 +147,10 @@ export function tooltip(node: HTMLElement, opts: TooltipOptions | string | undef
 				hover: true,
 				disablePortal: typeof init === 'object' ? init.disablePortal : false,
 				interactiveHover: typeof init === 'object' ? !!init.interactive : false,
-				enterTransition: 'daisy'
+				enterTransition: 'daisy',
+				anchor: typeof init === 'object' ? init.anchor : undefined,
+				offset: typeof init === 'object' ? init.offset : undefined,
+				positionOffset: typeof init === 'object' ? init.positionOffset : undefined
 			})
 		);
 
@@ -215,7 +219,10 @@ export function tooltip(node: HTMLElement, opts: TooltipOptions | string | undef
 		if (typeof o === 'object') {
 			popoverTooltipParams?.update({
 				disablePortal: o.disablePortal,
-				interactiveHover: !!o.interactive
+				interactiveHover: !!o.interactive,
+				anchor: o.anchor,
+				offset: o.offset,
+				positionOffset: o.positionOffset
 			});
 		}
 
@@ -237,6 +244,10 @@ export function tooltip(node: HTMLElement, opts: TooltipOptions | string | undef
 			ao.interactive === bo.interactive &&
 			ao.disablePortal === bo.disablePortal &&
 			ao.snippet === bo.snippet &&
+			ao.anchor === bo.anchor &&
+			ao.offset === bo.offset &&
+			(ao.positionOffset?.x ?? 0) === (bo.positionOffset?.x ?? 0) &&
+			(ao.positionOffset?.y ?? 0) === (bo.positionOffset?.y ?? 0) &&
 			JSON.stringify(ao.classes ?? []) === JSON.stringify(bo.classes ?? [])
 		);
 	}

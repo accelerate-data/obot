@@ -6,18 +6,26 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	"github.com/obot-platform/obot/pkg/api/authz"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 )
 
 // Resolve configuration before building the aggregate or probing component OAuth.
 // In particular, an instance may not have deployed its components yet.
 func vmcpConsentTarget(req api.Context, connectID string) (*v1.VMCP, *v1.VMCPInstance, error) {
 	vmcp, instance, err := vmcpconfig.ResolveConnectID(req.Context(), req.Storage, connectID, req.User.GetUID())
-	if err != nil || vmcp == nil {
-		return vmcp, instance, err
+	if err != nil {
+		return nil, nil, err
+	}
+	if vmcp == nil {
+		return nil, nil, types.NewErrBadRequest("mcp_id must identify a vMCP or vMCP instance")
+	}
+	if !authz.UserCanConnectVMCP(req.User, vmcp) {
+		return nil, nil, types.NewErrForbidden("access denied to vMCP %q", vmcp.Name)
 	}
 	if instance == nil {
 		instance, err = vmcpconfig.FindInstance(req.Context(), req.Storage, vmcp.Namespace, vmcp.Name, req.User.GetUID())
@@ -26,6 +34,16 @@ func vmcpConsentTarget(req api.Context, connectID string) (*v1.VMCP, *v1.VMCPIns
 		}
 	}
 	if instance == nil {
+		// Consent can create the connection before the runtime path sees it. Admit
+		// it under the same proof and provider fences as direct vMCP connection.
+		release, err := vmcpconfig.LockOAuthConnection(req.Context(), req.GatewayClient, req.Storage, vmcp, nil, req.User)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer release()
+		if !authz.UserCanConnectVMCP(req.User, vmcp) {
+			return nil, nil, types.NewErrForbidden("access denied to vMCP %q", vmcp.Name)
+		}
 		instance = &v1.VMCPInstance{
 			Finalizers:   []string{v1.VMCPInstanceFinalizer},
 			GenerateName: system.VMCPInstancePrefix,
@@ -50,8 +68,14 @@ func vmcpConsentMissingConfiguration(req api.Context, vmcp v1.VMCP, instance v1.
 		return nil, err
 	}
 	var missing []string
-	for _, component := range vmcpconfig.ComponentsForInstance(vmcp, instance) {
+	for _, component := range vmcpConsentComponents(req.User, vmcp, instance) {
 		missing = append(missing, vmcpconfig.MissingRequiredConfiguration(component, credential.Secrets, true)...)
 	}
 	return missing, nil
+}
+
+// vmcpConsentComponents omits components disabled for the user. The user never
+// connects to them, so they require neither configuration nor OAuth.
+func vmcpConsentComponents(u kuser.Info, vmcp v1.VMCP, instance v1.VMCPInstance) []types.VMCPComponent {
+	return vmcpconfig.EnabledComponents(u, vmcp, vmcpconfig.ComponentsForInstance(vmcp, instance))
 }

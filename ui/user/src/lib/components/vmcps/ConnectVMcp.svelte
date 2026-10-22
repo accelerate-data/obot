@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { dialogAnimation } from '$lib/actions/dialogAnimation';
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
 	import Confirm from '$lib/components/Confirm.svelte';
 	import CopyField from '$lib/components/CopyField.svelte';
 	import ResponsiveDialog from '$lib/components/ResponsiveDialog.svelte';
@@ -7,26 +8,40 @@
 		type CompositeLaunchFormData
 	} from '$lib/components/mcp/CatalogConfigureForm.svelte';
 	import HowToConnect from '$lib/components/mcp/HowToConnect.svelte';
-	import IconButton from '$lib/components/primitives/IconButton.svelte';
+	import McpCompositeOauth from '$lib/components/mcp/McpCompositeOauth.svelte';
+	import McpLocalAuth from '$lib/components/mcp/McpLocalAuth.svelte';
 	import { isAbortError } from '$lib/errors';
+	import { m } from '$lib/i18n';
+	import Loading from '$lib/icons/Loading.svelte';
 	import { UserService, type VMCP, type VMCPConfiguration, type VMCPInstance } from '$lib/services';
-	import type { VMcpConnectOptions } from '$lib/services/vmcps/types';
+	import { isMcpLoginURL } from '$lib/services/user/mcp';
+	import type { VMcpComponentView, VMcpConnectOptions } from '$lib/services/vmcps/types';
+	import { vmcpLocalhostCallbackPaths } from '$lib/services/vmcps/utils';
 	import {
+		configureOAuthPath,
+		handleConfigureOAuth,
 		resolveVMcpComponents,
 		vmcpComponentId,
 		vmcpConnectURL,
-		vmcpInstanceNeedsUserConfiguration
+		vmcpMissingStaticOAuthComponent,
+		type OAuthReturnParam
 	} from '$lib/services/vmcps/utils';
-	import { vmcpInstances } from '$lib/stores';
+	import { profile, vmcpInstances } from '$lib/stores';
+	import { goto } from '$lib/url';
 	import VMcpIcon from './VMcpIcon.svelte';
-	import { CircleAlert, X } from '@lucide/svelte';
+	import { CircleAlert, MessageCircle } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import { twMerge } from 'tailwind-merge';
 
+	let {
+		reconciliationRetryMs = 1000,
+		configureOnly = false
+	}: { reconciliationRetryMs?: number; configureOnly?: boolean } = $props();
 	let vmcp = $state<VMCP>();
 	let instance = $state<VMCPInstance>();
 	let connectDialog = $state<ReturnType<typeof ResponsiveDialog>>();
+	let reauthenticateDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let configureDialog = $state<ReturnType<typeof CatalogConfigureForm>>();
 	let howToConnect = $state<ReturnType<typeof HowToConnect>>();
 	let connectionUrlField = $state<ReturnType<typeof CopyField>>();
@@ -37,34 +52,65 @@
 	let launchError = $state<string>();
 	let launchProgress = $state<number>(0);
 	let launchState = $state<'relaunching' | 'launching' | undefined>();
-	let oauthDialog = $state<HTMLDialogElement>();
+	let oauthDialog = $state<ReturnType<typeof ResponsiveDialog>>();
+	// True while the OAuth prompt is showing. Every way out of the prompt (its
+	// close buttons, completing authentication, or Escape) ends it exactly once.
+	let oauthPromptOpen = false;
+	let oauthContent = $state<HTMLDivElement>();
 	let oauthURL = $state<string>('');
 	let oauthVerifying = $state(false);
+	let oauthChecking = $state(false);
+	let compositeAuthID = $derived.by(() => {
+		if (!oauthURL) return '';
+		try {
+			const match = new URL(oauthURL, 'http://localhost').pathname.match(
+				/\/auth\/mcp\/composite\/([^/]+)$/
+			);
+			return match ? decodeURIComponent(match[1]) : '';
+		} catch {
+			return '';
+		}
+	});
 	let onConnected = $state<VMcpConnectOptions['onConnected']>();
 	let onDismissed = $state<VMcpConnectOptions['onDismissed']>();
+	let connectReturn = $state<VMcpConnectOptions['connectReturn']>();
 	let ignoreNextConfigureClose = false;
 	let skipConnectDialog = false;
 	let editConfigurationController: AbortController | undefined;
 
+	let localhostCallback = $derived(vmcp ? vmcpLocalhostCallbackPaths(vmcp).length > 0 : false);
 	let connectURL = $derived(vmcp ? vmcpConnectURL(vmcp) : undefined);
 	let displayName = $derived(vmcp?.displayName || 'vMCP');
 	let componentViews = $derived(vmcp ? resolveVMcpComponents(vmcp) : []);
+	let authenticatedComponents = $state<string[]>([]);
+
+	let statusRequest = 0;
+	let connectionFlow = 0;
+	let oauthStatusController: AbortController | undefined;
+	let reauthenticatingTarget = $state<'all' | string>();
+	let reauthenticateChoices = $state<(VMcpComponentView & { id: string })[]>([]);
+	let reauthenticatableComponents = $derived(
+		componentViews.filter((component): component is VMcpComponentView & { id: string } =>
+			Boolean(component.id && authenticatedComponents.includes(component.id))
+		)
+	);
+	let missingOAuthComponent = $derived(vmcp ? vmcpMissingStaticOAuthComponent(vmcp) : undefined);
 	let hasUserConfiguration = $derived(
 		vmcp?.components?.some((component) =>
 			component.configuration?.find((field) => field.policy === 'userAllowed')
 		)
 	);
-	let isReauthenticatable = $derived(
-		Boolean(instance) &&
-			!hasUserConfiguration &&
-			Boolean(
-				vmcp?.components?.some(
-					(component) =>
-						component.catalogEntry?.manifest?.runtime === 'remote' ||
-						Boolean(component.oauthCredentialID)
-				)
-			)
-	);
+	let hasConfiguredInstance = $derived.by(() => {
+		if (!vmcp) return false;
+		const candidates = instance ? [instance] : vmcpInstances.current.items;
+		return candidates.some(
+			(candidate) =>
+				candidate.vmcpID === vmcp?.id &&
+				candidate.userID === profile.current.id &&
+				!candidate.deleted &&
+				candidate.status?.configured === true
+		);
+	});
 
 	function generateIdFromName(name: string) {
 		return name
@@ -78,10 +124,13 @@
 		targetInstance?: VMCPInstance,
 		options?: VMcpConnectOptions
 	) {
+		connectionFlow += 1;
+		oauthStatusController?.abort();
 		vmcp = target;
 		instance = targetInstance;
 		onConnected = options?.onConnected;
 		onDismissed = options?.onDismissed;
+		connectReturn = options?.connectReturn;
 		configureForm = undefined;
 		error = undefined;
 		launchError = undefined;
@@ -93,6 +142,33 @@
 		ignoreNextConfigureClose = false;
 		connectionUrlField?.clear?.();
 		howToConnect?.resetCopied?.();
+		statusRequest += 1;
+		authenticatedComponents = [];
+	}
+
+	async function refreshOAuthStatus(vmcpID: string) {
+		oauthStatusController?.abort();
+		const controller = new AbortController();
+		oauthStatusController = controller;
+		const request = ++statusRequest;
+		try {
+			const ids = await UserService.getVMCPOAuthStatus(vmcpID, {
+				dontLogErrors: true,
+				signal: controller.signal
+			});
+			if (!controller.signal.aborted && request === statusRequest && vmcpID === vmcp?.id) {
+				authenticatedComponents = ids;
+			}
+		} catch (err) {
+			if (
+				controller.signal.aborted ||
+				isAbortError(err) ||
+				request !== statusRequest ||
+				vmcpID !== vmcp?.id
+			)
+				return;
+			authenticatedComponents = [];
+		}
 	}
 
 	export function open(target: VMCP, targetInstance?: VMCPInstance, options?: VMcpConnectOptions) {
@@ -103,11 +179,22 @@
 			initLaunch();
 		} else {
 			connectDialog?.open();
+			const candidates = targetInstance ? [targetInstance] : vmcpInstances.current.items;
+			if (
+				candidates.some(
+					(candidate) =>
+						candidate.vmcpID === target.id &&
+						candidate.userID === profile.current.id &&
+						!candidate.deleted
+				)
+			) {
+				void refreshOAuthStatus(target.id);
+			}
 		}
 	}
 
 	export async function openEditConfiguration(
-		target: VMCP,
+		target: VMCP | string,
 		targetInstance: VMCPInstance,
 		options?: VMcpConnectOptions
 	) {
@@ -117,12 +204,14 @@
 
 		let resolved: VMCP;
 		try {
-			resolved = await UserService.getVMCP(target.id, {
+			resolved = await UserService.getVMCP(typeof target === 'string' ? target : target.id, {
 				dontLogErrors: true,
 				signal: controller.signal
 			});
 		} catch (err) {
 			if (controller.signal.aborted || isAbortError(err)) return;
+			// A caller that passed only an ID has no vMCP to fall back to.
+			if (typeof target === 'string') throw err;
 			resolved = target;
 		}
 
@@ -137,6 +226,7 @@
 	}
 
 	function handleConfigure() {
+		if (missingOAuthComponent) return;
 		showIntroDialog = false;
 		ensureOauthVisibilityListener();
 		if (hasUserConfiguration) {
@@ -157,6 +247,29 @@
 	function initLaunch() {
 		showIntroDialog = true;
 		connectDialog?.close();
+	}
+
+	function connectOAuthReturnParam(): OAuthReturnParam | undefined {
+		if (!vmcp || !connectReturn) return;
+		if (connectReturn === 'inspector') return { key: 'inspector', value: vmcp.id };
+		if (connectReturn === 'list') return { key: 'connect', value: vmcp.id };
+		return { key: 'connect', value: 'true' };
+	}
+
+	function goToTester() {
+		if (!vmcp) return;
+		connectDialog?.close();
+		goto(`/vmcps/${vmcp.id}?view=inspector`);
+	}
+
+	function handleTest() {
+		if (hasConfiguredInstance) {
+			goToTester();
+			return;
+		}
+		onConnected = goToTester;
+		skipConnectDialog = true;
+		initLaunch();
 	}
 
 	async function initConfigureForm() {
@@ -230,41 +343,32 @@
 		return { components };
 	}
 
-	function configuredInstance(submitted: VMCPInstance): VMCPInstance {
-		return {
-			...submitted,
-			status: {
-				...submitted.status,
-				configured: true,
-				...(vmcpInstanceNeedsUserConfiguration(submitted)
-					? { missingRequiredConfiguration: [] }
-					: {})
-			}
-		};
+	function instanceConfigurationSettled(candidate: VMCPInstance) {
+		const status = candidate.status;
+		return status?.configured === true && status?.configurationCheckHash;
 	}
 
-	async function refreshConfiguredInstance(submitted: VMCPInstance): Promise<VMCPInstance> {
-		const optimistic = configuredInstance(submitted);
-		vmcpInstances.upsert(optimistic);
-		if (!vmcpInstanceNeedsUserConfiguration(submitted)) {
-			return optimistic;
-		}
+	async function waitForReconciledInstance(submitted: VMCPInstance): Promise<VMCPInstance> {
+		const maxAttempts = 5;
+		let latest = submitted;
 
-		for (let attempt = 0; attempt < 8; attempt++) {
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			if (attempt > 0) {
-				await new Promise((resolve) => setTimeout(resolve, 250));
+				await new Promise((resolve) => setTimeout(resolve, reconciliationRetryMs));
 			}
 			try {
-				const latest = await UserService.getVMCPInstance(submitted.id, { dontLogErrors: true });
-				if (!vmcpInstanceNeedsUserConfiguration(latest)) {
+				latest = await UserService.getVMCPInstance(submitted.id, { dontLogErrors: true });
+				if (instanceConfigurationSettled(latest)) {
 					vmcpInstances.upsert(latest);
 					return latest;
 				}
 			} catch {
-				// Status is reconciled asynchronously after configure.
+				// Status is reconciled asynchronously after create or configure.
 			}
 		}
-		return optimistic;
+
+		vmcpInstances.upsert(latest);
+		return latest;
 	}
 
 	function initUpdatingOrLaunchProgress() {
@@ -321,20 +425,33 @@
 	}
 
 	async function handleOauthVisibilityChange() {
-		if (!oauthURL && !oauthVerifying) return;
+		// The Continue button and the visibility listener can both fire; run one check at a time.
+		if ((!oauthURL && !oauthVerifying) || oauthChecking) return;
 		if (document.visibilityState === 'visible') {
-			oauthURL = await getOauthURL();
-			if (!oauthURL) {
-				oauthDialog?.close();
-				finishLaunch();
+			oauthChecking = true;
+			const currentURL = oauthURL;
+			try {
+				const nextURL = await getOauthURL();
+				// Dismissal or a newer attempt must not complete from a stale response.
+				if (oauthURL !== currentURL) return;
+				oauthURL = nextURL;
+				if (!oauthURL) {
+					finishOauthPrompt();
+				}
+				oauthVerifying = false;
+			} finally {
+				oauthChecking = false;
 			}
-			oauthVerifying = false;
 		}
 	}
 
+	function handleOauthTabReturn() {
+		if (!isMcpLoginURL(oauthURL)) void handleOauthVisibilityChange();
+	}
+
 	function ensureOauthVisibilityListener() {
-		document.removeEventListener('visibilitychange', handleOauthVisibilityChange);
-		document.addEventListener('visibilitychange', handleOauthVisibilityChange);
+		document.removeEventListener('visibilitychange', handleOauthTabReturn);
+		document.addEventListener('visibilitychange', handleOauthTabReturn);
 	}
 
 	async function verifyOauthOrConnect() {
@@ -346,65 +463,198 @@
 		launchProgress = 0;
 		if (oauthURL) {
 			closeConfigureWithoutDismissing();
-			oauthDialog?.showModal();
+			showOauthPrompt();
 		} else {
 			finishLaunch();
 		}
 	}
 
-	function handleOauthClose() {
+	function showOauthPrompt() {
+		oauthPromptOpen = true;
+		oauthDialog?.open();
+	}
+
+	async function finishOauthPrompt() {
+		if (!oauthPromptOpen) return;
+		oauthPromptOpen = false;
 		oauthDialog?.close();
 		oauthURL = '';
+		const vmcpID = vmcp?.id;
+		if (vmcpID) {
+			const refresh = refreshOAuthStatus(vmcpID);
+			const request = statusRequest;
+			await refresh;
+			if (request !== statusRequest || oauthStatusController?.signal.aborted) return;
+		}
 		finishLaunch();
 	}
 
-	export async function authenticate() {
+	// Escape closes the dialog natively, bypassing the close buttons.
+	function handleOauthDialogClosed() {
+		// A close event that arrives after the prompt reopened belongs to the earlier prompt.
+		if (oauthContent?.closest('dialog')?.open) return;
+		finishOauthPrompt();
+	}
+
+	export async function authenticate(opts?: { beforeOauthPrompt?: () => void }) {
 		if (!vmcp) return;
+		const flow = connectionFlow;
 		ensureOauthVisibilityListener();
 		oauthVerifying = false;
-		oauthURL = await getOauthURL();
+		const url = await getOauthURL();
+		if (flow !== connectionFlow) return;
+		oauthURL = url;
+		opts?.beforeOauthPrompt?.();
 		if (oauthURL) {
-			oauthDialog?.showModal();
+			connectDialog?.close();
+			showOauthPrompt();
 		} else {
 			finishLaunch();
 		}
 	}
 
-	async function reauthenticate() {
+	// Clears one component's OAuth token and sends the user back through the
+	// component OAuth flow, leaving every other component's authorization intact.
+	export async function reauthenticateComponent(
+		target: VMCP,
+		targetInstance: VMCPInstance | undefined,
+		componentID: string,
+		options?: VMcpConnectOptions & {
+			returnToConnectDialog?: boolean;
+			beforeOauthPrompt?: () => void;
+		}
+	) {
+		resetDialogState(target, targetInstance, options);
+		const flow = connectionFlow;
+		skipConnectDialog = !options?.returnToConnectDialog;
+
+		if (skipConnectDialog) connectDialog?.close();
+		try {
+			await UserService.clearVMCPComponentOAuth(target.id, componentID);
+		} catch (err) {
+			if (flow !== connectionFlow) return;
+			dismissConnect();
+			throw err;
+		}
+		if (flow !== connectionFlow) return;
+		try {
+			await authenticate({ beforeOauthPrompt: options?.beforeOauthPrompt });
+		} finally {
+			if (flow === connectionFlow) await refreshOAuthStatus(target.id);
+		}
+	}
+
+	function finishReauthenticateDialogHandoff() {
+		reauthenticateDialog?.close();
+		reauthenticateChoices = [];
+		reauthenticatingTarget = undefined;
+	}
+
+	async function reauthenticate(beforeOauthPrompt?: () => void) {
 		if (!vmcp) return;
-		await UserService.clearMcpServerOAuth(vmcp.id);
-		await authenticate();
+		const flow = connectionFlow;
+		const vmcpID = vmcp.id;
+		try {
+			await UserService.clearMcpServerOAuth(vmcpID);
+			if (flow !== connectionFlow) return;
+			await authenticate({ beforeOauthPrompt });
+		} finally {
+			if (flow === connectionFlow) await refreshOAuthStatus(vmcpID);
+		}
+	}
+
+	function openReauthenticateDialog() {
+		reauthenticateChoices = [...reauthenticatableComponents];
+		connectDialog?.close();
+		reauthenticateDialog?.open();
+	}
+
+	export function openReauthenticate(
+		target: VMCP,
+		componentIDs: string[],
+		targetInstance?: VMCPInstance,
+		options?: VMcpConnectOptions
+	) {
+		resetDialogState(target, targetInstance, options);
+		skipConnectDialog = Boolean(options?.onConnected);
+		authenticatedComponents = componentIDs;
+		if (reauthenticatableComponents.length > 0) handleReauthenticate();
+	}
+
+	function handleReauthenticate() {
+		if (reauthenticatableComponents.length > 1) {
+			openReauthenticateDialog();
+		} else {
+			reauthenticateSelected(reauthenticatableComponents[0].id);
+		}
+	}
+
+	function closeReauthenticateDialog() {
+		reauthenticateChoices = [];
+		reauthenticatingTarget = undefined;
+	}
+
+	async function reauthenticateAll() {
+		if (reauthenticatingTarget || !vmcp) return;
+		reauthenticatingTarget = 'all';
+		try {
+			await reauthenticate(finishReauthenticateDialogHandoff);
+		} finally {
+			if (reauthenticatingTarget === 'all') reauthenticatingTarget = undefined;
+		}
+	}
+
+	async function reauthenticateSelected(componentID: string) {
+		if (reauthenticatingTarget || !vmcp) return;
+		reauthenticatingTarget = componentID;
+		try {
+			await reauthenticateComponent(vmcp, instance, componentID, {
+				connectReturn,
+				returnToConnectDialog: true,
+				beforeOauthPrompt: finishReauthenticateDialogHandoff
+			});
+		} finally {
+			if (reauthenticatingTarget === componentID) reauthenticatingTarget = undefined;
+		}
 	}
 
 	async function saveConfiguration() {
 		const target = vmcp;
-		if (!target || saving) return;
+		if (!target || saving || missingOAuthComponent) return;
 		saving = true;
 		error = undefined;
 		const { timeout1, timeout2, timeout3 } = initUpdatingOrLaunchProgress();
 		try {
 			const targetInstance = instance ?? (await UserService.createVMCPInstance(target.id));
-			if (configureForm) {
-				instance = await refreshConfiguredInstance(
-					await UserService.configureVMCPInstance(
+			const submitted = configureForm
+				? await UserService.configureVMCPInstance(
 						targetInstance.id,
 						configurationPayload(configureForm)
 					)
-				);
-			} else {
-				instance = targetInstance;
-				vmcpInstances.upsert(instance);
+				: targetInstance;
+			instance = await waitForReconciledInstance(submitted);
+
+			// The consent page authenticates this exact instance after configuration settles.
+			if (configureOnly) {
+				if (!instanceConfigurationSettled(instance)) {
+					launchError = m.vmcps_failed_to_launch();
+					return;
+				}
+				finishLaunch();
+				return;
 			}
 
 			const launchResponse = await UserService.validateSingleOrRemoteMcpServerLaunched(target.id);
 			if (!launchResponse.success) {
-				launchError = launchResponse.message ?? 'Failed to launch this vMCP.';
+				launchError = launchResponse.message ?? m.vmcps_failed_to_launch();
 				return;
 			}
 
+			instance = await UserService.getVMCPInstance(submitted.id);
+			vmcpInstances.upsert(instance);
 			await verifyOauthOrConnect();
 		} catch (err) {
-			launchError = err instanceof Error ? err.message : 'Failed to launch this vMCP.';
+			launchError = err instanceof Error ? err.message : m.vmcps_failed_to_launch();
 		} finally {
 			clearTimeout(timeout1);
 			clearTimeout(timeout2);
@@ -416,7 +666,8 @@
 	onMount(() => {
 		ensureOauthVisibilityListener();
 		return () => {
-			document.removeEventListener('visibilitychange', handleOauthVisibilityChange);
+			oauthStatusController?.abort();
+			document.removeEventListener('visibilitychange', handleOauthTabReturn);
 		};
 	});
 </script>
@@ -426,6 +677,37 @@
 	{displayName}
 {/snippet}
 
+{#snippet oauthSetupGuidance()}
+	{#if missingOAuthComponent}
+		<p class="mb-4">
+			{m.vmcps_connect_requires_oauth_setup({ name: missingOAuthComponent.name })}
+		</p>
+		{#if profile.current.isAdmin?.()}
+			<a
+				class="btn btn-primary w-full"
+				href={resolve(
+					configureOAuthPath(
+						missingOAuthComponent.mcpServerCatalogEntryID,
+						page.url,
+						connectOAuthReturnParam()
+					)
+				)}
+				onclick={(event) =>
+					handleConfigureOAuth(
+						event,
+						missingOAuthComponent.mcpServerCatalogEntryID,
+						page.url,
+						connectOAuthReturnParam()
+					)}
+			>
+				{m.vmcps_configure_named_oauth({ name: missingOAuthComponent.name })}
+			</a>
+		{:else}
+			<p>{m.vmcps_ask_admin_configure_oauth()}</p>
+		{/if}
+	{/if}
+{/snippet}
+
 <ResponsiveDialog
 	bind:this={connectDialog}
 	animate="slide"
@@ -433,7 +715,11 @@
 	onClose={() => {
 		howToConnect?.resetCopied();
 		connectionUrlField?.clear();
+		const dismissed = onDismissed;
+		onDismissed = undefined;
+		dismissed?.();
 	}}
+	class={missingOAuthComponent ? 'md:w-sm' : undefined}
 >
 	{#snippet titleContent()}
 		<div class="flex items-center gap-2">
@@ -442,14 +728,26 @@
 	{/snippet}
 
 	{#if connectURL}
-		<div id="connection-url-container" class="flex flex-col gap-3 md:p-0 pb-0 p-4">
-			<CopyField
-				bind:this={connectionUrlField}
-				value={connectURL}
-				id="connectURL"
-				label="Connection URL"
-			/>
+		<div id="connection-url-container" class="flex items-end gap-2 md:p-0 pb-0 p-4">
+			<div class="min-w-0 grow">
+				<CopyField
+					bind:this={connectionUrlField}
+					value={connectURL}
+					id="connectURL"
+					label={m.vmcps_connection_url()}
+				/>
+			</div>
+			<button
+				type="button"
+				aria-label={m.vmcps_test_vmcp()}
+				class="btn btn-primary"
+				onclick={handleTest}
+			>
+				<MessageCircle class="size-4" />
+				{m.vmcps_test_vmcp()}
+			</button>
 		</div>
+
 		<HowToConnect
 			bind:this={howToConnect}
 			url={connectURL}
@@ -457,18 +755,64 @@
 			{displayName}
 			onLaunch={!instance ? initLaunch : undefined}
 			onEdit={instance && hasUserConfiguration ? initConfigureForm : undefined}
-			onReauthenticate={isReauthenticatable
-				? () => {
-						connectDialog?.close();
-						void reauthenticate();
-					}
-				: undefined}
+			onReauthenticate={reauthenticatableComponents.length > 0 ? handleReauthenticate : undefined}
 		/>
+	{:else if missingOAuthComponent}
+		<div class="flex flex-col items-start gap-3 md:p-0 p-4 text-sm">
+			{@render oauthSetupGuidance()}
+		</div>
 	{:else}
-		<p class="text-sm text-muted-content font-light md:p-0 p-4">
-			This vMCP does not have a connection URL yet.
-		</p>
+		<div class="flex flex-col items-start gap-3 md:p-0 p-4">
+			<p class="text-sm text-muted-content font-light">
+				{m.vmcps_not_ready_complete_setup()}
+			</p>
+			<button class="btn btn-primary btn-sm" onclick={initLaunch}
+				>{m.vmcps_preconfigure_server()}</button
+			>
+		</div>
 	{/if}
+</ResponsiveDialog>
+
+<ResponsiveDialog
+	bind:this={reauthenticateDialog}
+	class="md:w-sm"
+	id="vmcp-reauthenticate-dialog"
+	title={m.vmcps_reauthenticate()}
+	animate="slide"
+	onClose={closeReauthenticateDialog}
+>
+	<div class="flex flex-col gap-2 px-4 md:px-0">
+		<p class="mb-1 text-center text-sm">{m.vmcps_reauthenticate_choose()}</p>
+		{#each reauthenticateChoices as component (component.id)}
+			<button
+				type="button"
+				class="btn btn-secondary w-full justify-center gap-1"
+				disabled={Boolean(reauthenticatingTarget)}
+				aria-label={m.vmcps_reauthenticate_named({ name: component.name })}
+				onclick={() => void reauthenticateSelected(component.id)}
+			>
+				{#if reauthenticatingTarget === component.id}
+					<Loading class="size-4" />
+				{:else}
+					<span class="truncate">{component.name}</span>
+				{/if}
+			</button>
+		{/each}
+		{#if reauthenticateChoices.length > 1}
+			<button
+				type="button"
+				class="btn btn-secondary w-full"
+				disabled={Boolean(reauthenticatingTarget)}
+				onclick={() => void reauthenticateAll()}
+			>
+				{#if reauthenticatingTarget === 'all'}
+					<Loading class="size-4" />
+				{:else}
+					{m.vmcps_reauthenticate_all()}
+				{/if}
+			</button>
+		{/if}
+	</div>
 </ResponsiveDialog>
 
 <CatalogConfigureForm
@@ -483,12 +827,12 @@
 		}
 		dismissConnect();
 	}}
-	submitText={instance ? 'Update' : 'Configure'}
+	submitText={instance ? m.core_update() : m.vmcps_configure()}
 	loading={saving || launchState === 'launching'}
 	{error}
 	isNew={false}
 	showComponentToggle={false}
-	configurationTitle="User Specific Configuration"
+	configurationTitle={m.vmcps_user_specific_configuration()}
 >
 	{#snippet icon()}
 		<VMcpIcon components={componentViews} />
@@ -500,17 +844,17 @@
 					<div class="notification-error">
 						<div class="flex items-center gap-2">
 							<CircleAlert class="size-5 text-error" />
-							<h4 class="text-md font-medium">vMCP Launch Failed</h4>
+							<h4 class="text-md font-medium">{m.vmcps_launch_failed()}</h4>
 						</div>
 
 						<div class="text-xs mt-2">
-							There was an issue launching this vMCP.
+							{m.vmcps_launch_issue()}
 
 							<ul class="list-disc px-4 py-1 space-y-1">
 								{#if hasUserConfiguration}
-									<li>Verify your configurations provided at launch are correct and try again.</li>
+									<li>{m.vmcps_launch_verify_configurations()}</li>
 								{/if}
-								<li>If the issue persists, please contact support.</li>
+								<li>{m.vmcps_launch_contact_support()}</li>
 							</ul>
 						</div>
 					</div>
@@ -526,7 +870,7 @@
 									saving = false;
 								}}
 							>
-								Update Configuration and Try Again
+								{m.vmcps_update_configuration_and_retry()}
 							</button>
 						{/if}
 						<button
@@ -544,7 +888,7 @@
 								if (vmcp) connectDialog?.open();
 							}}
 						>
-							Close
+							{m.core_close()}
 						</button>
 					</div>
 				</div>
@@ -562,7 +906,7 @@
 					</div>
 
 					<div class="flex w-md flex-col justify-center gap-2 text-center">
-						<p class="text-xs font-light">Launching vMCP...</p>
+						<p class="text-xs font-light">{m.vmcps_launching_vmcp()}</p>
 					</div>
 				</div>
 			{/if}
@@ -572,10 +916,11 @@
 
 <Confirm
 	show={showIntroDialog}
-	onsuccess={handleConfigure}
-	submitText="Continue"
+	onsuccess={missingOAuthComponent ? undefined : handleConfigure}
+	submitText={m.core_continue()}
+	disabled={Boolean(missingOAuthComponent)}
 	type="info"
-	title="Connect To Server"
+	title={m.vmcps_connect_to_server()}
 	oncancel={() => {
 		showIntroDialog = false;
 		dismissConnect();
@@ -588,58 +933,75 @@
 		</div>
 	{/snippet}
 	{#snippet note()}
-		<p>
-			This will begin the initial setup process for this server.
-			{#if hasUserConfiguration}
-				Additional configuration details may also be required before the server can be used.
-			{:else}
-				<br />Click below to begin.
-			{/if}
-		</p>
+		{#if missingOAuthComponent}
+			{@render oauthSetupGuidance()}
+		{:else}<p>
+				{m.vmcps_initial_setup_begin()}
+				{#if hasUserConfiguration}
+					{m.vmcps_initial_setup_additional_config()}
+				{:else}
+					<br />{m.vmcps_click_below_to_begin()}
+				{/if}
+			</p>{/if}
 	{/snippet}
 </Confirm>
 
-<dialog bind:this={oauthDialog} class="dialog" use:dialogAnimation={{ type: 'slide' }}>
-	<div class="dialog-container md:w-sm">
-		<div class="flex flex-col gap-4 p-4">
-			{#if oauthURL}
-				<div class="absolute top-2 right-2">
-					<IconButton onclick={handleOauthClose}>
-						<X class="size-4" />
-					</IconButton>
-				</div>
-				<div class="flex items-center gap-2">
-					<VMcpIcon components={componentViews} />
-					<h3 class="text-lg leading-5.5 font-semibold">
-						{displayName}
-					</h3>
-				</div>
-
-				<p>
-					In order to use {displayName}, authentication with the MCP server is required.
-				</p>
-
-				<p>Click the link below to authenticate.</p>
+<ResponsiveDialog
+	bind:this={oauthDialog}
+	animate="slide"
+	class={localhostCallback && compositeAuthID ? 'bg-base-200' : ''}
+	classes={{ header: 'mb-0' }}
+	closeButtonLabel={m.common_close_dialog()}
+	onClose={handleOauthDialogClosed}
+>
+	{#snippet titleContent()}
+		<div class="flex min-w-0 items-center gap-2">
+			<VMcpIcon components={componentViews} />
+			{displayName}
+		</div>
+	{/snippet}
+	<div
+		bind:this={oauthContent}
+		class={isMcpLoginURL(oauthURL)
+			? 'flex min-w-0 flex-col gap-4'
+			: 'flex min-w-0 flex-col gap-4 p-4 md:p-0'}
+	>
+		{#if oauthURL}
+			{#if !isMcpLoginURL(oauthURL)}<p class="text-sm">
+					{m.vmcps_oauth_required_named({ name: displayName })}
+				</p>{/if}
+			{#if isMcpLoginURL(oauthURL)}
+				<McpLocalAuth
+					url={oauthURL}
+					onComplete={handleOauthVisibilityChange}
+					loading={oauthChecking}
+				/>
+			{:else if localhostCallback && compositeAuthID && vmcp}
+				<McpCompositeOauth
+					embedded
+					compositeMcpId={compositeAuthID}
+					vmcpId={vmcp.id}
+					onComplete={finishOauthPrompt}
+				/>
+			{:else}
+				<p>{m.vmcps_click_link_to_authenticate()}</p>
 
 				<a
 					href={oauthURL}
 					rel="external noopener noreferrer"
 					target="_blank"
-					class="btn btn-primary text-center text-sm outline-none"
+					class="btn btn-primary self-end text-center text-sm outline-none"
 					onclick={() => {
 						oauthVerifying = true;
 					}}
 				>
 					{#if oauthVerifying}
-						Authenticating...
+						{m.vmcps_authenticating()}
 					{:else}
-						Authenticate
+						{m.vmcps_authenticate()}
 					{/if}
 				</a>
 			{/if}
-		</div>
+		{/if}
 	</div>
-	<form class="dialog-backdrop">
-		<button type="button" aria-label="Close dialog" onclick={handleOauthClose}>close</button>
-	</form>
-</dialog>
+</ResponsiveDialog>

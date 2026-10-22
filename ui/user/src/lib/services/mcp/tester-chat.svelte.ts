@@ -1,3 +1,6 @@
+import { m } from '$lib/i18n';
+import type { RejectedTesterTool } from './tester-client';
+import { testerErrorDetails } from './tester-errors';
 import type {
 	DirectOperationResult,
 	MCPTesterSession,
@@ -59,6 +62,7 @@ export interface TesterChatError {
 	code: string;
 	message: string;
 	retryable?: boolean;
+	details?: unknown;
 }
 
 export interface TesterToolApproval extends TesterChatToolCall {
@@ -165,14 +169,13 @@ function stagedMessages(contexts: StagedTesterContext[]): {
 }
 
 function parseToolCall(value: unknown): TesterChatToolCall {
-	if (!value || typeof value !== 'object')
-		throw new Error('The model returned an invalid tool call');
+	if (!value || typeof value !== 'object') throw new Error(m.mcps_tester_chat_invalid_tool_call());
 	const call = value as { id?: unknown; name?: unknown; arguments?: unknown };
 	if (typeof call.id !== 'string' || typeof call.name !== 'string') {
-		throw new Error('The model returned a tool call without an ID or name');
+		throw new Error(m.mcps_tester_chat_tool_call_missing_id());
 	}
 	if (!call.arguments || typeof call.arguments !== 'object' || Array.isArray(call.arguments)) {
-		throw new Error(`The model returned invalid arguments for ${call.name}`);
+		throw new Error(m.mcps_tester_chat_invalid_tool_arguments({ name: call.name }));
 	}
 	return { id: call.id, name: call.name, arguments: call.arguments as Record<string, unknown> };
 }
@@ -183,7 +186,7 @@ function parseStreamEvent(value: unknown): TesterStreamEvent {
 		typeof value !== 'object' ||
 		typeof (value as { type?: unknown }).type !== 'string'
 	) {
-		throw new Error('The model returned an invalid stream event');
+		throw new Error(m.mcps_tester_chat_invalid_stream_event());
 	}
 	const event = value as TesterStreamEvent;
 	if (event.type === 'tool_calls') {
@@ -196,7 +199,7 @@ async function readEventStream(
 	response: Response,
 	onEvent: (event: TesterStreamEvent) => void
 ): Promise<void> {
-	if (!response.body) throw new Error('The model response did not contain a stream');
+	if (!response.body) throw new Error(m.mcps_tester_chat_no_stream());
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
 	let buffered = '';
@@ -211,7 +214,7 @@ async function readEventStream(
 				} catch {
 					throw {
 						code: 'unsupported_response',
-						message: 'The model returned malformed streaming JSON',
+						message: m.mcps_tester_chat_malformed_stream_json(),
 						retryable: false
 					} satisfies TesterChatError;
 				}
@@ -236,16 +239,25 @@ async function readEventStream(
 }
 
 async function responseError(response: Response): Promise<TesterChatError> {
+	let details: unknown;
 	try {
-		const value = (await response.json()) as { error?: TesterChatError };
-		if (value.error?.message) return value.error;
+		const body = await response.text();
+		details = body;
+		try {
+			const value = JSON.parse(body) as { error?: TesterChatError };
+			details = value;
+			if (value?.error?.message) return { ...value.error, details: value.error.details ?? value };
+		} catch {
+			// Non-JSON provider errors remain available in the error dialog.
+		}
 	} catch {
 		// Fall through to the stable transport error below.
 	}
 	return {
 		code: 'provider_error',
-		message: `Chat request failed with status ${response.status}`,
-		retryable: response.status >= 500
+		message: m.mcps_tester_chat_request_failed({ status: response.status }),
+		retryable: response.status >= 500,
+		details
 	};
 }
 
@@ -274,6 +286,7 @@ export class MCPTesterChat {
 	messages = $state<TesterChatMessage[]>([]);
 	timeline = $state<TesterChatTimelineMessage[]>([]);
 	toolSnapshot = $state<TesterChatTool[]>();
+	toolDiscoveryIssues = $state<RejectedTesterTool[]>([]);
 	status = $state<TesterChatTurnStatus>('idle');
 	error = $state<TesterChatError>();
 	round = $state(0);
@@ -328,7 +341,13 @@ export class MCPTesterChat {
 		try {
 			if (this.toolSnapshot === undefined) {
 				this.status = 'snapshotting';
-				const tools = await this.#session.snapshotChatTools(workflow.abort.signal);
+				this.toolDiscoveryIssues = [];
+				const tools = await this.#session.snapshotChatTools(
+					workflow.abort.signal,
+					(rejectedTools) => {
+						if (this.#isCurrent(workflow, generation)) this.toolDiscoveryIssues = rejectedTools;
+					}
+				);
 				if (!this.#isCurrent(workflow, generation)) return;
 				this.toolSnapshot = tools.map(normalizedTool);
 			}
@@ -359,7 +378,7 @@ export class MCPTesterChat {
 		const attempt = this.#currentAssistant();
 		if (attempt) attempt.state = 'cancelled';
 		this.status = 'cancelled';
-		this.error = { code: 'cancelled', message: 'Stopped by user' };
+		this.error = { code: 'cancelled', message: m.mcps_tester_chat_stopped_by_user() };
 		this.#workflow?.abort.abort('Stopped by user');
 		this.#finishWorkflow();
 	}
@@ -393,6 +412,7 @@ export class MCPTesterChat {
 		this.messages = [];
 		this.timeline = [];
 		this.toolSnapshot = undefined;
+		this.toolDiscoveryIssues = [];
 		this.status = 'idle';
 		this.error = undefined;
 		this.round = 0;
@@ -497,7 +517,7 @@ export class MCPTesterChat {
 			this.status = 'round-limit';
 			this.error = {
 				code: 'round_limit',
-				message: `This turn reached the ${MCP_TESTER_MAX_ROUNDS}-round limit. Send Continue to start a new turn.`
+				message: m.mcps_tester_chat_round_limit({ count: MCP_TESTER_MAX_ROUNDS })
 			};
 			this.#finishWorkflow();
 			return;
@@ -536,7 +556,7 @@ export class MCPTesterChat {
 
 		try {
 			const response = await this.#fetcher(
-				`/api/mcp-servers/${encodeURIComponent(this.#serverID)}/tester/chat`,
+				`/api/vmcp-instances/${encodeURIComponent(this.#serverID)}/tester/chat`,
 				{
 					method: 'POST',
 					credentials: 'same-origin',
@@ -556,19 +576,24 @@ export class MCPTesterChat {
 				this.#consumeEvent(assistant, event);
 			});
 			if (assistant.state === 'streaming') {
-				throw new Error('The model stream ended without a completion event');
+				throw new Error(m.mcps_tester_chat_stream_ended());
 			}
 		} catch (error) {
 			if (!this.#isCurrent(workflow, generation)) return;
 			if (workflow.abort.signal.aborted || isAbortError(error)) {
 				assistant.state = 'cancelled';
 				this.status = 'cancelled';
-				this.error = { code: 'cancelled', message: 'Stopped by user' };
+				this.error = { code: 'cancelled', message: m.mcps_tester_chat_stopped_by_user() };
 			} else {
 				const normalized =
 					error && typeof error === 'object' && 'code' in error && 'message' in error
 						? (error as TesterChatError)
-						: { code: 'provider_error', message: errorMessage(error), retryable: true };
+						: {
+								code: 'provider_error',
+								message: errorMessage(error),
+								retryable: true,
+								details: testerErrorDetails(error)
+							};
 				assistant.state = 'failed';
 				assistant.error = normalized;
 				this.status = 'failed';
@@ -598,7 +623,7 @@ export class MCPTesterChat {
 				if (!assistant.text && !assistant.toolCalls?.length) {
 					throw {
 						code: 'unsupported_response',
-						message: 'The model returned an empty assistant response',
+						message: m.mcps_tester_chat_empty_response(),
 						retryable: false
 					} satisfies TesterChatError;
 				}
@@ -620,7 +645,7 @@ export class MCPTesterChat {
 					if (event.reason === 'max_tokens') {
 						this.error = {
 							code: 'max_tokens',
-							message: 'The model stopped because it reached its output limit.'
+							message: m.mcps_tester_chat_max_tokens()
 						};
 					}
 					this.status = 'idle';
@@ -632,7 +657,7 @@ export class MCPTesterChat {
 				throw (
 					event.error ?? {
 						code: 'unsupported_response',
-						message: 'The model returned an unsupported response'
+						message: m.mcps_tester_chat_unsupported_response()
 					}
 				);
 		}
@@ -642,10 +667,15 @@ export class MCPTesterChat {
 		if (!this.#isCurrent(workflow, generation)) return;
 		if (workflow.abort.signal.aborted || isAbortError(error)) {
 			this.status = 'cancelled';
-			this.error = { code: 'cancelled', message: 'Stopped by user' };
+			this.error = { code: 'cancelled', message: m.mcps_tester_chat_stopped_by_user() };
 		} else {
 			this.status = 'failed';
-			this.error = { code: 'transport_error', message: errorMessage(error), retryable: true };
+			this.error = {
+				code: 'transport_error',
+				message: errorMessage(error),
+				retryable: true,
+				details: testerErrorDetails(error)
+			};
 		}
 		this.#finishWorkflow();
 	}

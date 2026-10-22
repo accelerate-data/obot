@@ -259,7 +259,7 @@ func TestOAuthAuthorizeExchangeRefusesRedirect(t *testing.T) {
 		},
 		Body: io.NopCloser(strings.NewReader("")),
 	}
-	o := newOAuth(server.Client(), callback, &oauthTestClientCredLookup{}, storage, "test-server", "test-client", "https://obot.example.com/callback", "")
+	o := newOAuth(server.Client(), callback, &oauthTestClientCredLookup{}, storage, "test-server", server.URL+"/mcp", "test-client", "https://obot.example.com/callback", "")
 
 	err := o.Authorize(t.Context(), request, response)
 

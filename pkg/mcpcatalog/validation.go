@@ -2,14 +2,20 @@ package mcpcatalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 
+	"github.com/obot-platform/nah/pkg/name"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/utils"
+	"github.com/obot-platform/obot/pkg/version"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -17,10 +23,35 @@ var (
 	multipleDashes   = regexp.MustCompile(`-{2,}`)
 )
 
+// ObotVersionBounds is the range of Obot versions that a catalog item declares support for.
+type ObotVersionBounds struct {
+	Name           string `json:"name"`
+	EntryKey       string `json:"entryKey"`
+	MinObotVersion string `json:"minObotVersion"`
+	MaxObotVersion string `json:"maxObotVersion"`
+}
+
 type ValidationOptions struct {
 	MCP        mcp.ValidationOptions
 	MCPBackend string
 	GitManaged bool
+}
+
+// VMCPName gives catalog sync and composite migration the same resource identity.
+func VMCPName(catalogName, sourceURL, entryKey, displayName string) string {
+	return name.SafeHashConcatName(system.VMCPPrefix, catalogName, utils.Digest(mcp.SourceIDForURL(sourceURL))[:12], VMCPEntryKey(entryKey, displayName))
+}
+
+// VMCPEntryKey returns the key that identifies a vMCP within its source,
+// falling back to one derived from the display name.
+func VMCPEntryKey(entryKey, displayName string) string {
+	if entryKey != "" {
+		return entryKey
+	}
+	if key := SanitizeName(displayName); key != "" {
+		return key
+	}
+	return utils.Digest(displayName)[:12]
 }
 
 // SanitizeName converts a catalog entry name to the RFC 1123-compatible form
@@ -65,13 +96,110 @@ func ValidateSourceFields(entry types.MCPServerCatalogEntryManifest) error {
 	if SanitizeName(entry.Name) == "" {
 		return fmt.Errorf("invalid catalog entry name after sanitization: original=%q sanitized=%q", entry.Name, SanitizeName(entry.Name))
 	}
-	if entry.EntryKey == "" {
+	return ValidateEntryKey(entry.EntryKey)
+}
+
+func ValidateEntryKey(key string) error {
+	if key == "" {
 		return nil
 	}
-	if errs := kvalidation.IsDNS1123Subdomain(entry.EntryKey); len(errs) > 0 {
-		return fmt.Errorf("source entry key %q must be DNS-friendly: %s", entry.EntryKey, strings.Join(errs, "; "))
+	if errs := kvalidation.IsDNS1123Subdomain(key); len(errs) > 0 {
+		return fmt.Errorf("source entry key %q must be DNS-friendly: %s", key, strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// ValidateConfigurationFields checks removed fields before typed decoding discards them.
+// Other unknown fields remain allowed for forward compatibility.
+func ValidateConfigurationFields(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := yaml.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+
+	for _, path := range [][]string{
+		{"env"},
+		{"remoteConfig", "headers"},
+		{"multiUserConfig", "userDefinedHeaders"},
+	} {
+		parent := fields
+		if len(path) == 2 {
+			parent = nil
+			if err := json.Unmarshal(fields[path[0]], &parent); err != nil {
+				continue // Typed decoding reports malformed runtime configurations.
+			}
+		}
+		if _, exists := parent[path[len(path)-1]]; exists {
+			return fmt.Errorf("legacy configuration field %q is no longer supported; move it to top-level config", strings.Join(path, "."))
+		}
+	}
+	return nil
+}
+
+// DecodeObotVersionBounds decodes and validates only the Obot version bounds of a catalog item,
+// so items for other Obot versions can be excluded before validation that depends on this
+// version's runtimes and configuration fields.
+func DecodeObotVersionBounds(data []byte) (ObotVersionBounds, error) {
+	var bounds ObotVersionBounds
+	if err := yaml.Unmarshal(data, &bounds); err != nil {
+		return bounds, err
+	}
+	if err := version.ValidateRange(bounds.MinObotVersion, bounds.MaxObotVersion); err != nil {
+		return bounds, err
+	}
+	return bounds, nil
+}
+
+// InCurrentRange reports whether the running Obot version falls within the bounds.
+func (b ObotVersionBounds) InCurrentRange() bool {
+	return version.CurrentInRange(b.MinObotVersion, b.MaxObotVersion)
+}
+
+// DecodeVMCPManifest maps catalog entry-key references to the resolved-ID
+// field used by the vMCP API and storage model. vMCPs do not support Obot
+// version bounds, so they are rejected rather than ignored.
+func DecodeVMCPManifest(data []byte) (types.VMCPManifest, error) {
+	var manifest types.VMCPManifest
+	if err := yaml.Unmarshal(data, &manifest); err != nil {
+		return manifest, err
+	}
+
+	var references struct {
+		EntryKey       string `json:"entryKey"`
+		MinObotVersion string `json:"minObotVersion"`
+		MaxObotVersion string `json:"maxObotVersion"`
+		Components     []struct {
+			EntryKey string `json:"mcpServerCatalogEntryKey"`
+		} `json:"components"`
+	}
+	if err := yaml.Unmarshal(data, &references); err != nil {
+		return manifest, err
+	}
+	if references.MinObotVersion != "" || references.MaxObotVersion != "" {
+		return manifest, fmt.Errorf("vMCP %q: minObotVersion and maxObotVersion are not supported on vMCPs", manifest.DisplayName)
+	}
+
+	for i := range manifest.Components {
+		if strings.TrimSpace(manifest.Components[i].ID) == "" {
+			return manifest, fmt.Errorf("vMCP %q components[%d] id is required", manifest.DisplayName, i)
+		}
+
+		if references.Components[i].EntryKey == "" {
+			name := manifest.DisplayName
+			if name == "" {
+				name = references.EntryKey
+			}
+			if name == "" {
+				name = "<unnamed>"
+			}
+			return manifest, fmt.Errorf("vMCP %q component %q mcpServerCatalogEntryKey is required", name,
+				manifest.Components[i].ID)
+		}
+
+		manifest.Components[i].MCPServerCatalogEntryID = references.Components[i].EntryKey
+	}
+
+	return manifest, nil
 }
 
 func ValidateManifest(ctx context.Context, entry types.MCPServerCatalogEntryManifest, options ValidationOptions) error {

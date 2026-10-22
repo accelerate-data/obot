@@ -38,6 +38,21 @@ func ConfigurationCredentialName() string {
 	return configurationCredentialName
 }
 
+func StaticConfigurationCredentialName(vmcp *v1.VMCP) string {
+	if vmcp.Spec.StaticConfigurationCredentialName != "" {
+		return vmcp.Spec.StaticConfigurationCredentialName
+	}
+	return ConfigurationCredentialName()
+}
+
+// VersionStaticConfiguration lets a manifest and its credential revision be
+// published together without overwriting credentials used by the old manifest.
+// The vMCP status handler deletes superseded revisions once a newer one is published.
+func VersionStaticConfiguration(vmcp *v1.VMCP, configuration map[string]string) {
+	SetStaticConfigurationHashes(vmcp, configuration)
+	vmcp.Spec.StaticConfigurationCredentialName = ConfigurationCredentialName() + "-" + vmcp.Spec.StaticConfigurationHash
+}
+
 // StaticConfigurationCredentialContext scopes fixed configuration to a VMCP.
 func StaticConfigurationCredentialContext(vmcpID string) string {
 	return "vmcp/" + vmcpID
@@ -116,7 +131,9 @@ func ExtractStaticConfiguration(manifest *types.VMCPManifest, existingConfig map
 		component := &manifest.Components[componentIndex]
 		for policyIndex := range component.Configuration {
 			policy := &component.Configuration[policyIndex]
-			if policy.Policy == types.VMCPConfigurationPolicyFixed {
+			// Secret-bound values are resolved at launch, so a previously stored
+			// literal must not linger in the credential.
+			if policy.Policy == types.VMCPConfigurationPolicyFixed && policy.SecretBinding == nil {
 				val := existingConfig[ConfigurationKey(component.ID, policy.Key)]
 				if policy.Value != "" {
 					val = policy.Value

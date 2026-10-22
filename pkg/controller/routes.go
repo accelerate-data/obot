@@ -5,14 +5,11 @@ import (
 	"github.com/obot-platform/obot/pkg/controller/generationed"
 	"github.com/obot-platform/obot/pkg/controller/handlers/accesscontrolrule"
 	"github.com/obot-platform/obot/pkg/controller/handlers/adminworkspace"
-	"github.com/obot-platform/obot/pkg/controller/handlers/agentcatalog"
+	"github.com/obot-platform/obot/pkg/controller/handlers/agentinstance"
 	"github.com/obot-platform/obot/pkg/controller/handlers/alias"
 	"github.com/obot-platform/obot/pkg/controller/handlers/auditlogexport"
 	"github.com/obot-platform/obot/pkg/controller/handlers/cleanup"
 	gitcredentialhandler "github.com/obot-platform/obot/pkg/controller/handlers/gitcredential"
-	"github.com/obot-platform/obot/pkg/controller/handlers/hostedagent"
-	hostedagentcreds "github.com/obot-platform/obot/pkg/controller/handlers/hostedagent/credentials"
-	"github.com/obot-platform/obot/pkg/controller/handlers/hostedagentpool"
 	"github.com/obot-platform/obot/pkg/controller/handlers/imagepullsecret"
 	"github.com/obot-platform/obot/pkg/controller/handlers/mcpcatalog"
 	"github.com/obot-platform/obot/pkg/controller/handlers/mcpclientsession"
@@ -25,9 +22,7 @@ import (
 	"github.com/obot-platform/obot/pkg/controller/handlers/model"
 	"github.com/obot-platform/obot/pkg/controller/handlers/modelaccesspolicy"
 	"github.com/obot-platform/obot/pkg/controller/handlers/modelinfosource"
-	"github.com/obot-platform/obot/pkg/controller/handlers/nanobotagent"
 	"github.com/obot-platform/obot/pkg/controller/handlers/poweruserworkspace"
-	"github.com/obot-platform/obot/pkg/controller/handlers/project"
 	"github.com/obot-platform/obot/pkg/controller/handlers/provider"
 	"github.com/obot-platform/obot/pkg/controller/handlers/providerconfigurationchange"
 	"github.com/obot-platform/obot/pkg/controller/handlers/scheduledauditlogexport"
@@ -36,22 +31,28 @@ import (
 	vmcphandler "github.com/obot-platform/obot/pkg/controller/handlers/vmcp"
 	"github.com/obot-platform/obot/pkg/controller/handlers/vmcpinstance"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/substrate"
 	"github.com/obot-platform/obot/pkg/system"
 )
 
 func (c *Controller) setupRoutes() {
 	root := c.services.Router
+	agents := &agentinstance.Handler{Substrate: c.services.Substrate, Gateway: c.services.GatewayClient}
+	root.Type(&v1.AgentInstance{}).FinalizeFunc(substrate.Finalizer, agents.Cleanup)
+	if c.services.Substrate != nil {
+		root.Type(&v1.AgentInstance{}).HandlerFunc(agents.Reconcile)
+	}
 
 	providers := provider.New(c.services.GatewayClient, c.services.ProviderDispatcher, c.services.LicenseProvider, c.services.ProviderRegistryPaths)
-	providerConfigurationChanges := providerconfigurationchange.New(c.services.GatewayClient, c.services.ProviderDispatcher, c.services.LicenseProvider, c.services.PostgresDSN)
+	providerConfigurationChanges := providerconfigurationchange.New(c.services.GatewayClient, c.services.ProviderDispatcher, c.services.LicenseProvider, c.services.PostgresDSN, c.services.StorageClient)
 	credentialCleanup := cleanup.NewCredentials(c.services.MCPSessionManager, c.services.GatewayClient, c.services.ServerURL)
 	userCleanup := cleanup.NewUserCleanup(c.services.GatewayClient, c.services.AccessControlRuleHelper)
 	authProviderCleanup := cleanup.NewAuthProviderCleanup(c.services.GatewayClient)
-	mcpCatalog := mcpcatalog.New(c.services.DefaultMCPCatalogPath, c.services.DefaultSystemMCPCatalogPath, c.services.GatewayClient, c.services.AccessControlRuleHelper, c.services.MCPSessionManager)
+	mcpCatalog := mcpcatalog.New(c.services.DefaultMCPCatalogPath, c.services.DefaultSystemMCPCatalogPath, c.services.GatewayClient, c.services.AccessControlRuleHelper, c.services.MCPSessionManager, c.services.GitMaxRepoSizeMB)
 	modelInfoSource := modelinfosource.New(c.services.ModelInfoSourceURL, c.services.MCPSessionManager.RemoteMCPURLValidationConfig())
 	mdmAssetSource := mdmassetsource.New(c.services.MDMAssetSource, c.services.ServerURL, c.services.GatewayClient)
-	skillRepository := skillrepository.New(c.services.GatewayClient)
-	mcpserver := mcpserver.New(c.services.GatewayClient, c.services.MCPSessionManager, c.services.MCPOAuthTokenStorage, c.services.MCPNetworkPolicyEnabled, c.services.MCPDefaultDenyAllEgress, c.services.SingleUserIdleServerShutdownInterval, c.services.MultiUserIdleServerShutdownInterval, c.services.AgentIdleServerShutdownInterval, c.services.ServerURL, c.services.MCPRuntimeBackend, c.services.MCPImagePullSecrets)
+	skillRepository := skillrepository.New(c.services.GatewayClient, c.services.GitMaxRepoSizeMB)
+	mcpserver := mcpserver.New(c.services.GatewayClient, c.services.MCPSessionManager, c.services.MCPOAuthTokenStorage, c.services.MCPNetworkPolicyEnabled, c.services.MCPDefaultDenyAllEgress, c.services.SingleUserIdleServerShutdownInterval, c.services.MultiUserIdleServerShutdownInterval, c.services.ServerURL, c.services.MCPRuntimeBackend, c.services.MCPImagePullSecrets)
 	mcpserverinstance := mcpserverinstance.New(c.services.GatewayClient)
 	vmcpinstance := vmcpinstance.New(c.services.GatewayClient)
 	vmcpHandler := vmcphandler.New(c.services.GatewayClient, c.services.AccessControlRuleHelper)
@@ -63,11 +64,6 @@ func (c *Controller) setupRoutes() {
 	auditLogExportHandler := auditlogexport.NewHandler(c.services.GatewayClient)
 	scheduledAuditLogExportHandler := scheduledauditlogexport.NewHandler()
 	systemMCPServerHandler := systemmcpserver.New(c.services.GatewayClient, c.services.MCPSessionManager, c.services.ServerURL)
-	nanobotAgentHandler := nanobotagent.New(c.services.GatewayClient, c.services.LocalRouter, c.services.NanobotAgentImage, c.services.ServerURL, c.services.MCPServerNamespace, c.services.MCPSessionManager)
-	agentCatalogHandler := agentcatalog.New()
-	hostedAgentHandler := hostedagent.New(c.services.AgentBackend, hostedagentcreds.New(c.services.GatewayClient), c.services.ServerURL, c.services.AgentServerURL)
-	hostedAgentPoolHandler := hostedagentpool.New(c.services.AgentBackend)
-	projectHandler := project.New(c.services.GatewayClient)
 	imagePullSecretHandler := imagepullsecret.New(c.services.GatewayClient, c.services.LocalK8sClient, c.services.MCPRuntimeBackend, c.services.MCPServerNamespace, c.services.ServiceNamespace, c.services.ServiceAccountName, c.services.MCPImagePullSecrets, c.services.ServiceAccountIssuerURL)
 	gitCredentialHandler := gitcredentialhandler.New(c.services.GatewayClient)
 	modelHandler := model.NewHandler(c.services.GatewayClient)
@@ -126,24 +122,6 @@ func (c *Controller) setupRoutes() {
 	// Skill
 	root.Type(&v1.Skill{}).HandlerFunc(cleanup.Cleanup)
 
-	// AgentCatalog
-	root.Type(&v1.AgentCatalog{}).HandlerFunc(agentCatalogHandler.Sync)
-
-	// HostedAgent
-	// cleanup.Cleanup honors DeleteRefs, which removes agents whose AgentCatalog
-	// is gone. Hand-registered agents have no SourceID and are left alone.
-	root.Type(&v1.HostedAgent{}).HandlerFunc(cleanup.Cleanup)
-
-	// HostedAgentInstance
-	root.Type(&v1.HostedAgentInstance{}).HandlerFunc(cleanup.Cleanup)
-	root.Type(&v1.HostedAgentInstance{}).HandlerFunc(hostedAgentHandler.EnsurePool)
-	root.Type(&v1.HostedAgentInstance{}).FinalizeFunc(v1.HostedAgentInstanceFinalizer, hostedAgentHandler.RemoveInstance)
-	root.Type(&v1.HostedAgentInstance{}).HandlerFunc(hostedAgentHandler.OrchestrateInstance)
-
-	// HostedAgentPool
-	root.Type(&v1.HostedAgentPool{}).FinalizeFunc(v1.HostedAgentPoolFinalizer, hostedAgentPoolHandler.Remove)
-	root.Type(&v1.HostedAgentPool{}).HandlerFunc(hostedAgentPoolHandler.Orchestrate)
-
 	// ImagePullSecret
 	root.Type(&v1.ImagePullSecret{}).FinalizeFunc(v1.ImagePullSecretFinalizer, imagePullSecretHandler.Cleanup)
 	root.Type(&v1.ImagePullSecret{}).HandlerFunc(imagePullSecretHandler.Reconcile)
@@ -154,17 +132,19 @@ func (c *Controller) setupRoutes() {
 
 	// MCPServerCatalogEntry
 	root.Type(&v1.MCPServerCatalogEntry{}).HandlerFunc(cleanup.Cleanup)
-	root.Type(&v1.MCPServerCatalogEntry{}).FinalizeFunc(v1.MCPServerCatalogEntryFinalizer, mcpServerCatalogEntryHandler.RemoveOAuthCredentials)
+	root.Type(&v1.MCPServerCatalogEntry{}).FinalizeFunc(v1.MCPServerCatalogEntryFinalizer, mcpServerCatalogEntryHandler.RemoveCredentials)
 	root.Type(&v1.MCPServerCatalogEntry{}).HandlerFunc(mcpServerCatalogEntryHandler.DeleteEntriesWithoutRuntime)
 	root.Type(&v1.MCPServerCatalogEntry{}).HandlerFunc(mcpServerCatalogEntryHandler.UpdateManifestHashAndLastUpdated)
 	root.Type(&v1.MCPServerCatalogEntry{}).HandlerFunc(mcpServerCatalogEntryHandler.EnsureUserCount)
 	root.Type(&v1.MCPServerCatalogEntry{}).HandlerFunc(mcpServerCatalogEntryHandler.ReconcileOAuthCredential)
+	root.Type(&v1.MCPServerCatalogEntry{}).HandlerFunc(mcpServerCatalogEntryHandler.CleanupStaticConfiguration)
 
 	// SystemMCPServerCatalogEntry
 	root.Type(&v1.SystemMCPServerCatalogEntry{}).HandlerFunc(cleanup.Cleanup)
 	root.Type(&v1.SystemMCPServerCatalogEntry{}).HandlerFunc(mcpServerCatalogEntryHandler.UpdateSystemManifestHashAndLastUpdated)
 
 	// MCPServer
+	root.Type(&v1.MCPServer{}).HandlerFunc(cleanup.UnassociatedMCPResources)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.EnsureMCPCatalogID)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.MigrateSharedWithinMCPCatalogName)
 	root.Type(&v1.MCPServer{}).HandlerFunc(credentialCleanup.RemoveAuditLogCred)
@@ -172,13 +152,13 @@ func (c *Controller) setupRoutes() {
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.SyncVMCPConfiguration)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.DeleteServersWithoutRuntime)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.DeleteServersForAnonymousUser)
-	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.DetectDrift)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.DetectK8sSettingsDrift)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.EnsureMCPNetworkPolicy)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.EnsureMCPServerInstanceUserCount)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.SyncOAuthCredentialStatus)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.SyncOAuthMetadata)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.SyncThirdPartyAuthStatus)
+	root.Type(&v1.MCPServer{}).HandlerFunc(c.secretBindingHandler().SyncMCPServerStatus)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.ShutdownIdleServers)
 	root.Type(&v1.MCPServer{}).HandlerFunc(mcpserver.SetNonDeployServerStatus)
 	root.Type(&v1.MCPServer{}).FinalizeFunc(v1.MCPServerFinalizer, credentialCleanup.RemoveMCPCredentials)
@@ -187,6 +167,7 @@ func (c *Controller) setupRoutes() {
 	root.Type(&v1.MCPNetworkPolicy{}).HandlerFunc(cleanup.Cleanup)
 
 	// MCPServerInstance
+	root.Type(&v1.MCPServerInstance{}).HandlerFunc(cleanup.UnassociatedMCPResources)
 	root.Type(&v1.MCPServerInstance{}).HandlerFunc(cleanup.Cleanup)
 	root.Type(&v1.MCPServerInstance{}).HandlerFunc(mcpserverinstance.MigrationDeleteSingleUserInstances)
 	root.Type(&v1.MCPServerInstance{}).HandlerFunc(mcpserverinstance.UpdateMultiUserConfig)
@@ -267,15 +248,6 @@ func (c *Controller) setupRoutes() {
 
 	// ScheduledAuditLogExport
 	root.Type(&v1.ScheduledAuditLogExport{}).HandlerFunc(scheduledAuditLogExportHandler.ScheduleExports)
-
-	// ProjectV2 Migration
-	//nolint:staticcheck
-	root.Type(&v1.ProjectV2{}).HandlerFunc(projectHandler.MigrateProjectV2)
-
-	// NanobotAgent
-	root.Type(&v1.NanobotAgent{}).HandlerFunc(nanobotAgentHandler.EnsureMCPServer)
-	root.Type(&v1.NanobotAgent{}).HandlerFunc(cleanup.Cleanup)
-	root.Type(&v1.NanobotAgent{}).FinalizeFunc(v1.NanobotAgentFinalizer, nanobotAgentHandler.Cleanup)
 
 	c.providerHandler = providers
 	c.mcpCatalogHandler = mcpCatalog

@@ -55,7 +55,8 @@ type MCPServerSpec struct {
 	Template bool `json:"template,omitempty"`
 	// CompositeName is the name of the composite server that this MCP server is a component of, if there is one.
 	CompositeName string `json:"compositeName,omitempty"`
-	// NanobotAgentID is the name of the NanobotAgent that created this MCP server, if there is one.
+	// NanobotAgentID is the name of the Obot Agent that created this MCP server, if there is one.
+	// Obot Agents were removed; this is only read to delete the MCP servers they left behind.
 	NanobotAgentID string `json:"nanobotAgentID,omitempty"`
 	// VMCPInstanceID is the VMCPInstance that owns this component server, if there is one.
 	VMCPInstanceID string `json:"vmcpInstanceID,omitempty"`
@@ -76,8 +77,6 @@ type MCPServerStatus struct {
 	VMCPSnapshotHash string `json:"vmcpSnapshotHash,omitempty"`
 	// MCPCatalogID is the catalog ID of the catalog entry that this MCP server is based on.
 	MCPCatalogID string `json:"mcpCatalogID,omitempty"`
-	// NeedsUpdate indicates whether the configuration in this server's catalog entry has drift from this server's configuration.
-	NeedsUpdate bool `json:"needsUpdate,omitempty"`
 	// MCPServerInstanceUserCount contains the number of unique users with server instances pointing to this MCP server.
 	MCPServerInstanceUserCount *int `json:"mcpInstanceUserCount,omitempty"`
 	// DeploymentStatus indicates the overall status of the MCP server deployment (Available, Progressing, Unavailable, Needs Attention, Shutdown, Unknown).
@@ -103,6 +102,12 @@ type MCPServerStatus struct {
 	// for this server's catalog entry. Only relevant for remote servers that require static OAuth.
 	OAuthCredentialConfigured bool   `json:"oauthCredentialConfigured,omitempty"`
 	OAuthCredentialCheckHash  string `json:"oauthCredentialCheckHash,omitempty"`
+	// UnresolvedSecretBindings contains the config keys bound to a Kubernetes Secret
+	// that could not be resolved because the Secret or key is missing, empty, or not allowed.
+	UnresolvedSecretBindings []string `json:"unresolvedSecretBindings,omitempty"`
+	// SecretBindingsCheckHash identifies the secret bindings and allow label that
+	// UnresolvedSecretBindings was computed from. It is empty when the server has no bindings.
+	SecretBindingsCheckHash string `json:"secretBindingsCheckHash,omitempty"`
 	// OAuthMetadata contains discovered OAuth metadata for remote MCP servers.
 	OAuthMetadata *OAuthMetadata `json:"oauthMetadata,omitempty"`
 	// UserHasAuthenticated indicates whether the user has authenticated with the third-party OAuth provider.
@@ -219,7 +224,6 @@ func (in *MCPServer) DeleteRefs() []Ref {
 		{ObjType: &MCPCatalog{}, Name: in.Spec.MCPCatalogID},
 		{ObjType: &PowerUserWorkspace{}, Name: in.Spec.PowerUserWorkspaceID},
 		{ObjType: &MCPServer{}, Name: in.Spec.CompositeName},
-		{ObjType: &NanobotAgent{}, Name: in.Spec.NanobotAgentID},
 		{ObjType: &VMCPInstance{}, Name: in.Spec.VMCPInstanceID},
 		{ObjType: &VMCP{}, Name: in.Spec.VMCPID},
 	}
@@ -232,16 +236,17 @@ func (in *MCPServer) DeleteRefs() []Ref {
 }
 
 func (in *MCPServer) ValidConnectURLs(base string) []string {
-	var urls []string
-	if in.Spec.IsSingleUser() && in.Spec.VMCPID == "" && in.Spec.VMCPInstanceID == "" {
-		urls = append(urls, system.MCPConnectURL(base, in.Spec.MCPServerCatalogEntryName))
-	}
-	return append(urls, system.MCPConnectURL(base, in.Name))
+	return []string{system.MCPConnectURL(base, in.Name)}
 }
 
 // IsSingleUser returns true if this is a single-user MCP server.
 func (s MCPServerSpec) IsSingleUser() bool {
-	return s.MCPCatalogID == "" && s.PowerUserWorkspaceID == "" && s.VMCPID == ""
+	return s.VMCPInstanceID != ""
+}
+
+// IsMultiUser returns true if this is a multi-user MCP server.
+func (s MCPServerSpec) IsMultiUser() bool {
+	return s.VMCPID != ""
 }
 
 // IsOwnedBy returns true if the given user created this server and it is not

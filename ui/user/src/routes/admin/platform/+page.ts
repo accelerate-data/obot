@@ -9,24 +9,18 @@ import {
 	type ImagePullSecretCapability,
 	type K8sSettings,
 	type License,
+	type ModelProxySettings,
+	type ModelProxyUsage,
 	type ProductTelemetryConsent
 } from '$lib/services';
 import { defaultAppNotification } from '$lib/stores/appNotification.svelte';
 import type { PageLoad } from './$types';
 
-const views = new Set([
-	'license',
-	'branding',
-	'notifications',
-	'product-analytics',
-	'mcp-config',
-	'registry-connections',
-	'git-credentials'
-]);
+const views = new Set(['license', 'branding', 'settings', 'mcp-config']);
 
 let hasHydratedAppNotification = false;
 
-export const load: PageLoad = async ({ fetch, parent, url }) => {
+export const load: PageLoad = async ({ depends, fetch, parent, url }) => {
 	const {
 		profile,
 		version,
@@ -38,12 +32,7 @@ export const load: PageLoad = async ({ fetch, parent, url }) => {
 	const canManageProductAnalytics =
 		productTelemetryConsentAvailable === true && profile.groups.includes(Group.ADMIN);
 	const requestedView = url.searchParams.get('view');
-	const view =
-		requestedView &&
-		views.has(requestedView) &&
-		(requestedView !== 'product-analytics' || canManageProductAnalytics)
-			? requestedView
-			: 'license';
+	const view = requestedView && views.has(requestedView) ? requestedView : 'license';
 
 	let license: License | undefined;
 	let appNotification: AppNotification = defaultAppNotification;
@@ -51,15 +40,11 @@ export const load: PageLoad = async ({ fetch, parent, url }) => {
 	let capability: ImagePullSecretCapability = { available: false };
 	let imagePullSecrets: ImagePullSecret[] = [];
 	let gitCredentials: GitCredential[] = [];
+	let modelProxySettings: ModelProxySettings | undefined;
+	let modelProxyUsage: ModelProxyUsage | undefined;
 	let productTelemetryConsent: ProductTelemetryConsent | undefined = initialProductTelemetryConsent;
 
 	switch (view) {
-		case 'git-credentials':
-			gitCredentials = await AdminService.listGitCredentials({
-				fetch,
-				dontLogErrors: true
-			}).catch(() => []);
-			break;
 		case 'license':
 			try {
 				license = await UserService.getLicense({ fetch });
@@ -67,37 +52,91 @@ export const load: PageLoad = async ({ fetch, parent, url }) => {
 				handleRouteError(err, '/admin/platform?view=license', profile);
 			}
 			break;
-		case 'notifications':
-			try {
-				let response: AppNotification | undefined;
+		case 'settings':
+			depends('model-proxy:usage');
+			await Promise.all([
+				(async () => {
+					try {
+						let response: AppNotification | undefined;
 
-				if (import.meta.env.SSR && initialAppNotification) {
-					response = initialAppNotification;
-				} else if (!hasHydratedAppNotification && initialAppNotification) {
-					hasHydratedAppNotification = true;
-					response = initialAppNotification;
-				} else {
-					hasHydratedAppNotification = true;
-					response = await UserService.getAppNotification({ fetch });
-				}
+						if (import.meta.env.SSR && initialAppNotification) {
+							response = initialAppNotification;
+						} else if (!hasHydratedAppNotification && initialAppNotification) {
+							hasHydratedAppNotification = true;
+							response = initialAppNotification;
+						} else {
+							hasHydratedAppNotification = true;
+							response = await UserService.getAppNotification({ fetch });
+						}
 
-				appNotification = {
-					...defaultAppNotification,
-					...(response ?? {})
-				};
-			} catch (err) {
-				handleRouteError(err, '/admin/platform?view=notifications', profile);
-			}
-			break;
-		case 'product-analytics':
-			try {
-				productTelemetryConsent = await AdminService.getProductTelemetryConsent({
-					fetch,
-					dontLogErrors: true
-				});
-			} catch (err) {
-				handleRouteError(err, '/admin/platform?view=product-analytics', profile);
-			}
+						appNotification = {
+							...defaultAppNotification,
+							...(response ?? {})
+						};
+					} catch (err) {
+						handleRouteError(err, '/admin/platform?view=settings', profile);
+					}
+				})(),
+				(async () => {
+					if (!canManageProductAnalytics) return;
+					try {
+						productTelemetryConsent = await AdminService.getProductTelemetryConsent({
+							fetch,
+							dontLogErrors: true
+						});
+					} catch (err) {
+						handleRouteError(err, '/admin/platform?view=settings', profile);
+					}
+				})(),
+				(async () => {
+					try {
+						modelProxySettings = await AdminService.getModelProxySettings({
+							fetch,
+							dontLogErrors: true
+						});
+					} catch (err) {
+						handleRouteError(err, '/admin/platform?view=settings', profile);
+					}
+
+					// The model proxy is only used when it's enabled, no model provider is configured,
+					// and the installation is licensed, so don't contact it otherwise. Don't use
+					// version.mcpTesterModelProxyAvailable here: version isn't reloaded when the
+					// enabled setting changes, so usage would stay hidden after enabling it.
+					if (
+						modelProxySettings?.enabled !== true ||
+						version?.hasModelProvider !== false ||
+						version?.hasValidLicense !== true
+					) {
+						return;
+					}
+
+					try {
+						modelProxyUsage = await AdminService.getModelProxyUsage({
+							fetch,
+							dontLogErrors: true
+						});
+					} catch {
+						modelProxyUsage = undefined;
+					}
+				})(),
+				(async () => {
+					gitCredentials = await AdminService.listGitCredentials({
+						fetch,
+						dontLogErrors: true
+					}).catch(() => []);
+				})(),
+				(async () => {
+					if (version?.engine !== 'kubernetes') return;
+					try {
+						[capability, imagePullSecrets] = await Promise.all([
+							AdminService.getImagePullSecretCapability({ fetch }),
+							AdminService.listImagePullSecrets({ fetch })
+						]);
+					} catch (err) {
+						handleRouteError(err, '/admin/platform?view=settings', profile);
+					}
+				})()
+			]);
 			break;
 		case 'mcp-config':
 			if (version?.engine === 'kubernetes' && !version?.hideK8sDetails) {
@@ -106,16 +145,6 @@ export const load: PageLoad = async ({ fetch, parent, url }) => {
 				} catch (err) {
 					handleRouteError(err, '/admin/platform?view=mcp-config', profile);
 				}
-			}
-			break;
-		case 'registry-connections':
-			try {
-				[capability, imagePullSecrets] = await Promise.all([
-					AdminService.getImagePullSecretCapability({ fetch }),
-					AdminService.listImagePullSecrets({ fetch })
-				]);
-			} catch (err) {
-				handleRouteError(err, '/admin/platform?view=registry-connections', profile);
 			}
 			break;
 	}
@@ -128,6 +157,8 @@ export const load: PageLoad = async ({ fetch, parent, url }) => {
 		capability,
 		imagePullSecrets,
 		gitCredentials,
+		modelProxySettings,
+		modelProxyUsage,
 		productTelemetryConsent,
 		productTelemetryConsentAvailable
 	};

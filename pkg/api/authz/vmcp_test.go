@@ -25,7 +25,7 @@ func TestEmptyVMCPIsReadableButNotConnectable(t *testing.T) {
 			Manifest: types.VMCPManifest{DisplayName: "Empty draft"},
 		},
 	}
-	vmcp.Spec.Manifest.Default(true, u.UID)
+	vmcp.Spec.Manifest.Default(true)
 	if err := vmcp.Spec.Manifest.Validate(); err != nil {
 		t.Fatalf("empty draft should be valid: %v", err)
 	}
@@ -204,7 +204,10 @@ func TestVMCPAuthorization(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			groups := append([]string{types.GroupAPI}, tt.groups...)
 			req := httptest.NewRequest(tt.method, tt.path, nil)
-			got := authorizer.Authorize(req, &user.DefaultInfo{Name: tt.userID, UID: tt.userID, Groups: groups})
+			got := authorizer.Authorize(req, &user.DefaultInfo{
+				Name: tt.userID, UID: tt.userID, Groups: groups,
+				Extra: map[string][]string{"auth_provider_groups": tt.groups},
+			})
 			if got != tt.allowed {
 				t.Fatalf("Authorize() = %v, want %v", got, tt.allowed)
 			}
@@ -240,6 +243,8 @@ func TestUserCanReadVMCP(t *testing.T) {
 			},
 		},
 	}
+	sharedWithObotGroupProfile := sharedWithGroupProfile.DeepCopy()
+	sharedWithObotGroupProfile.Spec.Manifest.Profiles[0].Subjects[0].Type = types.SubjectTypeObotGroup
 	sharedWithWildcardProfile := &v1.VMCP{
 		Spec: v1.VMCPSpec{
 			Manifest: types.VMCPManifest{
@@ -302,13 +307,13 @@ func TestUserCanReadVMCP(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "group profile grants shared VMCP",
+			name: "generic groups do not grant shared VMCP",
 			user: &user.DefaultInfo{
 				UID:    "owner-role",
 				Groups: []string{types.GroupOwner, "team-a"},
 			},
 			vmcp: sharedWithGroupProfile,
-			want: true,
+			want: false,
 		},
 		{
 			name: "Obot group extra grants shared VMCP",
@@ -318,7 +323,7 @@ func TestUserCanReadVMCP(t *testing.T) {
 					"obot_groups": {"team-a"},
 				},
 			},
-			vmcp: sharedWithGroupProfile,
+			vmcp: sharedWithObotGroupProfile,
 			want: true,
 		},
 		{
@@ -540,6 +545,32 @@ func TestVMCPActionRouteAuthorization(t *testing.T) {
 			userID: "other",
 		},
 		{
+			name:    "profile-matched shared VMCP can delete one component's OAuth",
+			method:  http.MethodDelete,
+			path:    "/api/vmcps/" + shared.Name + "/components/component-a/oauth",
+			userID:  "allowed",
+			allowed: true,
+		},
+		{
+			name:   "profile-unmatched shared VMCP cannot delete one component's OAuth",
+			method: http.MethodDelete,
+			path:   "/api/vmcps/" + shared.Name + "/components/component-a/oauth",
+			userID: "other",
+		},
+		{
+			name:    "profile-matched shared VMCP can read its OAuth status",
+			method:  http.MethodGet,
+			path:    "/api/vmcps/" + shared.Name + "/oauth-status",
+			userID:  "allowed",
+			allowed: true,
+		},
+		{
+			name:   "profile-unmatched shared VMCP cannot read its OAuth status",
+			method: http.MethodGet,
+			path:   "/api/vmcps/" + shared.Name + "/oauth-status",
+			userID: "other",
+		},
+		{
 			name:    "personal VMCP owner is readable through VMCP route",
 			method:  http.MethodGet,
 			path:    "/api/vmcps/" + personal.Name,
@@ -736,7 +767,7 @@ func TestVMCPComponentOAuthAuthorizationChecksParentConnection(t *testing.T) {
 			WithIndex(&v1.VMCPInstance{}, "spec.manifest.vmcpID", func(obj kclient.Object) []string {
 				return []string{obj.(*v1.VMCPInstance).Spec.Manifest.VMCPID}
 			}).Build()
-		return NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
+		return NewAuthorizer(nil, storage, storage, false, nil, nil, false)
 	}
 	newObjects := func(singleUser bool) (*v1.VMCP, *v1.VMCPInstance, *v1.MCPServer) {
 		vmcp := &v1.VMCP{
@@ -817,7 +848,7 @@ func TestVMCPComponentOAuthAuthorizationChecksParentConnection(t *testing.T) {
 
 func newVMCPTestAuthorizer(objects ...kclient.Object) *Authorizer {
 	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(objects...).Build()
-	return NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
+	return NewAuthorizer(nil, storage, storage, false, nil, nil, false)
 }
 
 func objectMetaForAuthzTest(name string) metav1.ObjectMeta {

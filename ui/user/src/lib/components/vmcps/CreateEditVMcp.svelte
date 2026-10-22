@@ -1,26 +1,42 @@
 <script lang="ts">
 	import Confirm from '$lib/components/Confirm.svelte';
 	import ResponsiveDialog from '$lib/components/ResponsiveDialog.svelte';
+	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import { UserService, type VMCP, type VMCPComponent } from '$lib/services';
-	import { initVMcp, vmcpManifest, type VMcpFormData } from '$lib/services/vmcps/utils';
+	import {
+		getToolCounts,
+		initVMcp,
+		isCatalogSyncedVMcp,
+		resolveVMcpComponents,
+		vmcpManifest,
+		type VMcpFormData
+	} from '$lib/services/vmcps/utils';
 	import { errors } from '$lib/stores';
 	import { success } from '$lib/stores/success';
+	import VMcpCatalogSyncedIndicator from './VMcpCatalogSyncedIndicator.svelte';
 	import { twMerge } from 'tailwind-merge';
+
+	export type VMcpCreateDraft = VMcpFormData & {
+		components: VMCPComponent[];
+	};
 
 	interface Props {
 		onCreated?: (created: VMCP) => void | Promise<void>;
 		onDeleted?: (deleted: VMCP) => void | Promise<void>;
 		onUpdated?: (updated: VMCP) => void | Promise<void>;
+		onClose?: () => void;
+		onCreate?: (draft: VMcpCreateDraft) => boolean | Promise<boolean>;
 	}
 
-	let { onCreated, onDeleted, onUpdated }: Props = $props();
+	let { onCreated, onDeleted, onUpdated, onClose, onCreate }: Props = $props();
 
 	let form = $state<VMcpFormData>(initVMcp());
 	let creatingComponents = $state<VMCPComponent[]>([]);
 	let showRequired = $state<Record<string, boolean>>({});
 	let saving = $state(false);
 	let dialogOpen = $state(false);
+	let confirmToolSearch = $state(false);
 
 	let vmcpDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let selectedVMcp = $state<VMCP>();
@@ -29,12 +45,24 @@
 	let deletingVMcp = $state(false);
 
 	const editing = $derived(Boolean(selectedVMcp));
+	const readonly = $derived(isCatalogSyncedVMcp(selectedVMcp));
+	const toolCounts = $derived(
+		getToolCounts(resolveVMcpComponents({ components: creatingComponents }))
+	);
+	const dialogTitle = $derived(
+		confirmToolSearch
+			? m.vmcps_tool_search_prompt_title()
+			: editing
+				? m.vmcps_edit_details()
+				: m.vmcps_create_vmcp()
+	);
 
 	function resetForm() {
 		form = initVMcp();
 		creatingComponents = [];
 		selectedVMcp = undefined;
 		showRequired = {};
+		confirmToolSearch = false;
 	}
 
 	function openDialog() {
@@ -53,6 +81,7 @@
 	function handleDialogClose() {
 		dialogOpen = false;
 		resetForm();
+		onClose?.();
 	}
 
 	function validateForm() {
@@ -66,32 +95,73 @@
 		return Object.keys(showRequired).length === 0;
 	}
 
-	async function handleSubmit() {
-		if (!validateForm()) return;
-		if (selectedVMcp) {
-			await updateVMcp(selectedVMcp);
-		} else {
-			await createVMcp();
-		}
+	function createDraft(): VMcpCreateDraft {
+		return {
+			displayName: form.displayName.trim(),
+			description: form.description.trim(),
+			toolSearch: form.toolSearch,
+			components: creatingComponents
+		};
 	}
 
-	async function createVMcp() {
+	async function handleSubmit() {
+		if (saving || !validateForm()) return;
+		if (selectedVMcp) {
+			await updateVMcp(selectedVMcp);
+			return;
+		}
+
+		if (!form.toolSearch && toolCounts.enabled > 50) {
+			confirmToolSearch = true;
+			return;
+		}
+
+		await submitCreate();
+	}
+
+	async function submitCreate() {
+		const draft = createDraft();
+		if (await onCreate?.(draft)) {
+			closeDialog();
+			return;
+		}
+
+		await createVMcp(draft);
+	}
+
+	async function createVMcp(draft: VMcpCreateDraft) {
+		if (saving) return false;
 		saving = true;
 		try {
 			const created = await UserService.createVMCP({
-				displayName: form.displayName.trim(),
-				description: form.description.trim(),
-				components: creatingComponents
+				displayName: draft.displayName,
+				description: draft.description,
+				toolSearch: draft.toolSearch,
+				components: draft.components
 			});
 
-			success.add(`${created.displayName} vMCP added.`);
+			success.add(m.vmcps_vmcp_added({ name: created.displayName }));
 			await onCreated?.(created);
 			closeDialog();
+			return true;
 		} catch {
-			errors.append('Failed to create vMCP.');
+			errors.append(m.vmcps_failed_to_create());
+			return false;
 		} finally {
 			saving = false;
 		}
+	}
+
+	export async function saveCreate(draft: VMcpCreateDraft) {
+		if (!(await createVMcp(draft))) {
+			throw new Error(m.vmcps_failed_to_create());
+		}
+	}
+
+	async function createWithToolSearch(enabled: boolean) {
+		if (saving) return;
+		form.toolSearch = enabled;
+		await submitCreate();
 	}
 
 	async function updateVMcp(vmcp: VMCP) {
@@ -100,13 +170,14 @@
 			const updatedVMcp = await UserService.updateVMCP(vmcp.id, {
 				...vmcpManifest(vmcp),
 				displayName: form.displayName.trim(),
-				description: form.description.trim()
+				description: form.description.trim(),
+				toolSearch: form.toolSearch
 			});
-			success.add(`${updatedVMcp.displayName} vMCP updated.`);
+			success.add(m.vmcps_vmcp_updated({ name: updatedVMcp.displayName }));
 			closeDialog();
 			await onUpdated?.(updatedVMcp);
 		} catch {
-			errors.append('Failed to update vMCP.');
+			errors.append(m.vmcps_failed_to_update());
 		} finally {
 			saving = false;
 		}
@@ -117,6 +188,7 @@
 		selectedVMcp = undefined;
 		creatingComponents = components;
 		form = initVMcp();
+		confirmToolSearch = false;
 
 		if (components.length === 1) {
 			form.displayName = components[0].name ?? '';
@@ -135,9 +207,11 @@
 		if (saving) return;
 		creatingComponents = [];
 		selectedVMcp = vmcp;
+		confirmToolSearch = false;
 		form = {
 			displayName: vmcp.displayName ?? '',
-			description: vmcp.description ?? ''
+			description: vmcp.description ?? '',
+			toolSearch: vmcp.toolSearch ?? false
 		};
 		showRequired = {};
 		openDialog();
@@ -153,10 +227,10 @@
 			if (selectedVMcp?.id === deleted.id) {
 				closeDialog();
 			}
-			success.add(`${deleted.displayName} vMCP deleted.`);
+			success.add(m.vmcps_vmcp_deleted({ name: deleted.displayName }));
 			await onDeleted?.(deleted);
 		} catch {
-			errors.append('Failed to delete vMCP.');
+			errors.append(m.vmcps_failed_to_delete());
 		} finally {
 			deletingVMcp = false;
 			confirmDeleteVMcp = undefined;
@@ -174,11 +248,12 @@
 	oncancel={() => (confirmDeleteVMcp = undefined)}
 	msg=""
 	loading={deletingVMcp}
-	title="Confirm Delete"
+	title={m.vmcps_deployments_confirm_delete()}
 >
 	{#snippet note()}
-		Are you sure you want to delete "<b>{confirmDeleteVMcp?.displayName ?? 'this vMCP'}</b>"? This
-		cannot be undone.
+		{m.vmcps_delete_confirm_prefix()}<b
+			>{confirmDeleteVMcp?.displayName ?? m.vmcps_deployments_this_vmcp()}</b
+		>{m.vmcps_delete_confirm_suffix()}
 	{/snippet}
 </Confirm>
 
@@ -186,63 +261,127 @@
 	animate="slide"
 	class="md:w-md"
 	bind:this={vmcpDialog}
-	title={editing ? 'Edit Details' : 'Create vMCP'}
+	title={dialogTitle}
 	onClose={handleDialogClose}
 >
+	{#snippet titleContent()}
+		<span class:font-normal={confirmToolSearch}>{dialogTitle}</span>
+	{/snippet}
 	<div class="flex grow flex-col p-4 md:p-0">
-		<div class="mb-4 flex flex-col gap-1">
-			<label
-				for="vmcp-name"
-				class={twMerge('text-sm font-light', showRequired.displayName && 'error')}
-			>
-				Name <span class={showRequired.displayName ? 'text-error' : ''} aria-hidden="true">*</span>
-			</label>
-			<input
-				id="vmcp-name"
-				class={twMerge('text-input-filled', showRequired.displayName && 'error')}
-				bind:value={form.displayName}
-				aria-required="true"
-				oninput={() => updateRequired('displayName')}
-			/>
-			{#if showRequired.displayName}
-				<p class="text-error text-xs" role="alert">Name is required</p>
+		{#if confirmToolSearch}
+			<p class="text-sm text-muted-content">
+				{toolCounts.approximate
+					? m.vmcps_tool_search_prompt_preview()
+					: m.vmcps_tool_search_prompt_description()}
+			</p>
+			<div class="mt-4 flex flex-wrap justify-end gap-2">
+				<button
+					type="button"
+					class="btn btn-ghost"
+					disabled={saving}
+					onclick={() => (confirmToolSearch = false)}>{m.common_back()}</button
+				>
+				<button
+					type="button"
+					class="btn btn-secondary"
+					disabled={saving}
+					onclick={() => createWithToolSearch(false)}>{m.vmcps_tool_search_keep_direct()}</button
+				>
+				<button
+					type="button"
+					class="btn btn-primary"
+					disabled={saving}
+					onclick={() => createWithToolSearch(true)}
+				>
+					{#if saving && form.toolSearch}<Loading class="text-primary-content size-4" />{/if}
+					{m.vmcps_tool_search_enable()}
+				</button>
+			</div>
+		{:else}
+			{#if selectedVMcp}
+				<VMcpCatalogSyncedIndicator vmcp={selectedVMcp} inline />
 			{/if}
-		</div>
 
-		<div class="flex flex-col gap-1">
-			<label
-				for="vmcp-description"
-				class={twMerge('text-sm font-light', showRequired.description && 'error')}
-			>
-				Description
-				<span class={showRequired.description ? 'text-error' : ''} aria-hidden="true">*</span>
-			</label>
-			<textarea
-				id="vmcp-description"
-				rows="3"
-				class={twMerge('text-input-filled resize-none', showRequired.description && 'error')}
-				bind:value={form.description}
-				aria-required="true"
-				oninput={() => updateRequired('description')}
-			></textarea>
-			{#if showRequired.description}
-				<p class="text-error text-xs" role="alert">Description is required</p>
-			{/if}
-		</div>
-
-		<div class="flex grow"></div>
-
-		<div class="flex md:flex-row flex-col justify-end gap-2 mt-4">
-			<button class="btn btn-ghost rounded-full" onclick={closeDialog} disabled={saving}>
-				Cancel
-			</button>
-			<button class="btn btn-primary" onclick={handleSubmit} disabled={saving}>
-				{#if saving}
-					<Loading class="text-primary-content size-4" />
-				{:else}
-					{editing ? 'Save' : 'Create'}
+			<div class="mb-4 flex flex-col gap-1">
+				<label
+					for="vmcp-name"
+					class={twMerge('text-sm font-light', showRequired.displayName && 'error')}
+				>
+					{m.core_name()}
+					<span class={showRequired.displayName ? 'text-error' : ''} aria-hidden="true">*</span>
+				</label>
+				<input
+					id="vmcp-name"
+					class={twMerge('text-input-filled', showRequired.displayName && 'error')}
+					bind:value={form.displayName}
+					aria-required="true"
+					oninput={() => updateRequired('displayName')}
+					disabled={readonly}
+					aria-disabled={readonly}
+				/>
+				{#if showRequired.displayName}
+					<p class="text-error text-xs" role="alert">{m.vmcps_name_required()}</p>
 				{/if}
-			</button>
-		</div>
+			</div>
+
+			<div class="flex flex-col gap-1">
+				<label
+					for="vmcp-description"
+					class={twMerge('text-sm font-light', showRequired.description && 'error')}
+				>
+					{m.core_description()}
+					<span class={showRequired.description ? 'text-error' : ''} aria-hidden="true">*</span>
+				</label>
+				<textarea
+					id="vmcp-description"
+					rows="3"
+					class={twMerge('text-input-filled resize-none', showRequired.description && 'error')}
+					bind:value={form.description}
+					aria-required="true"
+					oninput={() => updateRequired('description')}
+					disabled={readonly}
+					aria-disabled={readonly}></textarea>
+				{#if showRequired.description}
+					<p class="text-error text-xs" role="alert">{m.vmcps_description_required()}</p>
+				{/if}
+			</div>
+
+			<label
+				for="vmcp-tool-search"
+				class="border-base-300 dark:border-base-400 mt-4 flex items-center justify-between gap-4 rounded-lg border p-4"
+			>
+				<span>
+					<span class="text-sm font-medium">{m.vmcps_tool_search()}</span>
+					<span class="block text-xs opacity-70">
+						{m.vmcps_tool_search_description()}
+					</span>
+				</span>
+				<input
+					id="vmcp-tool-search"
+					type="checkbox"
+					class="toggle shrink-0"
+					bind:checked={form.toolSearch}
+					disabled={readonly}
+					aria-label={m.vmcps_tool_search()}
+				/>
+			</label>
+
+			<div class="flex grow"></div>
+
+			{#if !readonly}
+				<div class="flex md:flex-row flex-col justify-end gap-2 mt-4">
+					<button class="btn btn-ghost rounded-full" onclick={closeDialog} disabled={saving}>
+						{m.common_cancel()}
+					</button>
+					<button class="btn btn-primary" onclick={handleSubmit} disabled={saving}>
+						{#if saving}
+							<Loading class="text-primary-content size-4" />
+						{:else}
+							{editing ? m.core_save() : m.vmcps_create()}
+						{/if}
+					</button>
+				</div>
+			{/if}
+		{/if}
 	</div>
 </ResponsiveDialog>

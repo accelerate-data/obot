@@ -10,13 +10,15 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strconv"
 	"uuid"
 
 	"github.com/obot-platform/nah/pkg/name"
-	"github.com/obot-platform/nah/pkg/router"
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/controller/handlers/catalogmigration"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcpcatalog"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/utils"
@@ -24,6 +26,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/fields"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	// MigrationName is the durable gateway marker for the composite migration.
+	MigrationName = "composite_mcp_to_vmcp"
+
+	// DefaultCatalogSourceAnnotation preserves the removed parent's default-catalog, non-workspace scope.
+	DefaultCatalogSourceAnnotation = "obot.ai/composite-migration-default-catalog-source"
 )
 
 type Handler struct {
@@ -64,9 +74,13 @@ func (h *Handler) MigrateAll(ctx context.Context, client kclient.WithWatch) erro
 	if err := client.List(ctx, &entries); err != nil {
 		return err
 	}
+	deleting := map[kclient.ObjectKey]struct{}{}
 	for i := range entries.Items {
 		entry := &entries.Items[i]
-		if err := h.Migrate(router.Request{Ctx: ctx, Client: client, Object: entry}, nil); err != nil {
+		if !entry.DeletionTimestamp.IsZero() {
+			deleting[kclient.ObjectKeyFromObject(entry)] = struct{}{}
+		}
+		if err := h.Migrate(ctx, client, entry); err != nil {
 			return fmt.Errorf("migrate composite catalog entry %s/%s: %w", entry.Namespace, entry.Name, err)
 		}
 	}
@@ -77,6 +91,10 @@ func (h *Handler) MigrateAll(ctx context.Context, client kclient.WithWatch) erro
 		return err
 	}
 	for _, server := range servers.Items {
+		if _, ok := deleting[kclient.ObjectKey{Namespace: server.Namespace, Name: server.Spec.MCPServerCatalogEntryName}]; ok {
+			// Cleanup removes this server once the controllers finish deleting its entry.
+			continue
+		}
 		if server.Spec.Manifest.Runtime == types.RuntimeComposite && server.DeletionTimestamp.IsZero() {
 			return fmt.Errorf("composite MCP server %s/%s was not migrated; restore its source catalog entry before restarting", server.Namespace, server.Name)
 		}
@@ -109,11 +127,11 @@ func migrationName(prefix, namespace, name string) string {
 	return prefix + id.String()
 }
 
-func (h *Handler) Migrate(req router.Request, _ router.Response) error {
-	entry := req.Object.(*v1.MCPServerCatalogEntry)
-	if entry.Spec.Manifest.Runtime != types.RuntimeComposite {
+func (h *Handler) Migrate(ctx context.Context, client kclient.Client, entry *v1.MCPServerCatalogEntry) error {
+	if entry.Spec.Manifest.Runtime != types.RuntimeComposite || !entry.DeletionTimestamp.IsZero() {
 		return nil
 	}
+
 	var legacy legacyManifest
 	if err := json.Unmarshal(entry.Spec.LegacyCompositeManifest, &legacy); err != nil { //nolint:staticcheck // This migration is the consumer of the deprecated snapshot.
 		return fmt.Errorf("decode legacy composite %q: %w", entry.Name, err)
@@ -122,15 +140,15 @@ func (h *Handler) Migrate(req router.Request, _ router.Response) error {
 		return fmt.Errorf("composite %q has no recoverable component snapshots; retaining source", entry.Name)
 	}
 	var parents v1.MCPServerList
-	if err := req.List(&parents, &kclient.ListOptions{Namespace: entry.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entry.Name)}); err != nil {
+	if err := client.List(ctx, &parents, &kclient.ListOptions{Namespace: entry.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.mcpServerCatalogEntryName", entry.Name)}); err != nil {
 		return err
 	}
-	target, static, skipped, err := h.buildVMCP(req, entry, legacy)
+	target, static, skipped, err := h.buildVMCP(ctx, client, entry, legacy)
 	if err != nil {
 		return err
 	}
 	var existing v1.VMCP
-	if err := req.Get(&existing, target.Namespace, target.Name); err == nil {
+	if err := client.Get(ctx, kclient.ObjectKeyFromObject(&target), &existing); err == nil {
 		if existing.Spec.LegacySlug != entry.Name {
 			return fmt.Errorf("migration target %q has different ownership", target.Name)
 		}
@@ -138,15 +156,15 @@ func (h *Handler) Migrate(req router.Request, _ router.Response) error {
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	} else {
-		if err := h.save(req.Ctx, vmcp.StaticConfigurationCredentialContext(target.Name), static); err != nil {
+		if err := h.save(ctx, vmcp.StaticConfigurationCredentialContext(target.Name), static); err != nil {
 			return err
 		}
-		if err := req.Client.Create(req.Ctx, &target); err != nil {
+		if err := client.Create(ctx, &target); err != nil {
 			return err
 		}
 	}
 
-	if err := migrateFilters(req, entry, parents.Items, target); err != nil {
+	if err := migrateFilters(ctx, client, entry, parents.Items, target); err != nil {
 		return fmt.Errorf("migrate composite filters: %w", err)
 	}
 
@@ -158,64 +176,36 @@ func (h *Handler) Migrate(req router.Request, _ router.Response) error {
 		if parent.Spec.Manifest.Runtime != types.RuntimeComposite || parent.Spec.CompositeName != "" {
 			return fmt.Errorf("unexpected dependent server %q; retaining composite source", parent.Name)
 		}
-		if err := h.migrateInstance(req, target, parent, skipped); err != nil {
+		if err := h.migrateInstance(ctx, client, target, parent, skipped); err != nil {
 			return fmt.Errorf("migrate composite connection %q: %w", parent.Name, err)
 		}
 	}
-	return kclient.IgnoreNotFound(req.Client.Delete(req.Ctx, entry))
+	defaultCatalogSource := strconv.FormatBool(entry.Spec.MCPCatalogName == system.DefaultCatalog && entry.Spec.PowerUserWorkspaceID == "")
+	if target.Annotations[DefaultCatalogSourceAnnotation] != defaultCatalogSource {
+		if target.Annotations == nil {
+			target.Annotations = make(map[string]string)
+		}
+		target.Annotations[DefaultCatalogSourceAnnotation] = defaultCatalogSource
+		if err := client.Update(ctx, &target); err != nil {
+			return fmt.Errorf("record composite source scope: %w", err)
+		}
+	}
+
+	return kclient.IgnoreNotFound(client.Delete(ctx, entry))
 }
 
-func migrateFilters(req router.Request, entry *v1.MCPServerCatalogEntry, parents []v1.MCPServer, target v1.VMCP) error {
-	resources := map[types.Resource]struct{}{
-		{Type: types.ResourceTypeMCPServerCatalogEntry, ID: entry.Name}: {},
-		{Type: types.ResourceTypeSelector, ID: "*"}:                     {},
-	}
-
-	if catalog := cmp.Or(entry.Spec.MCPCatalogName, entry.Spec.PowerUserWorkspaceID); catalog != "" {
-		resources[types.Resource{Type: types.ResourceTypeMcpCatalog, ID: catalog}] = struct{}{}
-	}
-
+func migrateFilters(ctx context.Context, client kclient.Client, entry *v1.MCPServerCatalogEntry, parents []v1.MCPServer, target v1.VMCP) error {
+	sources := []types.Resource{{Type: types.ResourceTypeMCPServerCatalogEntry, ID: entry.Name}}
+	catalogs := []string{cmp.Or(entry.Spec.MCPCatalogName, entry.Spec.PowerUserWorkspaceID)}
 	for _, parent := range parents {
-		resources[types.Resource{Type: types.ResourceTypeMCPServer, ID: parent.Name}] = struct{}{}
-
-		if catalog := cmp.Or(
-			parent.Spec.MCPCatalogID,
-			parent.Status.MCPCatalogID,
-			parent.Spec.PowerUserWorkspaceID,
-			entry.Spec.MCPCatalogName,
-			entry.Spec.PowerUserWorkspaceID,
-		); catalog != "" {
-			resources[types.Resource{Type: types.ResourceTypeMcpCatalog, ID: catalog}] = struct{}{}
-		}
+		sources = append(sources, types.Resource{Type: types.ResourceTypeMCPServer, ID: parent.Name})
+		catalogs = append(catalogs, cmp.Or(parent.Spec.MCPCatalogID, parent.Status.MCPCatalogID, parent.Spec.PowerUserWorkspaceID))
 	}
-
-	var filters v1.MCPWebhookValidationList
-	if err := req.List(&filters, &kclient.ListOptions{Namespace: entry.Namespace}); err != nil {
-		return err
-	}
-
-	targetResource := types.Resource{Type: types.ResourceTypeMCPServer, ID: target.Name}
-	for i := range filters.Items {
-		filter := &filters.Items[i]
-
-		if slices.Contains(filter.Spec.Manifest.Resources, targetResource) ||
-			!slices.ContainsFunc(filter.Spec.Manifest.Resources, func(resource types.Resource) bool {
-				_, ok := resources[resource]
-				return ok
-			}) {
-			continue
-		}
-
-		filter.Spec.Manifest.Resources = append(filter.Spec.Manifest.Resources, targetResource)
-		if err := req.Client.Update(req.Ctx, filter); err != nil {
-			return fmt.Errorf("update filter %q: %w", filter.Name, err)
-		}
-	}
-
-	return nil
+	return catalogmigration.MigrateFilters(ctx, client, entry.Namespace,
+		[]types.Resource{{Type: types.ResourceTypeMCPServer, ID: target.Name}}, sources, catalogs)
 }
 
-func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry, legacy legacyManifest) (v1.VMCP, map[string]string, []string, error) {
+func (h *Handler) buildVMCP(ctx context.Context, client kclient.Client, entry *v1.MCPServerCatalogEntry, legacy legacyManifest) (v1.VMCP, map[string]string, []string, error) {
 	target := v1.VMCP{
 		Name: migrationName(system.VMCPPrefix, entry.Namespace, entry.Name), Namespace: entry.Namespace,
 		Finalizers: []string{v1.VMCPFinalizer},
@@ -232,8 +222,15 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 	if target.Spec.Manifest.DisplayName == "" {
 		target.Spec.Manifest.DisplayName = entry.Name
 	}
+	if entry.Spec.SourceURL != "" {
+		target.Name = mcpcatalog.VMCPName(entry.Spec.MCPCatalogName, entry.Spec.SourceURL, entry.Spec.Manifest.EntryKey, target.Spec.Manifest.DisplayName)
+		target.Spec.Adopted = new(false)
+		target.Spec.AdoptionSourceURL = entry.Spec.SourceURL
+		target.Spec.AdoptionEntryKey = mcpcatalog.VMCPEntryKey(entry.Spec.Manifest.EntryKey, target.Spec.Manifest.DisplayName)
+	}
+
 	var rules v1.AccessControlRuleList
-	if err := req.List(&rules, &kclient.ListOptions{Namespace: entry.Namespace}); err != nil {
+	if err := client.List(ctx, &rules, &kclient.ListOptions{Namespace: entry.Namespace}); err != nil {
 		return target, nil, nil, err
 	}
 	for _, rule := range rules.Items {
@@ -242,18 +239,18 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 		}
 		for _, resource := range rule.Spec.Manifest.Resources {
 			if (resource.Type == types.ResourceTypeSelector && resource.ID == "*") || (resource.Type == types.ResourceTypeMCPServerCatalogEntry && resource.ID == entry.Name) {
-				target.Spec.Manifest.Profiles = append(target.Spec.Manifest.Profiles, types.VMCPProfile{Name: rule.Name, Subjects: rule.Spec.Manifest.Subjects, Permissions: types.VMCPProfilePermissions{AllowAllComponents: true}})
+				target.Spec.Manifest.Profiles = catalogmigration.AppendRuleProfile(target.Spec.Manifest.Profiles, rule)
 				break
 			}
 		}
 	}
 	if entry.Spec.PowerUserWorkspaceID != "" {
 		var workspace v1.PowerUserWorkspace
-		if err := req.Get(&workspace, entry.Namespace, entry.Spec.PowerUserWorkspaceID); err != nil {
+		if err := client.Get(ctx, kclient.ObjectKey{Namespace: entry.Namespace, Name: entry.Spec.PowerUserWorkspaceID}, &workspace); err != nil {
 			return target, nil, nil, err
 		}
 		// Preserve existing workspace sharing as explicit grants, never a wildcard.
-		target.Spec.Manifest.Profiles = append(target.Spec.Manifest.Profiles, types.VMCPProfile{Name: "owner", Subjects: []types.Subject{{Type: types.SubjectTypeUser, ID: workspace.Spec.UserID}}, Permissions: types.VMCPProfilePermissions{AllowAllComponents: true}})
+		target.Spec.Manifest.Profiles = append(target.Spec.Manifest.Profiles, types.VMCPProfile{Name: catalogmigration.OwnerProfileName, Subjects: []types.Subject{{Type: types.SubjectTypeUser, ID: workspace.Spec.UserID}}, Permissions: types.VMCPProfilePermissions{AllowAllComponents: true}})
 	}
 	static := map[string]string{}
 	var skipped []string
@@ -263,7 +260,7 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 
 		// We have seen instances where this is an MCPServer ID, which is wrong. Skip such things.
 		if system.IsMCPServerID(id) {
-			slog.WarnContext(req.Ctx, "catalog entry ID is actually an MCP server ID, skipping component", "id", id, "entry_name", entry.Name)
+			slog.WarnContext(ctx, "catalog entry ID is actually an MCP server ID, skipping component", "id", id, "entry_name", entry.Name)
 			skipped = append(skipped, id)
 			continue
 		}
@@ -272,7 +269,7 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 		var shared *v1.MCPServer
 		if old.MCPServerID != "" {
 			shared = &v1.MCPServer{}
-			if err := req.Get(shared, entry.Namespace, old.MCPServerID); err != nil {
+			if err := client.Get(ctx, kclient.ObjectKey{Namespace: entry.Namespace, Name: old.MCPServerID}, shared); err != nil {
 				return target, nil, nil, err
 			}
 			var err error
@@ -282,14 +279,14 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 			}
 			id = old.MCPServerID
 			catalogID = shared.Spec.MCPCatalogID
-			values, err = h.read(req.Ctx, shared.CredentialContext(shared.Spec.UserID), shared.Name)
+			values, err = h.read(ctx, shared.CredentialContext(shared.Spec.UserID), shared.Name)
 			if err != nil {
 				return target, nil, nil, err
 			}
 		}
 		if id == "" || manifest.Runtime == "" || manifest.Runtime == types.RuntimeComposite {
 			// Skip invalid manifests
-			slog.WarnContext(req.Ctx, "skipping invalid manifest", "id", id, "runtime", manifest.Runtime, "entry", entry.Name)
+			slog.WarnContext(ctx, "skipping invalid manifest", "id", id, "runtime", manifest.Runtime, "entry", entry.Name)
 			skipped = append(skipped, id)
 			continue
 		}
@@ -316,6 +313,9 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 		if component.Name == "" {
 			component.Name = id
 		}
+
+		// Track the source before moving fixed values into credential storage.
+		component.SourceDigest = vmcp.SourceDigest(component.CatalogEntry)
 
 		for i := range component.CatalogEntry.Manifest.Config {
 			item := &component.CatalogEntry.Manifest.Config[i]
@@ -344,7 +344,6 @@ func (h *Handler) buildVMCP(req router.Request, entry *v1.MCPServerCatalogEntry,
 		if shared != nil {
 			component.OAuthCredentialID = vmcp.StaticOAuthCredentialReference(manifest, shared.Spec.MCPServerCatalogEntryName)
 		}
-		component.SourceDigest = utils.Digest(component.CatalogEntry)
 		target.Spec.Manifest.Components = append(target.Spec.Manifest.Components, component)
 	}
 	vmcp.SetStaticConfigurationHashes(&target, static)
@@ -368,17 +367,17 @@ func (h *Handler) save(ctx context.Context, scope string, values map[string]stri
 	return h.upsert(ctx, gatewaytypes.Credential{Context: scope, Name: vmcp.ConfigurationCredentialName(), Secrets: values})
 }
 
-func (h *Handler) migrateInstance(req router.Request, target v1.VMCP, parent *v1.MCPServer, skipped []string) error {
+func (h *Handler) migrateInstance(ctx context.Context, client kclient.Client, target v1.VMCP, parent *v1.MCPServer, skipped []string) error {
 	instance := v1.VMCPInstance{
 		Name:       migrationName(system.VMCPInstancePrefix, parent.Namespace, parent.Name),
 		Namespace:  parent.Namespace,
 		Finalizers: []string{v1.VMCPInstanceFinalizer},
 	}
-	if err := req.Get(&instance, instance.Namespace, instance.Name); err == nil {
+	if err := client.Get(ctx, kclient.ObjectKeyFromObject(&instance), &instance); err == nil {
 		if instance.Spec.LegacySlug != parent.Name || instance.Spec.UserID != parent.Spec.UserID || instance.Spec.Manifest.VMCPID != target.Name {
 			return fmt.Errorf("migration instance has different ownership")
 		}
-		return kclient.IgnoreNotFound(req.Client.Delete(req.Ctx, parent))
+		return kclient.IgnoreNotFound(client.Delete(ctx, parent))
 	} else if !apierrors.IsNotFound(err) {
 		return err
 	}
@@ -390,18 +389,18 @@ func (h *Handler) migrateInstance(req router.Request, target v1.VMCP, parent *v1
 	instance.Spec.UserID = parent.Spec.UserID
 	instance.Spec.Manifest.VMCPID = target.Name
 	var children v1.MCPServerList
-	if err := req.List(&children, &kclient.ListOptions{Namespace: parent.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.compositeName", parent.Name)}); err != nil {
+	if err := client.List(ctx, &children, &kclient.ListOptions{Namespace: parent.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.compositeName", parent.Name)}); err != nil {
 		return err
 	}
 	var connections v1.MCPServerInstanceList
-	if err := req.List(&connections, &kclient.ListOptions{Namespace: parent.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.compositeName", parent.Name)}); err != nil {
+	if err := client.List(ctx, &connections, &kclient.ListOptions{Namespace: parent.Namespace, FieldSelector: fields.OneTermEqualSelector("spec.compositeName", parent.Name)}); err != nil {
 		return err
 	}
 	configuration := map[string]string{}
 	for _, old := range parent.Spec.Manifest.CompositeConfig.ComponentServers {
 		id := old.CatalogEntryID
 		if system.IsMCPServerID(id) {
-			slog.WarnContext(req.Ctx, "invalid catalog entry ID", "id", id, "parent", parent.Name)
+			slog.WarnContext(ctx, "invalid catalog entry ID", "id", id, "parent", parent.Name)
 			continue
 		}
 
@@ -411,7 +410,7 @@ func (h *Handler) migrateInstance(req router.Request, target v1.VMCP, parent *v1
 		index := slices.IndexFunc(target.Spec.Manifest.Components, func(c types.VMCPComponent) bool { return c.ID == id })
 		if index < 0 {
 			if slices.Contains(skipped, id) {
-				slog.WarnContext(req.Ctx, "skipping invalid component", "id", id, "vmcp_id", target.Name)
+				slog.WarnContext(ctx, "skipping invalid component", "id", id, "vmcp_id", target.Name)
 				continue
 			}
 			return fmt.Errorf("component %q no longer exists in migrated vMCP", id)
@@ -443,19 +442,19 @@ func (h *Handler) migrateInstance(req router.Request, target v1.VMCP, parent *v1
 			if child.Spec.MCPServerCatalogEntryName != id {
 				continue
 			}
-			secret, err := h.read(req.Ctx, child.CredentialContext(child.Spec.UserID), child.Name)
+			secret, err := h.read(ctx, child.CredentialContext(child.Spec.UserID), child.Name)
 			if err != nil {
 				return err
 			}
 			maps.Copy(values, secret)
 			if h.copyOAuth != nil {
-				if err := h.copyOAuth(req.Ctx, parent.Spec.UserID, child.Name, name.SafeConcatName(system.MCPServerPrefix+instance.Name, id)); err != nil {
+				if err := h.copyOAuth(ctx, parent.Spec.UserID, child.Name, name.SafeConcatName(system.MCPServerPrefix+instance.Name, id)); err != nil {
 					return err
 				}
 			}
 		}
 		if old.MCPServerID != "" && h.copyOAuth != nil {
-			if err := h.copyOAuth(req.Ctx, parent.Spec.UserID, old.MCPServerID, name.SafeConcatName(system.MCPServerPrefix+instance.Name, id)); err != nil {
+			if err := h.copyOAuth(ctx, parent.Spec.UserID, old.MCPServerID, name.SafeConcatName(system.MCPServerPrefix+instance.Name, id)); err != nil {
 				return err
 			}
 		}
@@ -463,7 +462,7 @@ func (h *Handler) migrateInstance(req router.Request, target v1.VMCP, parent *v1
 			if connection.Spec.MCPServerName != id {
 				continue
 			}
-			secret, err := h.read(req.Ctx, connection.Spec.UserID+"-"+connection.Name, connection.Name)
+			secret, err := h.read(ctx, connection.Spec.UserID+"-"+connection.Name, connection.Name)
 			if err != nil {
 				return err
 			}
@@ -489,12 +488,12 @@ func (h *Handler) migrateInstance(req router.Request, target v1.VMCP, parent *v1
 			instance.Spec.LegacyDisabledComponents = append(instance.Spec.LegacyDisabledComponents, component.ID)
 		}
 	}
-	if err := h.save(req.Ctx, vmcp.InstanceConfigurationCredentialContext(instance.Name), configuration); err != nil {
+	if err := h.save(ctx, vmcp.InstanceConfigurationCredentialContext(instance.Name), configuration); err != nil {
 		return err
 	}
 	instance.Status.UserConfigurationHash = utils.Digest(configuration)
-	if err := req.Client.Create(req.Ctx, &instance); err != nil {
+	if err := client.Create(ctx, &instance); err != nil {
 		return err
 	}
-	return kclient.IgnoreNotFound(req.Client.Delete(req.Ctx, parent))
+	return kclient.IgnoreNotFound(client.Delete(ctx, parent))
 }

@@ -3,13 +3,13 @@ package modelaccesspolicy
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/alias"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/subjectgroups"
 	"github.com/obot-platform/obot/pkg/system"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -22,6 +22,7 @@ import (
 const (
 	mapUserIndex       = "user-id"
 	mapGroupIndex      = "group-id"
+	mapObotGroupIndex  = "obot-group-id"
 	mapSelectorIndex   = "selector-id"
 	dmaModelIndex      = "model-id"
 	modelProviderIndex = "model-provider"
@@ -44,9 +45,10 @@ func NewHelper(ctx context.Context, backend backend.Backend) (*Helper, error) {
 	}
 
 	if err := mapInformer.AddIndexers(gocache.Indexers{
-		mapUserIndex:     mapSubjectIndexFunc(types.SubjectTypeUser),
-		mapGroupIndex:    mapSubjectIndexFunc(types.SubjectTypeGroup),
-		mapSelectorIndex: mapSubjectIndexFunc(types.SubjectTypeSelector),
+		mapUserIndex:      mapSubjectIndexFunc(types.SubjectTypeUser),
+		mapGroupIndex:     mapSubjectIndexFunc(types.SubjectTypeGroup),
+		mapObotGroupIndex: mapSubjectIndexFunc(types.SubjectTypeObotGroup),
+		mapSelectorIndex:  mapSubjectIndexFunc(types.SubjectTypeSelector),
 	}); err != nil {
 		return nil, err
 	}
@@ -179,8 +181,20 @@ func (h *Helper) GetUserAllowedModels(user kuser.Info) (map[string]bool, bool, e
 	}
 
 	// Check policies based on group membership
-	for groupID := range authGroupSet(user) {
+	groups, obotGroups := subjectgroups.Sets(user)
+	for groupID := range groups {
 		groupPolicies, err := h.getGroupPolicies(groupID)
+		if err != nil {
+			return nil, false, err
+		}
+
+		for _, policy := range groupPolicies {
+			addResources(policy.Spec.Manifest.Models)
+		}
+	}
+
+	for groupID := range obotGroups {
+		groupPolicies, err := h.getIndexedPolicies(mapObotGroupIndex, groupID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -232,51 +246,6 @@ func (h *Helper) GetUserAllowedTargetModels(user kuser.Info, provider, dialect s
 			continue
 		}
 		if allowAll || allowedModels[m.Name] {
-			allowed[m.Spec.Manifest.TargetModel] = true
-		}
-	}
-
-	return allowed, false, nil
-}
-
-// GetAgentAllowedTargetModels enumerates the targets a hosted agent may use,
-// for the same passthrough list endpoint GetUserAllowedTargetModels serves.
-//
-// An agent's authority was fixed when its instance was created, so it is drawn
-// from the models configured on it rather than from access policies, which
-// describe people and would not match a principal that is not one. This mirrors
-// what the inference path already does; enumerating from policy here instead
-// would report a set the agent's own requests do not obey -- an agent told it
-// may use nothing, while every call it makes succeeds.
-//
-// modelIDs holds Model resource names, or "*" for every model.
-func (h *Helper) GetAgentAllowedTargetModels(modelIDs []string, provider, dialect string) (allowed map[string]bool, allowAll bool, _ error) {
-	allowAll = slices.Contains(modelIDs, "*")
-	if allowAll && dialect == "" {
-		// Nothing to filter, and the nil map must not be read as "allow
-		// nothing" -- the same contract GetUserAllowedTargetModels documents.
-		return nil, true, nil
-	}
-
-	// The provider index already drops deleted, inactive and unconfigured
-	// models, so every entry has a usable target.
-	objs, err := h.modelIndexer.ByIndex(modelProviderIndex, provider)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to get models for provider %q: %w", provider, err)
-	}
-
-	configured := make(map[string]bool, len(modelIDs))
-	for _, id := range modelIDs {
-		configured[id] = true
-	}
-
-	allowed = make(map[string]bool, len(objs))
-	for _, obj := range objs {
-		m, ok := obj.(*v1.Model)
-		if !ok || (dialect != "" && m.Spec.Manifest.Dialect != dialect) {
-			continue
-		}
-		if allowAll || configured[m.Name] {
 			allowed[m.Spec.Manifest.TargetModel] = true
 		}
 	}
@@ -467,16 +436,4 @@ func modelProviderIndexFunc(obj any) ([]string, error) {
 // unambiguous encoding even when targetModel itself contains "/".
 func modelProviderTargetKey(provider, targetModel string) string {
 	return fmt.Sprintf("%s/%s", provider, targetModel)
-}
-
-// authGroupSet returns a set of auth provider groups for a given user.
-func authGroupSet(user kuser.Info) map[string]struct{} {
-	var (
-		groups = user.GetExtra()["auth_provider_groups"]
-		set    = make(map[string]struct{}, len(groups))
-	)
-	for _, group := range groups {
-		set[group] = struct{}{}
-	}
-	return set
 }

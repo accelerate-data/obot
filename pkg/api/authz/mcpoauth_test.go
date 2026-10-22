@@ -14,15 +14,17 @@ import (
 )
 
 func TestMCPGroupAllowsMCPAndAnyGroupRoutes(t *testing.T) {
-	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&v1.MCPServerInstance{
-		Name:      "msi1test",
-		Namespace: system.DefaultNamespace,
-		Spec: v1.MCPServerInstanceSpec{
-			UserID:        "mcpoauth-user-uid",
-			MCPServerName: "ms1test",
-		},
-	}, &v1.MCPServer{Name: "ms1test", Namespace: system.DefaultNamespace}).Build()
-	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
+	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(
+		&v1.VMCP{Name: "vmcp1test", Namespace: system.DefaultNamespace, Spec: v1.VMCPSpec{
+			UserID:   "mcpoauth-user-uid",
+			Manifest: types.VMCPManifest{Components: []types.VMCPComponent{{ID: "component"}}},
+		}},
+		&v1.VMCPInstance{Name: "vmcpi1test", Namespace: system.DefaultNamespace, Spec: v1.VMCPInstanceSpec{
+			UserID:   "mcpoauth-user-uid",
+			Manifest: types.VMCPInstanceManifest{VMCPID: "vmcp1test"},
+		}},
+	).Build()
+	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, false)
 	mcpUser := &user.DefaultInfo{
 		Name:   "mcp-user",
 		UID:    "mcpoauth-user-uid",
@@ -47,7 +49,7 @@ func TestMCPGroupAllowsMCPAndAnyGroupRoutes(t *testing.T) {
 		{
 			name:   "MCP connect route",
 			method: http.MethodGet,
-			path:   "/mcp-connect/msi1test",
+			path:   "/mcp-connect/vmcpi1test",
 		},
 	}
 
@@ -62,7 +64,7 @@ func TestMCPGroupAllowsMCPAndAnyGroupRoutes(t *testing.T) {
 }
 
 func TestUnauthenticatedOAuthCallbackAuthorizationIsExact(t *testing.T) {
-	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, nil, false)
+	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, false)
 	unauthenticatedUser := &user.DefaultInfo{
 		Name:   "anonymous",
 		UID:    "anonymous",
@@ -92,14 +94,15 @@ func TestUnauthenticatedOAuthCallbackAuthorizationIsExact(t *testing.T) {
 }
 
 func TestDefaultAuthorizerAllowsMCPProxyRoutes(t *testing.T) {
-	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&v1.MCPServer{
-		Name:      "ms1test",
+	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&v1.VMCP{
+		Name:      "vmcp1test",
 		Namespace: system.DefaultNamespace,
-		Spec: v1.MCPServerSpec{
-			UserID: "mcp-user-uid",
+		Spec: v1.VMCPSpec{
+			UserID:   "mcp-user-uid",
+			Manifest: types.VMCPManifest{Components: []types.VMCPComponent{{ID: "component"}}},
 		},
 	}).Build()
-	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
+	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, false)
 	mcpUser := &user.DefaultInfo{
 		Name:   "mcp-user",
 		UID:    "mcp-user-uid",
@@ -114,7 +117,7 @@ func TestDefaultAuthorizerAllowsMCPProxyRoutes(t *testing.T) {
 		{
 			name:   "MCP connect route",
 			method: http.MethodGet,
-			path:   "/mcp-connect/ms1test",
+			path:   "/mcp-connect/vmcp1test",
 		},
 		{
 			name:   "MCP OAuth route",
@@ -144,7 +147,7 @@ func TestDefaultAuthorizerAllowsMCPProxyRoutes(t *testing.T) {
 }
 
 func TestMCPGroupDeniesNonMCPAPIRoutes(t *testing.T) {
-	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, nil, false)
+	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, false)
 	mcpUser := &user.DefaultInfo{
 		Name:   "mcp-user",
 		UID:    "mcp-user-uid",
@@ -188,6 +191,114 @@ func TestMCPGroupDeniesNonMCPAPIRoutes(t *testing.T) {
 	}
 }
 
+func TestMCPScopedComponentOAuth(t *testing.T) {
+	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(
+		&v1.VMCP{
+			Name:      "vmcp1allowed",
+			Namespace: system.DefaultNamespace,
+			Spec: v1.VMCPSpec{
+				UserID:   "7",
+				Manifest: types.VMCPManifest{Components: []types.VMCPComponent{{ID: "gmail"}}},
+			},
+		},
+		&v1.VMCPInstance{
+			Name:      "vmcpi1allowed",
+			Namespace: system.DefaultNamespace,
+			Spec: v1.VMCPInstanceSpec{
+				UserID:   "7",
+				Manifest: types.VMCPInstanceManifest{VMCPID: "vmcp1allowed"},
+			},
+		},
+	).Build()
+	a := NewAuthorizer(nil, storage, storage, false, nil, nil, false)
+	runner := []string{types.GroupMCP, types.GroupClaudeEnvironment, types.GroupAuthenticated}
+	for _, tc := range []struct {
+		name    string
+		method  string
+		path    string
+		userID  string
+		scope   string
+		groups  []string
+		allowed bool
+	}{
+		{
+			name:    "pending URLs and completion status",
+			method:  http.MethodGet,
+			path:    "/api/oauth/vmcp/vmcp1allowed",
+			userID:  "7",
+			scope:   "vmcp1allowed",
+			allowed: true,
+		},
+		{
+			name:   "MCP key outside a Claude environment",
+			method: http.MethodGet,
+			path:   "/api/oauth/vmcp/vmcp1allowed",
+			userID: "7",
+			scope:  "vmcp1allowed",
+			groups: []string{types.GroupMCP, types.GroupAuthenticated},
+		},
+		{
+			name:    "own instance",
+			method:  http.MethodGet,
+			path:    "/api/oauth/vmcp/vmcpi1allowed",
+			userID:  "7",
+			scope:   "vmcp1allowed",
+			allowed: true,
+		},
+		{
+			name:   "outside key scope",
+			method: http.MethodGet,
+			path:   "/api/oauth/vmcp/vmcp1allowed",
+			userID: "7",
+			scope:  "vmcp1other",
+		},
+		{
+			name:   "another user's connection",
+			method: http.MethodGet,
+			path:   "/api/oauth/vmcp/vmcpi1allowed",
+			userID: "8",
+			scope:  "vmcp1allowed",
+		},
+		{
+			name:   "no current access",
+			method: http.MethodGet,
+			path:   "/api/oauth/vmcp/vmcp1allowed",
+			userID: "8",
+			scope:  "vmcp1allowed",
+		},
+		{
+			name:   "cannot reset credentials",
+			method: http.MethodDelete,
+			path:   "/api/vmcps/vmcp1allowed/oauth",
+			userID: "7",
+			scope:  "vmcp1allowed",
+		},
+		{
+			name:   "cannot manage vMCP",
+			method: http.MethodPut,
+			path:   "/api/vmcps/vmcp1allowed",
+			userID: "7",
+			scope:  "vmcp1allowed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groups := tc.groups
+			if groups == nil {
+				groups = runner
+			}
+			caller := &user.DefaultInfo{
+				Name:   "runner",
+				UID:    tc.userID,
+				Groups: groups,
+				Extra:  map[string][]string{"authorized_mcp_ids": {tc.scope}},
+			}
+			if got := a.Authorize(httptest.NewRequest(tc.method, tc.path, nil), caller); got != tc.allowed {
+				t.Fatalf("Authorize() = %v, want %v", got, tc.allowed)
+			}
+		})
+	}
+}
+
 func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoute(t *testing.T) {
 	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(&v1.MCPServerInstance{
 		Name:      "instance-1",
@@ -196,7 +307,7 @@ func TestAPIGroupAllowsOwnedMCPServerInstanceOAuthRoute(t *testing.T) {
 			UserID: "owner-uid",
 		},
 	}).Build()
-	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, nil, false)
+	authorizer := NewAuthorizer(nil, storage, storage, false, nil, nil, false)
 	apiUser := &user.DefaultInfo{
 		Name:   "owner",
 		UID:    "owner-uid",

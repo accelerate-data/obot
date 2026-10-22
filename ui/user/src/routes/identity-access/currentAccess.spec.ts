@@ -19,7 +19,8 @@ const userTarget: CurrentAccessTarget = {
 	kind: 'user',
 	id: 'user-1',
 	name: 'Ada',
-	groupIds: ['engineering']
+	authProviderGroups: ['engineering'],
+	obotGroups: ['admin', 'authenticated']
 };
 
 const groupTarget: CurrentAccessTarget = {
@@ -41,6 +42,17 @@ describe('subjectsApplyTo', () => {
 		]);
 		expect(subjectsApplyTo([{ type: 'user', id: 'other' }], userTarget)).toEqual([]);
 		expect(subjectsApplyTo([{ type: 'group', id: 'sales' }], userTarget)).toEqual([]);
+	});
+
+	it("matches Obot role groups from the user's effective role", () => {
+		expect(subjectsApplyTo([{ type: 'obotGroup', id: 'admin' }], userTarget)).toEqual(['via-role']);
+		expect(subjectsApplyTo([{ type: 'obotGroup', id: 'owner' }], userTarget)).toEqual([]);
+		expect(subjectsApplyTo([{ type: 'obotGroup', id: 'admin' }], groupTarget)).toEqual([]);
+	});
+
+	it('does not treat an Obot role group as an auth provider group, or the reverse', () => {
+		expect(subjectsApplyTo([{ type: 'group', id: 'admin' }], userTarget)).toEqual([]);
+		expect(subjectsApplyTo([{ type: 'obotGroup', id: 'engineering' }], userTarget)).toEqual([]);
 	});
 
 	it('matches everyone and the group itself for a group target', () => {
@@ -127,6 +139,23 @@ describe('collectAccessResources', () => {
 			false
 		);
 	});
+
+	it('expands an everything grant into each catalog resource', () => {
+		const everything = policy('policy-all', 'All', [{ type: 'selector', id: '*' }]);
+		const specific = policy('policy-one', 'One', [{ type: 'model', id: 'model-1' }]);
+
+		const resources = collectAccessResources([everything, specific], describeResource, [
+			{ type: 'model', id: 'model-2' },
+			{ type: 'model', id: 'model-1' }
+		]);
+
+		expect(resources.map((resource) => resource.id)).toEqual(['model-1', 'model-2']);
+		expect(resources[0]?.policies.map((granting) => granting.id)).toEqual([
+			'policy-one',
+			'policy-all'
+		]);
+		expect(resources[1]?.policies.map((granting) => granting.id)).toEqual(['policy-all']);
+	});
 });
 
 describe('groupMcpAccessPolicies', () => {
@@ -188,7 +217,6 @@ describe('loadCurrentAccess', () => {
 		]);
 		const listModels = vi.spyOn(AdminService, 'listModelAccessPolicies');
 		const listSkills = vi.spyOn(AdminService, 'listSkillAccessPolicies');
-		const listHosted = vi.spyOn(AdminService, 'listHostedAgentAccessPolicies');
 		const listVmcps = vi.spyOn(AdminService, 'listAllVMCPs');
 
 		const mcp = await loadCurrentAccess(userTarget, 'mcp');
@@ -198,11 +226,8 @@ describe('loadCurrentAccess', () => {
 		expect(mcp[1]?.powerUserID).toBe('owner-1');
 		expect(listModels).not.toHaveBeenCalled();
 		expect(listSkills).not.toHaveBeenCalled();
-		expect(listHosted).not.toHaveBeenCalled();
 		expect(listVmcps).not.toHaveBeenCalled();
-		expect(hasAnyCurrentAccess({ mcp, models: [], skills: [], hostedAgents: [], vmcps: [] })).toBe(
-			true
-		);
+		expect(hasAnyCurrentAccess({ mcp, models: [], skills: [], vmcps: [] })).toBe(true);
 	});
 
 	it('normalizes the resources each policy grants', async () => {
@@ -276,9 +301,46 @@ describe('loadCurrentAccess', () => {
 			}
 		]);
 		expect(listMcp).not.toHaveBeenCalled();
-		expect(hasAnyCurrentAccess({ mcp: [], models: [], skills: [], hostedAgents: [], vmcps })).toBe(
-			true
-		);
+		expect(hasAnyCurrentAccess({ mcp: [], models: [], skills: [], vmcps })).toBe(true);
+	});
+
+	it('includes admin-created vMCPs and personal vMCPs the user owns', async () => {
+		vi.spyOn(AdminService, 'listAllVMCPs').mockResolvedValue([
+			createVMCP({
+				id: 'vmcp-shared',
+				displayName: 'Shared vMCP',
+				creatorUserID: 'user-1',
+				profiles: [
+					{
+						name: 'default',
+						subjects: [{ type: 'obotGroup', id: 'admin' }],
+						vmcpPermissions: { allowAllComponents: true }
+					}
+				]
+			}),
+			createVMCP({ id: 'vmcp-personal', displayName: 'Personal', userID: 'user-1' }),
+			createVMCP({ id: 'vmcp-someone-else', displayName: 'Not Mine', userID: 'user-2' })
+		]);
+
+		const vmcps = await loadCurrentAccess(userTarget, 'vmcps');
+
+		expect(vmcps).toEqual([
+			{
+				id: 'vmcp-shared:default',
+				displayName: 'default',
+				href: '/vmcps/vmcp-shared?view=profiles',
+				reasons: ['via-role'],
+				resources: [{ type: 'vmcp', id: 'vmcp-shared', name: 'Shared vMCP' }]
+			},
+			{
+				id: 'vmcp-personal:owner',
+				displayName: 'Personal vMCP',
+				href: '/vmcps/vmcp-personal',
+				reasons: ['owner'],
+				resources: [{ type: 'vmcp', id: 'vmcp-personal', name: 'Personal' }]
+			}
+		]);
+		expect(await loadCurrentAccess(groupTarget, 'vmcps')).toEqual([]);
 	});
 
 	it('rejects when the requested view fails', async () => {

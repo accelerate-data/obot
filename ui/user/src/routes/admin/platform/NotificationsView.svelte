@@ -4,6 +4,7 @@
 	import MarkdownInput from '$lib/components/MarkdownInput.svelte';
 	import Select from '$lib/components/Select.svelte';
 	import { PAGE_TRANSITION_DURATION } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import { AdminService, type AppNotification, type BannerType } from '$lib/services';
 	import { profile, appNotification as appNotificationStore } from '$lib/stores';
 	import { defaultAppNotification } from '$lib/stores/appNotification.svelte';
@@ -28,13 +29,37 @@
 		};
 	}
 
-	let { appNotification: initialAppNotification }: { appNotification: AppNotification } = $props();
+	let {
+		appNotification: initialAppNotification,
+		saving = false,
+		dirty = $bindable(false)
+	}: {
+		appNotification: AppNotification;
+		saving?: boolean;
+		dirty?: boolean;
+	} = $props();
+	let persisted = $state(untrack(() => withBanner(initialAppNotification)));
 	let appNotification = $state(untrack(() => withBanner(initialAppNotification)));
 
 	const duration = PAGE_TRANSITION_DURATION;
-	let saving = $state(false);
 	let bannerTextValidationError = $state<string | null>(null);
+	function bannerKey(notification: EditableAppNotification) {
+		const banner = notification.banner;
+		return JSON.stringify({
+			dismissible: banner.dismissible,
+			enabled: banner.enabled,
+			resetDismissed: banner.resetDismissed,
+			text: banner.text ?? '',
+			type: banner.type
+		});
+	}
+
 	let isAdminReadonly = $derived(profile.current.isAdminReadonly?.());
+	let isDirty = $derived(bannerKey(appNotification) !== bannerKey(persisted));
+
+	$effect(() => {
+		if (dirty !== isDirty) dirty = isDirty;
+	});
 
 	function hasOnlyAllowedMarkdown(text: string) {
 		const disallowedPatterns = [
@@ -76,16 +101,16 @@
 		return true;
 	}
 
-	function validate(banner: EditableAppNotification['banner']) {
+	export function validate() {
+		const banner = appNotification.banner;
 		const text = banner.text?.trim() ?? '';
 		if ((!text || !banner.type) && banner.enabled) {
-			bannerTextValidationError = 'This field is required.';
+			bannerTextValidationError = m.platform_field_required();
 			return false;
 		}
 
 		if (!hasOnlyAllowedMarkdown(text)) {
-			bannerTextValidationError =
-				'Only simple formatting and HTTP(S) text links are supported (bold, italic, strikethrough, and [text](url)).';
+			bannerTextValidationError = m.platform_settings_notifications_markdown_invalid();
 			return false;
 		}
 
@@ -93,34 +118,38 @@
 		return true;
 	}
 
-	async function handleSave() {
-		if (!validate(appNotification.banner)) {
-			return;
-		}
-
+	export function reset() {
+		appNotification = withBanner(persisted);
 		bannerTextValidationError = null;
-		saving = true;
+	}
+
+	export async function save() {
+		if (!validate()) return false;
+
 		try {
 			const response = await AdminService.updateAppNotification(appNotification);
+			const next = withBanner(response);
+			persisted = next;
+			appNotification = withBanner(response);
 			appNotificationStore.initialize(response);
-			success.add('App notification updated successfully.');
+			success.add(m.platform_settings_notifications_updated());
+			return true;
 		} catch (_err) {
 			// errors are surfaced via the global HTTP error handling (errors store)
-		} finally {
-			saving = false;
+			return false;
 		}
 	}
 </script>
 
-<div class="relative h-full w-full @container flex flex-col gap-4" in:fade={{ duration }}>
+<div class="relative h-full w-full @container flex flex-col gap-2" in:fade={{ duration }}>
 	<div class="paper gap-0.5">
 		<div>
-			<p class="text-sm font-medium mb-2">Banner Preview</p>
+			<p class="text-sm font-medium mb-2">{m.platform_settings_notifications_banner_preview()}</p>
 
 			<div class="w-full mb-4">
 				<AppNotificationBanner
 					data={appNotification.banner}
-					placeholder="[insert text to display here]"
+					placeholder={m.platform_settings_notifications_banner_placeholder()}
 				/>
 			</div>
 
@@ -128,19 +157,20 @@
 
 			<div class="flex flex-col gap-4">
 				<div class="flex items-center gap-4">
-					<label for="banner-type-selector" class="text-sm font-light">Type</label>
+					<label for="banner-type-selector" class="text-sm font-light shrink-0"
+						>{m.core_type()}</label
+					>
 					<div class="w-full">
 						<Select
 							id="banner-type-selector"
-							class="bg-base-200 dark:bg-base-100 dark:border-base-400 flex-1 border border-transparent shadow-none"
 							selected={appNotification.banner.type}
 							onSelect={(selected) => {
 								appNotification.banner.type = selected.id as BannerType;
 							}}
-							disabled={isAdminReadonly}
+							disabled={isAdminReadonly || saving}
 							options={[
-								{ id: 'info', label: 'Info' },
-								{ id: 'warning', label: 'Warning' }
+								{ id: 'info', label: m.platform_settings_notifications_info() },
+								{ id: 'warning', label: m.platform_branding_warning() }
 							]}
 						/>
 					</div>
@@ -153,17 +183,18 @@
 							bannerTextValidationError && 'text-error'
 						)}
 					>
-						Text <InfoTooltip text="Supports simple markdown formatting and text URL links." />
+						{m.platform_branding_text()}
+						<InfoTooltip text={m.platform_settings_notifications_text_help()} />
 					</p>
 					<MarkdownInput
 						bind:value={appNotification.banner.text}
 						class={twMerge(
-							'min-h-[120px]',
+							'min-h-30',
 							bannerTextValidationError && 'ring-2 ring-error border-error'
 						)}
 						classes={{ input: 'min-h-[120px]' }}
-						placeholder="Add banner text. Supports simple formatting and [text](https://example.com) links."
-						disabled={isAdminReadonly}
+						placeholder={m.platform_settings_notifications_text_placeholder()}
+						disabled={isAdminReadonly || saving}
 						disablePreview
 					/>
 					{#if bannerTextValidationError}
@@ -173,13 +204,11 @@
 				<div class="divider my-0"></div>
 				<label for="dismiss-banner-toggle" class="flex items-center justify-between">
 					<div>
-						<p class="text-sm font-light">Dismissible</p>
+						<p class="text-sm font-light">{m.platform_settings_notifications_dismissible()}</p>
 						<p class="text-xs font-light text-muted-content mb-2">
-							The banner is {appNotification.banner.dismissible
-								? 'dismissible'
-								: 'not dismissible'}. {appNotification.banner.dismissible
-								? 'The user can dismiss the banner and it will not appear again for their device.'
-								: 'The banner will stay visible and cannot be hidden by the user.'}
+							{appNotification.banner.dismissible
+								? m.platform_settings_notifications_dismissible_on()
+								: m.platform_settings_notifications_dismissible_off()}
 						</p>
 					</div>
 					<input
@@ -187,15 +216,14 @@
 						type="checkbox"
 						class="toggle toggle-sm"
 						bind:checked={appNotification.banner.dismissible}
-						disabled={isAdminReadonly}
+						disabled={isAdminReadonly || saving}
 					/>
 				</label>
 				<label for="reset-dismissed-toggle" class="flex items-center justify-between">
 					<div>
-						<p class="text-sm font-light">Reset Dismissed</p>
+						<p class="text-sm font-light">{m.platform_settings_notifications_reset_dismissed()}</p>
 						<p class="text-xs font-light text-muted-content mb-2">
-							When enabled, the dismissed banner is shown again for users. They can dismiss the
-							banner again after it is shown.
+							{m.platform_settings_notifications_reset_dismissed_description()}
 						</p>
 					</div>
 					<input
@@ -203,16 +231,15 @@
 						type="checkbox"
 						class="toggle toggle-sm"
 						bind:checked={appNotification.banner.resetDismissed}
-						disabled={isAdminReadonly || !appNotification.banner.dismissible}
+						disabled={isAdminReadonly || saving || !appNotification.banner.dismissible}
 					/>
 				</label>
 
 				<label for="enable-banner" class="w-full flex items-start justify-between gap-4">
 					<div class="text-sm">
-						<p>Enable Banner</p>
+						<p>{m.platform_settings_notifications_enable_banner()}</p>
 						<p class="text-xs font-light text-muted-content mb-2">
-							Enabling the banner will display it at the top of the page across all pages (except
-							agents, if enabled).
+							{m.platform_settings_notifications_enable_banner_description()}
 						</p>
 					</div>
 					<input
@@ -220,7 +247,7 @@
 						class="toggle toggle-sm"
 						bind:checked={appNotification.banner.enabled}
 						id="enable-banner"
-						disabled={isAdminReadonly}
+						disabled={isAdminReadonly || saving}
 						onclick={() => {
 							bannerTextValidationError = null;
 						}}
@@ -229,26 +256,4 @@
 			</div>
 		</div>
 	</div>
-	<div class="flex grow"></div>
-	{#if !isAdminReadonly}
-		<div
-			class="bg-base-200 text-muted-content dark:bg-base-100 sticky bottom-0 left-0 z-50 flex w-full justify-end gap-2 py-4"
-		>
-			<div class="flex w-full justify-end gap-2">
-				<button
-					class="btn btn-secondary text-sm"
-					onclick={() => {
-						appNotification = withBanner(appNotificationStore.current ?? initialAppNotification);
-						bannerTextValidationError = null;
-					}}
-					disabled={saving}
-				>
-					Cancel
-				</button>
-				<button class="btn btn-primary text-sm" disabled={saving} onclick={handleSave}>
-					Save
-				</button>
-			</div>
-		</div>
-	{/if}
 </div>

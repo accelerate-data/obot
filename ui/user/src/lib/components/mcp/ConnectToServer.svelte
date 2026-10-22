@@ -1,6 +1,7 @@
 <script lang="ts">
-	import { dialogAnimation } from '$lib/actions/dialogAnimation';
+	import McpLocalAuth from '$lib/components/mcp/McpLocalAuth.svelte';
 	import { DEFAULT_MCP_CATALOG_ID } from '$lib/constants';
+	import { m } from '$lib/i18n';
 	import {
 		AdminService,
 		UserService,
@@ -12,6 +13,7 @@
 		Group
 	} from '$lib/services';
 	import { EventStreamService } from '$lib/services/admin/eventstream.svelte';
+	import { isMcpLoginURL } from '$lib/services/user/mcp';
 	import {
 		convertEnvHeadersToRecord,
 		getSecretBindingEngineError,
@@ -27,15 +29,12 @@
 	import { errors, mcpServersAndEntries, profile, version } from '$lib/stores';
 	import { goto } from '$lib/url';
 	import Confirm from '../Confirm.svelte';
-	import CopyField from '../CopyField.svelte';
 	import DotDotDot from '../DotDotDot.svelte';
 	import ResponsiveDialog from '../ResponsiveDialog.svelte';
 	import SelectMcpAccessControlRules from '../admin/SelectMcpAccessControlRules.svelte';
-	import IconButton from '../primitives/IconButton.svelte';
 	import CatalogConfigureForm, { type LaunchFormData } from './CatalogConfigureForm.svelte';
-	import HowToConnect from './HowToConnect.svelte';
 	import McpDeprecatedNotice from './McpDeprecatedNotice.svelte';
-	import { Server, X, CircleAlert } from '@lucide/svelte';
+	import { Server, CircleAlert } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import { twMerge } from 'tailwind-merge';
@@ -50,24 +49,7 @@
 		catalogID?: string;
 		workspaceID?: string;
 		onConnect?: (result: ConnectionResult) => void;
-		onEdit?: ({
-			server,
-			entry,
-			instance
-		}: {
-			server?: MCPCatalogServer;
-			entry?: MCPCatalogEntry;
-			instance?: MCPServerInstance;
-		}) => void;
-		onReauthenticate?: ({
-			server,
-			entry
-		}: {
-			server?: MCPCatalogServer;
-			entry?: MCPCatalogEntry;
-		}) => void;
 		onClose?: () => void;
-		skipConnectDialog?: boolean;
 		renderIntroText?: ({
 			entry,
 			server
@@ -78,17 +60,7 @@
 		introTitle?: string;
 	}
 
-	let {
-		catalogID,
-		workspaceID,
-		onConnect,
-		onClose,
-		onEdit,
-		onReauthenticate,
-		skipConnectDialog,
-		renderIntroText,
-		introTitle
-	}: Props = $props();
+	let { catalogID, workspaceID, onConnect, onClose, renderIntroText, introTitle }: Props = $props();
 
 	let server = $state<MCPCatalogServer>();
 	let entry = $state<MCPCatalogEntry>();
@@ -114,23 +86,8 @@
 			? undefined
 			: getSecretBindingEngineError(manifest)
 	);
-	let isLaunchable = $derived(
-		(entry && !isMultiUserCatalogEntry(entry) && !server) ||
-			(!instance && server && hasMultiUserInstanceConfiguration(server))
-	);
-	let isEditable = $derived(
-		(entry && !isMultiUserCatalogEntry(entry) && hasEditableConfiguration(entry) && server) ||
-			(server && instance && hasMultiUserInstanceConfiguration(server))
-	);
-	let isReauthenticatable = $derived(
-		server?.manifest.runtime === 'remote' &&
-			Object.keys(server.oauthMetadata ?? {}).length > 0 &&
-			!hasEditableConfiguration(server)
-	);
-
 	let showIntroDialog = $state(false);
 
-	let connectDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let configDialog = $state<ReturnType<typeof CatalogConfigureForm>>();
 	let configureForm = $state<LaunchFormData>();
 	let configureFormTitle = $state<string>();
@@ -172,7 +129,7 @@
 				dontLogErrors: true
 			});
 		} catch (err) {
-			errors.append(`Failed to load Kubernetes Secrets for binding: ${err}`);
+			errors.append(m.mcps_deployments_secret_targets_load_failed({ error: String(err) }));
 			secretBindingTargets = [];
 		} finally {
 			secretBindingTargetsLoaded = true;
@@ -180,9 +137,10 @@
 		}
 	}
 
-	let oauthDialog = $state<HTMLDialogElement>();
+	let oauthDialog = $state<ReturnType<typeof ResponsiveDialog>>();
 	let oauthURL = $state<string>('');
 	let oauthVerifying = $state(false);
+	let oauthChecking = $state(false);
 
 	let selectRulesDialog = $state<ReturnType<typeof SelectMcpAccessControlRules>>();
 
@@ -192,15 +150,6 @@
 			.filter(Boolean)
 			.map((name) => name.toLowerCase())
 	);
-
-	let howToConnect = $state<ReturnType<typeof HowToConnect>>();
-	let connectionUrlField = $state<ReturnType<typeof CopyField>>();
-
-	function handleOnClose() {
-		howToConnect?.resetCopied();
-		connectionUrlField?.clear();
-		onClose?.();
-	}
 
 	function notifyConnected(skipOnConnect = false) {
 		const result = { server, entry, instance };
@@ -213,25 +162,9 @@
 	function handleConnect(skipOnConnect?: boolean) {
 		launchState = undefined;
 		configDialog?.close();
-		if (!skipConnectDialog && !connectCompletion) {
-			connectDialog?.open();
-		}
 
 		notifyConnected(skipOnConnect);
-	}
-
-	export async function authenticate(item: MCPCatalogServer, parentEntry?: MCPCatalogEntry) {
-		connectCompletion = undefined;
-		server = item;
-		entry = parentEntry;
-		instance = undefined;
-		oauthVerifying = false;
-		oauthURL = await getOauthURL();
-		if (oauthURL) {
-			oauthDialog?.showModal();
-		} else {
-			handleConnect();
-		}
+		onClose?.();
 	}
 
 	function getUniqueAlias(serverName: string): string | undefined {
@@ -261,13 +194,13 @@
 			envs: env.map((field) => ({
 				...field,
 				value: '',
-				isStatic: field.value !== '',
+				isStatic: Boolean(field.static) || field.value !== '',
 				secretBindingReadonly: hasSecretBinding(field)
 			})),
 			headers: headers.map((field) => ({
 				...field,
 				value: '',
-				isStatic: field.value !== '',
+				isStatic: Boolean(field.static) || field.value !== '',
 				secretBindingReadonly: hasSecretBinding(field)
 			})),
 			...(item.manifest?.remoteConfig?.hostname
@@ -337,7 +270,7 @@
 		item: MCPCatalogServer,
 		currentInstance?: MCPServerInstance
 	) {
-		configureFormTitle = 'User Specific Configuration';
+		configureFormTitle = m.mcps_connect_user_specific_configuration();
 		let values: Record<string, string> = {};
 		if (currentInstance) {
 			try {
@@ -422,7 +355,7 @@
 		];
 		if (missing.length === 0) return undefined;
 
-		return `Missing Kubernetes Secret required by this MCP server: ${missing.join(', ')}`;
+		return m.mcps_connect_missing_secret({ keys: missing.join(', ') });
 	}
 
 	async function getOauthURL() {
@@ -435,20 +368,34 @@
 	}
 
 	async function handleOauthVisibilityChange() {
-		if (!oauthURL && !oauthVerifying) return;
+		// The Continue button and the visibility listener can both fire; run one check at a time.
+		if ((!oauthURL && !oauthVerifying) || oauthChecking) return;
 		if (document.visibilityState === 'visible') {
-			oauthURL = await getOauthURL();
-			if (!oauthURL) {
-				oauthDialog?.close();
-				handleConnect();
+			oauthChecking = true;
+			const currentURL = oauthURL;
+			try {
+				const nextURL = await getOauthURL();
+				// Dismissal or a newer attempt must not complete from a stale response.
+				if (oauthURL !== currentURL) return;
+				oauthURL = nextURL;
+				if (!oauthURL) {
+					oauthDialog?.close();
+					handleConnect();
+				}
+				oauthVerifying = false;
+			} finally {
+				oauthChecking = false;
 			}
-			oauthVerifying = false;
 		}
 	}
 
+	function handleOauthTabReturn() {
+		if (!isMcpLoginURL(oauthURL)) void handleOauthVisibilityChange();
+	}
+
 	function ensureOauthVisibilityListener() {
-		document.removeEventListener('visibilitychange', handleOauthVisibilityChange);
-		document.addEventListener('visibilitychange', handleOauthVisibilityChange);
+		document.removeEventListener('visibilitychange', handleOauthTabReturn);
+		document.addEventListener('visibilitychange', handleOauthTabReturn);
 	}
 
 	async function verifyOauthOrConnect() {
@@ -461,7 +408,7 @@
 			launchProgress = 0;
 			if (oauthURL) {
 				configDialog?.close();
-				oauthDialog?.showModal();
+				oauthDialog?.open();
 			} else {
 				handleConnect();
 			}
@@ -502,7 +449,7 @@
 			const configuredResponse = server;
 			await validateConfiguredServerAndConnect(configuredResponse);
 		} catch (err) {
-			launchError = err instanceof Error ? err.message : 'An unknown error occurred';
+			launchError = err instanceof Error ? err.message : m.mcps_unknown_error();
 		} finally {
 			clearTimeout(timeout1);
 			clearTimeout(timeout2);
@@ -541,7 +488,7 @@
 			server = response;
 		} catch (err) {
 			console.error('error: ', err);
-			launchError = err instanceof Error ? err.message : 'An unknown error occurred';
+			launchError = err instanceof Error ? err.message : m.mcps_unknown_error();
 		}
 
 		if (response) {
@@ -554,7 +501,7 @@
 				);
 				await validateConfiguredServerAndConnect(configuredResponse);
 			} catch (err) {
-				launchError = err instanceof Error ? err.message : 'An unknown error occurred';
+				launchError = err instanceof Error ? err.message : m.mcps_unknown_error();
 			} finally {
 				clearTimeout(timeout1);
 				clearTimeout(timeout2);
@@ -575,14 +522,14 @@
 			instance = response;
 			await finishMultiUserServerConnect();
 		} catch (err) {
-			error = err instanceof Error ? err.message : 'An unknown error occurred';
+			error = err instanceof Error ? err.message : m.mcps_unknown_error();
 		}
 	}
 
 	async function handleLaunchMultiUserCatalogEntry() {
 		if (!entry) return;
 		if (!catalogID && !workspaceID) {
-			error = 'A catalog or workspace is required to deploy a multi-user catalog entry.';
+			error = m.mcps_connect_catalog_required();
 			return;
 		}
 
@@ -657,7 +604,7 @@
 				notifyConnected();
 			}
 		} catch (err) {
-			launchError = err instanceof Error ? err.message : 'An unknown error occurred';
+			launchError = err instanceof Error ? err.message : m.mcps_unknown_error();
 			launchMissingSecretBinding = launchError.includes('secret binding');
 			if (created && !launchHandedOff) {
 				try {
@@ -682,7 +629,7 @@
 	async function finishMultiUserServerConnect() {
 		oauthURL = await getOauthURL();
 		if (oauthURL) {
-			oauthDialog?.showModal();
+			oauthDialog?.open();
 		} else {
 			handleConnect();
 		}
@@ -772,7 +719,7 @@
 				configDialog?.close();
 				await finishMultiUserServerConnect();
 			} catch (err) {
-				error = err instanceof Error ? err.message : 'An unknown error occurred';
+				error = err instanceof Error ? err.message : m.mcps_unknown_error();
 			} finally {
 				saving = false;
 			}
@@ -890,13 +837,8 @@
 
 		if (server && instance && configureInstance && hasMultiUserInstanceConfiguration(server)) {
 			initMultiUserInstanceForm(server, instance);
-		} else if (
-			entry?.connectURL ||
-			server?.connectURL ||
-			(entry && server) ||
-			(server && instance)
-		) {
-			connectDialog?.open();
+		} else if ((entry && server) || (server && instance)) {
+			handleConnect();
 		} else {
 			showIntroDialog = true;
 		}
@@ -906,13 +848,6 @@
 		oauthDialog?.close();
 		oauthURL = '';
 		handleConnect();
-	}
-
-	function generateIdFromName(name: string) {
-		return name
-			.toLowerCase()
-			.replace(/ /g, '-')
-			.replace(/[^a-z0-9-_]/g, '');
 	}
 
 	function isEditableCatalogEntry(entry?: MCPCatalogEntry) {
@@ -927,7 +862,7 @@
 	onMount(() => {
 		ensureOauthVisibilityListener();
 		return () => {
-			document.removeEventListener('visibilitychange', handleOauthVisibilityChange);
+			document.removeEventListener('visibilitychange', handleOauthTabReturn);
 		};
 	});
 </script>
@@ -948,68 +883,13 @@
 	{/if}
 {/snippet}
 
-<ResponsiveDialog
-	bind:this={connectDialog}
-	animate="slide"
-	onClose={handleOnClose}
-	id="connect-to-server-dialog"
->
-	{#snippet titleContent()}
-		{@render dialogTitle(server || entry)}
-		<McpDeprecatedNotice {deprecated} />
-	{/snippet}
-
-	{#if entry?.connectURL || server?.connectURL || instance?.connectURL}
-		{@const url = instance?.connectURL || server?.connectURL || entry?.connectURL}
-		{@const displayName = getMCPDisplayName(server, entry?.manifest?.name ?? '')}
-		{#if url}
-			<div id="connection-url-container" class="flex flex-col gap-3 md:p-0 pb-0 p-4">
-				<McpDeprecatedNotice {deprecated} variant="notification" />
-				<CopyField
-					bind:this={connectionUrlField}
-					value={url}
-					id="connectURL"
-					label="Connection URL"
-				/>
-			</div>
-			<HowToConnect
-				bind:this={howToConnect}
-				{url}
-				id={generateIdFromName(displayName)}
-				{displayName}
-				onLaunch={isLaunchable
-					? () => {
-							connectDialog?.close();
-							if (server && !instance && hasMultiUserInstanceConfiguration(server)) {
-								showIntroDialog = true;
-							} else if (entry) {
-								setupNewInstance(entry);
-							}
-						}
-					: undefined}
-				onEdit={onEdit && isEditable
-					? () => {
-							connectDialog?.close();
-							onEdit({ entry, server, instance });
-						}
-					: undefined}
-				onReauthenticate={onReauthenticate && isReauthenticatable
-					? () => {
-							connectDialog?.close();
-							onReauthenticate({ server, entry });
-						}
-					: undefined}
-			/>
-		{/if}
-	{/if}
-</ResponsiveDialog>
-
 <Confirm
 	show={showIntroDialog}
 	onsuccess={handleLaunchOrConfigure}
-	submitText="Continue"
+	submitText={m.core_continue()}
 	type="info"
-	title={introTitle ?? (isMultiUserCatalogEntry(entry) ? 'Launch Server' : 'Connect To Server')}
+	title={introTitle ??
+		(isMultiUserCatalogEntry(entry) ? m.mcps_servers_launch_server() : m.mcps_connect_to_server())}
 	oncancel={() => (showIntroDialog = false)}
 	hideCancelButton
 >
@@ -1029,14 +909,14 @@
 			{#if renderIntroText}
 				{renderIntroText({ entry, server })}
 			{:else if isMultiUserCatalogEntry(entry)}
-				You are about to launch a new server.
+				{m.mcps_connect_intro_launch()}
 			{:else}
-				This will begin the initial setup process for this server.
+				{m.mcps_connect_intro_setup()}
 			{/if}
 			{#if (entry && hasEditableConfiguration(entry)) || (server && hasMultiUserInstanceConfiguration(server))}
-				Additional configuration details may also be required before the server can be used.
+				{m.mcps_connect_intro_additional_config()}
 			{:else}
-				<br />Click below to begin.
+				<br />{m.mcps_connect_intro_click_below()}
 			{/if}
 		</p>
 	{/snippet}
@@ -1050,10 +930,10 @@
 	name={getMCPDisplayName(server, entry?.manifest?.name ?? '')}
 	onSave={handleConfigureForm}
 	submitText={isDeployingMultiUserCatalogEntry
-		? 'Create Server'
+		? m.mcps_servers_actions_create_server()
 		: isConfigured
-			? 'Update'
-			: 'Launch'}
+			? m.core_update()
+			: m.mcps_catalog_launch()}
 	loading={saving || launchState === 'launching'}
 	disableSave={!!secretBindingEngineError}
 	isNew={!isConfigured}
@@ -1070,24 +950,22 @@
 					<div class="notification-error">
 						<div class="flex items-center gap-2">
 							<CircleAlert class="size-5 text-error" />
-							<h4 class="text-md font-medium">MCP Server Launch Failed</h4>
+							<h4 class="text-md font-medium">{m.mcps_deployments_launch_failed_title()}</h4>
 						</div>
 
 						<div class="text-xs mt-2">
-							There was an issue launching the MCP server. Launch logs, if available, will be
-							provided below.
+							{m.mcps_connect_launch_issue()}
 
 							<ul class="list-disc px-4 py-1 space-y-1">
 								{#if isEditableCatalogEntry(entry)}
-									<li>Verify your configurations provided at launch are correct and try again.</li>
+									<li>{m.mcps_connect_verify_launch_config()}</li>
 								{/if}
 								{#if canModifyCatalogEntry}
 									<li>
-										Verify your catalog entry configurations consist of all necessary information to
-										properly configure the server.
+										{m.mcps_connect_verify_entry_config()}
 									</li>
 								{/if}
-								<li>If the issue persists, please contact support.</li>
+								<li>{m.mcps_connect_contact_support()}</li>
 							</ul>
 						</div>
 					</div>
@@ -1111,7 +989,7 @@
 									onclick={handleCancelLaunch}
 									class="flex grow items-center justify-center btn btn-secondary rounded-r-none!"
 								>
-									Cancel and Delete Server
+									{m.mcps_connect_cancel_and_delete()}
 								</button>
 							{:else}
 								<button
@@ -1123,7 +1001,7 @@
 										configDialog?.close();
 									}}
 								>
-									Close
+									{m.core_close()}
 								</button>
 							{/if}
 							<DotDotDot
@@ -1142,7 +1020,7 @@
 											toggle(false);
 										}}
 									>
-										Update Configuration and Try Again
+										{m.mcps_deployments_launch_update_and_retry()}
 									</button>
 									<button
 										class="menu-button"
@@ -1153,7 +1031,7 @@
 											toggle(false);
 										}}
 									>
-										Go to Catalog Entry
+										{m.mcps_connect_go_to_entry()}
 									</button>
 								{/snippet}
 							</DotDotDot>
@@ -1171,7 +1049,7 @@
 										saving = false;
 									}}
 								>
-									Update Configuration and Try Again
+									{m.mcps_deployments_launch_update_and_retry()}
 								</button>
 							{/if}
 							{#if server}
@@ -1179,7 +1057,7 @@
 									class="btn btn-secondary w-full md:w-1/2 md:flex-1"
 									onclick={handleCancelLaunch}
 								>
-									Cancel and Delete Server
+									{m.mcps_connect_cancel_and_delete()}
 								</button>
 							{:else}
 								<button
@@ -1191,7 +1069,7 @@
 										configDialog?.close();
 									}}
 								>
-									Close
+									{m.core_close()}
 								</button>
 							{/if}
 						</div>
@@ -1211,7 +1089,7 @@
 					</div>
 
 					<div class="flex w-md flex-col justify-center gap-2 text-center">
-						<p class="text-xs font-light">Launching MCP server...</p>
+						<p class="text-xs font-light">{m.mcps_deployments_launching_server()}</p>
 					</div>
 				</div>
 			{/if}
@@ -1219,57 +1097,64 @@
 	{/snippet}
 </CatalogConfigureForm>
 
-<dialog bind:this={oauthDialog} class="dialog" use:dialogAnimation={{ type: 'slide' }}>
-	<div class="dialog-container md:w-sm">
-		<div class="flex flex-col gap-4 p-4">
-			{#if oauthURL}
-				<div class="absolute top-2 right-2">
-					<IconButton onclick={handleOauthClose}>
-						<X class="size-4" />
-					</IconButton>
-				</div>
-				<div class="flex items-center gap-2">
-					<div class="h-fit shrink-0 self-start rounded-md bg-base-200 p-1 dark:bg-base-300">
-						{#if server?.manifest.icon}
-							<img src={server?.manifest.icon} alt={getMCPDisplayName(server)} class="size-6" />
-						{:else}
-							<Server class="size-6" />
-						{/if}
-					</div>
-					<h3 class="text-lg leading-5.5 font-semibold">
-						{getMCPDisplayName(server)}
-					</h3>
-				</div>
-
-				<p>
-					In order to use {getMCPDisplayName(server)}, authentication with the MCP server is
-					required.
-				</p>
-
-				<p>Click the link below to authenticate.</p>
+<ResponsiveDialog
+	bind:this={oauthDialog}
+	animate="slide"
+	classes={{ header: 'mb-0' }}
+	onClose={() => {
+		if (oauthURL) handleOauthClose();
+	}}
+>
+	{#snippet titleContent()}
+		<div class="flex min-w-0 items-center gap-2">
+			<div class="bg-base-200 rounded-sm p-1 dark:bg-base-300">
+				{#if server?.manifest.icon}
+					<img src={server.manifest.icon} alt={getMCPDisplayName(server)} class="size-8" />
+				{:else}
+					<Server class="size-8" />
+				{/if}
+			</div>
+			{getMCPDisplayName(server)}
+		</div>
+	{/snippet}
+	<div
+		class={isMcpLoginURL(oauthURL)
+			? 'flex min-w-0 flex-col gap-4'
+			: 'flex min-w-0 flex-col gap-4 p-4 md:p-0'}
+	>
+		{#if oauthURL}
+			{#if !isMcpLoginURL(oauthURL)}<p class="text-sm">
+					{m.mcps_connect_oauth_required({ name: getMCPDisplayName(server) })}
+				</p>{/if}
+			{#if isMcpLoginURL(oauthURL)}
+				<McpLocalAuth
+					url={oauthURL}
+					serverName={getMCPDisplayName(server, entry?.manifest?.name ?? '')}
+					onComplete={handleOauthVisibilityChange}
+					loading={oauthChecking}
+				/>
+			{:else}
+				<p>{m.mcps_connect_oauth_click_link()}</p>
 
 				<a
 					href={oauthURL}
 					rel="external noopener noreferrer"
 					target="_blank"
-					class="btn btn-primary text-center text-sm outline-none"
+					class="btn btn-primary self-end text-center text-sm outline-none"
 					onclick={() => {
 						oauthVerifying = true;
 					}}
 				>
 					{#if oauthVerifying}
-						Authenticating...
+						{m.mcps_oauth_authenticating()}
 					{:else}
-						Authenticate
+						{m.mcps_oauth_authenticate()}
 					{/if}
 				</a>
 			{/if}
-		</div>
+		{/if}
 	</div>
-	<form class="dialog-backdrop">
-		<button type="button" aria-label="Close dialog" onclick={handleOauthClose}>close</button>
-	</form>
-</dialog>
+</ResponsiveDialog>
 
 <SelectMcpAccessControlRules
 	bind:this={selectRulesDialog}

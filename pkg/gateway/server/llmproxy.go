@@ -38,9 +38,6 @@ import (
 
 const (
 	tokenUsageTimePeriod = 24 * time.Hour
-
-	internalRequestTypeHeader = "X-Nanobot-Internal-Request-Type"
-	threadTitleRequestType    = "nanobot.summary.thread_title"
 )
 
 var (
@@ -163,22 +160,7 @@ func copyBody(body *io.ReadCloser) ([]byte, error) {
 
 func (r *responseModifier) modifyResponse(resp *http.Response) error {
 	if isModelsListRequest(resp.Request) {
-		// Which authority applies is decided the same way the inference path
-		// decides it, or the list contradicts the requests it describes: a
-		// hosted agent evaluated against its owner's policies is told it may
-		// use nothing while every call it makes succeeds. A client that picks
-		// its model by listing -- Claude Code does -- then refuses to run at
-		// all against models it is in fact authorized for.
-		var (
-			allowedTargetModels map[string]bool
-			allowAllModels      bool
-			err                 error
-		)
-		if agentModels, isAgent := principal.AuthorizedModelIDs(r.user); isAgent {
-			allowedTargetModels, allowAllModels, err = r.mapHelper.GetAgentAllowedTargetModels(agentModels, r.modelProvider, string(r.routeDialect))
-		} else {
-			allowedTargetModels, allowAllModels, err = r.mapHelper.GetUserAllowedTargetModels(r.user, r.modelProvider, string(r.routeDialect))
-		}
+		allowedTargetModels, allowAllModels, err := r.mapHelper.GetUserAllowedTargetModels(r.user, r.modelProvider, string(r.routeDialect))
 		if err != nil {
 			return fmt.Errorf("failed to determine accessible models: %w", err)
 		}
@@ -420,7 +402,7 @@ func (r *responseModifier) streamAndEvaluateToolCalls(ctx context.Context, pw *i
 // Text delta chunks are forwarded immediately; once the first tool_call chunk appears,
 // all remaining lines are buffered until the stream ends. After policy evaluation,
 // the buffered lines (including tool calls) are forwarded unmodified, and a violation
-// marker is injected if a policy was violated. The downstream client (nanobot) detects
+// marker is injected if a policy was violated. A downstream client that understands it detects
 // this marker and returns error tool_results instead of executing the tools.
 func (r *responseModifier) streamAndEvaluateToolCallsSSE(ctx context.Context, pw *io.PipeWriter) {
 	var (
@@ -516,7 +498,7 @@ func (r *responseModifier) streamAndEvaluateToolCallsSSE(ctx context.Context, pw
 	}
 
 	// Violation — forward tool calls (to keep conversation history valid)
-	// and inject a violation marker that nanobot can detect.
+	// and inject a violation marker that clients can detect.
 	var explanations []string
 	for _, v := range violations {
 		explanations = append(explanations, v.Explanation)
@@ -753,7 +735,7 @@ func (r *responseModifier) Close() error {
 
 func newRunTokenActivity(user kuser.Info, model string, usage types.TokenUsage) *types.RunTokenActivity {
 	activity := &types.RunTokenActivity{
-		UserID: principal.ResourceOwnerID(user),
+		UserID: user.GetUID(),
 		Model:  model,
 		Usage:  usage,
 	}
@@ -825,7 +807,6 @@ func llmRewriteRequest(u url.URL) func(*httputil.ProxyRequest) {
 		// If we forward Accept-Encoding from the client, net/http transport will not
 		// auto-decompress and token usage parsing can see compressed bytes.
 		req.Header.Del("Accept-Encoding")
-		req.Header.Del(internalRequestTypeHeader)
 	}
 }
 
@@ -1003,22 +984,12 @@ func (l *llmProviderProxy) proxy(req api.Context) (retErr error) {
 		prepared.model = model.Spec.Manifest.TargetModel
 		audit.setModel(modelProvider.Name, model.Name, prepared.model)
 
-		// A hosted agent's authority was fixed when its instance was created, so
-		// it is limited to the models configured on it rather than re-evaluated
-		// against access policies, which describe people and would not match a
-		// principal that is not one.
-		if agentModels, isAgent := principal.AuthorizedModelIDs(req.User); isAgent {
-			if !modelAllowedForAgent(agentModels, model.Name) {
-				return types2.NewErrForbidden("agent is not configured to use model %q", targetModel)
-			}
-		} else {
-			hasAccess, err := l.mapHelper.UserHasAccessToModel(req.User, model.Name)
-			if err != nil {
-				return fmt.Errorf("failed to check user access to model %q: %w", model.Name, err)
-			}
-			if !hasAccess {
-				return types2.NewErrForbidden("user does not have permission to use model %q", targetModel)
-			}
+		hasAccess, err := l.mapHelper.UserHasAccessToModel(req.User, model.Name)
+		if err != nil {
+			return fmt.Errorf("failed to check user access to model %q: %w", model.Name, err)
+		}
+		if !hasAccess {
+			return types2.NewErrForbidden("user does not have permission to use model %q", targetModel)
 		}
 
 		prepared.tokenUsageTracker = newTokenUsageTracker(*model)
@@ -1031,19 +1002,15 @@ func (l *llmProviderProxy) proxy(req api.Context) (retErr error) {
 	}
 
 	var (
-		messagePolicyHelper    = l.messagePolicyHelper
 		outputPolicies         []messagepolicy.ApplicablePolicy
 		conversationHistory    []messagepolicy.ConversationMessage
 		inputPolicyReplacement string
 	)
-	if shouldSkipMessagePolicyEnforcement(req.Request) {
-		messagePolicyHelper = nil
-	}
-	if messagePolicyHelper != nil && req.User.GetUID() != "" {
+	if l.messagePolicyHelper != nil && req.User.GetUID() != "" {
 		var bodyMap map[string]any
 		if err := json.Unmarshal(prepared.body, &bodyMap); err == nil {
 			outputPolicies, conversationHistory, inputPolicyReplacement, err = applyMessagePolicies(
-				req.Context(), messagePolicyHelper, req.User, req.GatewayClient, bodyMap, "", "",
+				req.Context(), l.messagePolicyHelper, req.User, req.GatewayClient, bodyMap, "", "",
 			)
 			if err != nil {
 				return err
@@ -1061,15 +1028,9 @@ func (l *llmProviderProxy) proxy(req api.Context) (retErr error) {
 	req.Request.Body = io.NopCloser(bytes.NewReader(prepared.body))
 	req.ContentLength = int64(len(prepared.body))
 
-	// Daily token limits are a per-person quota, and a hosted agent is not a
-	// person: its UID identifies an instance, so a user lookup would fail. Bill
-	// the owner instead, so an agent still counts against whoever created it
-	// rather than escaping accounting altogether.
-	usageUserID := principal.ResourceOwnerID(req.User)
-
 	if remainingUsage, err := req.GatewayClient.RemainingTokenUsageForUser(
 		req.Context(),
-		usageUserID,
+		req.User.GetUID(),
 		tokenUsageTimePeriod,
 		l.dailyUserInputTokenLimit,
 		l.dailyUserOutputTokenLimit,
@@ -1093,7 +1054,7 @@ func (l *llmProviderProxy) proxy(req api.Context) (retErr error) {
 		tokenUsageTracker:      prepared.tokenUsageTracker,
 		mapHelper:              l.mapHelper,
 		inputPolicyReplacement: inputPolicyReplacement,
-		messagePolicyHelper:    messagePolicyHelper,
+		messagePolicyHelper:    l.messagePolicyHelper,
 		outputPolicies:         outputPolicies,
 		conversationHistory:    conversationHistory,
 		audit:                  audit,
@@ -1185,26 +1146,4 @@ func applyMessagePolicies(
 	}
 
 	return outputPolicies, conversationHistory, inputPolicyReplacement, nil
-}
-
-func shouldSkipMessagePolicyEnforcement(req *http.Request) bool {
-	if req == nil {
-		return false
-	}
-
-	return req.Header.Get(internalRequestTypeHeader) == threadTitleRequestType
-}
-
-// modelAllowedForAgent matches a model against an agent's configured list.
-//
-// The match is literal. Alias references are expanded into concrete model IDs
-// when the agent principal is built, so anything still carrying an "obot://"
-// prefix here failed to resolve and correctly grants nothing.
-//
-// Only exact IDs and the "*" wildcard are understood. Alias references such as
-// obot://llm and wildcard suffixes are not expanded here, so an agent
-// configured solely with those cannot yet reach a model through this proxy.
-// Denying is the safe direction while that resolution is missing.
-func modelAllowedForAgent(configured []string, modelID string) bool {
-	return slices.Contains(configured, "*") || slices.Contains(configured, modelID)
 }

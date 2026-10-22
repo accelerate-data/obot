@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -50,19 +51,52 @@ type CredentialNotFoundError struct {
 // uses an advisory lock so independent Obot processes share the same lock;
 // other databases use a context-aware process-local semaphore.
 func (c *Client) AcquireCredentialLock(ctx context.Context, key string) (func(), error) {
-	if key == "" {
-		return nil, fmt.Errorf("credential lock key is required")
-	}
+	return c.AcquireCredentialLocks(ctx, key)
+}
 
+// AcquireCredentialLocks acquires a set of keys on one PostgreSQL connection,
+// so a multi-component operation cannot exhaust the dedicated lock pool. Callers
+// supply a consistent lock order: catalog mutation fence first, then sorted
+// credential keys. Duplicate keys are acquired once. Release is idempotent.
+func (c *Client) AcquireCredentialLocks(ctx context.Context, keys ...string) (func(), error) {
+	unique := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			return nil, fmt.Errorf("credential lock key is required")
+		}
+		if !slices.Contains(unique, key) {
+			unique = append(unique, key)
+		}
+	}
+	if len(unique) == 0 {
+		return func() {}, nil
+	}
 	db := c.db.WithContext(ctx)
 	if db.Name() == "postgres" {
-		lockPool, err := c.postgresCredentialLockPool(db)
+		pool, err := c.postgresCredentialLockPool(db)
 		if err != nil {
 			return nil, err
 		}
-		return acquirePostgresCredentialLock(ctx, lockPool, key)
+		return acquirePostgresCredentialLocks(ctx, pool, unique)
 	}
-	return c.acquireProcessCredentialLock(ctx, key)
+	releases := make([]func(), 0, len(unique))
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			for _, unlock := range slices.Backward(releases) {
+				unlock()
+			}
+		})
+	}
+	for _, key := range unique {
+		unlock, err := c.acquireProcessCredentialLock(ctx, key)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		releases = append(releases, unlock)
+	}
+	return release, nil
 }
 
 func (c *Client) postgresCredentialLockPool(db *gorm.DB) (*sql.DB, error) {
@@ -84,9 +118,7 @@ func (c *Client) postgresCredentialLockPool(db *gorm.DB) (*sql.DB, error) {
 	return c.credentialLockPool, c.credentialLockPoolErr
 }
 
-func acquirePostgresCredentialLock(ctx context.Context, sqlDB *sql.DB, key string) (func(), error) {
-	lockID := credentialLockID(key)
-
+func acquirePostgresCredentialLocks(ctx context.Context, sqlDB *sql.DB, keys []string) (func(), error) {
 	for {
 		conn, err := sqlDB.Conn(ctx)
 		if err != nil {
@@ -97,11 +129,18 @@ func acquirePostgresCredentialLock(ctx context.Context, sqlDB *sql.DB, key strin
 			_ = conn.Close()
 			return nil, fmt.Errorf("failed to begin credential lock transaction: %w", err)
 		}
-		var acquired bool
-		if err := tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", lockID).Scan(&acquired); err != nil {
-			_ = tx.Rollback()
-			_ = conn.Close()
-			return nil, fmt.Errorf("failed to acquire credential lock: %w", err)
+		acquired := true
+		for _, key := range keys {
+			var locked bool
+			if err := tx.QueryRowContext(ctx, "SELECT pg_try_advisory_xact_lock($1)", credentialLockID(key)).Scan(&locked); err != nil {
+				_ = tx.Rollback()
+				_ = conn.Close()
+				return nil, fmt.Errorf("failed to acquire credential lock: %w", err)
+			}
+			if !locked {
+				acquired = false
+				break
+			}
 		}
 		if acquired {
 			var release sync.Once
@@ -209,6 +248,55 @@ func (c *Client) RevealCredential(ctx context.Context, contexts []string, name s
 	}
 
 	return credential, CredentialNotFoundError{Contexts: contexts, Name: name}
+}
+
+// RevealAuthProviderCredential is RevealCredential for the credential of the auth provider namespace/name, and also
+// returns the adapter type of the provider's SCIM connection, or "" when it has none. It reads both in one query, as
+// it runs for every request that checks whether the provider is configured.
+func (c *Client) RevealAuthProviderCredential(ctx context.Context, contexts []string, namespace, name string) (types.Credential, string, error) {
+	if len(contexts) == 0 {
+		return types.Credential{}, "", CredentialNotFoundError{Contexts: contexts, Name: name}
+	}
+
+	type credentialRow struct {
+		types.Credential
+		SCIMAdapterType *string
+	}
+	var rows []credentialRow
+	if err := c.db.WithContext(ctx).Model(new(types.Credential)).
+		Select("credentials.*, (SELECT adapter_type FROM scim_connections WHERE auth_provider_namespace = ? AND auth_provider_name = ?) AS scim_adapter_type", namespace, name).
+		Where("context IN ? AND name = ?", contexts, name).
+		Scan(&rows).Error; err != nil {
+		return types.Credential{}, "", fmt.Errorf("failed to read the credential of auth provider %s/%s: %w", namespace, name, err)
+	}
+
+	// The first context that has the credential wins, as in RevealCredential.
+	for _, credentialContext := range contexts {
+		i := slices.IndexFunc(rows, func(row credentialRow) bool {
+			return row.Context == credentialContext
+		})
+		if i < 0 {
+			continue
+		}
+
+		credential := rows[i].Credential
+		if err := c.decryptCredential(ctx, &credential); err != nil {
+			return types.Credential{}, "", fmt.Errorf("failed to decrypt credential: %w", err)
+		}
+		var adapterType string
+		if rows[i].SCIMAdapterType != nil {
+			adapterType = *rows[i].SCIMAdapterType
+		}
+		return credential, adapterType, nil
+	}
+
+	return types.Credential{}, "", CredentialNotFoundError{Contexts: contexts, Name: name}
+}
+
+// HasCredential reports whether a credential with name exists in any of contexts. It does not decrypt the credential,
+// so it answers even when the credential could not be decrypted.
+func (c *Client) HasCredential(ctx context.Context, contexts []string, name string) (bool, error) {
+	return hasCredentialTx(c.db.WithContext(ctx), contexts, name)
 }
 
 // UpsertCredential creates or replaces a credential identified by context+name.
@@ -323,4 +411,16 @@ func blankCredentialSecrets(secrets map[string]string) map[string]string {
 		blank[key] = ""
 	}
 	return blank
+}
+
+func hasCredentialTx(tx *gorm.DB, contexts []string, name string) (bool, error) {
+	if len(contexts) == 0 {
+		return false, nil
+	}
+
+	var count int64
+	if err := tx.Model(new(types.Credential)).Where("context IN ? AND name = ?", contexts, name).Count(&count).Error; err != nil {
+		return false, fmt.Errorf("failed to check for credential %s: %w", name, err)
+	}
+	return count > 0, nil
 }

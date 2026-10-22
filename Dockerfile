@@ -10,6 +10,7 @@ RUN if [ "${BASE_IMAGE}" = "cgr.dev/chainguard/wolfi-base" ]; then \
   fi
 
 FROM base AS bin
+ARG OBOT_VERSION
 WORKDIR /app
 COPY . .
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
@@ -32,15 +33,20 @@ RUN apk add --no-cache postgresql-17 postgresql-17-oci-entrypoint postgresql-17-
 
 ENTRYPOINT [ "/usr/bin/docker-entrypoint.sh", "postgres" ]
 
-FROM final-base AS build-pgvector
-RUN apk add --no-cache build-base git postgresql-17-dev clang-19
-RUN git clone --branch v0.8.1 https://github.com/pgvector/pgvector.git && \
-  cd pgvector && \
-  make clean && \
-  make OPTFLAGS="" && \
-  PG_MAJOR=17 make install && \
-  cd .. && \
-  rm -rf pgvector
+# Download and verify the pinned CLI without executing it during the build.
+# Update the version and both checksums together from the release manifest.
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/wolfi-base:latest AS claude-cli
+ARG CLAUDE_CODE_VERSION=2.1.289
+ARG TARGETARCH
+RUN apk add --no-cache curl ca-certificates
+RUN case "$TARGETARCH" in \
+      amd64) arch=x64; sha256=a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348 ;; \
+      arm64) arch=arm64; sha256=d100d5e41dcbee220c80d3a3099292e4b5a508b57cafd181856efedf29f84f28 ;; \
+      *) exit 1 ;; \
+    esac \
+    && curl -fsSL "https://downloads.claude.ai/claude-code-releases/${CLAUDE_CODE_VERSION}/linux-${arch}/claude" -o /claude \
+    && echo "$sha256  /claude" | sha256sum -c - \
+    && chmod 755 /claude
 
 FROM ${PROVIDERS_IMAGE} AS providers
 # The enterprise-providers image is scratch-based (no /bin/sh) and already
@@ -50,15 +56,19 @@ FROM ${ENTERPRISE_PROVIDERS_IMAGE} AS enterprise-providers
 FROM ${ENCRYPTION_BINS_IMAGE} AS encryption-bins
 
 FROM final-base AS final
+RUN apk add --no-cache bash tini python3 libstdc++ libgcc ca-certificates
+
+COPY --from=claude-cli /claude /usr/local/bin/claude
+COPY runtime/claude-orchestrator/spawn.py /opt/obot/spawn.py
+COPY --chmod=0755 runtime/claude-orchestrator/spawn-runner /opt/obot/hooks/spawn-runner
+
 ENV POSTGRES_USER=obot
 ENV POSTGRES_PASSWORD=obot
 ENV POSTGRES_DB=obot
 ENV PGDATA=/data/postgresql
 
-COPY --from=build-pgvector /usr/lib/postgresql17/vector.so /usr/lib/postgresql17/
-COPY --from=build-pgvector /usr/share/postgresql17/extension/vector* /usr/share/postgresql17/extension/
 
-RUN apk add --no-cache git npm nodejs-24 bash tini procps libreoffice docker perl-utils sqlite sqlite-dev curl kubectl jq
+RUN apk add --no-cache git npm nodejs-24 bash tini procps docker perl-utils sqlite sqlite-dev curl kubectl jq
 
 ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/accelerate-data/mcp-catalog
 ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog/v2-schema
@@ -76,7 +86,6 @@ RUN /combine-envrc.sh && rm /combine-envrc.sh
 COPY --from=encryption-bins /bin/*-encryption-provider /bin/
 COPY --from=bin /app/bin/obot /bin/
 
-ENV PATH=$PATH:/usr/lib/libreoffice/program
 
 ENV HOME=/data
 ENV XDG_CACHE_HOME=/data/cache

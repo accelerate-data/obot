@@ -23,6 +23,13 @@ describe('local login page', () => {
 		await expect.element(page.getByCSS('input[name="rd"]')).toHaveValue(rd);
 	});
 
+	it('focuses the email input on load', async () => {
+		render(LoginPage);
+
+		await expect.element(page.getByLabelText('Email')).toHaveAttribute('autofocus');
+		await expect.element(page.getByLabelText('Email')).toHaveFocus();
+	});
+
 	it('restores the saved email after a failed login and clears it', async () => {
 		sessionStorage.setItem(emailKey, email);
 		setQuery('?error=Incorrect+email+or+password.');
@@ -31,7 +38,7 @@ describe('local login page', () => {
 
 		await expect.element(page.getByText('Incorrect email or password.')).toBeVisible();
 		await expect.element(page.getByLabelText('Email')).toHaveValue(email);
-		await expect.element(page.getByLabelText('Password')).toHaveValue('');
+		await expect.element(page.getByLabelText('Password', { exact: false })).toHaveValue('');
 		expect(sessionStorage.getItem(emailKey)).toBeNull();
 	});
 

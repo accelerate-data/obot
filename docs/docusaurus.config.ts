@@ -43,6 +43,7 @@ const config: Config = {
   organizationName: "obot-platform",
   projectName: "obot",
   onBrokenLinks: "throw",
+  onBrokenAnchors: "throw",
 
   i18n: {
     defaultLocale: "en",
@@ -51,6 +52,7 @@ const config: Config = {
 
   markdown: {
     mermaid: true,
+    hooks: { onBrokenMarkdownLinks: "throw" },
   },
 
   themes: ["@docusaurus/theme-mermaid"],
@@ -64,6 +66,38 @@ const config: Config = {
       "@docusaurus/plugin-client-redirects",
       {
         redirects: [
+          {
+            from: "/next/agents/availability",
+            to: "/next/start-here/choose",
+          },
+          {
+            from: "/next/agents/first-agent",
+            to: "/next/start-here/govern",
+          },
+          {
+            from: "/next/agents/identity",
+            to: "/next/security/credentials",
+          },
+          {
+            from: "/next/agents/runtime",
+            to: "/next/installation/overview",
+          },
+          {
+            from: "/next/agents/workflows",
+            to: "/next/registries/publish-skills",
+          },
+          {
+            from: "/next/concepts/obot-agent",
+            to: "/next/start-here/choose",
+          },
+          {
+            from: "/next/functionality/obot-agent-management",
+            to: "/next/security/model",
+          },
+          {
+            from: "/next/functionality/workflow-sharing",
+            to: "/next/registries/publish-skills",
+          },
           {
             from: "/functionality/mcp-registries",
             to: "/functionality/mcp-access-policies",
@@ -86,18 +120,40 @@ const config: Config = {
           },
           {
             from: "/configuration/workspace-provider",
-            to: "/concepts/obot-agent",
+            to: "/start-here/choose",
           },
           {
             from: "/functionality/chat/overview",
-            to: "/concepts/obot-agent",
+            to: "/start-here/choose",
+          },
+          {
+            from: "/concepts/obot-agent",
+            to: "/start-here/choose",
+          },
+          {
+            from: "/functionality/obot-agent-management",
+            to: "/security/model",
+          },
+          {
+            from: "/functionality/workflow-sharing",
+            to: "/registries/publish-skills",
+          },
+          {
+            from: "/functionality/mcp-inspector",
+            to: "/mcp-gateway/inspector",
           },
         ],
-        createRedirects(existingPath) {
+        createRedirects(existingPath: string) {
           if (existingPath.endsWith("/functionality/agent-auth-scopes/")) {
             return existingPath.replace(
               "/functionality/agent-auth-scopes/",
               "/functionality/api-keys/",
+            );
+          }
+          if (existingPath.endsWith("/functionality/ai-judge-policies/")) {
+            return existingPath.replace(
+              "/functionality/ai-judge-policies/",
+              "/functionality/message-policies/",
             );
           }
           return undefined;

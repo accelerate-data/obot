@@ -19,8 +19,9 @@ import (
 	llmtypes "github.com/obot-platform/obot/pkg/llm"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/mcptester"
-	"github.com/obot-platform/obot/pkg/principal"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	"github.com/obot-platform/obot/pkg/system"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -29,7 +30,7 @@ const (
 )
 
 type mcpTesterServerActionResolver interface {
-	ServerForActionWithConnectID(context.Context, string, string) (string, v1.MCPServer, mcp.ServerConfig, error)
+	ServerForActionWithConnectID(context.Context, string, kuser.Info) (string, v1.MCPServer, mcp.ServerConfig, error)
 }
 
 type mcpTesterHTTPClient interface {
@@ -41,17 +42,13 @@ type MCPTesterHandler struct {
 	serverResolver   mcpTesterServerActionResolver
 	accessHelper     *accesscontrolrule.Helper
 	modelResolver    mcptester.ModelAccessResolver
-	serverURL        string
+	localServerURL   string
 	httpClient       mcpTesterHTTPClient
 	modelProxy       MCPTesterModelProxyOptions
 	modelProxyClient mcpTesterHTTPClient
 }
 
-func NewMCPTesterHandler(storage kclient.Client, serverResolver mcpTesterServerActionResolver, accessHelper *accesscontrolrule.Helper, modelResolver mcptester.ModelAccessResolver, serverURL string, httpClient *http.Client) *MCPTesterHandler {
-	return NewMCPTesterHandlerWithModelProxy(storage, serverResolver, accessHelper, modelResolver, serverURL, httpClient, MCPTesterModelProxyOptions{})
-}
-
-func NewMCPTesterHandlerWithModelProxy(storage kclient.Client, serverResolver mcpTesterServerActionResolver, accessHelper *accesscontrolrule.Helper, modelResolver mcptester.ModelAccessResolver, serverURL string, httpClient *http.Client, options MCPTesterModelProxyOptions) *MCPTesterHandler {
+func NewMCPTesterHandlerWithModelProxy(storage kclient.Client, serverResolver mcpTesterServerActionResolver, accessHelper *accesscontrolrule.Helper, modelResolver mcptester.ModelAccessResolver, localServerURL string, httpClient *http.Client, options MCPTesterModelProxyOptions) *MCPTesterHandler {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -61,7 +58,7 @@ func NewMCPTesterHandlerWithModelProxy(storage kclient.Client, serverResolver mc
 		serverResolver:   serverResolver,
 		accessHelper:     accessHelper,
 		modelResolver:    modelResolver,
-		serverURL:        serverURL,
+		localServerURL:   localServerURL,
 		httpClient:       httpClient,
 		modelProxy:       options,
 		modelProxyClient: mcptester.NewModelProxyHTTPClient(),
@@ -71,13 +68,17 @@ func NewMCPTesterHandlerWithModelProxy(storage kclient.Client, serverResolver mc
 // Chat handles one stateless model continuation for the MCP Tester. It checks
 // current MCP and model access on every call and never executes MCP tools.
 func (h *MCPTesterHandler) Chat(req api.Context) error {
-	mcpServerID := req.PathValue("mcp_server_id")
+	mcpServerID := req.PathValue("vmcp_instance_id")
+	if !system.IsVMCPInstanceID(mcpServerID) {
+		return writeMCPTesterError(req, http.StatusForbidden, types.MCPTesterErrorAccessDenied, "a vMCP instance is required", false)
+	}
+
 	authorized, err := authz.UserCanConnectToMCP(req.Context(), h.storage, h.accessHelper, req.User, mcpServerID)
 	if err != nil || !authorized {
 		return writeMCPTesterError(req, http.StatusForbidden, types.MCPTesterErrorAccessDenied, "you do not have permission to connect to this MCP server", false)
 	}
 
-	_, server, _, err := h.serverResolver.ServerForActionWithConnectID(req.Context(), mcpServerID, principal.ResourceOwnerID(req.User))
+	_, server, _, err := h.serverResolver.ServerForActionWithConnectID(req.Context(), mcpServerID, req.User)
 	if err != nil {
 		return writeMCPTesterError(req, http.StatusForbidden, types.MCPTesterErrorAccessDenied, "the MCP server is not available to this user", false)
 	}
@@ -149,7 +150,7 @@ func (h *MCPTesterHandler) Chat(req api.Context) error {
 			return writeMCPTesterError(req, http.StatusBadRequest, types.MCPTesterErrorInvalidRequest, err.Error(), false)
 		}
 
-		proxyRequest, err = mcptester.NewLLMProxyRequest(ctx, h.serverURL, model, body, req.Request.Header)
+		proxyRequest, err = mcptester.NewLLMProxyRequest(ctx, h.localServerURL, model, body, req.Request.Header)
 		if err != nil {
 			return writeMCPTesterError(req, http.StatusInternalServerError, types.MCPTesterErrorProvider, "failed to prepare model request", true)
 		}
@@ -255,7 +256,7 @@ func testerSystemInstruction(server v1.MCPServer) string {
 	if name == "" {
 		name = server.Name
 	}
-	return fmt.Sprintf("You are testing the deployed MCP server %q in Obot's ephemeral MCP Tester. Use only the tools provided in this request. Do not claim access to any other tools, servers, files, or browser capabilities. Every tool call requires explicit user approval. Keep responses focused on testing this deployment.", name)
+	return fmt.Sprintf("You are testing the deployed MCP server %q in Obot's ephemeral MCP Tester. Use only the tools provided in this request. Do not claim access to any other tools, servers, files, or browser capabilities. Only fulfill requests directly related to testing this deployed MCP server. Briefly decline any unrelated request or unrelated part of a request, and ask the user to test this server instead. Do not call tools for unrelated requests.", name)
 }
 
 func (h *MCPTesterHandler) writeProxyError(req api.Context, response *http.Response) error {

@@ -1,11 +1,4 @@
 // json diff utility functions
-import type { MCPCatalogEntryServerManifest } from '$lib/services/admin/types';
-import type { MCPServer } from '$lib/services/user/types';
-
-type ManifestDiff = MCPCatalogEntryServerManifest | MCPServer;
-type DiffManifest = ManifestDiff & {
-	config?: DiffField[];
-};
 
 /**
  * Strips fields from a manifest that should not be considered when computing
@@ -18,12 +11,8 @@ type DiffManifest = ManifestDiff & {
  * - `remoteConfig.fixedURL`: catalog-only field translated to `url` at deploy time
  * - `remoteConfig.url`: runtime-only field derived from catalog's `fixedURL`
  * - `remoteConfig.isTemplate`: runtime-only field not present on catalog manifests
- * - `secretBinding.adminAdded`: runtime-only ownership metadata
  */
-export function stripManifestMetadata<T>(
-	manifest: T,
-	options?: { keepSecretBindingMetadata?: boolean }
-): T {
+export function stripManifestMetadata<T>(manifest: T): T {
 	if (!manifest || typeof manifest !== 'object') return manifest;
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -32,12 +21,13 @@ export function stripManifestMetadata<T>(
 	delete clone.entryKey;
 	delete clone.repoURL;
 	delete clone.upgradeNote;
+	delete clone.minObotVersion;
+	delete clone.maxObotVersion;
 	if (clone.remoteConfig) {
 		delete clone.remoteConfig.fixedURL;
 		delete clone.remoteConfig.url;
 		delete clone.remoteConfig.isTemplate;
 	}
-	if (!options?.keepSecretBindingMetadata) stripSecretBindingMetadata(clone);
 
 	return clone as T;
 }
@@ -46,84 +36,7 @@ export function normalizeManifestsForDiff<Current, Next>(
 	currentManifest: Current,
 	newManifest: Next
 ): [Current, Next] {
-	const current = stripManifestMetadata(currentManifest, {
-		keepSecretBindingMetadata: true
-	}) as DiffManifest;
-	const next = stripManifestMetadata(newManifest, {
-		keepSecretBindingMetadata: true
-	}) as DiffManifest;
-
-	// stripManifestMetadata returns undefined for an undefined manifest. Bail out before
-	// dereferencing so callers fall through to their "unable to compare" fallback UI
-	// instead of throwing on current.config.
-	if (!current || !next) {
-		return [current as Current, next as Next];
-	}
-
-	normalizeFieldList(current.config, next.config);
-
-	stripSecretBindingMetadata(current);
-	stripSecretBindingMetadata(next);
-	return [current as Current, next as Next];
-}
-
-type DiffField = {
-	key: string;
-	value?: unknown;
-	secretBinding?: {
-		adminAdded?: boolean;
-	};
-};
-
-function normalizeFieldList(
-	currentFields: DiffField[] | undefined,
-	nextFields: DiffField[] | undefined
-) {
-	removeAdminAddedOnlyFields(currentFields, nextFields);
-	removeAdminAddedOnlyFields(nextFields, currentFields);
-	normalizeAdminAddedFieldBindings(currentFields, nextFields);
-	normalizeAdminAddedFieldBindings(nextFields, currentFields);
-}
-
-function removeAdminAddedOnlyFields(
-	currentFields: DiffField[] | undefined,
-	nextFields: DiffField[] | undefined
-) {
-	if (!currentFields) return;
-	const nextByKey = new Map((nextFields ?? []).map((field) => [field.key, field]));
-
-	for (let i = currentFields.length - 1; i >= 0; i--) {
-		const currentField = currentFields[i];
-		if (currentField?.secretBinding?.adminAdded && !nextByKey.has(currentField.key)) {
-			currentFields.splice(i, 1);
-		}
-	}
-}
-
-function normalizeAdminAddedFieldBindings(
-	currentFields: DiffField[] | undefined,
-	nextFields: DiffField[] | undefined
-) {
-	if (!currentFields || !nextFields) return;
-	const nextByKey = new Map(nextFields.map((field) => [field.key, field]));
-
-	for (const currentField of currentFields) {
-		if (!currentField?.secretBinding?.adminAdded) continue;
-
-		const nextField = nextByKey.get(currentField.key);
-		if (!nextField?.secretBinding || nextField.secretBinding.adminAdded) {
-			delete currentField.secretBinding;
-			currentField.value = nextField?.value;
-		}
-	}
-}
-
-function stripSecretBindingMetadata(manifest?: DiffManifest) {
-	if (!manifest || typeof manifest !== 'object') return;
-
-	for (const field of manifest.config ?? []) {
-		if (field.secretBinding) delete field.secretBinding.adminAdded;
-	}
+	return [stripManifestMetadata(currentManifest), stripManifestMetadata(newManifest)];
 }
 
 export function formatJsonWithHighlighting(json: unknown): string {
@@ -234,65 +147,6 @@ function backtrackDiff(
 	return result;
 }
 
-export type LineDiffOpType = 'unchanged' | 'removed' | 'added' | 'modified';
-
-export type LineDiffOp = {
-	type: LineDiffOpType;
-	line: string;
-	oldIndex?: number;
-	newIndex?: number;
-	/** When type is 'modified', which side this line belongs to (for filtering old vs new view) */
-	modifiedSide?: 'old' | 'new';
-};
-
-export type LineDiffResult = {
-	oldLines: string[];
-	newLines: string[];
-	unifiedLines: string[];
-	diffOps: LineDiffOp[];
-};
-
-/** Line-based diff for plain text (e.g. workflow markdown). Treats consecutive remove+add as "modified". */
-export function generateLineDiff(oldText: string, newText: string): LineDiffResult {
-	const oldLines = oldText.split('\n');
-	const newLines = newText.split('\n');
-	const dp = computeLCS(oldLines, newLines);
-	const rawOps = backtrackDiff(dp, oldLines, newLines);
-
-	// Mark consecutive removed+added pairs as 'modified'
-	const diffOps: LineDiffOp[] = rawOps.map((op, idx) => {
-		const next = rawOps[idx + 1];
-		const prev = rawOps[idx - 1];
-		if (op.type === 'removed' && next?.type === 'added') {
-			return { ...op, type: 'modified' as const, modifiedSide: 'old' as const };
-		}
-		if (op.type === 'added' && prev?.type === 'removed') {
-			return { ...op, type: 'modified' as const, modifiedSide: 'new' as const };
-		}
-		return { ...op, type: op.type };
-	});
-
-	const unifiedLines = diffOps.map((op) => {
-		switch (op.type) {
-			case 'modified':
-				return op.modifiedSide === 'old' ? `-${op.line}` : `+${op.line}`;
-			case 'unchanged':
-				return ` ${op.line}`;
-			case 'removed':
-				return `-${op.line}`;
-			case 'added':
-				return `+${op.line}`;
-		}
-	});
-
-	return {
-		oldLines,
-		newLines,
-		unifiedLines,
-		diffOps
-	};
-}
-
 function escapeHtml(text: string): string {
 	return text
 		.replace(/&/g, '&amp;')
@@ -300,38 +154,6 @@ function escapeHtml(text: string): string {
 		.replace(/>/g, '&gt;')
 		.replace(/"/g, '&quot;')
 		.replace(/'/g, '&#039;');
-}
-
-/**
- * Renders diff ops as HTML with red (removal), green (addition), yellow (modified).
- * @param diff Result of generateLineDiff(currentWorkflowContents, latestVersionContents)
- * @param isOldVersion true = show current workflow (removed/modified); false = show latest (added/modified)
- */
-export function formatTextWithDiffHighlighting(
-	diff: LineDiffResult,
-	isOldVersion: boolean
-): string {
-	const relevantOps = diff.diffOps.filter((op) => {
-		if (isOldVersion) {
-			return op.type === 'unchanged' || op.type === 'removed' || op.modifiedSide === 'old';
-		}
-		return op.type === 'unchanged' || op.type === 'added' || op.modifiedSide === 'new';
-	});
-
-	let html = '';
-	for (const op of relevantOps) {
-		const escaped = escapeHtml(op.line);
-		let lineClass = 'text-base-content';
-		if (op.type === 'removed') {
-			lineClass = 'bg-error/20 text-error';
-		} else if (op.type === 'added') {
-			lineClass = 'bg-success/20 text-success';
-		} else if (op.type === 'modified') {
-			lineClass = 'bg-warning/20 text-warning';
-		}
-		html += `<div class="font-mono text-sm whitespace-pre-wrap wrap-break-word ${lineClass} px-2 py-0.5 border-l-2 border-transparent">${escaped}</div>`;
-	}
-	return html;
 }
 
 export function generateJsonDiff(

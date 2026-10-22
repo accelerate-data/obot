@@ -1,6 +1,7 @@
 package enforcement
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/obot-platform/obot/apiclient/types"
@@ -113,7 +114,11 @@ func TestEvaluate(t *testing.T) {
 			name: "url match scheme+host+default-port",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://mcp.example.com/api"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://mcp.example.com:443/api"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://mcp.example.com:443/api",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -121,7 +126,11 @@ func TestEvaluate(t *testing.T) {
 			name: "url mismatch on port",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://mcp.example.com:8443/api"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://mcp.example.com/api"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://mcp.example.com/api",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -129,7 +138,11 @@ func TestEvaluate(t *testing.T) {
 			name: "url path prefix matches at boundary",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/a/mcp"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://h.example.com/team"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -137,15 +150,287 @@ func TestEvaluate(t *testing.T) {
 			name: "url path prefix does not match mid-segment",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/teamwork"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://h.example.com/team"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
 			},
 			wantAllow: false,
+		},
+		{
+			name: "url path prefix does not match after dot-segments escape it",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/../admin/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix keeps empty segments when resolving dot-segments",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/other//../team/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix keeps an empty segment after a removed parent segment",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/other/..//team/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix keeps an encoded slash beside a character Go escapes",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/x%2f../team/é"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url entry with dot-segments matches nothing",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/admin/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team/..",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url entry with an encoded dot inside a segment matches the decoded path",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/v1.0/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/v1%2e0",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url path prefix matches a non-ASCII path written either way",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/é/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/%C3%A9",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url path prefix matches a caret written either way",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/a^b/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/a%5Eb",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url path prefix does not decode encoded slashes before resolving dot-segments",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/other/%2f/../team/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix resolves percent-encoded dot-segments",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/%2e%2e/admin/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix does not match an encoded slash after the prefix",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team%2f..%2fadmin"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix matches after a single-dot segment",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/./mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url path prefix treats a literal backslash as a separator",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: `https://h.example.com/team/\../../admin`}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix does not treat an encoded backslash as a separator",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: `https://h.example.com/team/%5C../admin`}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url path prefix matches backslash separators within it",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: `https://h.example.com/team\mcp`}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url host ends at a literal backslash",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: `https://h.example.com\@evil.com/team/mcp`}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url with a backslash ending the authority does not match a host-only entry",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: `https://h.example.com\@evil.com/mcp`}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url entry with a path longer than the matched limit matches nothing",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/" + strings.Repeat("/", MaxMatchedPathBytes),
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url with an invalid escape in its fragment matches its path",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/mcp#%zz"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url with a long query still matches",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team?" + strings.Repeat("q", MaxMatchedPathBytes)}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: true,
+		},
+		{
+			name: "url path longer than the matched limit does not match a host-only entry",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/" + strings.Repeat("/", MaxMatchedPathBytes)}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com",
+					},
+				},
+			},
+			wantAllow: false,
+		},
+		{
+			name: "url path prefix matches after dot-segments stay within it",
+			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/team/a/../b/mcp"}},
+			allowlist: types.EnforcementAllowlist{
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com/team",
+					},
+				},
+			},
+			wantAllow: true,
 		},
 		{
 			name: "url with no path constraint matches any path",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://h.example.com/anything/here"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://h.example.com"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://h.example.com",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -153,7 +438,11 @@ func TestEvaluate(t *testing.T) {
 			name: "url mismatch on host",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://other.example.com/api"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://mcp.example.com/api"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://mcp.example.com/api",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -163,7 +452,11 @@ func TestEvaluate(t *testing.T) {
 			name: "npm package match any version",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Package: npmPkg("@scope/server", "2.3.4")}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@scope/server"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@scope/server"},
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -171,7 +464,11 @@ func TestEvaluate(t *testing.T) {
 			name: "npm package exact version match",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Package: npmPkg("@scope/server", "2.3.4")}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@scope/server", Version: "2.3.4"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@scope/server", Version: "2.3.4"},
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -179,7 +476,11 @@ func TestEvaluate(t *testing.T) {
 			name: "npm package exact version mismatch",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Package: npmPkg("@scope/server", "2.3.4")}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@scope/server", Version: "9.9.9"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@scope/server", Version: "9.9.9"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -187,7 +488,11 @@ func TestEvaluate(t *testing.T) {
 			name: "pypi package match",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Package: pypiPkg("mcp-server-git", "")}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourcePyPI, Name: "mcp-server-git"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourcePyPI, Name: "mcp-server-git"},
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -195,7 +500,11 @@ func TestEvaluate(t *testing.T) {
 			name: "package source mismatch npm vs pypi",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Package: npmPkg("mcp-server-git", "")}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourcePyPI, Name: "mcp-server-git"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourcePyPI, Name: "mcp-server-git"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -205,7 +514,11 @@ func TestEvaluate(t *testing.T) {
 			name: "connector match by display name",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindMCP, Tool: "search", Server: ServerIdentity{Connector: "claude.ai Linear"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Connector: "claude.ai Linear"}},
+				Servers: []types.AllowlistServer{
+					{
+						Connector: "claude.ai Linear",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -213,7 +526,11 @@ func TestEvaluate(t *testing.T) {
 			name: "connector match is case-insensitive",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindMCP, Tool: "search", Server: ServerIdentity{Connector: "claude.ai Linear"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Connector: "CLAUDE.AI LINEAR"}},
+				Servers: []types.AllowlistServer{
+					{
+						Connector: "CLAUDE.AI LINEAR",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -221,7 +538,11 @@ func TestEvaluate(t *testing.T) {
 			name: "connector mismatch",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindMCP, Tool: "search", Server: ServerIdentity{Connector: "claude.ai Notion"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Connector: "claude.ai Linear"}},
+				Servers: []types.AllowlistServer{
+					{
+						Connector: "claude.ai Linear",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -229,7 +550,11 @@ func TestEvaluate(t *testing.T) {
 			name: "connector entry does not match a call that resolved no connector",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindMCP, Tool: "search", Server: ServerIdentity{URL: "https://mcp.linear.app/sse"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Connector: "claude.ai Linear"}},
+				Servers: []types.AllowlistServer{
+					{
+						Connector: "claude.ai Linear",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -237,7 +562,12 @@ func TestEvaluate(t *testing.T) {
 			name: "connector entry scoped to specific tools",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindMCP, Tool: "delete_issue", Server: ServerIdentity{Connector: "claude.ai Linear"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Connector: "claude.ai Linear", Tools: []string{"search_issues"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Connector: "claude.ai Linear",
+						Tools:     []string{"search_issues"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -245,7 +575,11 @@ func TestEvaluate(t *testing.T) {
 			name: "shell call is NOT allowed by a matching connector entry",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindShell, Tool: "bash", Server: ServerIdentity{Connector: "claude.ai Linear"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Connector: "claude.ai Linear"}},
+				Servers: []types.AllowlistServer{
+					{
+						Connector: "claude.ai Linear",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -255,7 +589,11 @@ func TestEvaluate(t *testing.T) {
 			name: "hostname match against explicit hostname",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Hostname: "gitmcp.io"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "gitmcp.io"}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "gitmcp.io",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -263,7 +601,11 @@ func TestEvaluate(t *testing.T) {
 			name: "hostname match derived from url",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://gitmcp.io/owner/repo"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "GitMCP.io"}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "GitMCP.io",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -271,7 +613,11 @@ func TestEvaluate(t *testing.T) {
 			name: "hostname mismatch",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{Hostname: "evil.io"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "gitmcp.io"}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "gitmcp.io",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -281,7 +627,11 @@ func TestEvaluate(t *testing.T) {
 			name: "empty tools list allows any tool on matched server",
 			call: NormalizedCall{Kind: KindMCP, Tool: "delete_everything", Server: ServerIdentity{Hostname: "gitmcp.io"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "gitmcp.io"}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "gitmcp.io",
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -289,7 +639,12 @@ func TestEvaluate(t *testing.T) {
 			name: "listed tool allowed on matched server",
 			call: NormalizedCall{Kind: KindMCP, Tool: "read_file", Server: ServerIdentity{Hostname: "gitmcp.io"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "gitmcp.io", Tools: []string{"read_file", "list_files"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "gitmcp.io",
+						Tools:    []string{"read_file", "list_files"},
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -297,7 +652,12 @@ func TestEvaluate(t *testing.T) {
 			name: "unlisted tool denied on matched server",
 			call: NormalizedCall{Kind: KindMCP, Tool: "write_file", Server: ServerIdentity{Hostname: "gitmcp.io"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "gitmcp.io", Tools: []string{"read_file", "list_files"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "gitmcp.io",
+						Tools:    []string{"read_file", "list_files"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -307,7 +667,12 @@ func TestEvaluate(t *testing.T) {
 			name: "shell call is NOT allowed by a matching url entry",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindShell, Tool: "search", Server: ServerIdentity{URL: "https://gitmcp.io/docs"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://gitmcp.io/docs", Tools: []string{"search"}}},
+				Servers: []types.AllowlistServer{
+					{
+						URL:   "https://gitmcp.io/docs",
+						Tools: []string{"search"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -315,7 +680,11 @@ func TestEvaluate(t *testing.T) {
 			name: "write call is NOT allowed by a matching hostname entry",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindWrite, Tool: "anything", Server: ServerIdentity{Hostname: "gitmcp.io"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Hostname: "gitmcp.io"}},
+				Servers: []types.AllowlistServer{
+					{
+						Hostname: "gitmcp.io",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -323,7 +692,11 @@ func TestEvaluate(t *testing.T) {
 			name: "shell call is NOT allowed by a matching package entry",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindShell, Tool: "rm", Server: ServerIdentity{Package: &PackageIdentity{Source: types.AllowlistServerPackageSourceNPM, Name: "@modelcontextprotocol/server-filesystem"}}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@modelcontextprotocol/server-filesystem"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Package: &types.AllowlistServerPackage{Source: types.AllowlistServerPackageSourceNPM, Name: "@modelcontextprotocol/server-filesystem"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -331,7 +704,11 @@ func TestEvaluate(t *testing.T) {
 			name: "unrecognized kind is NOT allowed by a matching url entry",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: "mcp_lookalike", Tool: "search", Server: ServerIdentity{URL: "https://gitmcp.io/docs"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://gitmcp.io/docs"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://gitmcp.io/docs",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -339,7 +716,11 @@ func TestEvaluate(t *testing.T) {
 			name: "empty kind is NOT allowed by a matching url entry",
 			call: NormalizedCall{Agent: AgentClaudeCode, Tool: "search", Server: ServerIdentity{URL: "https://gitmcp.io/docs"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://gitmcp.io/docs"}},
+				Servers: []types.AllowlistServer{
+					{
+						URL: "https://gitmcp.io/docs",
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -347,7 +728,12 @@ func TestEvaluate(t *testing.T) {
 			name: "mcp call with the same identity IS allowed",
 			call: NormalizedCall{Agent: AgentClaudeCode, Kind: KindMCP, Tool: "search", Server: ServerIdentity{URL: "https://gitmcp.io/docs"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{URL: "https://gitmcp.io/docs", Tools: []string{"search"}}},
+				Servers: []types.AllowlistServer{
+					{
+						URL:   "https://gitmcp.io/docs",
+						Tools: []string{"search"},
+					},
+				},
 			},
 			wantAllow: true,
 		},
@@ -369,7 +755,11 @@ func TestEvaluate(t *testing.T) {
 			name: "malformed entry with no dimension matches nothing",
 			call: NormalizedCall{Kind: KindMCP, Tool: "t", Server: ServerIdentity{URL: "https://mcp.example.com"}},
 			allowlist: types.EnforcementAllowlist{
-				Servers: []types.AllowlistServer{{Tools: []string{"t"}}},
+				Servers: []types.AllowlistServer{
+					{
+						Tools: []string{"t"},
+					},
+				},
 			},
 			wantAllow: false,
 		},
@@ -466,5 +856,14 @@ func TestEvaluateResolvedCallIgnoresAStaleReason(t *testing.T) {
 	allowlist := types.EnforcementAllowlist{Servers: []types.AllowlistServer{{URL: "https://gitmcp.io/docs"}}}
 	if got := Evaluate(call, allowlist); !got.Allow {
 		t.Fatalf("Evaluate() denied a resolved call carrying only a reason string (reason: %q)", got.Reason)
+	}
+}
+
+func TestParseClientURLWithoutAColonDoesNotPanic(t *testing.T) {
+	for _, rawURL := range []string{"http", "HTTPS", "https?x", "https#x"} {
+		u, path, err := ParseClientURL(rawURL)
+		if err == nil && u.Host != "" {
+			t.Fatalf("ParseClientURL(%q) = host %q, path %q; want no host", rawURL, u.Host, path)
+		}
 	}
 }

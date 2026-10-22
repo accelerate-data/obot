@@ -102,13 +102,14 @@ func TestVMCPComponentToolPreviewConfigUsesCachedSnapshotAndFixedConfiguration(t
 
 func TestVMCPComponentToolPreviewUserConfiguration(t *testing.T) {
 	vmcp := vmcpToolPreviewTestObject("vmcp1user-preview")
+	vmcp.Spec.StaticConfigurationCredentialName = "configuration-revision"
 	component := &vmcp.Spec.Manifest.Components[0]
 	component.CatalogEntry.Manifest.Config[1].Required = true
 	storage := clientfake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(vmcp).Build()
 	gateway := newHandlerTestGateway(t)
 	credential := gatewaytypes.Credential{
 		Context: vmcpconfig.StaticConfigurationCredentialContext(vmcp.Name),
-		Name:    vmcpconfig.ConfigurationCredentialName(),
+		Name:    vmcpconfig.StaticConfigurationCredentialName(vmcp),
 		Secrets: map[string]string{vmcpconfig.ConfigurationKey(component.ID, "TOKEN"): "fixed-token"},
 	}
 	require.NoError(t, gateway.UpsertCredential(t.Context(), credential))
@@ -285,6 +286,7 @@ func TestTempServerAndConfigIgnoresAuditLogsWithoutChangingNormalTraffic(t *test
 		t.Context(),
 		nil,
 		nil,
+		nil,
 		"",
 		"",
 		"entry",
@@ -304,11 +306,11 @@ func TestTempServerAndConfigIgnoresAuditLogsWithoutChangingNormalTraffic(t *test
 		"temp",
 		"temp",
 		"catalog",
-		nil,
+		nil, false,
 	)
 	require.NoError(t, err)
 	assert.Empty(t, missingFields)
-	assert.Equal(t, "false", normalConfig.AuditLogMetadata[mcp.AuditLogIgnore])
+	assert.NotContains(t, normalConfig.AuditLogMetadata, mcp.AuditLogIgnore)
 }
 
 func TestVMCPComponentToolPreviewConfigMissingResourcesAreSafe(t *testing.T) {
@@ -346,8 +348,9 @@ func TestVMCPComponentToolPreviewConfigMissingResourcesAreSafe(t *testing.T) {
 			User:           testUser("user"),
 			GatewayClient:  handler.gatewayClient,
 		})
-		require.Error(t, err)
-		assert.True(t, types.IsNotFound(err))
+		var httpErr *types.ErrHTTP
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusNotFound, httpErr.Code)
 		assert.Contains(t, err.Error(), "vMCP component not found")
 	})
 }
