@@ -6,7 +6,7 @@ ARG BASE_IMAGE=cgr.dev/chainguard/wolfi-base
 FROM ${BASE_IMAGE} AS base
 ARG BASE_IMAGE
 RUN if [ "${BASE_IMAGE}" = "cgr.dev/chainguard/wolfi-base" ]; then \
-  apk add --no-cache gcc go make git nodejs npm pnpm; \
+  apk add --no-cache gcc go make git nodejs-24 npm pnpm; \
   fi
 
 FROM base AS bin
@@ -14,6 +14,7 @@ WORKDIR /app
 COPY . .
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
   --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/.cache/uv \
   --mount=type=cache,target=/root/go/pkg/mod \
   make all
 
@@ -47,6 +48,9 @@ RUN case "$TARGETARCH" in \
     && chmod 755 /claude
 
 FROM ${PROVIDERS_IMAGE} AS providers
+# The enterprise-providers image is scratch-based (no /bin/sh) and already
+# ships /obot-providers, so the final stage copies it directly rather than
+# creating the directory with a RUN.
 FROM ${ENTERPRISE_PROVIDERS_IMAGE} AS enterprise-providers
 FROM ${ENCRYPTION_BINS_IMAGE} AS encryption-bins
 
@@ -56,6 +60,17 @@ RUN apk add --no-cache bash tini python3 libstdc++ libgcc ca-certificates
 COPY --from=claude-cli /claude /usr/local/bin/claude
 COPY runtime/claude-orchestrator/spawn.py /opt/obot/spawn.py
 COPY --chmod=0755 runtime/claude-orchestrator/spawn-runner /opt/obot/hooks/spawn-runner
+
+ENV POSTGRES_USER=obot
+ENV POSTGRES_PASSWORD=obot
+ENV POSTGRES_DB=obot
+ENV PGDATA=/data/postgresql
+
+
+RUN apk add --no-cache git npm nodejs-24 bash tini procps docker perl-utils sqlite sqlite-dev curl kubectl jq
+
+ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/accelerate-data/mcp-catalog
+ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog/v2-schema
 
 COPY aws-encryption.yaml /
 COPY azure-encryption.yaml /
@@ -70,18 +85,11 @@ RUN /combine-envrc.sh && rm /combine-envrc.sh
 COPY --from=encryption-bins /bin/*-encryption-provider /bin/
 COPY --from=bin /app/bin/obot /bin/
 
-ENV OBOT_SERVER_DEFAULT_MCPCATALOG_PATH=https://github.com/obot-platform/mcp-catalog/v2-schema
-ENV OBOT_SERVER_DEFAULT_SYSTEM_MCPCATALOG_PATH=https://github.com/obot-platform/system-mcp-catalog/v2-schema
-
-ENV POSTGRES_USER=obot
-ENV POSTGRES_PASSWORD=obot
-ENV POSTGRES_DB=obot
-ENV PGDATA=/data/postgresql
 
 ENV HOME=/data
 ENV XDG_CACHE_HOME=/data/cache
 ENV TERM=vt100
-
+ENV OBOT_CONTAINER_ENV=true
 WORKDIR /data
 VOLUME /data
 ENTRYPOINT ["run.sh"]

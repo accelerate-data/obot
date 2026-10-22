@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -32,6 +33,29 @@ func TestNewClientUsesEnvOverrides(t *testing.T) {
 	}
 	if client.Token != "env-token" {
 		t.Fatalf("expected env token, got %q", client.Token)
+	}
+}
+
+func TestServerHelpAdvertisesMCPDockerNetworkEnv(t *testing.T) {
+	var output bytes.Buffer
+	cmd := New()
+	cmd.SetArgs([]string{"server", "--help"})
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	help := output.String()
+	if !strings.Contains(help, "--mcp-docker-network") {
+		t.Fatalf("expected server help to include --mcp-docker-network, got:\n%s", help)
+	}
+	if !strings.Contains(help, "$OBOT_MCP_DOCKER_NETWORK") {
+		t.Fatalf("expected server help to include OBOT_MCP_DOCKER_NETWORK, got:\n%s", help)
+	}
+	if strings.Contains(help, "$OBOT_SERVER_MCPDOCKER_NETWORK") {
+		t.Fatalf("server help advertised legacy env name:\n%s", help)
 	}
 }
 
@@ -180,4 +204,30 @@ func captureStderr(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func TestServerHelpAdvertisesMCPDockerResourceEnvs(t *testing.T) {
+	var output bytes.Buffer
+	cmd := New()
+	cmd.SetArgs([]string{"server", "--help"})
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	help := output.String()
+	for _, want := range []string{
+		"--mcp-docker-memory",
+		"$OBOT_MCP_DOCKER_MEMORY",
+		"--mcp-docker-cpus",
+		"$OBOT_MCP_DOCKER_CPUS",
+		"--mcp-docker-pids-limit",
+		"$OBOT_MCP_DOCKER_PIDS_LIMIT",
+	} {
+		if !strings.Contains(help, want) {
+			t.Fatalf("expected server help to include %q, got:\n%s", want, help)
+		}
+	}
 }

@@ -47,6 +47,7 @@ import (
 	"github.com/obot-platform/obot/pkg/mcptester"
 	"github.com/obot-platform/obot/pkg/messagepolicy"
 	"github.com/obot-platform/obot/pkg/modelaccesspolicy"
+	"github.com/obot-platform/obot/pkg/oidcjwt"
 	"github.com/obot-platform/obot/pkg/otel"
 	"github.com/obot-platform/obot/pkg/producttelemetry"
 	"github.com/obot-platform/obot/pkg/proxy"
@@ -111,6 +112,7 @@ type Config struct {
 	MCPOAuthClientNativeExceptions []string              `usage:"Additional Client ID Metadata Document URLs that default to the native application type when application_type is omitted"`
 	ForceDynamicClient             bool                  `usage:"Force Dynamic Client Registration for MCP OAuth instead of Client ID Metadata Documents"`
 	ProductAnalyticsMode           producttelemetry.Mode `usage:"Product analytics mode: consent, on, or off" default:"consent" env:"OBOT_SERVER_PRODUCT_ANALYTICS_MODE"`
+	MCPOAuthCompletionURL          string                `usage:"Where downstream-only MCP OAuth flows finish (root-relative path or absolute http(s) URL); empty keeps Obot's page" env:"OBOT_SERVER_MCP_OAUTH_COMPLETION_URL"`
 
 	DevMode              bool   `usage:"Enable development mode" default:"false" name:"dev-mode" env:"OBOT_DEV_MODE"`
 	DevUIPort            int    `usage:"The port on localhost running the dev instance of the UI" default:"5174"`
@@ -214,6 +216,7 @@ type Services struct {
 
 	MCPOAuthClientSecretExpiration time.Duration
 	MCPOAuthClientNativeExceptions []string
+	MCPOAuthCompletionURL          string
 	ForceDynamicClient             bool
 	ProductTelemetryConsent        *producttelemetry.Consent
 	ProductTelemetryPublisher      *producttelemetry.Publisher
@@ -422,6 +425,10 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	if err := config.ProductAnalyticsMode.Validate(); err != nil {
 		return nil, err
 	}
+	if err := validateMCPOAuthCompletionURL(config.MCPOAuthCompletionURL); err != nil {
+		return nil, err
+	}
+
 	modelProxyURL, err := mcptester.ParseModelProxyURL(config.ModelProxyURL, config.DevMode)
 	if err != nil {
 		return nil, err
@@ -581,9 +588,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		gatewayDB,
 		storageClient,
 		encryptionConfig,
-		func(ctx context.Context, mcpID string) error {
-			return r.Backend().Trigger(ctx, v1.SchemeGroupVersion.WithKind("MCPServer"), mcpID, 0)
-		},
+		r.Backend(),
 		config.AuthOwnerEmails,
 		config.AuthAdminEmails,
 		time.Duration(config.MCPAuditLogPersistIntervalSeconds)*time.Second,
@@ -600,6 +605,9 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	}
 	if err := gatewayClient.MigrateToolReferenceCredentialContexts(ctx); err != nil {
 		return nil, fmt.Errorf("failed to migrate ToolReference credential contexts: %w", err)
+	}
+	if err := gatewayClient.MigrateUnencryptedCredentials(ctx); err != nil {
+		return nil, fmt.Errorf("failed to encrypt existing credentials: %w", err)
 	}
 
 	storageServices.Authn.SetServiceAccountValidator(func(ctx context.Context, token string) (string, error) {
@@ -781,7 +789,9 @@ func New(ctx context.Context, config Config) (*Services, error) {
 
 	webhookHelper := mcp.NewWebhookHelper(mcpWebhookValidationInformer.GetIndexer(), config.Hostname)
 
-	mcpOAuthTokenStorage := mcp.NewGlobalTokenStore(gatewayClient)
+	mcpOAuthTokenStorage := mcp.NewGlobalTokenStore(gatewayClient, mcp.WithTokenRefreshHTTPClient(
+		mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfigFromOptions(mcp.Options(config.MCPConfig))),
+	))
 	mcpSessionManager, err := mcp.NewSessionManager(ctx, config.EnableAuthentication, config.DevMode, mcpOAuthTokenStorage, persistentTokenServer, config.Hostname, config.HTTPListenPort, mcp.Options(config.MCPConfig), webhookHelper, localK8sConfig, apiLocalK8sClient, localCacheClient, storageClient, gatewayClient, config.ServiceNamespace, tunnelManager)
 	if err != nil {
 		return nil, err
@@ -1004,8 +1014,19 @@ func New(ctx context.Context, config Config) (*Services, error) {
 
 		// Token Auth + OAuth auth
 		authenticators = union.NewFailOnError(authenticators, proxyManager)
+		oidcJWTCfg := oidcjwt.LoadConfigFromEnv(os.Getenv)
+		if oidcJWTCfg.Enabled() {
+			oidcVerifier, err := oidcjwt.NewVerifier(ctx, oidcJWTCfg)
+			if err != nil {
+				return nil, fmt.Errorf("oidcjwt verifier: %w", err)
+			}
+			authenticators = union.New(authenticators, oidcjwt.NewAuthenticator(oidcJWTCfg, oidcVerifier))
+		}
 		// Add gateway user info
 		authenticators = client.NewUserDecorator(authenticators, gatewayClient, licenseProvider)
+		if oidcJWTCfg.Enabled() {
+			authenticators = oidcjwt.NewRoleUplift(authenticators, oidcJWTCfg)
+		}
 		// Tunnel credentials are non-user principals and must be handled after
 		// the user decorator. Authorization restricts them to tunnel setup only.
 		authenticators = union.New(authenticators, tunnel.NewTunnelAuthenticator(storageClient))
@@ -1188,6 +1209,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		ModelInfoSourceURL:             config.ModelInfoSourceURL,
 		MCPOAuthClientSecretExpiration: oauthClientExpiration,
 		MCPOAuthClientNativeExceptions: config.MCPOAuthClientNativeExceptions,
+		MCPOAuthCompletionURL:          config.MCPOAuthCompletionURL,
 		ForceDynamicClient:             config.ForceDynamicClient,
 		ProductTelemetryConsent:        telemetryConsent,
 		ProductTelemetryPublisher:      producttelemetry.NewPublisher(ctx, telemetryConsent, gatewayClient, storageClient, licenseProvider, config.MCPRuntimeBackend),
@@ -1366,4 +1388,28 @@ func localK8sCacheByObject(mcpServerNamespace, runtimeNamespace string) map[kcli
 			Namespaces: secretNamespaces,
 		},
 	}
+}
+
+// validateMCPOAuthCompletionURL rejects values that could turn the completion
+// redirect into an open redirect or smuggle a query/fragment that would collide
+// with the parameters appended to it.
+func validateMCPOAuthCompletionURL(v string) error {
+	if v == "" {
+		return nil
+	}
+	invalid := fmt.Errorf("invalid MCP OAuth completion URL: %q", v)
+	if strings.ContainsAny(v, "?#") {
+		return invalid
+	}
+	if strings.HasPrefix(v, "/") {
+		if strings.HasPrefix(v, "//") || strings.HasPrefix(v, "/\\") {
+			return invalid
+		}
+		return nil
+	}
+	u, err := url.Parse(v)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return invalid
+	}
+	return nil
 }

@@ -266,6 +266,35 @@ func TestHeadersResponseWriter_ReadFromFallsBackToCopyWhenUnsupported(t *testing
 	}
 }
 
+func TestHeadersResponseWriter_ReadFromDoesNotRecurseWhenSourceIsNotWriterTo(t *testing.T) {
+	t.Parallel()
+
+	// The previous fallback was `io.Copy(w, r)`. `headersResponseWriter` itself
+	// implements io.ReaderFrom, so for a source that does not implement
+	// io.WriterTo (an os.File served through http.ServeContent, for example),
+	// io.Copy re-entered ReadFrom recursively until the stack overflowed and the
+	// process died. io.LimitReader hides strings.Reader's WriteTo, forcing the
+	// destination ReadFrom path. This test regresses that crash.
+	crw := newNoReaderFromResponseWriter()
+	rw := &headersResponseWriter{ResponseWriter: crw}
+
+	src := io.LimitReader(strings.NewReader("abcd"), 4)
+
+	n, err := rw.ReadFrom(src)
+	if err != nil {
+		t.Fatalf("ReadFrom error: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("ReadFrom bytes = %d, want 4", n)
+	}
+	if crw.writeCalls == 0 {
+		t.Fatalf("expected fallback to Write")
+	}
+	if got := crw.body.String(); got != "abcd" {
+		t.Fatalf("body = %q, want %q", got, "abcd")
+	}
+}
+
 func TestHeadersResponseWriter_WroteHeaderPreventsDuplicateWriteHeaderCalls(t *testing.T) {
 	t.Parallel()
 

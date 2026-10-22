@@ -282,6 +282,12 @@ func (ap *AuthProviderHandler) Configure(req api.Context) error {
 			delete(envVars, key)
 		}
 	}
+	if err := validateGenericOAuthConfigChange(req.Context(), req.GatewayClient, authProvider.Name, []string{
+		authProvider.Name,
+		system.GenericAuthProviderCredentialContext,
+	}, envVars); err != nil {
+		return err
+	}
 
 	if err := ap.validateAuthProviderConfiguration(req, authProvider, configuredProvider == authProvider.Name, envVars); err != nil {
 		return err
@@ -475,6 +481,11 @@ func (ap *AuthProviderHandler) Stage(req api.Context) error {
 		if val == "" {
 			delete(envVars, key)
 		}
+	}
+	if err := validateGenericOAuthConfigChange(req.Context(), req.GatewayClient, authProvider.Name, []string{
+		system.ReplacementAuthProviderCredentialContext,
+	}, envVars); err != nil {
+		return err
 	}
 
 	if err := ap.validateAuthProviderConfiguration(req, authProvider, false, envVars); err != nil {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/obot-platform/mmmcp/config"
 	"github.com/obot-platform/obot/apiclient/types"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
@@ -669,6 +670,11 @@ func TestServerConfigForVMCPChecksStaticOAuthStatusBeforeCreatingInstance(t *tes
 	if err := storage.Get(t.Context(), kclient.ObjectKeyFromObject(vmcp), &current); err != nil {
 		t.Fatal(err)
 	}
+	manager.gatewayClient = newCatalogTokenStoreTestClient(t, "salesforce-entry", "unused-instance", true)
+	require.NoError(t, manager.gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName("salesforce-entry"), Name: system.StaticOAuthCredentialName,
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret", "GENERATION": "proved", "MCP_URL": vmcp.Spec.Manifest.Components[0].CatalogEntry.Manifest.RemoteConfig.FixedURL},
+	}))
 	current.Status.Components[0].OAuthCredentialConfigured = true
 	if err := storage.Update(t.Context(), &current); err != nil {
 		t.Fatal(err)

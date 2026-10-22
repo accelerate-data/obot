@@ -9,6 +9,9 @@ kubeconfig
 # Ignore envrc
 .envrc
 
+# Ignore local environment files
+.env
+
 # Ignore any compiled Go binaries
 *.exe
 *.exe~

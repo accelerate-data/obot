@@ -68,6 +68,9 @@ func TestSyncReadiness(t *testing.T) {
 			if name == system.StaticOAuthCredentialName && !oauthConfigured {
 				return gatewaytypes.Credential{}, gateway.CredentialNotFoundError{}
 			}
+			if name == system.StaticOAuthCredentialName {
+				return gatewaytypes.Credential{Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret", "GENERATION": "proved", "MCP_URL": "https://example.com/mcp"}}, nil
+			}
 			return gatewaytypes.Credential{Secrets: values}, nil
 		},
 		list: func(context.Context, gateway.ListCredentialsOptions) ([]gatewaytypes.Credential, error) {

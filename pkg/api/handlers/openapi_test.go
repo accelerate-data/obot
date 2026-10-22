@@ -100,6 +100,7 @@ func openAPIRequest(t *testing.T, storage kclient.WithWatch, scope, method strin
 		Request:        request,
 		ResponseWriter: recorder,
 		Storage:        storage,
+		GatewayClient:  newHandlerTestGateway(t),
 		User:           testUserWithRole("admin", types.GroupAdmin),
 	}, recorder
 }

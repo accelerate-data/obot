@@ -46,22 +46,11 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 			return ServerConfig{}, err
 		}
 	}
-	var currentInstance v1.VMCPInstance
-	if instance != nil {
-		currentInstance = *instance
+	releaseOAuth, err := vmcpaccess.LockOAuthConnection(ctx, sm.gatewayClient, sm.storageClient, vmcp, instance, user)
+	if err != nil {
+		return ServerConfig{}, err
 	}
-	for _, component := range vmcpaccess.EnabledComponents(user, *vmcp, vmcpaccess.ComponentsForInstance(*vmcp, currentInstance)) {
-		manifest := component.CatalogEntry.Manifest
-		if manifest.RemoteConfig == nil || !manifest.RemoteConfig.StaticOAuthRequired {
-			continue
-		}
-		for _, status := range vmcp.Status.Components {
-			// An empty check hash means the controller has not checked the credential yet.
-			if status.Name == component.Name && status.ConfigurationError == "" && status.OAuthCredentialCheckHash != "" && !status.OAuthCredentialConfigured {
-				return ServerConfig{}, types.NewErrBadRequest("%s requires administrator static OAuth configuration", component.Name)
-			}
-		}
-	}
+	defer releaseOAuth()
 
 	if instance == nil {
 		instance = &v1.VMCPInstance{
@@ -74,20 +63,24 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 			},
 		}
 
-		var err error
+		if err := sm.storageClient.Create(ctx, instance); err != nil {
+			return ServerConfig{}, fmt.Errorf("failed to create vMCP connection: %w", err)
+		}
+		releaseOAuth()
 		instance, err = wait.For(ctx, sm.storageClient, instance, func(i *v1.VMCPInstance) (bool, error) {
 			return i.Status.ConfigurationCheckHash != "", nil
-		}, wait.Option{Timeout: 15 * time.Second, Create: true})
+		}, wait.Option{Timeout: 15 * time.Second})
 		if err != nil {
 			return ServerConfig{}, fmt.Errorf("failed to create vMCP connection: %w", err)
 		}
 	}
 
+	releaseOAuth()
 	if instance.Spec.Manifest.VMCPID != vmcpID || instance.Spec.UserID != userID {
 		return ServerConfig{}, fmt.Errorf("VMCP instance %q does not belong to VMCP %q and user %q", instance.Name, vmcpID, userID)
 	}
 
-	instance, err := sm.waitForVMCPInstanceConfiguration(ctx, vmcp, instance, user)
+	instance, err = sm.waitForVMCPInstanceConfiguration(ctx, vmcp, instance, user)
 	if err != nil {
 		return ServerConfig{}, err
 	}

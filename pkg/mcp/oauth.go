@@ -515,7 +515,8 @@ func (o *oauth) Authorize(ctx context.Context, req *http.Request, resp *http.Res
 		}
 	}
 
-	tok, err := ExchangeOAuthToken(withOAuthHTTPClient(ctx, o.httpClient), conf, cb.Code, verifier, resourceURL)
+	// The exchange carries the server-specific network policy and never follows redirects.
+	tok, err := ExchangeOAuthToken(withOAuthHTTPClient(ctx, safehttp.NoRedirects(o.httpClient)), conf, cb.Code, verifier, resourceURL)
 	if err != nil {
 		slog.Warn("oauth code exchange failed",
 			"server", o.serverName,
@@ -844,10 +845,11 @@ func withOAuthHTTPClient(ctx context.Context, client *http.Client) context.Conte
 // oauthHTTPClientContext returns ctx with an HTTP client for oauth2 set, keeping the
 // caller's client when it has one and falling back to strictEgressClient otherwise.
 func oauthHTTPClientContext(ctx context.Context) context.Context {
-	if _, ok := ctx.Value(oauth2.HTTPClient).(*http.Client); ok {
-		return ctx
+	client, _ := ctx.Value(oauth2.HTTPClient).(*http.Client)
+	if client == nil {
+		client = strictEgressClient
 	}
-	return withOAuthHTTPClient(ctx, strictEgressClient)
+	return withOAuthHTTPClient(ctx, safehttp.NoRedirects(client))
 }
 
 // ExchangeOAuthToken exchanges an OAuth authorization code for a token. The token

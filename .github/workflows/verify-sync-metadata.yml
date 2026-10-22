@@ -1,0 +1,52 @@
+name: Verify Sync Metadata
+
+# Guards .accelerate/upstream-sync.json (which drives the vibedata image tag)
+# against drift, and fork-only Go tests against removal by a sync. Runs on every
+# PR to main so it also catches syncs done as manual merges, not just those
+# produced by the Upstream Sync workflow.
+
+permissions:
+  contents: read
+
+on:
+  # ready_for_review: upstream-sync drafts are created with GITHUB_TOKEN, whose
+  # events trigger no workflows — marking the draft ready must start the checks.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: verify-sync-metadata-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/obot-platform/obot.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream branch and release tags
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
+
+      - name: Verify upstream-sync metadata
+        run: bash scripts/verify-sync-metadata.sh
+
+      # A sync that takes upstream's side of a shared test file deletes the fork's
+      # tests in it without failing anything else (VD-6903).
+      - name: Verify fork-only tests survive
+        if: github.event_name == 'pull_request' || github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/check-fork-test-survival.sh "$BASE_SHA"

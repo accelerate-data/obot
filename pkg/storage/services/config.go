@@ -35,12 +35,20 @@ func New(config Config) (_ *Services, err error) {
 	// Sanitize DSN for logging (remove credentials)
 	sanitizedDSN := logutil.SanitizeDSN(config.DSN)
 	slog.Debug("Creating database factory", "dsn", sanitizedDSN)
-	dbClient, err := db.NewFactory(scheme.Scheme, config.DSN)
+	dbClient, err := connectDB(
+		func() (*db.Factory, error) { return db.NewFactory(scheme.Scheme, config.DSN) },
+		dbConnectMaxAttempts,
+		dbConnectRetryDelay,
+	)
 	if err != nil {
 		slog.Error("Failed to create database factory", "dsn", sanitizedDSN, "error", err)
 		return nil, err
 	}
 	slog.Debug("Database factory created successfully", "dsn", sanitizedDSN)
+
+	// Query logging must never write bound parameter values.
+	dbClient.DB.Logger = newParameterizedLogger(dbClient.DB.Logger)
+	parameterizeRecorder()
 
 	services := &Services{
 		DB:    dbClient,

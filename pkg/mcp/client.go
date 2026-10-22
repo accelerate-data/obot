@@ -172,6 +172,7 @@ func (sm *SessionManager) loadSession(ctx context.Context, server ServerConfig, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
+	httpClient = withSafeProtocolErrors(httpClient)
 
 	// A tunneled server is reached through a bridge URL on Obot's own host, but its OAuth
 	// metadata names its real URL, so validate the metadata against the server's URL.

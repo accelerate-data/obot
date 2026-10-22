@@ -476,5 +476,6 @@
 	"identity_access_users_update_role_failed": "ユーザーロールの更新に失敗しました。もう一度お試しください。",
 	"identity_access_users_update_role_title": "{name} のロールを更新",
 	"identity_access_users_user_limits": "ユーザー数の上限：",
-	"identity_access_view_access_policies": "アクセスポリシーを表示"
+	"identity_access_view_access_policies": "アクセスポリシーを表示",
+	"identity_access_auth_providers_generic_issuer_warning": "発行者を変更すると、ID の信頼境界が変わります。新しい発行者が返すメールアドレスの所有権を信頼できる場合のみ、アカウント連携を再確認してください。"
 }

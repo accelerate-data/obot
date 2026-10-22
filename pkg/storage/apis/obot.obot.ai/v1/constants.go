@@ -13,6 +13,7 @@ const (
 	GitCredentialFinalizer         = "obot.obot.ai/git-credential"
 
 	ModelProviderSyncAnnotation         = "obot.ai/model-provider-sync"
+	AuthProviderSyncAnnotation          = "obot.ai/auth-provider-sync"
 	MCPCatalogSyncAnnotation            = "obot.ai/mcp-catalog-sync"
 	SystemMCPCatalogSyncAnnotation      = "obot.ai/system-mcp-catalog-sync"
 	SkillRepositorySyncAnnotation       = "obot.ai/skill-repository-sync"

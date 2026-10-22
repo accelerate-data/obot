@@ -604,16 +604,6 @@ icon: icon
 runtime: npx
 npxConfig:
   package: test`,
-		"legacy-schema.yaml": `name: Legacy
-shortDescription: Legacy
-description: Legacy
-icon: icon
-runtime: npx
-npxConfig:
-  package: test
-serverUserType: singleUser
-env:
-  - key: TOKEN`,
 		"invalid-config.yaml": `name: Invalid Config
 shortDescription: Invalid Config
 description: Invalid Config

@@ -153,7 +153,8 @@ func TestClearOAuthCredentialsVMCPUsesDeclaredRemoteComponents(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNoContent, recorder.Code)
-	assert.Equal(t, []string{component.Name}, trigger.keys)
+	// MCPServer is namespace-scoped; a bare name resolves to no object (VD-4889).
+	assert.Equal(t, []string{system.DefaultNamespace + "/" + component.Name}, trigger.keys)
 }
 
 func TestClearOAuthCredentialsVMCPComponentOnlyClearsThatComponent(t *testing.T) {
@@ -223,7 +224,7 @@ func TestClearOAuthCredentialsVMCPComponentOnlyClearsThatComponent(t *testing.T)
 	trigger, err := clearComponent(otherID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{componentID}, authenticatedComponents())
-	assert.Equal(t, []string{other.Name}, trigger.keys)
+	assert.Equal(t, []string{system.DefaultNamespace + "/" + other.Name}, trigger.keys)
 
 	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), userID, other.Name, other.Spec.Manifest.RemoteConfig.URL)
 	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)

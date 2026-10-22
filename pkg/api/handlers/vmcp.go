@@ -117,9 +117,15 @@ func (h *VMCPHandler) Create(req api.Context) error {
 		userID = req.User.GetUID()
 	}
 
-	if err := h.loadComponentSnapshots(req, &manifest, userID, nil, true); err != nil {
+	if err := h.loadComponentSnapshots(req, &manifest, userID, nil); err != nil {
 		return err
 	}
+
+	releaseOAuth, err := vmcpconfig.LockOAuthCredentials(req.Context(), req.GatewayClient, req.Storage, req.Namespace(), manifest.Components, true)
+	if err != nil {
+		return err
+	}
+	defer releaseOAuth()
 
 	if err := manifest.Validate(); err != nil {
 		return types.NewErrBadRequest("invalid VMCP manifest: %v", err)
@@ -170,6 +176,7 @@ func (h *VMCPHandler) Create(req api.Context) error {
 		cleanupErr := req.Delete(&vmcp)
 		return errors.Join(fmt.Errorf("failed to publish VMCP static configuration: %w", err), cleanupErr)
 	}
+	releaseOAuth()
 	instance, err := vmcpconfig.FindInstance(req.Context(), req.Storage, vmcp.Namespace, vmcp.Name, req.User.GetUID())
 	if err != nil {
 		return err
@@ -198,9 +205,23 @@ func (h *VMCPHandler) Update(req api.Context) error {
 		return types.NewErrBadRequest("invalid VMCP manifest: %v", err)
 	}
 	vmcpconfig.PruneRemovedComponentProfiles(vmcp.Spec.Manifest.Components, &manifest)
-	if err := h.loadComponentSnapshots(req, &manifest, vmcp.Spec.UserID, vmcp.Spec.Manifest.Components, true); err != nil {
+	if err := h.loadComponentSnapshots(req, &manifest, vmcp.Spec.UserID, vmcp.Spec.Manifest.Components); err != nil {
 		return err
 	}
+	var added []types.VMCPComponent
+	for _, component := range manifest.Components {
+		if !slices.ContainsFunc(vmcp.Spec.Manifest.Components, func(previous types.VMCPComponent) bool {
+			return previous.ID == component.ID && previous.MCPServerCatalogEntryID == component.MCPServerCatalogEntryID
+		}) {
+			added = append(added, component)
+		}
+	}
+	releaseOAuth, err := vmcpconfig.LockOAuthCredentials(req.Context(), req.GatewayClient, req.Storage, req.Namespace(), added, true)
+	if err != nil {
+		return err
+	}
+	defer releaseOAuth()
+
 	if err := manifest.Validate(); err != nil {
 		return types.NewErrBadRequest("invalid VMCP manifest: %v", err)
 	}
@@ -240,6 +261,7 @@ func (h *VMCPHandler) Update(req api.Context) error {
 	}); err != nil {
 		return err
 	}
+	releaseOAuth()
 	instance, err := vmcpconfig.FindInstance(req.Context(), req.Storage, vmcp.Namespace, vmcp.Name, req.User.GetUID())
 	if err != nil {
 		return err
@@ -250,13 +272,22 @@ func (h *VMCPHandler) Update(req api.Context) error {
 // TriggerUpdate adopts current catalog snapshots in one resource update. It does
 // not change policies or credentials; ordinary edits never refresh snapshots.
 func (h *VMCPHandler) TriggerUpdate(req api.Context) error {
+	// Refresh remains available before OAuth is configured, but publishing new
+	// snapshots must serialize with connection creation and credential changes.
+	if req.GatewayClient != nil {
+		release, err := req.GatewayClient.AcquireCredentialLock(req.Context(), system.MCPStaticOAuthCatalogMutationLock)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	var vmcp v1.VMCP
 	// Controllers write the vMCP's status concurrently, so reload and retry on conflict.
 	if err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		if err := req.Get(&vmcp, req.PathValue("vmcp_id")); err != nil {
 			return err
 		}
-		if err := h.loadComponentSnapshots(req, &vmcp.Spec.Manifest, vmcp.Spec.UserID, nil, false); err != nil {
+		if err := h.loadComponentSnapshots(req, &vmcp.Spec.Manifest, vmcp.Spec.UserID, nil); err != nil {
 			return err
 		}
 		if err := vmcp.Spec.Manifest.Validate(); err != nil {
@@ -392,7 +423,7 @@ func (*VMCPHandler) Deconfigure(req api.Context) error {
 	return req.Write(convertVMCPForInstance(req, vmcp, instance))
 }
 
-func (h *VMCPHandler) loadComponentSnapshots(req api.Context, manifest *types.VMCPManifest, ownerID string, existing []types.VMCPComponent, rejectUnconfiguredOAuth bool) error {
+func (h *VMCPHandler) loadComponentSnapshots(req api.Context, manifest *types.VMCPManifest, ownerID string, existing []types.VMCPComponent) error {
 	for i := range manifest.Components {
 		component := &manifest.Components[i]
 		if component.MCPServerCatalogEntryID == "" {
@@ -413,13 +444,6 @@ func (h *VMCPHandler) loadComponentSnapshots(req api.Context, manifest *types.VM
 		if err == nil {
 			if err := authz.CheckVMCPComponentAccess(req.Context(), req.User, ownerID, &entry, h.acrHelper, req.GatewayClient.UserInfoByID); err != nil {
 				return err
-			}
-			if previous == nil && rejectUnconfiguredOAuth && entryRequiresStaticOAuthCreds(entry) {
-				name := entry.Spec.Manifest.Name
-				if name == "" {
-					name = entry.Name
-				}
-				return types.NewErrBadRequest("MCP server %q requires administrator OAuth configuration before it can be added to a vMCP", name)
 			}
 		}
 		if previous != nil {

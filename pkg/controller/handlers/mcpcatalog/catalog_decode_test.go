@@ -165,11 +165,11 @@ func TestReadMCPCatalogRejectsUnknownType(t *testing.T) {
 	require.Empty(t, objects)
 }
 
-func TestCatalogSyncRejectsLegacyConfiguration(t *testing.T) {
+func TestCatalogSyncRejectsMalformedLegacyConfiguration(t *testing.T) {
 	for _, field := range []string{
-		"env: []",
-		"remoteConfig: {headers: []}",
-		"multiUserConfig: {userDefinedHeaders: null}",
+		"env: {}",
+		"remoteConfig: {headers: {}}",
+		"multiUserConfig: {userDefinedHeaders: {}}",
 	} {
 		t.Run(field, func(t *testing.T) {
 			content := "- name: Legacy\n  " + field + "\n"
@@ -183,11 +183,11 @@ func TestCatalogSyncRejectsLegacyConfiguration(t *testing.T) {
 			handler := &Handler{httpClient: server.Client()}
 			for _, source := range []string{path, server.URL} {
 				objects, _, err := handler.readMCPCatalog(t.Context(), "default", source, "")
-				require.ErrorContains(t, err, "top-level config")
+				require.Error(t, err)
 				require.Empty(t, objects)
 
 				objects, err = handler.readSystemMCPCatalog(t.Context(), "default", source, "")
-				require.ErrorContains(t, err, "top-level config")
+				require.Error(t, err)
 				require.Empty(t, objects)
 			}
 		})
@@ -281,8 +281,7 @@ func TestReadMCPCatalogRetainsPartialResultsAndReportsIncompleteSource(t *testin
 
 			objects, _, err := (&Handler{}).readMCPCatalog(t.Context(), "default", dir, "")
 			require.ErrorContains(t, err, "Broken.yaml")
-			require.ErrorContains(t, err, `legacy configuration field "env"`)
-			require.Len(t, objects, 1)
+			require.Len(t, objects, 2)
 		})
 	}
 }

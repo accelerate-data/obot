@@ -2,6 +2,8 @@
 	import { browser } from '$app/environment';
 	import Logo from '$lib/components/Logo.svelte';
 	import { m } from '$lib/i18n';
+	import { safeRedirectPath } from '$lib/redirect';
+	import { appBasePath, appPath } from '$lib/url';
 	import { type PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -13,14 +15,18 @@
 		if (browser) {
 			const rd = new URL(window.location.href).searchParams.get('rd');
 			if (rd) {
-				return rd;
+				return redirectPath(rd);
 			}
 		}
 		if (overrideRedirect !== null) {
-			return overrideRedirect;
+			return redirectPath(overrideRedirect);
 		}
-		return '/';
+		return appPath('/');
 	});
+
+	function redirectPath(path: string) {
+		return safeRedirectPath(path, appBasePath()) ?? appPath('/');
+	}
 </script>
 
 <svelte:head>
@@ -68,9 +74,11 @@
 							disabled={provider.requiresActivation}
 							onclick={() => {
 								localStorage.setItem('preAuthRedirect', window.location.href);
-								window.location.href = `/oauth2/start?rd=${encodeURIComponent(
-									overrideRedirect !== null ? overrideRedirect : rd
-								)}&obot-auth-provider=${provider.namespace}/${provider.id}`;
+								window.location.href = appPath(
+									`/oauth2/start?rd=${encodeURIComponent(
+										overrideRedirect !== null ? overrideRedirect : rd
+									)}&obot-auth-provider=${provider.namespace}/${provider.id}`
+								);
 							}}
 						>
 							{#if provider.icon}
@@ -79,10 +87,10 @@
 									src={provider.icon}
 									alt={provider.name}
 								/>
-								<span class="text-center text-sm font-light"
-									>{m.login_continue_with({ provider: provider.name })}</span
-								>
 							{/if}
+							<span class="text-center text-sm font-light"
+								>{m.login_continue_with({ provider: provider.name })}</span
+							>
 						</button>
 					{/each}
 					{#if authProviders.some((provider) => provider.requiresActivation)}

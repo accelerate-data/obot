@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"cmp"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -17,19 +18,36 @@ import (
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/handlers"
+	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
+	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
 
 const (
-	ErrInvalidClient           ErrorCode = "invalid_client"
-	ErrInvalidGrant            ErrorCode = "invalid_grant"
-	ErrInvalidRequest          ErrorCode = "invalid_request"
-	ErrAccessDenied            ErrorCode = "access_denied"
-	ErrUnsupportedResponseType ErrorCode = "unsupported_response_type"
-	ErrServerError             ErrorCode = "server_error"
-	ErrInvalidClientMetadata   ErrorCode = "invalid_client_metadata"
+	ErrInvalidClient                        ErrorCode = "invalid_client"
+	ErrInvalidGrant                         ErrorCode = "invalid_grant"
+	ErrInvalidRequest                       ErrorCode = "invalid_request"
+	ErrAccessDenied                         ErrorCode = "access_denied"
+	ErrUnsupportedResponseType              ErrorCode = "unsupported_response_type"
+	ErrServerError                          ErrorCode = "server_error"
+	ErrInvalidClientMetadata                ErrorCode = "invalid_client_metadata"
+	invalidStaticOAuthCredentialTestMessage           = "invalid or expired static OAuth credential test"
+
+	// staticOAuthTestCompletionTimeout bounds persisting the outcome once the exchange
+	// settles, which runs detached from the request so a disconnect still records a
+	// terminal result.
+	staticOAuthTestCompletionTimeout = 10 * time.Second
+)
+
+var (
+	// staticOAuthTokenExchangeTimeout bounds one provider token exchange during a
+	// credential test. It is a var so tests can shorten it; keep it below the gateway's
+	// claim lease.
+	staticOAuthTokenExchangeTimeout = 30 * time.Second
 )
 
 // ErrorCode defines the set of OAuth 2.0 error codes as per RFC 6749.
@@ -513,13 +531,16 @@ func (h *handler) ensureMCPAuthComplete(req api.Context, oauthAppAuthRequest v1.
 
 // oauthCallback handles the second-level third-party OAuth for MCP servers.
 func (h *handler) oauthCallback(req api.Context) error {
+	if handled, err := h.maybeHandleStaticOAuthTestCallback(req); err != nil || handled {
+		return err
+	}
 	if handled, err := h.maybeHandleDebuggerCallback(req); err != nil || handled {
 		return err
 	}
 
 	pending, err := h.oauthChecker.stateMgr.gatewayClient.GetMCPOAuthPendingState(req.Context(), req.URL.Query().Get("state"))
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return types.NewErrBadRequest("authentication attempt not found")
+		return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get pending state: %w", err)
@@ -541,6 +562,19 @@ func (h *handler) oauthCallback(req api.Context) error {
 	}
 	oauthAuthRequestID, mcpServerID, err := h.oauthChecker.stateMgr.createToken(req.Context(), req.URL.Query().Get("state"), req.URL.Query().Get("code"), req.URL.Query().Get("error"), req.URL.Query().Get("error_description"))
 	if err != nil {
+		var cbErr *oauthCallbackError
+		if h.completionURL != "" && errors.As(err, &cbErr) {
+			if oauthAuthRequestID == "" {
+				http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, callbackFailureQuery("instance", mcpServerID, cbErr)), http.StatusFound)
+				return nil
+			}
+			// A component tab has no first-level client to report to; a
+			// standalone server's error stays with that client.
+			if _, component, lookupErr := resolveAggregateComponent(req, mcpServerID); lookupErr == nil && component {
+				http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, callbackFailureQuery("component", mcpServerID, cbErr)), http.StatusFound)
+				return nil
+			}
+		}
 		if oauthAuthRequestID != "" {
 			var request v1.OAuthAuthRequest
 			if loadErr := req.Get(&request, oauthAuthRequestID); loadErr != nil {
@@ -555,6 +589,12 @@ func (h *handler) oauthCallback(req api.Context) error {
 				return nil
 			}
 		}
+		if errors.Is(err, gorm.ErrRecordNotFound) || errors.Is(err, gatewayclient.ErrMCPOAuthPendingStateInvalid) {
+			return types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+		}
+		if cbErr != nil {
+			return types.NewErrBadRequest("upstream authentication failed")
+		}
 		return types.NewErrHTTP(http.StatusBadRequest, err.Error())
 	}
 
@@ -562,7 +602,14 @@ func (h *handler) oauthCallback(req api.Context) error {
 		// If there is no OAuth request object, then MCP OAuth wasn't started by OAuth; likely the UI kicked it off.
 		// Redirect to the OAuth completion page.
 		slog.Info("Completed MCP OAuth callback without first-level OAuth auth request context")
-		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		q := url.Values{
+			"flow":   {"instance"},
+			"status": {"success"},
+		}
+		if mcpServerID != "" {
+			q.Set("mcp_id", mcpServerID)
+		}
+		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 		return nil
 	}
 
@@ -581,34 +628,118 @@ func (h *handler) oauthCallback(req api.Context) error {
 	}
 
 	// Check if the MCP server is a component of an aggregate; only finalize if it's not
-	var instance v1.MCPServerInstance
-	if system.IsMCPServerInstanceID(mcpServerID) {
-		if err := req.Get(&instance, mcpServerID); err != nil {
-			redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
-			return nil
-		}
-		mcpServerID = instance.Spec.MCPServerName
-	}
-	var server v1.MCPServer
-	if err := req.Get(&server, mcpServerID); err != nil {
+	server, component, err := resolveAggregateComponent(req, mcpServerID)
+	if err != nil {
 		redirectWithAuthorizeError(req, oauthAppAuthRequest.Spec.RedirectURI, newOAuthError(ErrServerError, err.Error(), oauthAppAuthRequest.Spec.State))
 		return nil
 	}
 
-	if instance.Spec.VMCPInstanceID != "" || instance.Spec.CompositeName != "" || server.Spec.CompositeName != "" || server.Spec.VMCPInstanceID != "" || server.Spec.VMCPID != "" {
+	if component {
 		// MCP server is a component of an aggregate.
 		// Redirect to OAuth completion page; the checkCompositeAuth handler will redirect back
 		// to the 1st level OAuth redirect URL when all pending 2nd level OAuth for the aggregate server's
 		// component servers are completed.
 		slog.Info("MCP OAuth callback completed for aggregate component server, awaiting aggregate finalization", "authRequest", oauthAppAuthRequest.Name, "mcpServer", server.Name, "composite", server.Spec.CompositeName, "vmcpInstance", server.Spec.VMCPInstanceID, "vmcp", server.Spec.VMCPID)
-		http.Redirect(req.ResponseWriter, req.Request, "/auth/oauth/complete", http.StatusFound)
+		q := url.Values{
+			"flow":   {"component"},
+			"status": {"success"},
+			"mcp_id": {mcpServerID},
+		}
+		http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
 		return nil
 	}
 
-	slog.Info("Completed MCP OAuth callback and redirecting to completion screen", "authRequest", oauthAppAuthRequest.Name, "mcpServer", mcpServerID)
+	slog.Info("Completed MCP OAuth callback and redirecting to completion screen", "authRequest", oauthAppAuthRequest.Name, "mcpServer", server.Name)
 	redirectWithOAuthCompletion(req, oauthAppAuthRequest.Name)
 
 	return nil
+}
+
+// resolveAggregateComponent loads the server behind an MCP server or
+// connection id and reports whether it is a component of an aggregate.
+func resolveAggregateComponent(req api.Context, mcpServerID string) (v1.MCPServer, bool, error) {
+	var instance v1.MCPServerInstance
+	if system.IsMCPServerInstanceID(mcpServerID) {
+		if err := req.Get(&instance, mcpServerID); err != nil {
+			return v1.MCPServer{}, false, err
+		}
+		mcpServerID = instance.Spec.MCPServerName
+	}
+	var server v1.MCPServer
+	if err := req.Get(&server, mcpServerID); err != nil {
+		return v1.MCPServer{}, false, err
+	}
+	component := instance.Spec.VMCPInstanceID != "" || instance.Spec.CompositeName != "" || server.Spec.CompositeName != "" || server.Spec.VMCPInstanceID != "" || server.Spec.VMCPID != ""
+	return server, component, nil
+}
+
+func (h *handler) maybeHandleStaticOAuthTestCallback(req api.Context) (bool, error) {
+	state := req.URL.Query().Get("state")
+	if state == "" {
+		return false, nil
+	}
+	pending, err := h.oauthChecker.stateMgr.gatewayClient.GetMCPOAuthPendingState(req.Context(), state)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, errors.New("failed to load static OAuth credential test")
+	} else if !pending.StaticOAuthTest {
+		return false, nil
+	}
+	pending, err = h.oauthChecker.stateMgr.gatewayClient.ClaimMCPStaticOAuthTest(req.Context(), state)
+	if errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+	} else if err != nil {
+		return true, errors.New("failed to claim static OAuth credential test")
+	}
+
+	code := req.URL.Query().Get("code")
+	failure := staticOAuthCallbackInputFailure(pending, state, code, req.URL.Query().Get("error"))
+	status := types.MCPStaticOAuthTestStatusSucceeded
+	if failure != "" {
+		status = types.MCPStaticOAuthTestStatusFailed
+	} else {
+		conf := &oauth2.Config{ClientID: pending.ClientID, ClientSecret: pending.ClientSecret, Endpoint: oauth2.Endpoint{AuthURL: pending.AuthURL, TokenURL: pending.TokenURL, AuthStyle: pending.AuthStyle}, RedirectURL: pending.RedirectURL}
+		if pending.Scopes != "" {
+			conf.Scopes = strings.Fields(pending.Scopes)
+		}
+		// Bound the provider exchange so a stalled provider cannot hold the claim past its lease.
+		exchangeContext, cancelExchange := context.WithTimeout(req.Context(), staticOAuthTokenExchangeTimeout)
+		defer cancelExchange()
+		if h.staticOAuthHTTPClient != nil {
+			exchangeContext = mcp.WithOAuthHTTPClient(exchangeContext, h.staticOAuthHTTPClient)
+		}
+		if _, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pending.Verifier, pending.ResourceURL); err != nil {
+			status = types.MCPStaticOAuthTestStatusFailed
+			failure = types.MCPStaticOAuthTestFailureTokenExchange
+		}
+	}
+	// Record the outcome even when the browser has already gone away, so an abandoned
+	// popup leaves a terminal result rather than a claim the user has to wait out.
+	completionContext, cancelCompletion := context.WithTimeout(context.WithoutCancel(req.Context()), staticOAuthTestCompletionTimeout)
+	defer cancelCompletion()
+	if err := h.oauthChecker.stateMgr.gatewayClient.CompleteMCPStaticOAuthTest(completionContext, state, status, failure); errors.Is(err, gatewayclient.ErrMCPStaticOAuthTestInvalid) {
+		return true, types.NewErrBadRequest(invalidStaticOAuthCredentialTestMessage)
+	} else if err != nil {
+		return true, errors.New("failed to complete static OAuth credential test")
+	}
+	q := url.Values{"flow": {"static-test"}, "status": {"success"}}
+	if status == types.MCPStaticOAuthTestStatusFailed {
+		q.Set("status", "failed")
+		q.Set("error", string(failure))
+	}
+	http.Redirect(req.ResponseWriter, req.Request, handlers.MCPOAuthCompletionRedirect(h.completionURL, q), http.StatusFound)
+	return true, nil
+}
+
+func staticOAuthCallbackInputFailure(pending *gatewaytypes.MCPOAuthPendingState, state, code, errorCode string) types.MCPStaticOAuthTestFailureCategory {
+	if errorCode != "" {
+		return types.MCPStaticOAuthTestFailureAuthorizationDenied
+	}
+	if pending.State != state || code == "" {
+		return types.MCPStaticOAuthTestFailureInvalidCallback
+	}
+	return ""
 }
 
 func authenticatedOAuthUser(req api.Context, oauthAppAuthRequest v1.OAuthAuthRequest, phase string) (authProviderName, authProviderNamespace string, ok bool) {

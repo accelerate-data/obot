@@ -1,7 +1,15 @@
 package mcp
 
 import (
+	"context"
 	"testing"
+	"time"
+
+	"github.com/obot-platform/obot/apiclient/types"
+	gateway "github.com/obot-platform/obot/pkg/gateway/client"
+	gatewaydb "github.com/obot-platform/obot/pkg/gateway/db"
+	storageservices "github.com/obot-platform/obot/pkg/storage/services"
+	"golang.org/x/oauth2"
 
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
@@ -10,6 +18,11 @@ import (
 	kuser "k8s.io/apiserver/pkg/authentication/user"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type recordingContainerOAuthStore struct {
+	mcpID string
+	token *oauth2.Token
+}
 
 func TestCatalogEntryConnectionDoesNotSelectOrCreateServer(t *testing.T) {
 	for _, existingServer := range []bool{false, true} {
@@ -199,4 +212,80 @@ func TestCatalogNameForServerWhenSourceEntryIsDeleted(t *testing.T) {
 			require.Equal(t, tt.expectedCatalogName, catalogName)
 		})
 	}
+}
+
+func (s *recordingContainerOAuthStore) ForUserAndMCP(_ string, mcpID, _ string) TokenStorage {
+	s.mcpID = mcpID
+	return fixedContainerTokenStore{token: s.token}
+}
+
+func TestAddExtractedEnvVarsPreservesRemoteConfig(t *testing.T) {
+	server := &v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: types.MCPServerManifest{
+		Runtime:      types.RuntimeRemote,
+		RemoteConfig: &types.RemoteRuntimeConfig{URL: "https://${EXISTING}.example.com/${DETECTED}"},
+		Config:       []types.MCPConfig{{Name: "Existing", Key: "EXISTING", Required: true, Usage: types.Header}},
+	}}}
+	addExtractedEnvVars(server)
+	require.ElementsMatch(t, []types.MCPConfig{
+		{Name: "Existing", Key: "EXISTING", Required: true, Usage: types.Header},
+		{Name: "DETECTED", Key: "DETECTED", Description: "Automatically detected variable", Required: true, Sensitive: true, Usage: types.Env},
+	}, server.Spec.Manifest.Config)
+}
+
+func TestAllowMissingConfigInjectsContainerOAuthUsingResolvedInstanceID(t *testing.T) {
+	const (
+		serverID   = "ms1-shared-container"
+		instanceID = "msi1-user-container"
+		userID     = "user-1"
+	)
+	container := &types.ContainerizedRuntimeConfig{
+		Image: "example/container:latest",
+		OAuth: &types.ContainerOAuthConfig{
+			Provider: types.ContainerOAuthProviderMicrosoftEntra, AuthorityEnv: "INSTANCE", TenantIDEnv: "TENANT",
+			ClientIDEnv: "CLIENT", ClientSecretEnv: "SECRET", Scopes: []string{"api://${CLIENT}/Mcp.Tools.ReadWrite"},
+		},
+	}
+	server := &v1.MCPServer{
+		Name: serverID, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerSpec{
+			Manifest: types.MCPServerManifest{
+				Runtime: types.RuntimeContainerized, ContainerizedConfig: container,
+				Config: []types.MCPConfig{
+					{Key: "INSTANCE", Usage: types.Env, Value: "https://login.microsoftonline.com/"},
+					{Key: "TENANT", Usage: types.Env, Value: "tenant"},
+					{Key: "CLIENT", Usage: types.Env, Value: "client"},
+					{Key: "SECRET", Usage: types.Env, Value: "secret"},
+				},
+			},
+		},
+	}
+	instance := &v1.MCPServerInstance{
+		Name: instanceID, Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerInstanceSpec{MCPServerName: serverID, UserID: userID},
+	}
+	storage := fake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(server, instance).Build()
+	services, err := storageservices.New(storageservices.Config{DSN: "sqlite://:memory:"})
+	require.NoError(t, err)
+	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
+	require.NoError(t, err)
+	require.NoError(t, database.AutoMigrate())
+	gatewayClient := gateway.New(t.Context(), database, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
+	tokens := &recordingContainerOAuthStore{token: &oauth2.Token{AccessToken: "instance-access", TokenType: "Bearer", Expiry: time.Now().Add(time.Hour)}}
+	manager := &SessionManager{
+		backend:          &policyRecordingBackend{},
+		storageClient:    storage,
+		gatewayClient:    gatewayClient,
+		globalTokenStore: tokens,
+		baseURL:          "https://obot.example",
+	}
+
+	connectID, _, config, missing, err := manager.ServerForActionWithConnectIDAllowMissingConfig(context.Background(), instanceID, &kuser.DefaultInfo{UID: userID})
+	require.NoError(t, err)
+	require.Empty(t, missing)
+	require.Equal(t, instanceID, connectID)
+	require.Equal(t, instanceID, config.MCPServerInstanceID)
+	require.Equal(t, instanceID, tokens.mcpID)
+	require.Equal(t, []string{"Authorization"}, config.PassthroughHeaderNames)
+	require.Equal(t, []string{"Bearer instance-access"}, config.PassthroughHeaderValues)
 }

@@ -13,7 +13,8 @@ vi.mock('$lib/url', async (importOriginal) => ({
 
 const savedCredentials = {
 	clientID: 'client-id',
-	clientSecret: 'client-secret'
+	clientSecret: 'client-secret',
+	proof: 'tested-proof'
 };
 
 const toolSetupPrompt = 'Would you like to return to the vMCP tool setup you were working on?';
@@ -118,15 +119,30 @@ function deferredSave() {
 async function openModal(
 	onSave: (credentials: { clientID: string; clientSecret: string }) => Promise<void>
 ) {
-	const result = await render(StaticOAuthConfigureModal, { onSave });
+	const result = await render(StaticOAuthConfigureModal, {
+		onSave,
+		onStartTest: vi.fn().mockResolvedValue({
+			testState: 'test-state',
+			oauthURL: 'https://provider.example/authorize'
+		}),
+		onGetTest: vi.fn().mockResolvedValue({
+			status: 'succeeded',
+			proof: 'tested-proof',
+			expiresAt: new Date(Date.now() + 60000).toISOString()
+		})
+	});
 	result.component.open();
 	await expect.element(page.getByRole('heading', { name: 'Configure Static OAuth' })).toBeVisible();
 	return result;
 }
 
 async function fillAndSave() {
-	await page.getByLabelText('Client ID', { exact: true }).fill('  client-id  ');
-	await page.getByLabelText('Client Secret (optional)', { exact: true }).fill('  client-secret  ');
+	await page.getByLabelText('Client ID', { exact: true }).fill('client-id');
+	await page.getByLabelText('Client Secret', { exact: true }).fill('client-secret');
+	await page.getByRole('button', { name: 'Test Credentials', exact: true }).click();
+	await expect
+		.element(page.getByText('Credentials tested successfully. You can save them.'))
+		.toBeVisible();
 	await page.getByRole('button', { name: 'Save', exact: true }).click();
 }
 
@@ -148,11 +164,21 @@ async function expectReturnPrompt(prompt: string) {
 
 describe('StaticOAuthConfigureModal', () => {
 	beforeEach(() => {
+		vi.spyOn(window, 'open').mockImplementation(
+			() =>
+				({
+					opener: null,
+					closed: false,
+					location: { href: '' },
+					close: vi.fn()
+				}) as unknown as Window
+		);
 		setOAuthRedirect();
 		vi.mocked(goto).mockClear();
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		if (originalUrl) {
 			Object.defineProperty(appPage, 'url', originalUrl);
 		} else {
@@ -160,8 +186,23 @@ describe('StaticOAuthConfigureModal', () => {
 		}
 	});
 
+	it('requires a successful test and invalidates it when credentials change', async () => {
+		const onSave = vi.fn();
+		await openModal(onSave);
+		const save = page.getByRole('button', { name: 'Save', exact: true });
+		await expect.element(save).toBeDisabled();
+		await page.getByLabelText('Client ID', { exact: true }).fill('client-id');
+		await page.getByLabelText('Client Secret', { exact: true }).fill('client-secret');
+		await expect.element(save).toBeDisabled();
+		await page.getByRole('button', { name: 'Test Credentials', exact: true }).click();
+		await expect.element(save).toBeEnabled();
+		await page.getByLabelText('Client Secret', { exact: true }).fill('different-secret');
+		await expect.element(save).toBeDisabled();
+		expect(onSave).not.toHaveBeenCalled();
+	});
+
 	it.each(returnPrompts)(
-		'saves trimmed credentials and returns to $name when Go Back is accepted',
+		'saves tested credentials and returns to $name when Go Back is accepted',
 		async ({ redirect, destination, prompt }) => {
 			const save = deferredSave();
 			setOAuthRedirect(redirectValue(redirect));

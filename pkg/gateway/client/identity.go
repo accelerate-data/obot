@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	types2 "github.com/obot-platform/obot/apiclient/types"
@@ -25,7 +27,10 @@ import (
 )
 
 const (
-	userCreationAdvisoryLockID int64 = 0x6f626f7455736572 // "obotUser"
+	genericOAuthAuthProviderName           = "generic-oauth-auth-provider"
+	genericOAuthIssuerEnvVar               = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
+	genericOAuthTrustEmailLinkingVar       = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING"
+	userCreationAdvisoryLockID       int64 = 0x6f626f7455736572 // "obotUser"
 )
 
 var (
@@ -123,11 +128,12 @@ func (c *Client) EnsureIdentity(ctx context.Context, id *types.Identity, timezon
 // If the user already exists with a superset of the given role, it will not be updated.
 func (c *Client) EnsureIdentityWithRole(ctx context.Context, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit) (*types.User, error) {
 	var ensured ensuredIdentity
+	verified := c.identityCanLinkByVerifiedEmail(ctx, id)
 
 	// Transaction #1: ensure the identity + user rows exist / are corrected, and read what we need.
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
-		ensured, err = c.ensureIdentity(ctx, tx, id, timezone, role, userLimit)
+		ensured, err = c.ensureIdentity(ctx, tx, id, timezone, role, userLimit, verified)
 		return err
 	})
 	if err != nil {
@@ -219,8 +225,11 @@ func (c *Client) EncryptIdentities(ctx context.Context, force bool) error {
 // Once SCIM is enforced for the provider, sign-in requires a SCIM binding, and neither the identity nor the user is
 // ever created here. Before that, users are still created just in time. Either way, sign-in never overwrites the
 // profile of a user that SCIM has provisioned.
-func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit) (ensuredIdentity, error) {
+func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit, verifiedOverride ...bool) (ensuredIdentity, error) {
 	verified := slices.Contains(verifiedAuthProviders, fmt.Sprintf("%s/%s", id.AuthProviderNamespace, id.AuthProviderName))
+	if len(verifiedOverride) > 0 {
+		verified = verifiedOverride[0]
+	}
 
 	email := id.Email
 	providerUserID := id.ProviderUserID
@@ -701,6 +710,48 @@ func (c *Client) ensureIdentityProviderData(ctx context.Context, id *types.Ident
 	}
 
 	return nil
+}
+
+func (c *Client) identityCanLinkByVerifiedEmail(ctx context.Context, id *types.Identity) bool {
+	if slices.Contains(verifiedAuthProviders, fmt.Sprintf("%s/%s", id.AuthProviderNamespace, id.AuthProviderName)) {
+		return true
+	}
+
+	if id.AuthProviderNamespace != system.DefaultNamespace || id.AuthProviderName != genericOAuthAuthProviderName {
+		return false
+	}
+	if id.ProviderEmailVerified != nil && !*id.ProviderEmailVerified {
+		return false
+	}
+	if id.ProviderIssuer == "" {
+		return false
+	}
+
+	return c.genericOAuthTrustEmailLinking(ctx, id.ProviderIssuer)
+}
+
+func (c *Client) genericOAuthTrustEmailLinking(ctx context.Context, issuer string) bool {
+	var authProvider v1.AuthProvider
+	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: genericOAuthAuthProviderName}, &authProvider); err != nil {
+		return false
+	}
+
+	cred, err := c.RevealCredential(ctx, []string{authProvider.Name, system.GenericAuthProviderCredentialContext}, authProvider.Name)
+	if err != nil || cred.Secrets == nil {
+		return false
+	}
+	configuredIssuer := strings.TrimRight(strings.TrimSpace(cred.Secrets[genericOAuthIssuerEnvVar]), "/")
+	if configuredIssuer == "" || configuredIssuer != strings.TrimRight(strings.TrimSpace(issuer), "/") {
+		return false
+	}
+
+	rawTrust := cred.Secrets[genericOAuthTrustEmailLinkingVar]
+	if rawTrust == "" {
+		return true
+	}
+
+	trusted, err := strconv.ParseBool(rawTrust)
+	return err == nil && trusted
 }
 
 // fetchProviderGroupLookupID calls the auth provider's /obot-get-user-info endpoint

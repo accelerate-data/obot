@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -459,5 +460,19 @@ func TestPSASettingsIndependentOfPodScheduling(t *testing.T) {
 	}
 	if psaSettings == nil {
 		t.Error("expected PSA settings to be non-nil")
+	}
+}
+
+func TestValidateMCPOAuthCompletionURL(t *testing.T) {
+	for _, ok := range []string{"", "/auth/mcp-oauth/complete", "https://studio.example.com/auth/mcp-oauth/complete", "http://localhost:5173/x"} {
+		if err := validateMCPOAuthCompletionURL(ok); err != nil {
+			t.Errorf("%q: unexpected error %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"//evil.example", "/\\evil", "auth/complete", "javascript:alert(1)", "https://", "/x?y=1", "/x#frag", "ftp://h/x"} {
+		err := validateMCPOAuthCompletionURL(bad)
+		if err == nil || err.Error() != fmt.Sprintf("invalid MCP OAuth completion URL: %q", bad) {
+			t.Errorf("%q: want rejection, got %v", bad, err)
+		}
 	}
 }

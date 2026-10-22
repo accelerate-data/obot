@@ -476,5 +476,6 @@
 	"identity_access_users_update_role_failed": "사용자 역할을 업데이트하지 못했습니다. 다시 시도하세요.",
 	"identity_access_users_update_role_title": "{name}의 역할 업데이트",
 	"identity_access_users_user_limits": "사용자 한도:",
-	"identity_access_view_access_policies": "액세스 정책 보기"
+	"identity_access_view_access_policies": "액세스 정책 보기",
+	"identity_access_auth_providers_generic_issuer_warning": "발급자를 변경하면 ID 신뢰 경계가 변경됩니다. 새 발급자가 반환하는 이메일 주소를 소유한다고 신뢰하는 경우에만 계정 연결을 다시 확인하세요."
 }

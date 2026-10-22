@@ -13,7 +13,6 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
-	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/utils"
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -72,12 +71,17 @@ func (h *Handler) SyncStatus(req router.Request, _ router.Response) error {
 			if err != nil {
 				return err
 			}
+			fixedURL := ""
+			if remote := component.CatalogEntry.Manifest.RemoteConfig; remote != nil {
+				fixedURL = remote.FixedURL
+			}
+			checkHash = utils.Digest([]any{checkHash, fixedURL})
 			if status.OAuthCredentialCheckHash != checkHash {
-				_, err := h.credentials.RevealCredential(req.Ctx, []string{ref}, system.StaticOAuthCredentialName)
-				if err != nil && !errors.As(err, &gateway.CredentialNotFoundError{}) {
+				configured, err := vmcpconfig.OAuthCredentialReady(req.Ctx, h.credentials, ref, fixedURL)
+				if err != nil {
 					return err
 				}
-				status.OAuthCredentialConfigured = err == nil
+				status.OAuthCredentialConfigured = configured
 				status.OAuthCredentialCheckHash = checkHash
 			}
 			if !status.OAuthCredentialConfigured {

@@ -33,6 +33,32 @@ type Runtime string
 // ServerUserType specifies whether a catalog entry is single-user or multi-user.
 type ServerUserType string
 
+type MCPStaticOAuthTestStatus string
+
+const (
+	MCPStaticOAuthTestStatusPending   MCPStaticOAuthTestStatus = "pending"
+	MCPStaticOAuthTestStatusSucceeded MCPStaticOAuthTestStatus = "succeeded"
+	MCPStaticOAuthTestStatusFailed    MCPStaticOAuthTestStatus = "failed"
+)
+
+type MCPStaticOAuthTestFailureCategory string
+
+const (
+	MCPStaticOAuthTestFailureAuthorizationDenied MCPStaticOAuthTestFailureCategory = "authorization_denied"
+	MCPStaticOAuthTestFailureInvalidCallback     MCPStaticOAuthTestFailureCategory = "invalid_callback"
+	MCPStaticOAuthTestFailureTokenExchange       MCPStaticOAuthTestFailureCategory = "token_exchange_failed"
+	MCPStaticOAuthTestFailureExpired             MCPStaticOAuthTestFailureCategory = "expired"
+	// Interrupted: the callback was admitted but never completed, so the test must be retried.
+	MCPStaticOAuthTestFailureInterrupted MCPStaticOAuthTestFailureCategory = "interrupted"
+)
+
+type MCPStaticOAuthTestResult struct {
+	Status          MCPStaticOAuthTestStatus          `json:"status"`
+	FailureCategory MCPStaticOAuthTestFailureCategory `json:"failureCategory,omitempty"`
+	Proof           string                            `json:"proof,omitempty"`
+	ExpiresAt       Time                              `json:"expiresAt"`
+}
+
 // UVXRuntimeConfig represents configuration for UVX runtime (Python packages via uvx)
 type UVXRuntimeConfig struct {
 	Package               string   `json:"package"`                         // Required: Python package name
@@ -63,6 +89,24 @@ type ContainerizedRuntimeConfig struct {
 	EgressDomains         []string `json:"egressDomains,omitempty"`         // Optional: Empty means allow all, otherwise allow only the listed domains when network policy enforcement is enabled
 	DenyAllEgress         *bool    `json:"denyAllEgress,omitempty"`         // Optional: Deny all egress when network policy enforcement is enabled
 	StartupTimeoutSeconds int      `json:"startupTimeoutSeconds,omitempty"` // Optional: Timeout to start and connect to the MCP server, in seconds. Defaults to 60s, max 600s.
+	// OAuth configures Obot-managed per-user OAuth for the shared container.
+	OAuth *ContainerOAuthConfig `json:"oauth,omitempty"`
+}
+
+type ContainerOAuthProvider string
+
+const ContainerOAuthProviderMicrosoftEntra ContainerOAuthProvider = "microsoftEntra"
+
+// ContainerOAuthConfig describes a deployment-owned OAuth application whose
+// values are read from the container's encrypted organization configuration.
+// Access and refresh tokens remain user-scoped and are never added to Env.
+type ContainerOAuthConfig struct {
+	Provider        ContainerOAuthProvider `json:"provider"`
+	AuthorityEnv    string                 `json:"authorityEnv"`
+	TenantIDEnv     string                 `json:"tenantIDEnv"`
+	ClientIDEnv     string                 `json:"clientIDEnv"`
+	ClientSecretEnv string                 `json:"clientSecretEnv"`
+	Scopes          []string               `json:"scopes"`
 }
 
 // RemoteRuntimeConfig represents configuration for remote runtime (External MCP servers)
@@ -88,6 +132,8 @@ type RemoteCatalogConfig struct {
 	URLTemplate              string `json:"urlTemplate,omitempty"`         // URL template for user URLs
 	Hostname                 string `json:"hostname,omitempty"`            // Required hostname for user URLs
 	StaticOAuthRequired      bool   `json:"staticOAuthRequired,omitempty"` // Indicates static OAuth configuration is required
+	// Deprecated: retained to decode catalog source files still using the pre-vMCP schema; migrated into Config on load.
+	DeprecatedHeaders []MCPHeader `json:"headers,omitempty"`
 }
 
 // MultiUserConfig is retained only for storage migrations.
@@ -172,6 +218,43 @@ type MCPServerCatalogEntryManifest struct {
 	StaticConfigurationRevision string `json:"staticConfigurationRevision,omitempty"`
 
 	Resources *MCPResourceRequirements `json:"resources,omitempty"`
+
+	// Deprecated: retained to decode catalog source files still using the pre-vMCP schema; migrated into Config on load.
+	DeprecatedServerUserType  ServerUserType   `json:"serverUserType,omitempty"`
+	DeprecatedMultiUserConfig *MultiUserConfig `json:"multiUserConfig,omitempty"`
+	DeprecatedEnv             []MCPEnv         `json:"env,omitempty"`
+}
+
+// MigrateDeprecatedCatalogFields folds the pre-vMCP catalog fields (env,
+// remoteConfig.headers, multiUserConfig.userDefinedHeaders) into the unified
+// Config list so MapCatalogEntryToServer deploys a catalog entry's
+// configuration. Fields migrated from multiUserConfig.userDefinedHeaders are
+// per-user inputs and carry UserAllowed so the deployment asks each user for
+// them; env and remoteConfig.headers stay server-owned. The deprecated fields
+// are intentionally left populated because existing API consumers still read
+// them. It is called once per decode.
+func (m *MCPServerCatalogEntryManifest) MigrateDeprecatedCatalogFields() {
+	m.Config = append(m.Config, deprecatedCatalogConfig(m.DeprecatedEnv, m.RemoteConfig, m.DeprecatedMultiUserConfig)...)
+}
+
+func deprecatedCatalogConfig(env []MCPEnv, remote *RemoteCatalogConfig, multi *MultiUserConfig) []MCPConfig {
+	var config []MCPConfig
+	for _, item := range env {
+		config = append(config, ConfigFromEnv(item))
+	}
+	if remote != nil {
+		for _, item := range remote.DeprecatedHeaders {
+			config = append(config, ConfigFromHeader(item))
+		}
+	}
+	if multi != nil {
+		for _, item := range multi.UserDefinedHeaders {
+			userConfig := ConfigFromHeader(item)
+			userConfig.UserAllowed = true
+			config = append(config, userConfig)
+		}
+	}
+	return config
 }
 
 // ToolOverride defines how a single component tool is exposed by the composite server
@@ -289,11 +372,15 @@ const (
 	Interpolated Usage = "interpolated"
 )
 
-// ValidateConfig rejects ambiguous keys and missing or unknown usages.
+// ValidateConfig rejects ambiguous keys and missing or unknown usages. A
+// userAllowed input is only meaningful for a header on a multi-user entry, so a
+// catalog entry may carry it there (the deployment then asks each user for the
+// value); every other use is rejected.
 func (m MCPServerCatalogEntryManifest) ValidateConfig() error {
 	for _, config := range m.Config {
-		if config.UserAllowed {
-			return fmt.Errorf("config key %q: userAllowed is only supported on deployed servers", config.Key)
+		//nolint:staticcheck // DeprecatedServerUserType still carries the decoded serverUserType.
+		if config.UserAllowed && (config.Usage != Header || m.DeprecatedServerUserType != ServerUserTypeMultiUser) {
+			return fmt.Errorf("config key %q: userAllowed is only supported for multi-user headers", config.Key)
 		}
 	}
 	return (MCPServerManifest{Config: m.Config}).ValidateConfig()
@@ -427,7 +514,7 @@ type MCPServer struct {
 	Configured              bool           `json:"configured"`
 	MissingRequiredEnvVars  []string       `json:"missingRequiredEnvVars,omitempty"`
 	MissingRequiredHeaders  []string       `json:"missingRequiredHeader,omitempty"`
-	MissingOAuthCredentials bool           `json:"missingOAuthCredentials,omitempty"`
+	MissingOAuthCredentials bool           `json:"missingOAuthCredentials"`
 	CatalogEntryID          string         `json:"catalogEntryID"`
 	PowerUserWorkspaceID    string         `json:"powerUserWorkspaceID"`
 	MCPCatalogID            string         `json:"mcpCatalogID,omitempty"`
@@ -560,7 +647,12 @@ type RuntimeValidationError struct {
 // MCPServerOAuthCredentialRequest represents a request to set OAuth credentials for an MCP server
 type MCPServerOAuthCredentialRequest struct {
 	ClientID     string `json:"clientID"`
-	ClientSecret string `json:"clientSecret,omitempty"`
+	ClientSecret string `json:"clientSecret"`
+	Proof        string `json:"proof"`
+}
+
+type MCPServerOAuthCredentialDeleteRequest struct {
+	ExpectedGeneration string `json:"expectedGeneration"`
 }
 
 // MCPServerOAuthCredentialStatus represents the status of OAuth credentials for an MCP server
@@ -568,7 +660,23 @@ type MCPServerOAuthCredentialStatus struct {
 	// Configured is true if OAuth credentials have been set
 	Configured bool `json:"configured"`
 	// ClientID is the configured client ID (never includes secret)
-	ClientID string `json:"clientID,omitempty"`
+	ClientID    string `json:"clientID,omitempty"`
+	Generation  string `json:"generation,omitempty"`
+	CallbackURL string `json:"callbackURL"`
+}
+
+type MCPServerOAuthCredentialTestRequest struct {
+	ClientID     string `json:"clientID"`
+	ClientSecret string `json:"clientSecret"`
+}
+
+type MCPServerOAuthCredentialTestStatusRequest struct {
+	TestState string `json:"testState"`
+}
+
+type MCPServerOAuthCredentialTestStart struct {
+	TestState string `json:"testState"`
+	OAuthURL  string `json:"oauthURL"`
 }
 
 // IsSingleUser returns true if the type represents a single-user server.
@@ -758,6 +866,7 @@ func MapCatalogEntryToServer(catalogEntry MCPServerCatalogEntryManifest, userURL
 			EgressDomains:         catalogEntry.ContainerizedConfig.EgressDomains,
 			DenyAllEgress:         catalogEntry.ContainerizedConfig.DenyAllEgress,
 			StartupTimeoutSeconds: catalogEntry.ContainerizedConfig.StartupTimeoutSeconds,
+			OAuth:                 catalogEntry.ContainerizedConfig.OAuth.DeepCopy(),
 		}
 
 	case RuntimeRemote:

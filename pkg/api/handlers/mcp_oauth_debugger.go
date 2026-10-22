@@ -17,6 +17,7 @@ import (
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gwtypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
@@ -89,13 +90,14 @@ func (m *MCPHandler) RegisterOAuthDebuggerClient(req api.Context) error {
 
 	conf := oauthDebuggerConfig(clientID, clientSecret, authServer.AuthorizationEndpoint, authServer.TokenEndpoint, registration.TokenEndpointAuthMethod, firstString(registration.RedirectURIs), registration.Scope, staticClient)
 	resourceURL = mcp.ResolveOAuthResourceURL(authServer.AuthorizationEndpoint, resourceURL, serverConfig.URL)
-	if err := req.GatewayClient.CreateMCPOAuthPendingState(
+	if err := req.GatewayClient.CreateMCPOAuthPendingStateWithTunnel(
 		req.Context(),
 		req.User.GetUID(),
 		server.Name,
 		serverConfig.URL,
 		serverConfig.TunnelName,
 		OAuthDebuggerPendingStateMarker,
+		"",
 		state,
 		oauth2.GenerateVerifier(),
 		resourceURL,
@@ -175,22 +177,14 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		return types.NewErrNotFound("OAuth debugger authorization state not found")
 	}
 
-	conf := oauthDebuggerConfigFromPendingState(pendingState)
-
 	httpClient, err := m.mcpSessionManager.OAuthClientForServer(serverConfig)
 	if err != nil {
 		return err
 	}
-	exchangeContext := context.WithValue(req.Context(), oauth2.HTTPClient, httpClient)
-	token, err := mcp.ExchangeOAuthToken(exchangeContext, conf, input.Code, pendingState.Verifier, pendingState.ResourceURL)
+	token, err := claimAndExchangeOAuthDebuggerToken(req.Context(), req.GatewayClient, input.State, input.Code, httpClient)
 	if err != nil {
-		return fmt.Errorf("failed to exchange OAuth code: %w", err)
-	}
-
-	if err := req.GatewayClient.ReplaceMCPOAuthToken(req.Context(), req.User.GetUID(), server.Name, serverConfig.URL, "", conf, token); err != nil {
 		return err
 	}
-	_ = req.GatewayClient.DeleteMCPOAuthPendingState(req.Context(), pendingState.HashedState)
 
 	var expiresIn int
 	if !token.Expiry.IsZero() {
@@ -203,6 +197,38 @@ func (m *MCPHandler) ExchangeOAuthDebuggerToken(req api.Context) error {
 		TokenType:    token.TokenType,
 		ExpiresIn:    expiresIn,
 	})
+}
+
+// claimAndExchangeOAuthDebuggerToken claims the pending state as the last step
+// before the code exchange, which makes the exchange one-use and enforces the
+// state's expiry: a replayed or concurrent request never reaches the provider.
+// Callers check ownership first, so a foreign state is never claimed.
+func claimAndExchangeOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, state, code string, httpClient *http.Client) (*oauth2.Token, error) {
+	pendingState, err := gatewayClient.ClaimMCPOAuthPendingState(ctx, state)
+	if errors.Is(err, gateway.ErrMCPOAuthPendingStateInvalid) {
+		return nil, types.NewErrNotFound("OAuth debugger authorization state not found")
+	} else if err != nil {
+		return nil, err
+	}
+	return exchangeAndPersistOAuthDebuggerToken(ctx, gatewayClient, pendingState, code, httpClient)
+}
+
+func exchangeAndPersistOAuthDebuggerToken(ctx context.Context, gatewayClient *gateway.Client, pendingState *gwtypes.MCPOAuthPendingState, code string, httpClients ...*http.Client) (*oauth2.Token, error) {
+	conf := oauthDebuggerConfigFromPendingState(pendingState)
+	exchangeContext := ctx
+	if len(httpClients) > 0 && httpClients[0] != nil {
+		// The exchange replays the authorization code, PKCE verifier, and client
+		// secret, so it must not follow a redirect to another origin.
+		exchangeContext = mcp.WithOAuthHTTPClient(ctx, safehttp.NoRedirects(httpClients[0]))
+	}
+	token, err := mcp.ExchangeOAuthToken(exchangeContext, conf, code, pendingState.Verifier, pendingState.ResourceURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to exchange OAuth code: %w", err)
+	}
+	if err := gatewayClient.CommitMCPOAuthPendingStateToken(ctx, pendingState, "", conf, token); err != nil {
+		return nil, err
+	}
+	return token, nil
 }
 
 func quarterToken(token string) string {
