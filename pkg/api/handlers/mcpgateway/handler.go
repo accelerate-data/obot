@@ -274,11 +274,16 @@ func (h *Handler) Proxy(req api.Context) error {
 		return err
 	}
 
-	gatewayToken, err := h.gatewayToken(req.Context(), req.User, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig)
-	if err != nil {
-		return fmt.Errorf("failed to mint MCP gateway token: %w", err)
+	// Composite control requests carry a signed loopback token with component
+	// scopes. Keep it across owner forwarding and MMMCP component authorization;
+	// a single-server gateway token cannot authenticate those internal hops.
+	if serverConfig.Runtime != types.RuntimeVMCP {
+		gatewayToken, err := h.gatewayToken(req.Context(), req.User, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig)
+		if err != nil {
+			return fmt.Errorf("failed to mint MCP gateway token: %w", err)
+		}
+		req.Request = req.WithContext(withGatewayToken(req.Context(), req.Request, gatewayToken))
 	}
-	req.Request = req.WithContext(withGatewayToken(req.Context(), req.Request, gatewayToken))
 
 	isCompositeRequest := strings.HasSuffix(req.URL.Path, "/mcp-connect-composite/"+req.PathValue("mcp_id"))
 	if isCompositeRequest {
