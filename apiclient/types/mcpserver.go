@@ -372,15 +372,12 @@ const (
 	Interpolated Usage = "interpolated"
 )
 
-// ValidateConfig rejects ambiguous keys and missing or unknown usages. A
-// userAllowed input is only meaningful for a header on a multi-user entry, so a
-// catalog entry may carry it there (the deployment then asks each user for the
-// value); every other use is rejected.
+// ValidateConfig rejects ambiguous keys, missing or unknown usages, and
+// deployment-only user configuration policy.
 func (m MCPServerCatalogEntryManifest) ValidateConfig() error {
 	for _, config := range m.Config {
-		//nolint:staticcheck // DeprecatedServerUserType still carries the decoded serverUserType.
-		if config.UserAllowed && (config.Usage != Header || m.DeprecatedServerUserType != ServerUserTypeMultiUser) {
-			return fmt.Errorf("config key %q: userAllowed is only supported for multi-user headers", config.Key)
+		if config.UserAllowed {
+			return fmt.Errorf("config key %q: userAllowed is only supported on deployed servers", config.Key)
 		}
 	}
 	return (MCPServerManifest{Config: m.Config}).ValidateConfig()

@@ -252,8 +252,8 @@ func TestNormalizeSystemManifest(t *testing.T) {
 // longer exist on the catalog-entry manifest, so DecodeCatalogFile must both
 // accept them (Deprecated* fields) and fold them into Config or
 // MapCatalogEntryToServer would deploy an entry with no configuration.
-// multiUserConfig.userDefinedHeaders are per-user inputs, so they migrate with
-// UserAllowed set and the deployment asks each user for them.
+// Decoding preserves the per-user intent of userDefinedHeaders. Catalog
+// validation rejects that policy until it is moved to a vMCP component.
 func TestDecodeCatalogFileMigratesDeprecatedCatalogSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(`name: Legacy
@@ -297,7 +297,7 @@ multiUserConfig:
 	require.Len(t, entry.RemoteConfig.DeprecatedHeaders, 1)                         //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
 	require.Len(t, entry.DeprecatedMultiUserConfig.UserDefinedHeaders, 1)           //nolint:staticcheck // Assert the deprecated decode fields stay populated for API consumers.
 
-	require.NoError(t, entry.ValidateConfig())
+	require.EqualError(t, entry.ValidateConfig(), `config key "X-USER": userAllowed is only supported on deployed servers`)
 }
 
 func TestDecodeCatalogFileMigratesDeprecatedSystemCatalogSchema(t *testing.T) {
