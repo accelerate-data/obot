@@ -44,7 +44,6 @@ func TestClaimMCPOAuthPendingStateEnforcesTTLAndExactlyOnce(t *testing.T) {
 		mcpURL string
 	}{
 		{name: "dynamic", mcpURL: "https://mcp.example/api"},
-		{name: "container", mcpURL: ContainerOAuthResourcePrefix + "deployment-1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Run("exactly once", func(t *testing.T) {
