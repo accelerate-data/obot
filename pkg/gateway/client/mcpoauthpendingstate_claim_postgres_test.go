@@ -70,7 +70,6 @@ func TestClaimMCPOAuthPendingStateExactlyOnceAcrossPostgresClients(t *testing.T)
 		mcpURL string
 	}{
 		{name: "dynamic", mcpURL: "https://mcp.example/api"},
-		{name: "container", mcpURL: ContainerOAuthResourcePrefix + "deployment-1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			state := "callback-state-" + tc.name

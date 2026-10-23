@@ -27,7 +27,6 @@ import (
 
 const (
 	pendingStateTTL                                                   = 30 * time.Minute
-	ContainerOAuthResourcePrefix                                      = "urn:obot:container-oauth:"
 	mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
 
 	// staticOAuthTestClaimLease bounds how long an admitted provider callback may hold a
@@ -63,10 +62,6 @@ type MCPStaticOAuthTestStart struct {
 
 type MCPStaticOAuthCredentialClaim struct {
 	mcpID, mcpURL, clientID, clientSecret, generation string
-}
-
-func IsContainerOAuthResource(resource string) bool {
-	return strings.HasPrefix(resource, ContainerOAuthResourcePrefix)
 }
 
 func MCPStaticOAuthCredentialReady(secrets map[string]string, fixedURL string) bool {
@@ -665,7 +660,7 @@ func (c *Client) triggerMCPOAuthTokenChanges(ctx context.Context, mcpIDs []strin
 
 func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pending *types.MCPOAuthPendingState, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
 	entryName := pending.CatalogEntryName
-	if entryName == "" && !IsContainerOAuthResource(pending.URL) && c.storageClient != nil {
+	if entryName == "" && c.storageClient != nil {
 		// A row written before entry identity was persisted carries no entry name;
 		// recover it from the server so the static-OAuth-only check below still
 		// applies. This needs no existing grant, so a first-time dynamic

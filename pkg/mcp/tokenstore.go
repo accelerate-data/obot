@@ -98,15 +98,13 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context) (*oauth2.Config, *oauth
 	}
 
 	catalogEntryName := mcpToken.CatalogEntryName
-	if !gateway.IsContainerOAuthResource(t.mcpURL) {
-		if catalogEntryName == "" {
-			catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, t.mcpURL, conf)
-			if err != nil {
-				return nil, nil, err
-			}
-		} else if err := t.gatewayClient.ValidateCatalogOAuthToken(ctx, t.mcpID, t.mcpURL, catalogEntryName, mcpToken.CatalogCredentialGeneration, conf); err != nil {
+	if catalogEntryName == "" {
+		catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, t.mcpURL, conf)
+		if err != nil {
 			return nil, nil, err
 		}
+	} else if err := t.gatewayClient.ValidateCatalogOAuthToken(ctx, t.mcpID, t.mcpURL, catalogEntryName, mcpToken.CatalogCredentialGeneration, conf); err != nil {
+		return nil, nil, err
 	}
 	t.mu.Lock()
 	t.catalogEntry = catalogCredentialFence{entryName: catalogEntryName, generation: mcpToken.CatalogCredentialGeneration}
@@ -127,9 +125,6 @@ func (t *tokenStore) SetTokenConfig(ctx context.Context, config *oauth2.Config, 
 	fence, captured := t.catalogEntry, t.catalogEntryCaptured
 	t.mu.Unlock()
 	if !captured {
-		if gateway.IsContainerOAuthResource(t.mcpURL) {
-			return t.gatewayClient.ReplaceMCPOAuthToken(ctx, t.userID, t.mcpID, t.mcpURL, "", config, token)
-		}
 		var err error
 		fence.entryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, t.mcpURL, config)
 		if err != nil {

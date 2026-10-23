@@ -93,3 +93,14 @@ pkg/api/handlers TestStaticOAuthCredentialReadyUsesCredentialStoreInsteadOfCache
 pkg/api/handlers TestCreateServerRereadsStaticOAuthProviderInsideCatalogMutationFence v0.27.0 direct MCPServer creation removed; credential readiness and persistence fence ported to canonical TestVMCPCreateRereadsStaticOAuthProviderInsideCatalogFence
 pkg/api/handlers TestCreateServerReleasesStaticOAuthFenceBeforeWritingResponse v0.27.0 direct MCPServer creation removed; credential readiness and persistence fence ported to canonical TestVMCPCreateReleasesStaticOAuthFenceBeforeWritingResponse
 pkg/api/handlers TestNonStaticCreateDoesNotAcquireStaticOAuthCredentialLock v0.27.0 direct MCPServer creation removed; equivalent canonical behavior covered by TestVMCPNonStaticCreateDoesNotAcquireStaticCredentialLock
+
+# VD-7177: remove fork-only container OAuth. Native remote OAuth remains.
+pkg/api/handlers/mcpgateway/oauth TestContainerOAuthCallbacksStoreSeparateGrantsForTwoUsers VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/api/handlers/mcpgateway/oauth TestContainerOAuthCheckStartsEntraAuthorizationWithPKCE VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestAllowMissingConfigInjectsContainerOAuthUsingResolvedInstanceID VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestResolveMicrosoftEntraContainerOAuth VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestResolveMicrosoftEntraContainerOAuthRejectsUntrustedAuthority VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestResolveMicrosoftEntraContainerOAuthRejectsUnsafeScopeAndTenant VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestContainerOAuthConfigMatchesScopeAndCredentialRotation VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestContainerOAuthAuthorizationIsInjectedPerUser VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
+pkg/mcp TestValidateCatalogEntryManifest_ContainerOAuth VD-7177 intentionally removes the fork-only container OAuth extension before remote MCP migration
