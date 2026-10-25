@@ -106,6 +106,78 @@ func TestForListPropagatesConditionError(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("ForList() error = %v, want %v", err, wantErr)
 	}
+	if errors.Is(err, ErrTimeout) {
+		t.Fatalf("ForList() error = %v, must not be %v", err, ErrTimeout)
+	}
+}
+
+func TestForListTimeoutIsErrTimeout(t *testing.T) {
+	client := newForListTestClient(t)
+
+	err := ForList(t.Context(), client, &corev1.ConfigMap{}, "default", func(*corev1.ConfigMap) (bool, error) {
+		return false, nil
+	}, ListOption{Timeout: 60 * time.Millisecond})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("ForList() error = %v, want %v", err, ErrTimeout)
+	}
+	if errors.Is(err, ErrWatchClosed) {
+		t.Fatalf("ForList() error = %v, must not be reported as a closed watch", err)
+	}
+}
+
+func TestForTimeoutIsErrTimeout(t *testing.T) {
+	client := newForListTestClient(t)
+
+	pending := &corev1.ConfigMap{}
+	pending.Name = "pending"
+	pending.Namespace = "default"
+	pending.UID = "pending-uid"
+
+	_, err := For(t.Context(), client, pending, func(*corev1.ConfigMap) (bool, error) {
+		return false, nil
+	}, Option{Timeout: 60 * time.Millisecond})
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("For() error = %v, want %v", err, ErrTimeout)
+	}
+}
+
+// A watch that ends before the timeout is a transport fault, not readiness.
+func TestForListWatchClosedIsErrWatchClosed(t *testing.T) {
+	client := newForListTestClient(t)
+	watching := make(chan struct{})
+	client.watching = watching
+	go func() {
+		<-watching
+		client.watcher.Stop()
+	}()
+
+	err := ForList(t.Context(), client, &corev1.ConfigMap{}, "default", func(*corev1.ConfigMap) (bool, error) {
+		return false, nil
+	}, ListOption{Timeout: time.Second})
+	if !errors.Is(err, ErrWatchClosed) {
+		t.Fatalf("ForList() error = %v, want %v", err, ErrWatchClosed)
+	}
+	if errors.Is(err, ErrTimeout) {
+		t.Fatalf("ForList() error = %v, must not be reported as a timeout", err)
+	}
+}
+
+// A caller's own deadline is the caller's, not the wait's: reporting it as
+// ErrTimeout would let a caller degrade on a request that has already expired.
+func TestForListCallerDeadlineIsNotATimeout(t *testing.T) {
+	client := newForListTestClient(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+
+	err := ForList(ctx, client, &corev1.ConfigMap{}, "default", func(*corev1.ConfigMap) (bool, error) {
+		return false, nil
+	}, ListOption{Timeout: time.Minute})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ForList() error = %v, want the caller's deadline", err)
+	}
+	if errors.Is(err, ErrTimeout) {
+		t.Fatalf("ForList() error = %v, must not be reported as the wait's timeout", err)
+	}
 }
 
 func (c *watchListClient) Watch(_ context.Context, _ kclient.ObjectList, opts ...kclient.ListOption) (watch.Interface, error) {
