@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"time"
@@ -87,7 +89,13 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 
 	// Components disabled for the user are omitted entirely, so users never need
 	// to configure or authenticate servers they cannot use.
-	configuredComponents := vmcpaccess.EnabledComponents(user, *vmcp, vmcpaccess.ComponentsForInstance(*vmcp, *instance))
+	// A component that still needs a userAllowed input cannot resolve, so classify
+	// it out before the waits below: an unconfigured component must not cost this
+	// connection the full readiness timeout, nor block the components that are ready.
+	configuredComponents := vmcpaccess.ConfiguredComponents(
+		vmcpaccess.EnabledComponents(user, *vmcp, vmcpaccess.ComponentsForInstance(*vmcp, *instance)),
+		instance.Status.MissingRequiredConfiguration,
+	)
 	sharedComponents := make(map[string]struct{}, len(configuredComponents))
 	connectionsNeeded := make(map[string]struct{}, len(configuredComponents))
 	instanceComponents := make(map[string]struct{}, len(configuredComponents))
@@ -126,18 +134,42 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 			return len(expected) == 0, nil
 		}, wait.ListOption{
 			ListOptions: []kclient.ListOption{selector},
+			Timeout:     sm.vmcpComponentTimeout,
 		})
 	}
+	// A readiness timeout leaves the unresolved component IDs in its expected map,
+	// so the aggregate omits them; a real watch error, or a caller that has gone
+	// away, still fails the connection.
+	degradeOnTimeout := func(expected map[string]struct{}, err error) error {
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if !errors.Is(err, wait.ErrTimeout) {
+			return err
+		}
+		for componentID := range expected {
+			slog.Warn("vMCP component is not ready; omitting it from the aggregate", "vmcpID", vmcpID, "componentID", componentID)
+		}
+		return nil
+	}
 	// Shared servers hold only fixed configuration; user values travel on each connection.
-	if err := waitForServers(sharedComponents, kclient.MatchingFields{"spec.vmcpID": vmcp.Name}, v1.VMCPInstance{}); err != nil {
+	if err := degradeOnTimeout(sharedComponents, waitForServers(sharedComponents, kclient.MatchingFields{"spec.vmcpID": vmcp.Name}, v1.VMCPInstance{})); err != nil {
 		return ServerConfig{}, fmt.Errorf("wait for MCPServers for VMCP %q: %w", vmcpID, err)
 	}
-	if err := waitForServers(instanceComponents, kclient.MatchingFields{"spec.vmcpInstanceID": instance.Name}, *instance); err != nil {
-		return ServerConfig{}, fmt.Errorf("wait for MCPServers for VMCP %q: %w", vmcpID, err)
+	if err := degradeOnTimeout(instanceComponents, waitForServers(instanceComponents, kclient.MatchingFields{"spec.vmcpInstanceID": instance.Name}, *instance)); err != nil {
+		return ServerConfig{}, fmt.Errorf("wait for instance MCPServers for VMCP %q: %w", vmcpID, err)
+	}
+	// A shared component whose server did not resolve cannot have a connection, so
+	// waiting for one would only spend a second readiness timeout.
+	for componentID := range sharedComponents {
+		delete(connectionsNeeded, componentID)
 	}
 	connections := map[string]string{}
 	if len(connectionsNeeded) > 0 {
-		if err := wait.ForList(ctx, sm.storageClient, &v1.MCPServerInstance{}, vmcp.Namespace, func(connection *v1.MCPServerInstance) (bool, error) {
+		if err := degradeOnTimeout(connectionsNeeded, wait.ForList(ctx, sm.storageClient, &v1.MCPServerInstance{}, vmcp.Namespace, func(connection *v1.MCPServerInstance) (bool, error) {
 			if _, ok := connectionsNeeded[connection.Spec.VMCPComponentID]; !ok {
 				return false, nil
 			}
@@ -150,33 +182,43 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 			connections[connection.Spec.VMCPComponentID] = connection.Name
 			delete(connectionsNeeded, connection.Spec.VMCPComponentID)
 			return len(connectionsNeeded) == 0, nil
-		}, wait.ListOption{ListOptions: []kclient.ListOption{kclient.MatchingFields{"spec.vmcpInstanceID": instance.Name}}}); err != nil {
+		}, wait.ListOption{
+			ListOptions: []kclient.ListOption{kclient.MatchingFields{"spec.vmcpInstanceID": instance.Name}},
+			Timeout:     sm.vmcpComponentTimeout,
+		})); err != nil {
 			return ServerConfig{}, fmt.Errorf("wait for component connections for VMCP instance %q: %w", instance.Name, err)
 		}
 	}
 
+	// The grant travels with its own component ID, so a skipped component cannot
+	// shift another one's tools.
+	allowedTools := vmcpaccess.InstanceGrant(user, *vmcp, *instance)
 	components := make([]ComponentServer, 0, len(configuredComponents))
 	for _, component := range configuredComponents {
-		server := serversByComponent[component.ID]
+		server, ok := serversByComponent[component.ID]
+		if !ok {
+			continue
+		}
+		// A shared component is only reachable through its connection.
+		if vmcpaccess.IsMultiUser(component) && connections[component.ID] == "" {
+			continue
+		}
 		connectID := server.Name
 		if connections[component.ID] != "" {
 			connectID = connections[component.ID]
 		}
-		components = append(components, ComponentServer{
+		componentServer := ComponentServer{
 			Name:                server.Name,
 			MCPServerInstanceID: connections[component.ID],
 			DisplayName:         component.Name,
 			URL:                 system.LocalMCPConnectURL(connectID, sm.httpListenPort),
 			Tools:               slices.Clone(component.ToolOverrides),
 			ToolPrefix:          component.ToolPrefix,
-		})
-	}
-
-	allowedTools := vmcpaccess.InstanceGrant(user, *vmcp, *instance)
-	for i := range components {
-		if err := restrictComponentTools(&components[i], allowedTools, configuredComponents[i].ID); err != nil {
+		}
+		if err := restrictComponentTools(&componentServer, allowedTools, component.ID); err != nil {
 			return ServerConfig{}, err
 		}
+		components = append(components, componentServer)
 	}
 
 	// Always retain the selected connection through the aggregate loopback.

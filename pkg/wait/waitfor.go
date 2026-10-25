@@ -3,6 +3,7 @@ package wait
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,6 +12,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var (
+	// ErrTimeout marks the wait's own elapsed timeout. Callers may degrade on it.
+	// An early watch close is ErrWatchClosed, and a caller whose context ends gets
+	// that context's error, so a transport fault never looks like a timeout.
+	ErrTimeout = errors.New("timeout")
+	// ErrWatchClosed marks a watch that ended before the wait's timeout elapsed.
+	ErrWatchClosed = errors.New("watch closed")
 )
 
 type Option struct {
@@ -74,6 +84,11 @@ func load(ctx context.Context, c kclient.Client, obj kclient.Object, create bool
 
 func For[T kclient.Object](ctx context.Context, c kclient.WithWatch, obj T, condition func(T) (bool, error), opts ...Option) (def T, _ error) {
 	opt := completeOptions(opts...)
+	// The local deadline is authoritative. A server-side watch timeout of the same
+	// duration would race it, and a watch the server closed would look like a fault.
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, opt.Timeout)
+	defer cancel()
 
 	obj = obj.DeepCopyObject().(T)
 
@@ -108,7 +123,6 @@ func For[T kclient.Object](ctx context.Context, c kclient.WithWatch, obj T, cond
 		kclient.MatchingFields{"metadata.name": obj.GetName()},
 		&kclient.ListOptions{
 			Raw: &metav1.ListOptions{
-				TimeoutSeconds:  new(int64(opt.Timeout / time.Second)),
 				ResourceVersion: obj.GetResourceVersion(),
 			},
 		})
@@ -122,31 +136,45 @@ func For[T kclient.Object](ctx context.Context, c kclient.WithWatch, obj T, cond
 		}
 	}()
 
-	for event := range w.ResultChan() {
-		if event.Type == watch.Deleted {
-			gvk, _ := c.GroupVersionKindFor(obj)
-			return def, apierrors.NewNotFound(schema.GroupResource{
-				Group:    gvk.Group,
-				Resource: gvk.Kind,
-			}, obj.GetName())
-		}
-		switch event.Type {
-		case watch.Added, watch.Modified:
-			if ok, err := condition(event.Object.(T)); err != nil {
+	for {
+		select {
+		case <-ctx.Done():
+			if err := parent.Err(); err != nil {
 				return def, err
-			} else if ok {
-				return event.Object.(T), nil
 			}
-		case watch.Error:
-			return def, apierrors.FromObject(event.Object)
+			return def, fmt.Errorf("%w waiting for %s %s to meet condition", ErrTimeout, gvk.Kind, obj.GetName())
+		case event, ok := <-w.ResultChan():
+			if !ok {
+				return def, fmt.Errorf("%w waiting for %s %s to meet condition", ErrWatchClosed, gvk.Kind, obj.GetName())
+			}
+			if event.Type == watch.Deleted {
+				gvk, _ := c.GroupVersionKindFor(obj)
+				return def, apierrors.NewNotFound(schema.GroupResource{
+					Group:    gvk.Group,
+					Resource: gvk.Kind,
+				}, obj.GetName())
+			}
+			switch event.Type {
+			case watch.Added, watch.Modified:
+				if ok, err := condition(event.Object.(T)); err != nil {
+					return def, err
+				} else if ok {
+					return event.Object.(T), nil
+				}
+			case watch.Error:
+				return def, apierrors.FromObject(event.Object)
+			}
 		}
 	}
-
-	return def, fmt.Errorf("timeout waiting for %s %s to meet condition", gvk.Kind, obj.GetName())
 }
 
 func ForList[T kclient.Object](ctx context.Context, c kclient.WithWatch, obj T, namespace string, condition func(T) (bool, error), opts ...ListOption) error {
 	opt := completeListOptions(opts...)
+	// The local deadline is authoritative. A server-side watch timeout of the same
+	// duration would race it, and a watch the server closed would look like a fault.
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, opt.Timeout)
+	defer cancel()
 
 	gvk, err := c.GroupVersionKindFor(obj)
 	if err != nil {
@@ -168,7 +196,6 @@ func ForList[T kclient.Object](ctx context.Context, c kclient.WithWatch, obj T, 
 				AllowWatchBookmarks:  true,
 				ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
 				SendInitialEvents:    new(true),
-				TimeoutSeconds:       new(int64(opt.Timeout / time.Second)),
 			},
 		})
 	w, err := c.Watch(ctx, list.(kclient.ObjectList), watchOptions...)
@@ -182,22 +209,31 @@ func ForList[T kclient.Object](ctx context.Context, c kclient.WithWatch, obj T, 
 		}
 	}()
 
-	for event := range w.ResultChan() {
-		switch event.Type {
-		case watch.Added, watch.Modified:
-			typedObject, ok := event.Object.(T)
-			if !ok {
-				return fmt.Errorf("unexpected %T in %s watch", event.Object, gvk.Kind)
-			}
-			if ok, err := condition(typedObject); err != nil {
+	for {
+		select {
+		case <-ctx.Done():
+			if err := parent.Err(); err != nil {
 				return err
-			} else if ok {
-				return nil
 			}
-		case watch.Error:
-			return apierrors.FromObject(event.Object)
+			return fmt.Errorf("%w waiting for %s list", ErrTimeout, gvk.Kind)
+		case event, ok := <-w.ResultChan():
+			if !ok {
+				return fmt.Errorf("%w waiting for %s list", ErrWatchClosed, gvk.Kind)
+			}
+			switch event.Type {
+			case watch.Added, watch.Modified:
+				typedObject, ok := event.Object.(T)
+				if !ok {
+					return fmt.Errorf("unexpected %T in %s watch", event.Object, gvk.Kind)
+				}
+				if ok, err := condition(typedObject); err != nil {
+					return err
+				} else if ok {
+					return nil
+				}
+			case watch.Error:
+				return apierrors.FromObject(event.Object)
+			}
 		}
 	}
-
-	return fmt.Errorf("timeout waiting for %s list", gvk.Kind)
 }
