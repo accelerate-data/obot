@@ -66,15 +66,21 @@ Task 3. Task 5 is independent.
 
 ### Task 1 — `pkg/wait`: a timeout the caller can distinguish
 
-`wait.For` (`pkg/wait/waitfor.go:145`) and `wait.ForList` (`:202`) return a bare `fmt.Errorf` on
-timeout, indistinguishable from a watch or list failure. Add `ErrTimeout` and wrap both timeout
-returns so callers can degrade on a timeout without swallowing infrastructure errors.
+`wait.For` and `wait.ForList` return a bare `fmt.Errorf` whenever the watch channel ends, so an
+elapsed timeout, an early watch close (client-go closes the channel silently on `io.EOF` and friends,
+so a storage-apiserver restart looks identical) and caller cancellation are currently
+indistinguishable. A caller that degrades on a timeout would therefore also swallow infrastructure
+faults.
 
-Keep the rendered message byte-identical (`fmt.Errorf("%w waiting for %s list", ErrTimeout, kind)`),
-so no existing log or assertion changes. No test currently asserts these strings.
+Run both waits under their own deadline and report the three outcomes distinctly:
+`ErrTimeout` when that deadline elapses, `ErrWatchClosed` when the watch ends sooner, and the
+caller's context error on cancellation. Keep the existing timeout message byte-identical
+(`fmt.Errorf("%w waiting for %s list", ErrTimeout, kind)`); no test asserts these strings today.
+A local deadline also removes the reliance on the server honouring `TimeoutSeconds`, which truncates
+a sub-second timeout to "no timeout".
 
-_Test:_ `pkg/wait` unit test asserting `errors.Is(err, wait.ErrTimeout)` on a timeout and that a
-condition error is **not** `ErrTimeout`.
+_Test:_ `pkg/wait` unit tests asserting `ErrTimeout` on a real elapsed timeout, `ErrWatchClosed` on an
+early close (and that it is not `ErrTimeout`), and that a condition error is neither.
 
 ### Task 2 — `pkg/vmcp`: classify components that still need `userAllowed` input
 
@@ -97,30 +103,38 @@ collision the component-scoped keys exist to prevent).
 1. **Classify before waiting.** Filter `configuredComponents` through the Task 2 helper immediately
    after `EnabledComponents`. This is what keeps connect fast: a permanently unready component must not
    cost the full 2-minute timeout on every connect.
-2. **Degrade on timeout.** Each of the three per-component waits tolerates `wait.ErrTimeout`
-   (`errors.Is`) and continues; every other error still returns. The closures already delete resolved
-   IDs from the `expected` maps, so those maps are exactly the unresolved set afterwards.
+2. **Degrade only on a real timeout.** Each per-component wait continues on `wait.ErrTimeout` and
+   returns on every other error. To make that distinction meaningful, `wait.For` and `wait.ForList`
+   run under their own deadline: they report `ErrTimeout` only when it elapses, `ErrWatchClosed` when
+   the watch ends sooner, and the caller's context error on cancellation. Otherwise a storage fault
+   that closes a watch would be indistinguishable from readiness and would silently shrink the
+   aggregate.
 3. **Never emit an unresolved component.** Build `Components` only from resolved servers and
-   connections: skip a component still present in `sharedComponents`/`instanceComponents`, and skip a
-   multi-user component with no entry in `connections`. Emitting a zero-value `ComponentServer` would
-   produce `LocalMCPConnectURL("")` — the accidental-exposure risk in the ticket.
-4. **Fix the positional pairing.** The current `restrictComponentTools(&components[i], allowedTools,
-   configuredComponents[i].ID)` relies on `components` and `configuredComponents` being index-aligned.
-   Once a component can be skipped, that pairing silences or misdirects a grant. Carry the component
-   ID alongside each appended `ComponentServer` and use that.
-5. **Keep instance-level waits fatal.** The create-instance wait and
+   connections: skip a component whose server is absent, and skip a multi-user component with no entry
+   in `connections`. Emitting a zero-value `ComponentServer` would produce `LocalMCPConnectURL("")` —
+   the accidental-exposure risk in the ticket.
+4. **Do not wait twice for the same component.** A shared component whose server did not resolve
+   cannot have a connection, so drop it from `connectionsNeeded` before the connection wait. Otherwise
+   one stalled component spends a second full timeout before the aggregate is returned.
+5. **Carry the grant with its own component.** The old `restrictComponentTools(&components[i],
+   allowedTools, configuredComponents[i].ID)` relied on two slices staying index-aligned; once a
+   component can be skipped, that pairing silences or misdirects a grant. Apply
+   `restrictComponentTools` to each server while building it, using that component's own ID, so there
+   is no index invariant left to break.
+6. **Keep instance-level waits fatal.** The create-instance wait and
    `waitForVMCPInstanceConfiguration` are per-user, not per-component.
-6. **Make the fingerprint honest.** `ConfigHash` becomes a digest over
-   `instance.Status.ConfigurationCheckHash` plus the resolved component set, so a set change invalidates
-   mmmcp's discovery (`pkg/mcp/backend.go:332`, its only consumer). Without this, a component that
-   becomes ready mid-session keeps the previous fingerprint and is never re-discovered.
 7. **Add the testability seam.** `SessionManager.vmcpComponentTimeout time.Duration`, passed as
    `wait.ListOption.Timeout` on the three per-component waits. Zero keeps the 2-minute default, so
    production behaviour is unchanged and a test can exercise the degrade path in milliseconds.
 8. **Log the omission once per connect** at warn, naming the vMCP and omitted component IDs.
-9. **Respect cancellation.** `wait.ForList` reports a canceled or expired caller context through the
-   same error it returns at its own timeout, so tolerating that error would assemble a config for a
-   requester that has gone away. After tolerating a timeout, return `ctx.Err()` when it is non-nil.
+9. **Respect cancellation.** A caller whose context ends gets that context's error, not a partial
+   config. The re-check after tolerating a timeout stays as the belt to the wait's braces, since the
+   deadline and a cancellation can race.
+
+`ConfigHash` deliberately stays `instance.Status.ConfigurationCheckHash`. Its only consumer is mmmcp's
+`DiscoveryRevision`, mmmcp's configuration is written per deployment
+(`constructMCPServerMMMCPYAML`), and nothing in Obot uses mmmcp's per-request config bridge — so no
+staleness mode is demonstrable, while `pkg/mcp/vmcp_test.go:768` asserts the current contract.
 
 An aggregate with zero resolved components returns an empty `Components`, not an error. mmmcp
 tolerates it (`frontendImplementation` special-cases only `len(Servers) == 1`, yielding an aggregate
@@ -137,8 +151,11 @@ In `pkg/mcp/vmcp_test.go`, reusing `newVMCPTestStorage`, `syncedVMCPInstance`,
 - **One component never syncs** — `vmcpComponentTimeout` set low; assert the ready component is still
   returned, the never-synced one is absent, and the ready component's tool grant was applied through
   its own ID (guards Task 3.4).
-- **A real error still fails** — assert a non-timeout wait error propagates rather than degrading, and
-  that a canceled caller context returns the context error instead of a partial config.
+- **A real error still fails** — a storage whose `Watch` returns an error must fail the connection and
+  must not be reported as a timeout; a canceled caller must get `context.Canceled` rather than a
+  partial config.
+- **An early watch close is not readiness** — covered in `pkg/wait`, where `ErrWatchClosed` is
+  asserted separately from `ErrTimeout`.
 
 ### Task 5 — docs and ADR
 
@@ -172,12 +189,14 @@ Run in order, recording each result in the Linear issue:
 ## Risks
 
 - **Grant widening.** The aggregation change touches which components a session can reach. Task 3.3
-  and 3.4 are what keep it strictly narrowing, and Task 4 covers both with a test that would fail if
-  the pairing regressed.
+  and 3.5 are what keep it strictly narrowing, and Task 4 covers the grant case with a test that would
+  fail if a component's tools were applied through another component's ID.
 - **Silent absence.** A component omitted for a transient reason is invisible to a caller that does
   not read `instance.Status`. Studio's attach status already derives its unavailable set from its own
   pre-connect skip and the bridge status file, so this change does not make it less truthful; the
-  warning log and the per-component vMCP status remain the operator-facing record.
-- **Time-to-first-connect.** Classification removes the 2-minute stall for the common case. A
-  component that is unready for a reason other than missing input still costs up to the timeout once
-  per connect; `vmcpComponentTimeout` is the knob if that proves too slow.
+  warning log and the per-component vMCP status remain the operator-facing record. A *watch fault* is
+  deliberately not silent: it fails the connection rather than shrinking the aggregate.
+- **Time-to-first-connect.** Classification removes the stall for the common case. A component that is
+  unready for another reason still costs up to one readiness wait — Task 3.4 is what keeps that to one
+  rather than two — and a missing fixed (administrator) required field costs it on every connect,
+  because only user inputs appear in `instance.Status.MissingRequiredConfiguration`.
