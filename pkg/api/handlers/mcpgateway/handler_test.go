@@ -23,9 +23,10 @@ import (
 	obotmcp "github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/safehttp"
 	"golang.org/x/oauth2"
+	"k8s.io/apiserver/pkg/authentication/user"
 )
 
-func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
+func TestVMCPToolSearchKeepsHealthyComponentWhenSiblingNeedsOAuth(t *testing.T) {
 	var called atomic.Bool
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "component", Version: "test"}, nil)
 	server.AddTool(&gomcp.Tool{Name: "echo", Description: "Echo a message", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, _ *gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
@@ -34,6 +35,10 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 	})
 	upstream := httptest.NewServer(gomcp.NewStreamableHTTPHandler(func(*http.Request) *gomcp.Server { return server }, nil))
 	defer upstream.Close()
+	pending := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer pending.Close()
 
 	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil)
 	if err != nil {
@@ -42,14 +47,14 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 
 	defer handler.Close()
 
-	cfg := obotmcp.MMMCPConfig(obotmcp.ServerConfig{
+	cfg := compositeConfig(obotmcp.ServerConfig{
 		Runtime:    types.RuntimeVMCP,
 		ToolSearch: true,
-		Components: []obotmcp.ComponentServer{{
-			DisplayName: "component",
-			URL:         upstream.URL,
-		}},
-	}, nil)
+		Components: []obotmcp.ComponentServer{
+			{DisplayName: "component", URL: upstream.URL},
+			{DisplayName: "pending", URL: pending.URL},
+		},
+	}, &user.DefaultInfo{UID: "7", Groups: []string{types.GroupMCP}})
 	frontend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handler.composite.HTTPHandler().ServeHTTP(w, r.WithContext(mmmcp.ContextWithConfig(r.Context(), cfg)))
 	}))
@@ -64,7 +69,7 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 	defer session.Close()
 
 	listed, err := session.ListTools(t.Context(), nil)
-	if err != nil || len(listed.Tools) != 2 {
+	if err != nil || len(listed.Tools) != 3 {
 		t.Fatalf("listed tools = %#v, error = %v", listed, err)
 	}
 
@@ -73,7 +78,7 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 		listedNames[tool.Name] = true
 	}
 
-	if !listedNames["search_tools"] || !listedNames["call_tool"] {
+	if !listedNames["search_tools"] || !listedNames["call_tool"] || !listedNames["mmmcp_auth_status"] {
 		t.Fatalf("unexpected search-mode tools: %v", listedNames)
 	}
 

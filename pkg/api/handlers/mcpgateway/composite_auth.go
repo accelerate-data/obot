@@ -118,15 +118,21 @@ func newCompositeLoopbackToken(ctx context.Context, tokens compositeTokenService
 
 func compositeConfig(serverConfig mcp.ServerConfig, caller user.Info) *mmmcpconfig.Config {
 	cfg := mcp.MMMCPConfig(serverConfig, nil)
-	cfg.DeferAuthorization = authz.IsClaudeEnvironment(caller)
+	cfg.PartialAuthorization = serverConfig.Runtime == types.RuntimeVMCP
+	cfg.DeferAuthorization = cfg.PartialAuthorization || authz.IsClaudeEnvironment(caller)
 	return cfg
 }
 
 func compositeAuthorizationURLs(lookup func(api.Context) ([]mmmcp.AuthorizationURL, error)) func(context.Context) ([]mmmcp.AuthorizationURL, error) {
 	return func(ctx context.Context) ([]mmmcp.AuthorizationURL, error) {
 		req, ok := ctx.Value(compositeAPIContextKey{}).(api.Context)
-		if !ok || !authz.IsClaudeEnvironment(req.User) || lookup == nil {
-			return nil, fmt.Errorf("authorization for this Claude environment is unavailable")
+		if !ok || lookup == nil {
+			return nil, fmt.Errorf("component authorization lookup is unavailable")
+		}
+		if !authz.IsClaudeEnvironment(req.User) {
+			// Agent sessions use Studio settings for downstream OAuth; they do
+			// not receive Claude's Obot consent links in the status tool.
+			return nil, nil
 		}
 		req.Request = req.WithContext(ctx)
 		return lookup(req)
