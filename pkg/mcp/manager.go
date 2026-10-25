@@ -116,6 +116,10 @@ type SessionManager struct {
 	secretBindingAllowedLabel string
 	tunnelManager             *tunnel.Manager
 
+	// vmcpComponentTimeout bounds each per-component readiness wait on a vMCP
+	// connect. Zero uses the wait package default.
+	vmcpComponentTimeout time.Duration
+
 	webhookHelper *WebhookHelper
 }
 
