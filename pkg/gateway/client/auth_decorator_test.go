@@ -58,6 +58,12 @@ func TestUserDecoratorPassesGenericOAuthIssuerAndEmailVerified(t *testing.T) {
 	if resp.User.GetUID() != fmt.Sprintf("%d", existing.ID) {
 		t.Fatalf("expected generic OAuth identity to link to existing user %d, got UID %q", existing.ID, resp.User.GetUID())
 	}
+	if got := resp.User.GetExtra()["auth_provider_name"]; len(got) != 1 || got[0] != genericOAuthAuthProviderName {
+		t.Fatalf("expected provider name to survive UID decoration, got %v", got)
+	}
+	if got := resp.User.GetExtra()["auth_provider_namespace"]; len(got) != 1 || got[0] != system.DefaultNamespace {
+		t.Fatalf("expected provider namespace to survive UID decoration, got %v", got)
+	}
 	if got := resp.User.GetExtra()["auth_provider_groups"]; got == nil {
 		t.Fatal("expected auth provider groups to be present in response extra")
 	}
