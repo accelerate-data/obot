@@ -131,10 +131,13 @@ collision the component-scoped keys exist to prevent).
    config. The re-check after tolerating a timeout stays as the belt to the wait's braces, since the
    deadline and a cancellation can race.
 
-`ConfigHash` deliberately stays `instance.Status.ConfigurationCheckHash`. Its only consumer is mmmcp's
-`DiscoveryRevision`, mmmcp's configuration is written per deployment
-(`constructMCPServerMMMCPYAML`), and nothing in Obot uses mmmcp's per-request config bridge — so no
-staleness mode is demonstrable, while `pkg/mcp/vmcp_test.go:768` asserts the current contract.
+`ConfigHash` deliberately stays `instance.Status.ConfigurationCheckHash`. It reaches mmmcp as
+`DiscoveryRevision` (`pkg/mcp/backend.go`), but it is not the cache key: mmmcp fingerprints the whole
+configuration it is handed, including the server list
+(`mmmcp/catalog.Fingerprint` → `canonicalConfig`), and Obot supplies that configuration per request
+(`mmmcp.ContextWithConfig` in `pkg/api/handlers/mcpgateway/handler.go`). A component becoming ready
+changes the fingerprint through the server list itself, so no extra input is needed — and the existing
+test asserts that the hash stays the controller revision.
 
 An aggregate with zero resolved components returns an empty `Components`, not an error. mmmcp
 tolerates it (`frontendImplementation` special-cases only `len(Servers) == 1`, yielding an aggregate
