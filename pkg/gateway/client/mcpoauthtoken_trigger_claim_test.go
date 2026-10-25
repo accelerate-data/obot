@@ -8,6 +8,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -37,11 +38,30 @@ type recordedControllerTrigger struct {
 
 type recordingControllerBackend struct {
 	triggers []recordedControllerTrigger
+	failNext bool
 }
 
 func (r *recordingControllerBackend) Trigger(_ context.Context, gvk schema.GroupVersionKind, key string, _ time.Duration) error {
 	r.triggers = append(r.triggers, recordedControllerTrigger{gvk: gvk, key: key})
+	if r.failNext {
+		r.failNext = false
+		return errors.New("trigger unavailable")
+	}
 	return nil
+}
+
+func TestRevokeMCPOAuthConnectionsRetriesNotificationAfterCommit(t *testing.T) {
+	backend := &recordingControllerBackend{}
+	c := newTriggerTestClient(t, backend)
+	require.NoError(t, c.db.WithContext(t.Context()).Create(&types.MCPOAuthToken{UserID: triggerTestUser, MCPID: triggerTestInstance}).Error)
+	backend.failNext = true
+	require.ErrorContains(t, c.RevokeMCPOAuthConnections(t.Context(), triggerTestUser, []string{triggerTestInstance}), "trigger unavailable")
+	var count int64
+	require.NoError(t, c.db.WithContext(t.Context()).Model(&types.MCPOAuthToken{}).Where("user_id = ?", triggerTestUser).Count(&count).Error)
+	require.Zero(t, count)
+	require.NoError(t, c.RevokeMCPOAuthConnections(t.Context(), triggerTestUser, []string{triggerTestInstance}))
+	require.Len(t, backend.triggers, 2)
+	wantOwningServerTriggers(t, backend.triggers, triggerTestServer)
 }
 
 // newTriggerTestClient constructs the client through New, the entry point

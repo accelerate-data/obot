@@ -160,6 +160,7 @@ func (db *DB) AutoMigrate() (err error) {
 		types.Image{},
 		types.RunTokenActivity{},
 		types.MCPOAuthToken{},
+		types.MCPOAuthRevokedConnection{},
 		types.MCPOAuthPendingState{},
 		types.MCPAuditLog{},
 		types.TempSetupUser{},

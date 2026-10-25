@@ -73,6 +73,13 @@ type MCPOAuthToken struct {
 	Encrypted bool
 }
 
+// MCPOAuthRevokedConnection fences late OAuth callbacks for a connection
+// revoked during user offboarding. A new authorization must use a new connection ID.
+type MCPOAuthRevokedConnection struct {
+	UserID string `gorm:"primaryKey"`
+	MCPID  string `gorm:"primaryKey"`
+}
+
 type MCPOAuthPendingState struct {
 	HashedState                    string `gorm:"primaryKey"`
 	State                          string

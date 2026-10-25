@@ -1332,6 +1332,62 @@ func (m *MCPHandler) ClearOAuthCredentials(req api.Context) error {
 	return nil
 }
 
+// RevokeVMCPUserOAuthCredentials deletes one user's grants for one shared vMCP.
+// Connection ownership comes from Obot's instance graph, not a caller-supplied
+// list of token IDs.
+func (m *MCPHandler) RevokeVMCPUserOAuthCredentials(req api.Context) error {
+	if !req.UserIsAdmin() {
+		return types.NewErrForbidden("administrator access required to revoke another user's vMCP OAuth credentials")
+	}
+	userID := req.PathValue("user_id")
+	if userID == "" {
+		return types.NewErrBadRequest("user ID is required")
+	}
+	var vmcp v1.VMCP
+	if err := req.Get(&vmcp, req.PathValue("vmcp_id")); err != nil {
+		return err
+	}
+	if vmcp.Spec.UserID != "" {
+		return types.NewErrBadRequest("user offboarding requires a shared vMCP")
+	}
+	var instances v1.VMCPInstanceList
+	if err := req.List(&instances, kclient.InNamespace(vmcp.Namespace), kclient.MatchingFields{
+		"spec.userID": userID, "spec.manifest.vmcpID": vmcp.Name,
+	}); err != nil {
+		return err
+	}
+	if len(instances.Items) == 0 {
+		return types.NewErrNotFound("user vMCP connection not found")
+	}
+	var ids []string
+	for _, instance := range instances.Items {
+		var servers v1.MCPServerList
+		if err := req.List(&servers, kclient.InNamespace(vmcp.Namespace), kclient.MatchingFields{"spec.vmcpInstanceID": instance.Name}); err != nil {
+			return err
+		}
+		for _, server := range servers.Items {
+			ids = append(ids, server.Name)
+		}
+		var connections v1.MCPServerInstanceList
+		if err := req.List(&connections, kclient.InNamespace(vmcp.Namespace), kclient.MatchingFields{"spec.vmcpInstanceID": instance.Name}); err != nil {
+			return err
+		}
+		for _, connection := range connections.Items {
+			if connection.Spec.UserID == userID {
+				ids = append(ids, connection.Name)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return types.NewErrNotFound("user vMCP component connections not found")
+	}
+	if err := req.GatewayClient.RevokeMCPOAuthConnections(req.Context(), userID, ids); err != nil {
+		return fmt.Errorf("failed to revoke user vMCP OAuth credentials: %w", err)
+	}
+	req.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
 func (m *MCPHandler) GetVMCPOAuthStatus(req api.Context) error {
 	targets, err := m.vmcpComponentOAuthTargets(req, req.PathValue("vmcp_id"), "", "")
 	if err != nil {

@@ -273,6 +273,93 @@ func TestClearOAuthCredentialsVMCPComponentClearsTokenFromPreviousURL(t *testing
 	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
+func TestRevokeVMCPUserOAuthCredentialsScopesGrantAndFencesLateCallback(t *testing.T) {
+	const (
+		targetUser = "departing-user"
+		vmcpID     = "vmcp1offboarding"
+	)
+	vmcp, instance, component, unrelated := vmcpActionObjects(vmcpID, targetUser, "component-a", false)
+	sharedConnection := &v1.MCPServerInstance{
+		ObjectMeta: objectMetaForVMCPActionTest("msi1shared-offboarding"),
+		Spec: v1.MCPServerInstanceSpec{
+			VMCPInstanceID:  instance.Name,
+			VMCPComponentID: "shared-component",
+			UserID:          targetUser,
+			MCPServerName:   "ms1shared-offboarding",
+		},
+	}
+	_, storage, gatewayClient := newVMCPActionSessionManager(t, vmcp, instance, component, unrelated, sharedConnection)
+	for _, userID := range []string{targetUser, "other-user"} {
+		for _, mcpID := range []string{component.Name, sharedConnection.Name, "ms1other-vmcp"} {
+			require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(t.Context(), userID, mcpID, "https://mcp.example/", "", &oauth2.Config{}, &oauth2.Token{AccessToken: userID + mcpID}))
+		}
+	}
+	const callbackState = "offboarding-pending-state"
+	require.NoError(t, gatewayClient.CreateMCPOAuthPendingState(t.Context(), targetUser, component.Name, "https://mcp.example/", "", "", callbackState, "verifier", "https://mcp.example/", &oauth2.Config{}))
+	pending, err := gatewayClient.GetMCPOAuthPendingState(t.Context(), callbackState)
+	require.NoError(t, err)
+
+	revoke := func(user kuser.Info, pathUser string) error {
+		req := httptest.NewRequest(http.MethodDelete, "/api/vmcps/"+vmcpID+"/users/"+pathUser+"/oauth", nil)
+		req.SetPathValue("vmcp_id", vmcpID)
+		req.SetPathValue("user_id", pathUser)
+		return (&MCPHandler{}).RevokeVMCPUserOAuthCredentials(api.Context{
+			ResponseWriter: httptest.NewRecorder(),
+			Request:        req,
+			Storage:        storage,
+			GatewayClient:  gatewayClient,
+			User:           user,
+		})
+	}
+
+	err = revoke(testUser("other-user"), targetUser)
+	var httpErr *types.ErrHTTP
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusForbidden, httpErr.Code)
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), targetUser, component.Name, "https://mcp.example/")
+	require.NoError(t, err)
+
+	require.NoError(t, revoke(testUserWithRole("offboarding-admin", types.GroupAdmin), targetUser))
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), targetUser, component.Name, "https://mcp.example/")
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), targetUser, sharedConnection.Name, "https://mcp.example/")
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), targetUser, "ms1other-vmcp", "https://mcp.example/")
+	require.NoError(t, err)
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), "other-user", component.Name, "https://mcp.example/")
+	require.NoError(t, err)
+	err = gatewayClient.ReplaceMCPOAuthToken(t.Context(), targetUser, component.Name, "https://mcp.example/", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "late-callback"})
+	assert.ErrorIs(t, err, gatewayclient.ErrMCPOAuthConnectionRevoked)
+	err = gatewayClient.ReplaceMCPOAuthToken(t.Context(), targetUser, sharedConnection.Name, "https://mcp.example/", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "late-callback"})
+	assert.ErrorIs(t, err, gatewayclient.ErrMCPOAuthConnectionRevoked)
+	err = gatewayClient.CommitMCPOAuthPendingStateToken(t.Context(), pending, "", &oauth2.Config{}, &oauth2.Token{AccessToken: "late-callback"})
+	assert.ErrorIs(t, err, gatewayclient.ErrMCPOAuthConnectionRevoked)
+	_, err = gatewayClient.GetMCPOAuthPendingState(t.Context(), callbackState)
+	assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.NoError(t, revoke(testUserWithRole("offboarding-admin", types.GroupAdmin), targetUser))
+}
+
+func TestRevokeVMCPUserOAuthCredentialsReportsMissingConnection(t *testing.T) {
+	vmcp, _, _, _ := vmcpActionObjects("vmcp1missing-connection", "departing-user", "component-a", false)
+	_, storage, gatewayClient := newVMCPActionSessionManager(t, vmcp)
+	require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(t.Context(), "departing-user", "msi1orphan", "https://mcp.example/", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "orphan"}))
+	req := httptest.NewRequest(http.MethodDelete, "/api/vmcps/"+vmcp.Name+"/users/departing-user/oauth", nil)
+	req.SetPathValue("vmcp_id", vmcp.Name)
+	req.SetPathValue("user_id", "departing-user")
+	err := (&MCPHandler{}).RevokeVMCPUserOAuthCredentials(api.Context{
+		ResponseWriter: httptest.NewRecorder(),
+		Request:        req,
+		Storage:        storage,
+		GatewayClient:  gatewayClient,
+		User:           testUserWithRole("offboarding-admin", types.GroupAdmin),
+	})
+	var httpErr *types.ErrHTTP
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, http.StatusNotFound, httpErr.Code)
+	_, err = gatewayClient.GetMCPOAuthToken(t.Context(), "departing-user", "msi1orphan", "https://mcp.example/")
+	require.NoError(t, err)
+}
+
 func TestAggregateComponentServersForActionVMCPUsesServerConfigComponents(t *testing.T) {
 	declared := &v1.MCPServer{
 		ObjectMeta: objectMetaForVMCPActionTest("ms1declared"),

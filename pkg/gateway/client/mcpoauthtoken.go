@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -53,6 +54,7 @@ var (
 	ErrMCPStaticOAuthEncryptionRequired = errors.New("static OAuth credential encryption is required")
 	ErrMCPOAuthCatalogCredentialChanged = errors.New("catalog OAuth credential changed")
 	ErrMCPOAuthPendingStateInvalid      = errors.New("invalid, expired, or already claimed OAuth state")
+	ErrMCPOAuthConnectionRevoked        = errors.New("MCP OAuth connection revoked for user offboarding")
 )
 
 type MCPStaticOAuthTestStart struct {
@@ -205,6 +207,18 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 }
 
 func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, generation string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	release, err := c.AcquireCredentialLock(ctx, mcpOAuthUserConnectionLock(userID, mcpID))
+	if err != nil {
+		return err
+	}
+	defer release()
+	var revoked int64
+	if err := c.db.WithContext(ctx).Model(&types.MCPOAuthRevokedConnection{}).Where("user_id = ? AND mcp_id = ?", userID, mcpID).Count(&revoked).Error; err != nil {
+		return err
+	}
+	if revoked != 0 {
+		return ErrMCPOAuthConnectionRevoked
+	}
 	t := &types.MCPOAuthToken{
 		UserID:                      userID,
 		MCPID:                       mcpID,
@@ -265,6 +279,18 @@ func (c *Client) mcpCatalogEntry(ctx context.Context, entryName string) (*v1.MCP
 // Existing destination tokens take precedence, including tokens refreshed after
 // a partially completed migration.
 func (c *Client) CopyMCPOAuthTokens(ctx context.Context, userID, sourceID, targetID string) error {
+	release, err := c.AcquireCredentialLock(ctx, mcpOAuthUserConnectionLock(userID, targetID))
+	if err != nil {
+		return err
+	}
+	defer release()
+	var revoked int64
+	if err := c.db.WithContext(ctx).Model(&types.MCPOAuthRevokedConnection{}).Where("user_id = ? AND mcp_id = ?", userID, targetID).Count(&revoked).Error; err != nil {
+		return err
+	}
+	if revoked != 0 {
+		return ErrMCPOAuthConnectionRevoked
+	}
 	var tokens []types.MCPOAuthToken
 	if err := c.db.WithContext(ctx).Where("mcp_id = ? AND user_id = ?", sourceID, userID).Find(&tokens).Error; err != nil {
 		return err
@@ -299,6 +325,43 @@ func (c *Client) DeleteMCPOAuthTokens(ctx context.Context, userID, mcpID string)
 		return err
 	}
 	return c.triggerMCPOAuthTokenChange(ctx, mcpID)
+}
+
+func mcpOAuthUserConnectionLock(userID, mcpID string) string {
+	return "mcp-oauth-user-connection:" + userID + ":" + mcpID
+}
+
+// RevokeMCPOAuthConnections fences and deletes only the target user's grants
+// for the vMCP connection IDs resolved by the caller. Repeating it also retries
+// notifications after a post-commit failure.
+func (c *Client) RevokeMCPOAuthConnections(ctx context.Context, userID string, mcpIDs []string) error {
+	ids := slices.Compact(slices.Sorted(slices.Values(mcpIDs)))
+	if len(ids) == 0 {
+		return nil
+	}
+	locks := make([]string, 0, len(ids))
+	for _, id := range ids {
+		locks = append(locks, mcpOAuthUserConnectionLock(userID, id))
+	}
+	release, err := c.AcquireCredentialLocks(ctx, locks...)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, id := range ids {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&types.MCPOAuthRevokedConnection{UserID: userID, MCPID: id}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Delete(&types.MCPOAuthPendingState{}, "user_id = ? AND mcp_id IN ?", userID, ids).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&types.MCPOAuthToken{}, "user_id = ? AND mcp_id IN ?", userID, ids).Error
+	}); err != nil {
+		return err
+	}
+	return c.triggerMCPOAuthTokenChanges(ctx, ids)
 }
 
 func (c *Client) DeleteMCPOAuthTokenForAllUsers(ctx context.Context, mcpID string) error {
