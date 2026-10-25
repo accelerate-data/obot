@@ -39,21 +39,30 @@ func (*Handler) EnsureMCPServerInstances(req router.Request, _ router.Response) 
 		if !server.DeletionTimestamp.IsZero() {
 			continue
 		}
+		// OAuth credential-generation fences resolve the catalog entry from the
+		// per-user connection, not only from its shared MCPServer.
 		connection := v1.MCPServerInstance{
 			Name:       name.SafeConcatName(system.MCPServerInstancePrefix+instance.Name, component.ID),
 			Namespace:  instance.Namespace,
 			Finalizers: []string{v1.MCPServerInstanceFinalizer},
 			Spec: v1.MCPServerInstanceSpec{
-				UserID:          instance.Spec.UserID,
-				MCPServerName:   serverName,
-				VMCPInstanceID:  instance.Name,
-				VMCPComponentID: component.ID,
+				UserID:                    instance.Spec.UserID,
+				MCPServerName:             serverName,
+				MCPServerCatalogEntryName: server.Spec.MCPServerCatalogEntryName,
+				VMCPInstanceID:            instance.Name,
+				VMCPComponentID:           component.ID,
 			},
 		}
 		var existing v1.MCPServerInstance
 		if err := req.Get(&existing, connection.Namespace, connection.Name); err == nil {
 			if existing.Spec.UserID != connection.Spec.UserID || existing.Spec.MCPServerName != serverName || existing.Spec.VMCPInstanceID != instance.Name || existing.Spec.VMCPComponentID != component.ID {
 				return fmt.Errorf("MCPServerInstance %q has different vMCP ownership", connection.Name)
+			}
+			if existing.Spec.MCPServerCatalogEntryName != connection.Spec.MCPServerCatalogEntryName {
+				existing.Spec.MCPServerCatalogEntryName = connection.Spec.MCPServerCatalogEntryName
+				if err := req.Client.Update(req.Ctx, &existing); err != nil {
+					return err
+				}
 			}
 		} else if !apierrors.IsNotFound(err) {
 			return err
