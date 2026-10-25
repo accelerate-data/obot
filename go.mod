@@ -368,3 +368,5 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.1 // indirect
 )
+
+replace github.com/obot-platform/mmmcp => github.com/accelerate-data/mmmcp v0.0.0-20261025163732-527876c2f175
