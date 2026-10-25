@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
 	vmcpaccess "github.com/obot-platform/obot/pkg/vmcp"
+	"github.com/obot-platform/obot/pkg/wait"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/watch"
@@ -51,6 +53,12 @@ type vmcpWatchNotifyingStorage struct {
 type vmcpServerConfigResult struct {
 	config ServerConfig
 	err    error
+}
+
+// vmcpWatchFailingStorage fails every watch, standing in for a storage fault.
+type vmcpWatchFailingStorage struct {
+	storage.Client
+	err error
 }
 
 func TestRestrictComponentTools(t *testing.T) {
@@ -603,6 +611,228 @@ func TestServerConfigForVMCPOmitsDisabledComponents(t *testing.T) {
 	// An entry without tools still enables the component; a missing entry disables it.
 	if len(cfg.Components) != 1 || cfg.Components[0].Name != enabled.Name || !cfg.Components[0].DisableTools {
 		t.Fatalf("components = %#v, want only the enabled component with tools disabled", cfg.Components)
+	}
+}
+
+// A component that still needs a userAllowed input must not hide the components
+// that are ready for the same connection.
+func TestServerConfigForVMCPKeepsReadyComponentsWhenOneNeedsConfiguration(t *testing.T) {
+	const (
+		userID   = "1"
+		inputKey = "GITHUB_TOKEN"
+	)
+	vmcp := &v1.VMCP{Name: "vmcp1needsinput", Namespace: system.DefaultNamespace, Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
+		Components: []types.VMCPComponent{
+			{
+				ID:   "needsInput",
+				Name: "needsInput",
+				// A required non-header userAllowed input makes the component a
+				// per-user deployment whose server cannot sync until it is supplied.
+				Configuration: []types.VMCPConfigurationPolicy{{Key: inputKey, Policy: types.VMCPConfigurationPolicyUserAllowed}},
+				CatalogEntry: types.MCPServerCatalogEntrySnapshot{Manifest: types.MCPServerCatalogEntryManifest{
+					Runtime: types.RuntimeRemote,
+					Config:  []types.MCPConfig{{Key: inputKey, Required: true, Usage: types.Env}},
+				}},
+			},
+			{ID: "ready", Name: "ready"},
+		},
+		Profiles: []types.VMCPProfile{{
+			Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+		}},
+	}}}
+	instance := syncedVMCPInstance(&v1.VMCPInstance{
+		Name: "vmcpi1needsinput", Namespace: system.DefaultNamespace,
+		Spec: v1.VMCPInstanceSpec{UserID: userID, Manifest: types.VMCPInstanceManifest{VMCPID: vmcp.Name}},
+	}, vmcp)
+	// The controller records the component-scoped key of the input the user has not supplied.
+	instance.Status.MissingRequiredConfiguration = []string{vmcpaccess.ConfigurationKey("needsInput", inputKey)}
+	server := vmcpComponentServer("ms1ready", "", "", "ready", "ready", "https://ready.example.test/mcp")
+	server.Spec.VMCPID = vmcp.Name
+	connection := syncedVMCPConnection(t, &v1.MCPServerInstance{
+		Name: "msi1ready", Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerInstanceSpec{UserID: userID, VMCPInstanceID: instance.Name, VMCPComponentID: "ready", MCPServerName: server.Name},
+	}, vmcp, instance)
+	watches := make(chan kclient.ObjectList, 16)
+	manager := &SessionManager{
+		storageClient: &vmcpWatchNotifyingStorage{
+			Client:  newVMCPTestStorage(vmcp, instance, server, connection),
+			watches: watches,
+		},
+		vmcpComponentTimeout: 150 * time.Millisecond,
+	}
+
+	cfg, err := manager.ServerConfigForVMCP(t.Context(), vmcp.Name, &kuser.DefaultInfo{UID: userID})
+	if err != nil {
+		t.Fatalf("ServerConfigForVMCP() error = %v, want the ready component despite the unconfigured one", err)
+	}
+	if len(cfg.Components) != 1 {
+		t.Fatalf("components = %#v, want only the ready component", cfg.Components)
+	}
+	if cfg.Components[0].Name != server.Name || cfg.Components[0].MCPServerInstanceID != connection.Name {
+		t.Fatalf("component = %#v, want server %q and connection %q", cfg.Components[0], server.Name, connection.Name)
+	}
+
+	// "needsInput" is a per-user deployment, so classifying it out is what keeps its
+	// dedicated server from being waited on at all. Without that, a second server
+	// list is watched and the connect pays the readiness timeout.
+	close(watches)
+	var serverListWatches int
+	for list := range watches {
+		if _, ok := list.(*v1.MCPServerList); ok {
+			serverListWatches++
+		}
+	}
+	if serverListWatches != 1 {
+		t.Fatalf("MCPServer watches = %d, want 1: the unconfigured component must be classified out before any wait", serverListWatches)
+	}
+}
+
+func (s *vmcpWatchFailingStorage) Watch(context.Context, kclient.ObjectList, ...kclient.ListOption) (watch.Interface, error) {
+	return nil, s.err
+}
+
+// A component that never reaches the synced state is omitted, and its omission must
+// not shift the tool grant onto another component.
+func TestServerConfigForVMCPDropsComponentThatNeverSyncs(t *testing.T) {
+	const userID = "1"
+	const componentTimeout = 150 * time.Millisecond
+	// The never-syncing component is first so index-paired grants would land on the wrong one.
+	vmcp := &v1.VMCP{Name: "vmcp1neversync", Namespace: system.DefaultNamespace, Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
+		Components: []types.VMCPComponent{
+			{ID: "neverSync", Name: "neverSync"},
+			{ID: "ready", Name: "ready", ToolOverrides: []types.ToolOverride{{Name: "t1", Enabled: true}}},
+		},
+		Profiles: []types.VMCPProfile{{
+			Subjects: []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			Permissions: types.VMCPProfilePermissions{AllowedComponents: map[string]types.VMCPComponentSet{
+				"neverSync": {AllowedTools: []string{}},
+				"ready":     {AllowedTools: []string{"t1"}},
+			}},
+		}},
+	}}}
+	instance := syncedVMCPInstance(&v1.VMCPInstance{
+		Name: "vmcpi1neversync", Namespace: system.DefaultNamespace,
+		Spec: v1.VMCPInstanceSpec{UserID: userID, Manifest: types.VMCPInstanceManifest{VMCPID: vmcp.Name}},
+	}, vmcp)
+	// Only the ready component has a server and a connection, so neverSync's component waits time out.
+	server := vmcpComponentServer("ms1ready", "", "", "ready", "ready", "https://ready.example.test/mcp")
+	server.Spec.VMCPID = vmcp.Name
+	connection := syncedVMCPConnection(t, &v1.MCPServerInstance{
+		Name: "msi1ready", Namespace: system.DefaultNamespace,
+		Spec: v1.MCPServerInstanceSpec{UserID: userID, VMCPInstanceID: instance.Name, VMCPComponentID: "ready", MCPServerName: server.Name},
+	}, vmcp, instance)
+	manager := &SessionManager{
+		storageClient:        newVMCPTestStorage(vmcp, instance, server, connection),
+		vmcpComponentTimeout: componentTimeout,
+	}
+
+	cfg, err := manager.ServerConfigForVMCP(t.Context(), vmcp.Name, &kuser.DefaultInfo{UID: userID})
+	if err != nil {
+		t.Fatalf("ServerConfigForVMCP() error = %v, want the ready component despite the never-synced one", err)
+	}
+	if len(cfg.Components) != 1 {
+		t.Fatalf("components = %#v, want only the ready component", cfg.Components)
+	}
+	component := cfg.Components[0]
+	if component.Name != server.Name || component.MCPServerInstanceID != connection.Name {
+		t.Fatalf("component = %#v, want server %q and connection %q", component, server.Name, connection.Name)
+	}
+	// The grant is the ready component's; applying it through the never-synced one disables tools.
+	if component.DisableTools || len(component.Tools) != 1 {
+		t.Fatalf("component tools = %#v (disabled %v), want the ready component's single granted tool", component.Tools, component.DisableTools)
+	}
+}
+
+// The degraded path must not assemble a configuration for a caller that has gone away.
+func TestServerConfigForVMCPFailsWhenTheCallerGoesAway(t *testing.T) {
+	const userID = "1"
+	vmcp := &v1.VMCP{Name: "vmcp1abandoned", Namespace: system.DefaultNamespace, Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
+		Components: []types.VMCPComponent{{ID: "component", Name: "component"}},
+		Profiles: []types.VMCPProfile{{
+			Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+		}},
+	}}}
+	instance := syncedVMCPInstance(&v1.VMCPInstance{
+		Name: "vmcpi1abandoned", Namespace: system.DefaultNamespace,
+		Spec: v1.VMCPInstanceSpec{UserID: userID, Manifest: types.VMCPInstanceManifest{VMCPID: vmcp.Name}},
+	}, vmcp)
+	// No component server or connection exists, so the component waits run until the caller is noticed.
+	manager := &SessionManager{
+		storageClient:        newVMCPTestStorage(vmcp, instance),
+		vmcpComponentTimeout: 100 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err := manager.ServerConfigForVMCP(ctx, vmcp.Name, &kuser.DefaultInfo{UID: userID}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ServerConfigForVMCP() error = %v, want context.Canceled", err)
+	}
+}
+
+// A watch fault is not readiness: the connection must fail rather than report a
+// smaller aggregate.
+func TestServerConfigForVMCPFailsWhenTheWatchFails(t *testing.T) {
+	const userID = "1"
+	vmcp := &v1.VMCP{Name: "vmcp1watchfault", Namespace: system.DefaultNamespace, Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
+		Components: []types.VMCPComponent{{ID: "component", Name: "component"}},
+		Profiles: []types.VMCPProfile{{
+			Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+		}},
+	}}}
+	instance := syncedVMCPInstance(&v1.VMCPInstance{
+		Name: "vmcpi1watchfault", Namespace: system.DefaultNamespace,
+		Spec: v1.VMCPInstanceSpec{UserID: userID, Manifest: types.VMCPInstanceManifest{VMCPID: vmcp.Name}},
+	}, vmcp)
+	watchErr := errors.New("watch unavailable")
+	manager := &SessionManager{
+		storageClient: &vmcpWatchFailingStorage{
+			Client: newVMCPTestStorage(vmcp, instance),
+			err:    watchErr,
+		},
+		vmcpComponentTimeout: time.Second,
+	}
+
+	_, err := manager.ServerConfigForVMCP(t.Context(), vmcp.Name, &kuser.DefaultInfo{UID: userID})
+	if !errors.Is(err, watchErr) {
+		t.Fatalf("ServerConfigForVMCP() error = %v, want %v", err, watchErr)
+	}
+	if errors.Is(err, wait.ErrTimeout) {
+		t.Fatalf("ServerConfigForVMCP() error = %v, must not be reported as a timeout", err)
+	}
+}
+
+// A shared component is only reachable through its own connection. When that
+// connection never resolves, emitting the component would point the session at the
+// shared server and skip the per-user connection that carries this user's config.
+func TestServerConfigForVMCPOmitsSharedComponentWithoutConnection(t *testing.T) {
+	const userID = "1"
+	vmcp := &v1.VMCP{Name: "vmcp1noconnection", Namespace: system.DefaultNamespace, Spec: v1.VMCPSpec{Manifest: types.VMCPManifest{
+		Components: []types.VMCPComponent{{ID: "shared", Name: "shared"}},
+		Profiles: []types.VMCPProfile{{
+			Subjects:    []types.Subject{{Type: types.SubjectTypeSelector, ID: "*"}},
+			Permissions: types.VMCPProfilePermissions{AllowAllComponents: true},
+		}},
+	}}}
+	instance := syncedVMCPInstance(&v1.VMCPInstance{
+		Name: "vmcpi1noconnection", Namespace: system.DefaultNamespace,
+		Spec: v1.VMCPInstanceSpec{UserID: userID, Manifest: types.VMCPInstanceManifest{VMCPID: vmcp.Name}},
+	}, vmcp)
+	server := vmcpComponentServer("ms1shared", "", "", "shared", "shared", "https://shared.example.test/mcp")
+	server.Spec.VMCPID = vmcp.Name
+	manager := &SessionManager{
+		storageClient:        newVMCPTestStorage(vmcp, instance, server),
+		vmcpComponentTimeout: 100 * time.Millisecond,
+	}
+
+	cfg, err := manager.ServerConfigForVMCP(t.Context(), vmcp.Name, &kuser.DefaultInfo{UID: userID})
+	if err != nil {
+		t.Fatalf("ServerConfigForVMCP() error = %v, want an aggregate without the unreachable component", err)
+	}
+	if len(cfg.Components) != 0 {
+		t.Fatalf("components = %#v, want none: a shared component without its connection is not reachable", cfg.Components)
 	}
 }
 
