@@ -6,9 +6,36 @@ import (
 	"testing"
 
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/stretchr/testify/require"
 )
+
+func TestReadSystemMCPCatalogHonorsRemoteURLPolicy(t *testing.T) {
+	dir := t.TempDir()
+	manifest := `name: Internal MCP
+shortDescription: Internal MCP
+description: Internal MCP server
+runtime: remote
+serverUserType: multiUser
+remoteConfig:
+  fixedURL: http://192.168.1.25/mcp
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "internal.yaml"), []byte(manifest), 0o600))
+
+	handler := &Handler{}
+	_, err := handler.readSystemMCPCatalog(t.Context(), "default", dir, "")
+	require.ErrorContains(t, err, "MCP server URL must not resolve to a private IP address")
+
+	handler.remoteURLValidationConfig = mcp.ValidationOptions{
+		RemoteMCPURLValidationConfig: mcp.RemoteMCPURLValidationConfig{
+			AllowPrivateIPMCP: true,
+		},
+	}
+	objects, err := handler.readSystemMCPCatalog(t.Context(), "default", dir, "")
+	require.NoError(t, err)
+	require.Len(t, objects, 1)
+}
 
 func TestReadMCPCatalogAcceptsOrgConfiguredRemoteEntries(t *testing.T) {
 	dir := t.TempDir()
