@@ -1333,8 +1333,9 @@ func (m *MCPHandler) ClearOAuthCredentials(req api.Context) error {
 }
 
 // RevokeVMCPUserOAuthCredentials deletes one user's grants for one shared vMCP.
-// Connection ownership comes from Obot's instance graph, not a caller-supplied
-// list of token IDs.
+// The path user_id is the subject from the administrator's identity provider;
+// connection ownership comes from Obot's instance graph, not caller-supplied
+// internal user or token IDs.
 func (m *MCPHandler) RevokeVMCPUserOAuthCredentials(req api.Context) error {
 	if !req.UserIsAdmin() {
 		return types.NewErrForbidden("administrator access required to revoke another user's vMCP OAuth credentials")
@@ -1350,6 +1351,20 @@ func (m *MCPHandler) RevokeVMCPUserOAuthCredentials(req api.Context) error {
 	if vmcp.Spec.UserID != "" {
 		return types.NewErrBadRequest("user offboarding requires a shared vMCP")
 	}
+	providerName, providerNamespace := req.AuthProviderNameAndNamespace()
+	if providerName == "" || providerNamespace == "" {
+		return types.NewErrForbidden("administrator identity provider is required for user offboarding")
+	}
+	target, err := req.GatewayClient.UserFromProviderUserID(req.Context(), providerNamespace, providerName, userID)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return types.NewErrNotFound("user vMCP connection not found")
+	}
+	if err != nil {
+		return fmt.Errorf("resolve offboarding user: %w", err)
+	}
+	// VMCPInstance and gateway OAuth tokens use Obot's numeric UID, while the
+	// path names the Studio identity provider subject.
+	userID = strconv.FormatUint(uint64(target.ID), 10)
 	var instances v1.VMCPInstanceList
 	if err := req.List(&instances, kclient.InNamespace(vmcp.Namespace), kclient.MatchingFields{
 		"spec.userID": userID, "spec.manifest.vmcpID": vmcp.Name,
