@@ -472,20 +472,22 @@ func TestMCPJSONRPCErrorPropagatesThroughTransport(t *testing.T) {
 	}
 }
 
-func TestCompositeLoopbackURLsUsesBackendTargetAndPublicAudience(t *testing.T) {
+func TestCompositeLoopbackURLsUsesBackendTargetAndLocalAudience(t *testing.T) {
 	const (
-		serverURL       = "https://obot.example.com/"
+		// The loopback base is Obot's self-reachable address, never the
+		// public ServerURL (VD-7416).
+		loopbackBaseURL = "http://localhost:8080/"
 		mcpServerName   = "mcp-composite"
 		internalBaseURL = "http://obot.obot-system.svc.cluster.local"
 	)
 
 	var transformedURL string
-	audienceURL, targetURL := compositeLoopbackURLs(serverURL, mcpServerName, func(rawURL string) string {
+	audienceURL, targetURL := compositeLoopbackURLs(loopbackBaseURL, mcpServerName, func(rawURL string) string {
 		transformedURL = rawURL
 		return internalBaseURL + "/mcp-connect-composite/" + mcpServerName
 	})
 
-	wantAudienceURL := "https://obot.example.com/mcp-connect-composite/mcp-composite"
+	wantAudienceURL := "http://localhost:8080/mcp-connect-composite/mcp-composite"
 	if audienceURL != wantAudienceURL {
 		t.Fatalf("audience URL = %q, want %q", audienceURL, wantAudienceURL)
 	}
@@ -495,6 +497,21 @@ func TestCompositeLoopbackURLsUsesBackendTargetAndPublicAudience(t *testing.T) {
 	wantTargetURL := "http://obot.obot-system.svc.cluster.local/mcp-connect-composite/mcp-composite"
 	if targetURL != wantTargetURL {
 		t.Fatalf("target URL = %q, want %q", targetURL, wantTargetURL)
+	}
+}
+
+func TestCompositeLoopbackURLsDoesNotStripSubpath(t *testing.T) {
+	// VD-7416: this helper preserves the base path by design (the backend
+	// transform also rewrites scheme+host only). A subpathed base therefore
+	// propagates /obot into the loopback target, where Obot's own mux has no
+	// route and denies the call at "/". The caller (router.go) must pass the
+	// prefix-free local address; this test pins the pass-through so a future
+	// reader does not mistake it for stripping.
+	audienceURL, _ := compositeLoopbackURLs("http://localhost:8080/obot", "vmcp123", func(rawURL string) string {
+		return rawURL
+	})
+	if audienceURL != "http://localhost:8080/obot/mcp-connect-composite/vmcp123" {
+		t.Fatalf("subpathed base must propagate unchanged, got %q", audienceURL)
 	}
 }
 
