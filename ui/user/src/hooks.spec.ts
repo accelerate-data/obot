@@ -1,4 +1,5 @@
 import { reroute } from './hooks';
+import { stripBasePath } from './lib/appBasePath';
 import { describe, expect, it } from 'vitest';
 
 function rerouted(pathname: string): string | undefined {
@@ -35,5 +36,15 @@ describe('reroute under Studio’s /obot base path', () => {
 	it('applies the admin reroutes inside the base path', () => {
 		expect(rerouted('/obot/admin/mcp-catalog')).toBe('/mcp-catalog');
 		expect(rerouted('/obot/admin/devices')).toBe('/inventory');
+	});
+});
+
+describe('stripBasePath against SvelteKit’s router base', () => {
+	it('leaves the path alone when the router already adopted the prefix as its base', () => {
+		expect(stripBasePath('/obot/vmcps', '/obot')).toBe('/obot/vmcps');
+	});
+
+	it('strips the prefix when the router base is empty', () => {
+		expect(stripBasePath('/obot/vmcps')).toBe('/vmcps');
 	});
 });
