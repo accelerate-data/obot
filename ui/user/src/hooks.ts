@@ -1,3 +1,4 @@
+import { stripBasePath } from './lib/appBasePath';
 import type { Reroute } from '@sveltejs/kit';
 
 const ADMIN_MCP_SERVERS_PREFIX = '/admin/mcp-catalog';
@@ -10,7 +11,10 @@ const ADMIN_MCP_AUDIT_LOGS_PREFIX = '/admin/audit-logs/exports';
 const ADMIN_LLM_AUDIT_LOGS_PREFIX = '/admin/llm-audit-logs/exports';
 
 export const reroute: Reroute = ({ url }) => {
-	const { pathname } = url;
+	// Studio serves this UI under /obot behind its nginx. The router matches
+	// routes without that prefix; without this the browser path falls through
+	// to the not-found page even though the server rendered it.
+	const pathname = stripBasePath(url.pathname);
 
 	if (pathname.startsWith(`${ADMIN_MCP_DEPLOYMENTS_PREFIX}/`)) {
 		return pathname.replace(ADMIN_MCP_DEPLOYMENTS_PREFIX, '/mcp-catalog');
@@ -53,4 +57,6 @@ export const reroute: Reroute = ({ url }) => {
 	if (pathname.startsWith(ADMIN_LLM_AUDIT_LOGS_PREFIX)) {
 		return pathname.replace(ADMIN_LLM_AUDIT_LOGS_PREFIX, '/audit-logs/llm/exports');
 	}
+
+	if (pathname !== url.pathname) return pathname;
 };
