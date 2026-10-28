@@ -15,7 +15,11 @@ export function basePathFor(pathname: string): string {
 }
 
 /** `pathname` with the base prefix removed; '/' when only the base remains. */
-export function stripBasePath(pathname: string): string {
+export function stripBasePath(pathname: string, routerBase = ''): string {
+	// Prerendered pages derive SvelteKit's base from the document URL, so their
+	// router has already removed the prefix. Only the fallback shell for
+	// dynamic routes pins `base` to "" and needs the prefix stripped here.
+	if (routerBase) return pathname;
 	const base = basePathFor(pathname);
 	if (!base) return pathname;
 	return pathname.slice(base.length) || '/';
