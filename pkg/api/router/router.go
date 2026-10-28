@@ -67,7 +67,10 @@ func NewRouter(ctx context.Context, services *services.Services) (*Router, error
 		services.MCPOAuthTokenStorage,
 		services.PersistentTokenServer,
 		mcpgateway.NewAuditLogHandler(services.GatewayClient),
-		services.ServerURL,
+		// Self-loopback for the vMCP aggregate must use the prefix-free local
+		// address: the public ServerURL carries Studio's /obot subpath, which
+		// Obot's own mux does not serve (VD-7416).
+		services.LocalServerURL,
 		services.DSN,
 		services.MCPSecretBindingAllowedLabel,
 		services.TunnelManager,

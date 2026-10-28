@@ -60,8 +60,13 @@ type Handler struct {
 	hookRunner                mcp.HookRunner
 	tunnelManager             *tunnel.Manager
 	secretBindingAllowedLabel string
-	serverURL                 string
-	mintToken                 func(context.Context, persistent.TokenContext) (string, error)
+	// loopbackBaseURL is Obot's address as Obot itself can reach it
+	// (services.LocalServerURL). It must NOT be the public ServerURL: Studio
+	// serves Obot under the /obot subpath, which Obot's own mux does not
+	// route, so a loopback built from the public URL falls through to the
+	// "/" catch-all and is denied (VD-7416).
+	loopbackBaseURL string
+	mintToken       func(context.Context, persistent.TokenContext) (string, error)
 }
 
 // mcpResponse keeps the client response and its audit representation together.
@@ -182,8 +187,8 @@ func handleGenericToolCallError(req api.Context, audit *proxyAudit, callErr erro
 	return true
 }
 
-func compositeLoopbackURLs(serverURL, mcpServerName string, transform func(string) string) (audienceURL, targetURL string) {
-	audienceURL = fmt.Sprintf("%s/mcp-connect-composite/%s", strings.TrimSuffix(serverURL, "/"), mcpServerName)
+func compositeLoopbackURLs(loopbackBaseURL, mcpServerName string, transform func(string) string) (audienceURL, targetURL string) {
+	audienceURL = fmt.Sprintf("%s/mcp-connect-composite/%s", strings.TrimSuffix(loopbackBaseURL, "/"), mcpServerName)
 	return audienceURL, transform(audienceURL)
 }
 
@@ -191,7 +196,7 @@ func compositeSessionKey(serverConfig mcp.ServerConfig) string {
 	return tunnel.CompositeSessionKey(serverConfig.MCPServerName)
 }
 
-func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, globalTokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, auditLogCollector proxyAuditCollector, serverURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager, authorizationURLs func(api.Context) ([]mmmcp.AuthorizationURL, error)) (*Handler, error) {
+func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, globalTokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, auditLogCollector proxyAuditCollector, loopbackBaseURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager, authorizationURLs func(api.Context) ([]mmmcp.AuthorizationURL, error)) (*Handler, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var componentAuth componenthttp.OAuthHandlerProvider
@@ -230,7 +235,7 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, glob
 		hookRunner:                mcp.NewHookRunner(mcpSessionManager),
 		tunnelManager:             tunnelManager,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
-		serverURL:                 serverURL,
+		loopbackBaseURL:           loopbackBaseURL,
 		mintToken:                 mintToken,
 	}, nil
 }
@@ -317,7 +322,7 @@ func (h *Handler) Proxy(req api.Context) error {
 		// The URL is changed to /mcp-connect-composite/{mcp_id} which comes back here and handles
 		// the multi-MCP server configuration (and calls no audit logs nor hooks).
 		if serverConfig.Runtime == types.RuntimeVMCP {
-			compositeAudienceURL, compositeTargetURL := compositeLoopbackURLs(h.serverURL, serverConfig.MCPServerName, h.mcpSessionManager.TransformObotHostname)
+			compositeAudienceURL, compositeTargetURL := compositeLoopbackURLs(h.loopbackBaseURL, serverConfig.MCPServerName, h.mcpSessionManager.TransformObotHostname)
 			serverConfig.URL = compositeTargetURL
 
 			authorizedMCPIDs := make([]string, 0, len(serverConfig.Components))
