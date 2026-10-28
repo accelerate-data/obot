@@ -2,6 +2,7 @@ import { browser } from '$app/environment';
 import { goto as svelteGoTo, replaceState as svelteReplaceState } from '$app/navigation';
 import { resolve } from '$app/paths';
 import { navigating, page } from '$app/state';
+import { basePathFor } from './appBasePath';
 import type { InitSort } from './components/table/Table.svelte';
 
 export function qIsSet(key: string): boolean {
@@ -104,8 +105,7 @@ export function goto(url: string | URL, state?: object) {
 
 export function appBasePath(): string {
 	if (!browser) return '';
-	const pathname = window.location.pathname;
-	return pathname === '/obot' || pathname.startsWith('/obot/') ? '/obot' : '';
+	return basePathFor(window.location.pathname);
 }
 
 export function appPath(path: string): string {
