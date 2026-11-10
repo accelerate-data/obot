@@ -19,7 +19,9 @@ export function stripBasePath(pathname: string, routerBase = ''): string {
 	// Prerendered pages derive SvelteKit's base from the document URL, so their
 	// router has already removed the prefix. Only the fallback shell for
 	// dynamic routes pins `base` to "" and needs the prefix stripped here.
-	if (routerBase) return pathname;
+	// Server rendering can hand back a relative base such as '.'; only an absolute
+	// base means the router already consumed the prefix.
+	if (routerBase.startsWith('/')) return pathname;
 	const base = basePathFor(pathname);
 	if (!base) return pathname;
 	return pathname.slice(base.length) || '/';
