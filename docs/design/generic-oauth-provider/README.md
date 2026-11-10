@@ -4,6 +4,12 @@ status: draft
 
 # Generic OAuth Provider Support
 
+> **Email linking superseded (v0.28.0, VD-7833).** Upstream obot#8415 removed email-based identity
+> linking: sign-in never matches an existing user by email, and identities match on provider plus
+> subject. The email-linking rules in this document describe the pre-v0.28.0 fork. The
+> `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING` value still exists and still gates an issuer
+> change, but it no longer enables any linking; retiring it is tracked as a VD-7833 follow-up.
+
 ## Overview
 
 Obot should support one native generic OAuth / OpenID Connect auth provider. The provider appears as a first-class auth provider in the admin UI and API, but it still follows the existing Obot convention of one registry-backed provider instance per provider type.
@@ -150,6 +156,8 @@ Configuration validation must verify:
 - TLS validation succeeds through the system trust store or an explicitly documented custom CA mechanism.
 
 ## Identity and Account Linking
+
+> Superseded for email linking since v0.28.0; see the note at the top of this document.
 
 Generic OAuth can be trusted for email/account linking because admins are intentionally configuring the issuer as their login authority. That trust is explicit provider configuration, defaults to enabled for `generic-oauth-auth-provider`, and is scoped to the configured issuer.
 
