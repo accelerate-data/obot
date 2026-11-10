@@ -11,6 +11,12 @@ status: draft
 > The setting itself is inert: Obot still accepts it (default `false`) because the published providers
 > registry declares it as required. Retiring it from providers, then Obot and the Studio installers,
 > is a VD-7833 follow-up.
+>
+> **Issuer binding is not implemented.** The identity key is the provider name plus a hash of the
+> provider user ID, which is the plain OIDC `sub`; it carries no issuer. The issuer-bound storage
+> and issuer-change rules below are the intended design, not the as-built behaviour. Until VD-7860
+> adds the issuer to the identity key, do not repoint a configured generic provider at a different
+> IdP: a user there whose `sub` matches an existing identity signs in as that user.
 
 ## Overview
 
@@ -25,8 +31,8 @@ The goal is Langfuse-style custom provider support: an admin can configure an is
 - A single built-in generic provider registry entry named `generic-oauth-auth-provider`.
 - API and UI support for configuring the generic provider through the existing auth provider flow.
 - OIDC issuer discovery from `/.well-known/openid-configuration`.
-- A precise trust model for email/account linking.
-- Issuer-bound identity storage so the same provider type can be safely reconfigured.
+- A trust model for email/account linking (superseded in v0.28.0: nothing links by email).
+- Issuer-bound identity storage so the same provider type can be safely reconfigured (not implemented; VD-7860).
 - A provider daemon contract for OIDC security, profile mapping, validation, and runtime errors.
 - Documentation for configuring common OIDC providers.
 - Backend, provider/runtime, UI, and route-level tests for provider configuration and login wiring.
@@ -48,7 +54,7 @@ The goal is Langfuse-style custom provider support: an admin can configure an is
 | Required fields are display name, issuer URL, client ID, client secret, and email domains. | These match the Langfuse-style configuration model and give admins the minimum operator-controlled inputs for a standard OIDC login. Email domains remain the primary Obot-side access gate. |
 | Scope defaults to `openid email profile`. | This is the common baseline for OIDC login and can be overridden for providers that require custom scopes. |
 | Make trusted email linking an explicit provider configuration value. | The provider is first-class, but the trust decision should be visible to admins and bound to the configured issuer, not hidden in a hardcoded provider-name allowlist. |
-| Persist issuer identity with Obot identities. | OIDC `sub` values are only unique within an issuer. Generic provider identities need issuer binding to avoid collisions after reconfiguration. |
+| Persist issuer identity with Obot identities. | OIDC `sub` values are only unique within an issuer. Generic provider identities need issuer binding to avoid collisions after reconfiguration. Not implemented: the identity key has no issuer (VD-7860). |
 | Preserve the existing one-configured-provider rule. | `AuthProviderHandler.Configure` currently rejects configuring a second provider. This feature adds a provider type; it does not change active-provider cardinality. |
 | Defer generic group mapping. | Vendor-specific group APIs belong in dedicated providers. Standard group-claim mapping can be added later with a separate design and tests. |
 | Validate the issuer before reporting the provider as usable. | Generic configuration has more typo and compatibility risk than GitHub/Google. Admins need synchronous validation or an explicit test action before login depends on the provider. |
@@ -80,7 +86,7 @@ generic OIDC provider daemon
 proxy and gateway complete login through provider daemon
         │
         ▼
-identity is stored with provider name + issuer fingerprint + subject
+identity is stored with provider name + subject (issuer fingerprint planned, VD-7860)
 ```
 
 The existing auth provider API remains the primary surface. The generic provider appears in `GET /api/auth-providers` with provider metadata and configuration parameters. Admins configure it through `POST /api/auth-providers/generic-oauth-auth-provider/configure`.
@@ -186,6 +192,8 @@ The provider daemon should return stable identity fields:
 ## Reconfiguration and Sessions
 
 Changing the issuer URL for `generic-oauth-auth-provider` is a trust-boundary change, not a routine credential edit.
+
+None of the rules in this section are implemented: Obot validates the new issuer but keeps existing identities and sessions. VD-7860 tracks issuer binding.
 
 When the configured issuer changes, Obot should:
 
