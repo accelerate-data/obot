@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { resolve } from '$app/paths';
 	import { m } from '$lib/i18n';
 	import Loading from '$lib/icons/Loading.svelte';
 	import {
@@ -16,6 +15,7 @@
 	} from '$lib/runes/vmcps/vmcpItem.svelte';
 	import { UserService, type VMCP } from '$lib/services';
 	import { profile } from '$lib/stores';
+	import { resolve } from '$lib/url';
 	import {
 		CircleFadingArrowUp,
 		ExternalLink,
@@ -199,7 +199,7 @@
 			toggle(false);
 		}}
 	>
-		{m.vmcps_deployments_view_audit_logs()}
+		{m.core_view_audit_logs()}
 		<ExternalLink class="size-4" />
 	</a>
 	<a

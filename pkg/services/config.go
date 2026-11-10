@@ -15,6 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/obot-platform/obot/pkg/modeldata"
+
+	"github.com/adrg/xdg"
 	"github.com/glebarez/sqlite"
 	kinmdb "github.com/obot-platform/kinm/pkg/db"
 	"github.com/obot-platform/nah"
@@ -37,10 +40,13 @@ import (
 	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
 	otime "github.com/obot-platform/obot/pkg/gateway/time"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/guardrails"
 	"github.com/obot-platform/obot/pkg/hash"
 	"github.com/obot-platform/obot/pkg/imagepullsecrets"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/license"
+	llmcoreclient "github.com/obot-platform/obot/pkg/llmcore/client"
+	"github.com/obot-platform/obot/pkg/llmengine"
 	"github.com/obot-platform/obot/pkg/localauth"
 	"github.com/obot-platform/obot/pkg/logutil"
 	"github.com/obot-platform/obot/pkg/mcp"
@@ -100,8 +106,6 @@ type Config struct {
 	AllowedOrigin                                  string   `usage:"Allowed origin for CORS"`
 	ProviderRegistries                             []string `usage:"Local filesystem paths to provider registries (directories) to load providers from"`
 	EnableAuthentication                           bool     `usage:"Enable authentication" default:"false"`
-	AuthAdminEmails                                []string `usage:"Emails of admin users"`
-	AuthOwnerEmails                                []string `usage:"Emails of owner users"`
 	LocalAuthInitialOwnerEmail                     string   `usage:"Email address for the initial local-auth owner" env:"OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_EMAIL"`
 	LocalAuthInitialOwnerSetupToken                string   `usage:"High-entropy setup token for the initial local-auth owner" env:"OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN"`
 	LocalAuthInitialOwnerSetupTokenExpirationHours int      `usage:"Hours the initial local-auth owner setup link remains valid" default:"168" env:"OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN_EXPIRATION_HOURS"`
@@ -123,19 +127,19 @@ type Config struct {
 
 	DefaultMCPCatalogPath       string `usage:"The path to the default MCP catalog (accessible to all users)" default:""`
 	DefaultSystemMCPCatalogPath string `usage:"The path to the default System MCP catalog" default:""`
-	MDMAssetSource              string `usage:"The source for MDM assets (a local directory, a tar archive path, or an HTTP(S) tarball URL)" default:"https://github.com/obot-platform/obot-sentry/releases/download/v0.1.8/mdm-assets.tar.gz" env:"OBOT_SERVER_MDM_ASSET_SOURCE"`
+	MDMAssetSource              string `usage:"The source for MDM assets (a local directory, a tar archive path, or an HTTP(S) tarball URL)" default:"https://github.com/obot-platform/obot-sentry/releases/download/v0.1.9/mdm-assets.tar.gz" env:"OBOT_SERVER_MDM_ASSET_SOURCE"`
 	DefaultSkillRepoURL         string `usage:"The default skill repository URL (must be HTTPS GitHub URL)" default:"https://github.com/obot-platform/skills" env:"OBOT_DEFAULT_SKILL_REPO_URL"`
 	DefaultSkillRepoRef         string `usage:"The ref (branch/tag) for the default skill repository" default:"" env:"OBOT_DEFAULT_SKILL_REPO_REF"`
-	ModelInfoSourceURL          string `usage:"Authoritative URL for the model info (pricing) source synced into model costs; changes take effect on restart, empty disables it" default:"https://models.dev/api.json"`
 	DisableUpdateCheck          bool   `usage:"Disable Obot server update checks"`
 	HideK8sDetails              bool   `usage:"Hide Kubernetes configuration details such as the Server Scheduling page from the UI" default:"false"`
-	EnableRegistryAuth          bool   `usage:"Enable authentication for the MCP registry API" default:"false" env:"OBOT_SERVER_ENABLE_REGISTRY_AUTH"`
-	EnableMessagePolicies       bool   `usage:"Enable message policies for LLM proxy content enforcement" default:"false"`
 	EgressAuditLogRetentionDays int    `usage:"Days to retain egress audit logs (0 disables cleanup)." default:"90"`
 	LLMAuditLogRetentionDays    int    `usage:"Number of days to retain LLM audit logs (0 to disable cleanup)." default:"90"`
 	DisableLLMAuditLog          bool   `usage:"Disable LLM gateway audit logging" default:"false"`
+	LLMGatewayDataDir           string `usage:"Directory for LLM gateway model pricing and capability files (default: $XDG_DATA_HOME/obot/llm-gateway)" name:"llm-gateway-data-dir" env:"OBOT_SERVER_LLM_GATEWAY_DATA_DIR"`
+	LLMGatewayLogLevel          string `usage:"Log level for the embedded LLM gateway (debug, info, warn, error)" name:"llm-gateway-log-level" default:"warn" env:"OBOT_SERVER_LLM_GATEWAY_LOG_LEVEL"`
+	LLMGatewayModelDataURL      string `usage:"Where the LLM gateway refreshes model prices and capabilities from, every 6 hours. Set to off to use only the prices bundled with Obot" name:"llm-gateway-model-data-url" default:"https://upgrade-server.obot.ai/v1/model-data" env:"OBOT_SERVER_LLM_GATEWAY_MODEL_DATA_URL"`
 	DeviceScanRetentionDays     int    `usage:"Number of days to retain submitted device scans (0 to disable cleanup)." default:"90"`
-	SubstrateRunnerImage        string `usage:"Default digest-pinned Claude runner image for new environments" default:"ghcr.io/obot-platform/obot-claude-runner@sha256:c6bef775ba97a3af60c7cad2c623598c583a6e33b7a1b1c3daec49e4f493cc8a"`
+	SubstrateRunnerImage        string `usage:"Default digest-pinned Claude runner image for new environments" default:"ghcr.io/obot-platform/obot-claude-runner@sha256:3fc6fde0409805b8878c364bc4f14da9dc7aff54cb2a07094a61a688f6183b72"`
 	SubstrateWorkerImage        string `usage:"Default Substrate worker image for new environments"`
 	SubstrateWorkerNodeSelector string `usage:"JSON node selector applied to all Substrate workers" default:"{\"kubernetes.io/os\":\"linux\"}"`
 	SubstrateWorkerTolerations  string `usage:"JSON tolerations applied to all Substrate workers, e.g. [{\"key\":\"workload\",\"operator\":\"Equal\",\"value\":\"agents\",\"effect\":\"NoSchedule\"}]" default:"[]"`
@@ -150,8 +154,6 @@ type Config struct {
 	MCPNetworkPolicyProviderChartPath    string `usage:"Local filesystem path to the network policy provider chart"`
 	MCPNetworkPolicyProviderValues       string `usage:"YAML or JSON values blob merged into the network policy provider chart values"`
 	MCPDefaultDenyAllEgress              bool   `usage:"Default new MCP servers to deny all egress when network policy enforcement is enabled" default:"false"`
-
-	// Published artifact storage
 
 	GatewayConfig
 	EncryptionConfig
@@ -187,23 +189,25 @@ type Services struct {
 	// Global token storage client for MCP OAuth
 	MCPOAuthTokenStorage         mcp.GlobalTokenStore
 	MCPSecretBindingAllowedLabel string
-	RegistryNoAuth               bool
 
-	PostgresDSN                 string
-	ProviderRegistryPaths       []string
-	DevUIPort                   int
-	DevMode                     bool
-	UserUIPort                  int
-	GatewayServer               *gserver.Server
-	Bootstrapper                *bootstrap.Bootstrap
-	LocalAuthProvider           *localauth.Provider
+	PostgresDSN           string
+	ProviderRegistryPaths []string
+	DevUIPort             int
+	DevMode               bool
+	UserUIPort            int
+	GatewayServer         *gserver.Server
+	Bootstrapper          *bootstrap.Bootstrap
+	LocalAuthProvider     *localauth.Provider
+	// BifrostEngine is the embedded LLM gateway.
+	BifrostEngine *llmengine.Engine
+	// GuardrailEngine checks LLM gateway traffic and MCP tool calls.
+	GuardrailEngine             *guardrails.Engine
 	AuthEnabled                 bool
 	DefaultMCPCatalogPath       string
 	DefaultSystemMCPCatalogPath string
 	MDMAssetSource              string
 	DefaultSkillRepoURL         string
 	DefaultSkillRepoRef         string
-	ModelInfoSourceURL          string
 
 	// Used for indexed lookups of access control rules.
 	AccessControlRuleHelper *accesscontrolrule.Helper
@@ -253,7 +257,6 @@ type Services struct {
 	MCPRuntimeBackend                    string
 	MCPImagePullSecrets                  []string
 	MCPHTTPWebhookBaseImage              string
-	MessagePoliciesEnabled               bool
 	MCPNetworkPolicyEnabled              bool
 	MCPDefaultDenyAllEgress              bool
 	Substrate                            *substrate.Client
@@ -264,8 +267,6 @@ type Services struct {
 	MCPNetworkPolicyProviderValues       string
 	SingleUserIdleServerShutdownInterval time.Duration
 	MultiUserIdleServerShutdownInterval  time.Duration
-
-	// Published artifact blob storage
 
 	// License provider
 	LicenseProvider *license.Provider
@@ -450,7 +451,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		if config.LocalAuthInitialOwnerSetupTokenExpirationHours <= 0 {
 			return nil, errors.New("initial local auth owner setup token expiration must be greater than zero")
 		}
-		config.AuthOwnerEmails = append(config.AuthOwnerEmails, config.LocalAuthInitialOwnerEmail)
 	}
 
 	// Setup Otel first so other services can use it.
@@ -589,8 +589,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		storageClient,
 		encryptionConfig,
 		r.Backend(),
-		config.AuthOwnerEmails,
-		config.AuthAdminEmails,
 		time.Duration(config.MCPAuditLogPersistIntervalSeconds)*time.Second,
 		config.MCPAuditLogsPersistBatchSize,
 		config.MCPAuditLogRetentionDays,
@@ -953,12 +951,57 @@ func New(ctx context.Context, config Config) (*Services, error) {
 
 	providerDispatcher := dispatcher.New(mcpSessionManager, storageClient, gatewayClient, licenseProvider, config.Hostname, system.LocalServerURL(config.HTTPListenPort), postgresDSN)
 
-	var msgPolicyHelper *messagepolicy.Helper
-	if config.EnableMessagePolicies {
-		msgPolicyHelper, err = messagepolicy.NewHelper(ctx, r.Backend(), storageClient, providerDispatcher, gatewayClient)
-		if err != nil {
-			return nil, err
+	bifrostEngine := llmengine.New()
+	providerDispatcher.RegisterBuiltinModelProvider(system.DefaultNamespace, system.LLMGatewayModelProvider, bifrostEngine)
+
+	// Message policies are now LLM judge guardrails, evaluated with the message policy judge.
+	judge := messagepolicy.NewHelper(storageClient, bifrostEngine)
+	guardrailEngine := guardrails.New(gatewayClient, judge)
+	go backfillIdentityGroupLookupIDHashes(ctx, gatewayClient)
+	go func() {
+		// LLM gateway traffic is governed by budgets rather than the daily token quota, so
+		// carry the configured daily limits over as budgets, once. This runs first so the
+		// profiles the message policy conversion creates, which grant no models, don't get one.
+		migrateDailyTokenLimits(ctx, storageClient, gatewayClient, config.DailyUserInputTokenLimit, config.DailyUserOutputTokenLimit)
+		migrateMessagePolicies(ctx, storageClient, gatewayClient, guardrailEngine)
+	}()
+	{
+		guardrailInput, guardrailOutput := guardrailEngine.Plugins()
+		dataDir := config.LLMGatewayDataDir
+		if dataDir == "" {
+			dataDir = filepath.Join(xdg.DataHome, "obot", "llm-gateway")
 		}
+		// Bootstrapping contacts configured providers to list their models, so it runs in
+		// the background; requests made before it finishes get a 503.
+		go func() {
+			coreStore, err := llmcoreclient.New(storageClient, gatewayClient)
+			if err != nil {
+				bifrostEngine.Fail(err)
+				return
+			}
+
+			modelDataURL, err := modeldata.RefreshURL(config.LLMGatewayModelDataURL)
+			if err != nil {
+				bifrostEngine.Fail(err)
+				return
+			}
+			_ = bifrostEngine.Start(ctx, llmengine.Options{
+				DataDir: dataDir,
+				Store:   coreStore,
+				TriggerModelSync: func(ctx context.Context) error {
+					return llmengine.TriggerModelSync(ctx, storageClient)
+				},
+				LogLevel:     config.LLMGatewayLogLevel,
+				ModelDataURL: modelDataURL,
+				// Guardrails are part of the gateway: it doesn't serve until they're in place.
+				FirstPlugin: guardrailInput,
+				LastPlugin:  guardrailOutput,
+				ClaudeSubscriptions: func(ctx context.Context) (bool, error) {
+					settings, err := gatewayClient.GetLLMGatewaySettings(ctx)
+					return settings.SubscriptionPassthrough, err
+				},
+			})
+		}()
 	}
 
 	apply.AddValidOwnerChange("otto-controller", "obot-controller")
@@ -974,10 +1017,11 @@ func New(ctx context.Context, config Config) (*Services, error) {
 	}
 
 	gatewayOpts := gserver.Options(config.GatewayConfig)
-	gatewayServer, err := gserver.New(gatewayDB, persistentTokenServer, providerDispatcher, acrHelper, mapHelper, msgPolicyHelper, gatewayOpts)
+	gatewayServer, err := gserver.New(gatewayDB, persistentTokenServer, providerDispatcher, acrHelper, mapHelper, gatewayOpts)
 	if err != nil {
 		return nil, err
 	}
+	gatewayServer.SetLLMGateway(bifrostEngine)
 
 	authenticators := gserver.NewGatewayTokenReviewer(gatewayClient, providerDispatcher)
 	var localAuthProvider *localauth.Provider
@@ -1114,9 +1158,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		return nil, fmt.Errorf("failed to create rate limiter: %w", err)
 	}
 
-	// Derive registryNoAuth flag from config
-	// When EnableRegistryAuth is false (default), registry is in no-auth mode
-	registryNoAuth := !config.EnableRegistryAuth
 	secretBindingAllowedLabel := strings.TrimSpace(config.MCPSecretBindingAllowedLabel)
 	if errs := kvalidation.IsQualifiedName(secretBindingAllowedLabel); len(errs) > 0 {
 		return nil, fmt.Errorf("invalid MCP secret binding allowed label %q: %s", secretBindingAllowedLabel, strings.Join(errs, "; "))
@@ -1138,7 +1179,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		ClientIDMetadataDocumentSupported: true,
 	}
 
-	authorizer := authz.NewAuthorizer(gatewayClient, r.Backend(), storageClient, config.DevMode, acrHelper, skillAccessRuleHelper, registryNoAuth)
+	authorizer := authz.NewAuthorizer(gatewayClient, r.Backend(), storageClient, config.DevMode, acrHelper, skillAccessRuleHelper, gatewayClient)
 
 	versionChecker, err := upgrade.NewVersionChecker(ctx, upgrade.VersionCheckerOptions{
 		GatewayClient:      gatewayClient,
@@ -1172,7 +1213,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 			rateLimiter,
 			config.Hostname,
 			oauthServerConfig.ScopesSupported,
-			registryNoAuth,
 			licenseProvider,
 		),
 		GatewayClient:                gatewayClient,
@@ -1187,7 +1227,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		OAuthServerConfig:            oauthServerConfig,
 		MCPOAuthTokenStorage:         mcpOAuthTokenStorage,
 		MCPSecretBindingAllowedLabel: secretBindingAllowedLabel,
-		RegistryNoAuth:               registryNoAuth,
 		DSN:                          config.DSN,
 		PostgresDSN:                  postgresDSN,
 		ObotNamespace:                config.ServiceNamespace,
@@ -1199,6 +1238,8 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		AuthEnabled:                  config.EnableAuthentication,
 		Bootstrapper:                 bootstrapper,
 		LocalAuthProvider:            localAuthProvider,
+		BifrostEngine:                bifrostEngine,
+		GuardrailEngine:              guardrailEngine,
 
 		DefaultMCPCatalogPath:          config.DefaultMCPCatalogPath,
 		GitMaxRepoSizeMB:               config.GitMaxRepoSizeMB,
@@ -1206,7 +1247,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		DefaultSystemMCPCatalogPath:    config.DefaultSystemMCPCatalogPath,
 		DefaultSkillRepoURL:            config.DefaultSkillRepoURL,
 		DefaultSkillRepoRef:            config.DefaultSkillRepoRef,
-		ModelInfoSourceURL:             config.ModelInfoSourceURL,
 		MCPOAuthClientSecretExpiration: oauthClientExpiration,
 		MCPOAuthClientNativeExceptions: config.MCPOAuthClientNativeExceptions,
 		MCPOAuthCompletionURL:          config.MCPOAuthCompletionURL,
@@ -1237,7 +1277,6 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		MCPHTTPWebhookBaseImage:              config.MCPHTTPWebhookBaseImage,
 		SingleUserIdleServerShutdownInterval: time.Duration(config.SingleUserIdleServerShutdownHours) * time.Hour,
 		MultiUserIdleServerShutdownInterval:  time.Duration(config.MultiUserIdleServerShutdownHours) * time.Hour,
-		MessagePoliciesEnabled:               config.EnableMessagePolicies,
 		MCPNetworkPolicyEnabled:              mcpNetworkPolicyEnabled,
 		MCPDefaultDenyAllEgress:              config.MCPDefaultDenyAllEgress,
 		MCPNetworkPolicyProviderChartRepo:    config.MCPNetworkPolicyProviderChartRepo,
@@ -1412,4 +1451,95 @@ func validateMCPOAuthCompletionURL(v string) error {
 		return invalid
 	}
 	return nil
+}
+
+// backfillIdentityGroupLookupIDHashes stores the hashed group lookup IDs of identities written without them, once. It
+// runs in the background because it reads every identity, and retries until it succeeds.
+func backfillIdentityGroupLookupIDHashes(ctx context.Context, gatewayClient *client.Client) {
+	for {
+		err := gatewayClient.BackfillIdentityGroupLookupIDHashes(ctx)
+		if err == nil {
+			return
+		}
+		slog.Warn("failed to backfill the hashed identity group lookup IDs; retrying", "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+// migrateDailyTokenLimits carries the daily token limits over as a budget on every profile,
+// once. It retries until storage is ready.
+func migrateDailyTokenLimits(ctx context.Context, storageClient kclient.Client, gatewayClient *client.Client, input, output int) {
+	for {
+		err := gatewayClient.CarryOverDailyTokenLimits(ctx, func(ctx context.Context) ([]string, error) {
+			return modelaccesspolicy.EnsureProfiles(ctx, storageClient)
+		}, input, output)
+		if err == nil {
+			return
+		}
+		slog.Warn("failed to carry the daily token limits over as LLM gateway budgets; retrying", "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
+}
+
+// messagePolicyProfile returns the gateway profile a converted message policy's guardrail policy belongs
+// to: the everyone profile if the policy applied to everyone, otherwise a profile named after
+// the policy with its subjects and no models. A policy that applied to no one gets a profile
+// with no subjects, so its guardrail policy still applies to no one if an administrator enables it.
+func messagePolicyProfile(storageClient kclient.Client) guardrails.ProfileFor {
+	return func(ctx context.Context, p guardrails.LegacyPolicy) (string, error) {
+		subjects := p.Manifest.Subjects
+		if modelaccesspolicy.AppliesToEveryone(subjects) {
+			return modelaccesspolicy.EnsureEveryoneProfile(ctx, storageClient)
+		}
+		name := system.ModelAccessPolicyPrefix + "-" + p.ID
+		displayName := p.Manifest.DisplayName
+		if displayName == "" {
+			displayName = p.ID
+		}
+		return name, modelaccesspolicy.EnsureProfile(ctx, storageClient, name, displayName+" (message policy)", subjects)
+	}
+}
+
+// migrateMessagePolicies converts message policies into guardrails, once. MessagePolicy
+// resources are left in place, unenforced, so the conversion can be reviewed.
+func migrateMessagePolicies(ctx context.Context, storageClient kclient.Client, gatewayClient *client.Client, engine *guardrails.Engine) {
+	for {
+		err := gatewayClient.MigrateKinmIfNotRun(ctx, "guardrails_message_policies", func() error {
+			var list v1.MessagePolicyList
+			if err := storageClient.List(ctx, &list, kclient.InNamespace(system.DefaultNamespace)); err != nil {
+				return err
+			}
+			policies := make([]guardrails.LegacyPolicy, 0, len(list.Items))
+			for _, p := range list.Items {
+				if p.DeletionTimestamp.IsZero() {
+					policies = append(policies, guardrails.LegacyPolicy{ID: p.Name, Manifest: p.Spec.Manifest})
+				}
+			}
+			if err := guardrails.MigrateMessagePolicies(ctx, gatewayClient, policies, messagePolicyProfile(storageClient)); err != nil {
+				return err
+			}
+			if len(policies) > 0 {
+				slog.Info("converted message policies into guardrails", "count", len(policies))
+			}
+			return nil
+		})
+		if err == nil {
+			engine.Invalidate()
+			return
+		}
+		slog.Warn("failed to convert message policies into guardrails; retrying", "error", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+	}
 }

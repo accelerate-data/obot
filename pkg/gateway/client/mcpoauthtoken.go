@@ -17,6 +17,7 @@ import (
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
+	"github.com/obot-platform/obot/pkg/utils"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -27,7 +28,9 @@ import (
 )
 
 const (
-	pendingStateTTL                                                   = 30 * time.Minute
+	// MCPOAuthPendingStateTTL bounds both pending attempts and temporary challenge batches.
+	MCPOAuthPendingStateTTL                                           = 30 * time.Minute
+	pendingStateTTL                                                   = MCPOAuthPendingStateTTL
 	mcpStaticOAuthTestStatusClaimed apitypes.MCPStaticOAuthTestStatus = "claimed"
 
 	// staticOAuthTestClaimLease bounds how long an admitted provider callback may hold a
@@ -104,14 +107,66 @@ func (c *Client) GetMCPOAuthToken(ctx context.Context, userID, mcpID, url string
 	return &token, nil
 }
 
-func (c *Client) ReplaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
-	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, "", "", oauthConf, token)
+// MCPOAuthDiscoveryRevision separates cached discovery by the caller's current grants.
+// Removal, reauthorization, and scope changes affect discovery identity. Token
+// values and expiry are excluded; read only grant metadata, never client secrets.
+func (c *Client) MCPOAuthDiscoveryRevision(ctx context.Context, userID string, mcpIDs []string) (string, error) {
+	var grants []struct {
+		MCPID              string
+		URL                string
+		OAuthAuthRequestID string
+		GrantID            string
+		Scopes             string
+	}
+	if len(mcpIDs) > 0 {
+		if err := c.db.WithContext(ctx).Model(&types.MCPOAuthToken{}).
+			Select("MCPID", "URL", "OAuthAuthRequestID", "GrantID", "Scopes").
+			Where("user_id = ? AND mcp_id IN ?", userID, mcpIDs).
+			Order("mcp_id").Scan(&grants).Error; err != nil {
+			return "", err
+		}
+	}
+
+	return utils.Digest([]any{userID, grants}), nil
 }
 
-func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, token *oauth2.Token) error {
-	if catalogEntryName == "" {
-		return c.ReplaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, oauthConf, token)
+func (c *Client) ReplaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID string, oauthConf *oauth2.Config, token *oauth2.Token, challenge ...string) error {
+	return c.saveMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, "", "", oauthConf, token, nil, firstChallenge(challenge))
+}
+
+func (c *Client) RefreshMCPOAuthToken(ctx context.Context, userID, mcpID, url, grantID string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	return c.saveMCPOAuthToken(ctx, userID, mcpID, url, "", "", "", oauthConf, token, &grantID, "")
+}
+
+func firstChallenge(challenge []string) string {
+	if len(challenge) > 0 {
+		return challenge[0]
 	}
+	return ""
+}
+
+func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, token *oauth2.Token, challenge ...string) error {
+	if catalogEntryName == "" {
+		return c.ReplaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, oauthConf, token, challenge...)
+	}
+	return c.withCatalogCredentialGenerationFence(ctx, mcpID, url, catalogEntryName, catalogCredentialGeneration, oauthConf, func() error {
+		return c.saveMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration, oauthConf, token, nil, firstChallenge(challenge))
+	})
+}
+
+// RefreshMCPOAuthTokenWithCatalogCredentialGenerationFence stores a refreshed grant only while the
+// catalog credential that issued it is still current, so a refresh racing a credential rotation
+// cannot persist a token minted under the replaced client.
+func (c *Client) RefreshMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx context.Context, userID, mcpID, url, grantID, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+	if catalogEntryName == "" {
+		return c.RefreshMCPOAuthToken(ctx, userID, mcpID, url, grantID, oauthConf, token)
+	}
+	return c.withCatalogCredentialGenerationFence(ctx, mcpID, url, catalogEntryName, catalogCredentialGeneration, oauthConf, func() error {
+		return c.saveMCPOAuthToken(ctx, userID, mcpID, url, "", catalogEntryName, catalogCredentialGeneration, oauthConf, token, &grantID, "")
+	})
+}
+
+func (c *Client) withCatalogCredentialGenerationFence(ctx context.Context, mcpID, url, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config, write func() error) error {
 	releaseCatalog, err := c.AcquireCredentialLock(ctx, system.MCPStaticOAuthCatalogMutationLock)
 	if err != nil {
 		return fmt.Errorf("failed to coordinate catalog OAuth token write with catalog mutation: %w", err)
@@ -125,7 +180,7 @@ func (c *Client) ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx co
 	if err := c.validateCatalogOAuthCredential(ctx, mcpID, url, catalogEntryName, catalogCredentialGeneration, oauthConf); err != nil {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-	return c.replaceMCPOAuthToken(ctx, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, catalogCredentialGeneration, oauthConf, token)
+	return write()
 }
 
 func (c *Client) ValidateCatalogOAuthToken(ctx context.Context, mcpID, url, catalogEntryName, catalogCredentialGeneration string, oauthConf *oauth2.Config) error {
@@ -206,7 +261,11 @@ func (c *Client) CatalogEntryForCurrentOAuthCredential(ctx context.Context, user
 	return entryName, nil
 }
 
-func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, generation string, oauthConf *oauth2.Config, token *oauth2.Token) error {
+// saveMCPOAuthToken is the single write path for MCP OAuth grants. It holds the
+// per-user connection lock and refuses a revoked connection before upstream's
+// grant-preserving transaction runs, so a callback or refresh racing a revoke
+// cannot resurrect the grant.
+func (c *Client) saveMCPOAuthToken(ctx context.Context, userID, mcpID, url, oauthAuthRequestID, catalogEntryName, generation string, oauthConf *oauth2.Config, token *oauth2.Token, refreshGrantID *string, challenge string) error {
 	release, err := c.AcquireCredentialLock(ctx, mcpOAuthUserConnectionLock(userID, mcpID))
 	if err != nil {
 		return err
@@ -220,6 +279,8 @@ func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, o
 		return ErrMCPOAuthConnectionRevoked
 	}
 	t := &types.MCPOAuthToken{
+		GrantID:                     rand.Text(),
+		UpstreamChallenge:           challenge,
 		UserID:                      userID,
 		MCPID:                       mcpID,
 		URL:                         url,
@@ -242,9 +303,49 @@ func (c *Client) replaceMCPOAuthToken(ctx context.Context, userID, mcpID, url, o
 		return fmt.Errorf("failed to encrypt token: %w", err)
 	}
 
-	if err := c.db.WithContext(ctx).Save(t).Error; err != nil {
+	if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Insert first so concurrent callbacks also serialize when no grant exists yet.
+		if refreshGrantID == nil {
+			result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(t)
+			if result.Error != nil || result.RowsAffected == 1 {
+				return result.Error
+			}
+		}
+
+		var current types.MCPOAuthToken
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("URL", "AuthURL", "TokenURL", "Scopes", "GrantID", "OAuthAuthRequestID", "UpstreamChallenge", "CatalogEntryName", "CatalogCredentialGeneration").
+			Where("user_id = ? AND mcp_id = ?", userID, mcpID).Take(&current).Error; err != nil {
+			return err
+		}
+
+		// A callback or refresh started before another grant must not erase its permissions.
+		if current.URL == url && current.AuthURL == oauthConf.Endpoint.AuthURL && current.TokenURL == oauthConf.Endpoint.TokenURL {
+			for scope := range strings.FieldsSeq(current.Scopes) {
+				if !slices.Contains(oauthConf.Scopes, scope) {
+					return fmt.Errorf("upstream OAuth permissions changed; start a new authorization")
+				}
+			}
+		}
+
+		if refreshGrantID != nil {
+			if current.GrantID != *refreshGrantID || current.URL != url {
+				return fmt.Errorf("upstream OAuth grant changed during refresh")
+			}
+
+			t.GrantID = current.GrantID
+			t.OAuthAuthRequestID = current.OAuthAuthRequestID
+			t.UpstreamChallenge = current.UpstreamChallenge
+			// A refresh keeps the grant's catalog binding; only an authorization callback rebinds it.
+			t.CatalogEntryName = current.CatalogEntryName
+			t.CatalogCredentialGeneration = current.CatalogCredentialGeneration
+		}
+
+		return tx.Save(t).Error
+	}); err != nil {
 		return err
 	}
+
 	return c.triggerMCPOAuthTokenChange(ctx, mcpID)
 }
 
@@ -746,7 +847,7 @@ func (c *Client) CommitMCPOAuthPendingStateToken(ctx context.Context, pending *t
 		_ = c.DeleteMCPOAuthPendingState(ctx, pending.HashedState)
 		return nil
 	}
-	if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, pending.UserID, pending.MCPID, pending.URL, oauthAuthRequestID, entryName, pending.CatalogCredentialGeneration, oauthConf, token); err != nil {
+	if err := c.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, pending.UserID, pending.MCPID, pending.URL, oauthAuthRequestID, entryName, pending.CatalogCredentialGeneration, oauthConf, token, pending.UpstreamChallenge); err != nil {
 		c.deleteChangedMCPOAuthPendingState(ctx, pending.HashedState, err)
 		return err
 	}
@@ -776,7 +877,7 @@ func (c *Client) replaceDynamicCatalogOAuthToken(ctx context.Context, pending *t
 	if err != nil || (entry.Spec.Manifest.RemoteConfig != nil && entry.Spec.Manifest.RemoteConfig.StaticOAuthRequired) {
 		return ErrMCPOAuthCatalogCredentialChanged
 	}
-	return c.ReplaceMCPOAuthToken(ctx, pending.UserID, pending.MCPID, pending.URL, oauthAuthRequestID, oauthConf, token)
+	return c.ReplaceMCPOAuthToken(ctx, pending.UserID, pending.MCPID, pending.URL, oauthAuthRequestID, oauthConf, token, pending.UpstreamChallenge)
 }
 
 func (c *Client) deleteChangedMCPOAuthPendingState(ctx context.Context, hashedState string, err error) {
@@ -785,11 +886,16 @@ func (c *Client) deleteChangedMCPOAuthPendingState(ctx context.Context, hashedSt
 	}
 }
 
-func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, oauthConf *oauth2.Config) error {
-	return c.CreateMCPOAuthPendingStateWithTunnel(ctx, userID, mcpID, mcpURL, "", oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL, oauthConf)
+// CreateMCPOAuthPendingState keeps upstream's argument order (tunnelName before
+// oauthAuthRequestID) and records no catalog entry. A caller that needs the
+// catalog credential-generation fence uses CreateMCPOAuthPendingStateWithTunnel:
+// both take the same number of strings, so a fork-order call here would compile
+// and silently bind the auth request as the tunnel.
+func (c *Client) CreateMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, state, verifier, resourceURL string, oauthConf *oauth2.Config, upstreamChallenge ...string) error {
+	return c.CreateMCPOAuthPendingStateWithTunnel(ctx, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, "", state, verifier, resourceURL, oauthConf, upstreamChallenge...)
 }
 
-func (c *Client) CreateMCPOAuthPendingStateWithTunnel(ctx context.Context, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, oauthConf *oauth2.Config) error {
+func (c *Client) CreateMCPOAuthPendingStateWithTunnel(ctx context.Context, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName, state, verifier, resourceURL string, oauthConf *oauth2.Config, upstreamChallenge ...string) error {
 	generation := ""
 	staticOAuth := false
 	if catalogEntryName != "" {
@@ -841,6 +947,10 @@ func (c *Client) CreateMCPOAuthPendingStateWithTunnel(ctx context.Context, userI
 		Scopes:                      strings.Join(oauthConf.Scopes, " "),
 	}
 
+	if len(upstreamChallenge) > 0 {
+		ps.UpstreamChallenge = upstreamChallenge[0]
+	}
+
 	if err := c.encryptMCPOAuthPendingState(ctx, ps); err != nil {
 		return fmt.Errorf("failed to encrypt pending state: %w", err)
 	}
@@ -882,12 +992,68 @@ func (c *Client) ClaimMCPOAuthPendingState(ctx context.Context, state string) (*
 	return c.GetMCPOAuthPendingState(ctx, state)
 }
 
+// ConsumeMCPOAuthPendingState elects one callback across replicas before code exchange.
+// Decrypt first so a storage/decryption failure leaves the attempt available to its owner.
+func (c *Client) ConsumeMCPOAuthPendingState(ctx context.Context, state string) (*types.MCPOAuthPendingState, error) {
+	pending, err := c.GetMCPOAuthPendingState(ctx, state)
+	if err != nil {
+		return nil, err
+	}
+
+	// Static OAuth credential tests and already-claimed states are owned by their
+	// own claim paths and must never be consumed by an ordinary callback.
+	result := c.db.WithContext(ctx).Delete(&types.MCPOAuthPendingState{}, "hashed_state = ? AND static_o_auth_test = ? AND claimed_at IS NULL", pending.HashedState, false)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+
+	if result.RowsAffected != 1 {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	return pending, nil
+}
+
+// FindMCPOAuthPendingState retrieves the same live attempt after a transaction URL save failed.
+func (c *Client) FindMCPOAuthPendingState(ctx context.Context, userID, mcpID, mcpURL, requestID, challenge string) (*types.MCPOAuthPendingState, error) {
+	pending := new(types.MCPOAuthPendingState)
+	binding := &types.MCPOAuthPendingState{
+		UserID:             userID,
+		MCPID:              mcpID,
+		URL:                mcpURL,
+		OAuthAuthRequestID: requestID,
+		UpstreamChallenge:  challenge,
+	}
+	if err := c.db.WithContext(ctx).
+		Where(binding, "UserID", "MCPID", "URL", "OAuthAuthRequestID", "UpstreamChallenge").
+		// A claimed callback state is spent even while its row awaits commit, so it
+		// must never be offered again as a live attempt.
+		Where("created_at > ? AND claimed_at IS NULL AND static_o_auth_test = ?", time.Now().Add(-pendingStateTTL), false).
+		First(pending).Error; err != nil {
+		return nil, err
+	}
+
+	if err := c.decryptMCPOAuthPendingState(ctx, pending); err != nil {
+		return nil, fmt.Errorf("failed to decrypt pending state: %w", err)
+	}
+
+	return pending, nil
+}
+
 func (c *Client) DeleteMCPOAuthPendingState(ctx context.Context, hashedState string) error {
 	return c.db.WithContext(ctx).Delete(&types.MCPOAuthPendingState{}, "hashed_state = ?", hashedState).Error
 }
 
 func (c *Client) CleanupExpiredMCPOAuthPendingStates(ctx context.Context, olderThan time.Duration) error {
 	cutoff := time.Now().Add(-olderThan)
+	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthChallenge{}, "expires_at < ?", time.Now()).Error; err != nil {
+		return err
+	}
+
+	if err := c.db.WithContext(ctx).Delete(&types.MCPOAuthAttemptBudget{}, "expires_at < ?", time.Now()).Error; err != nil {
+		return err
+	}
+
 	return c.db.WithContext(ctx).Delete(&types.MCPOAuthPendingState{}, "created_at < ?", cutoff).Error
 }
 

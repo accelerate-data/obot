@@ -42,6 +42,9 @@ func TestAPIKeyAuthenticatorCarriesAuditAttribution(t *testing.T) {
 	if !slices.Equal(response.User.GetExtra()["obot_groups"], wantObotGroups) {
 		t.Fatalf("Obot groups extra = %v, want role groups %v", response.User.GetExtra()["obot_groups"], wantObotGroups)
 	}
+	if got := response.User.GetExtra()[principal.APIKeyRawNameExtra]; len(got) != 1 || got[0] != "CLI token" {
+		t.Fatalf("raw key name = %v, want CLI token", got)
+	}
 	attribution, ok := principal.APIKeyAttributionFromUser(response.User)
 	if !ok || attribution.ID != created.ID || attribution.Name != "CLI token" {
 		t.Fatalf("attribution = %#v, %v; want key %d named CLI token", attribution, ok, created.ID)
@@ -74,6 +77,9 @@ func TestAPIKeyAuthenticatorCarriesMaskedAttributionForUnnamedKey(t *testing.T) 
 	}
 	attribution, ok := principal.APIKeyAttributionFromUser(response.User)
 	wantName := fmt.Sprintf("ok1-%d-%d-*****", keyOwner.ID, created.ID)
+	if got := response.User.GetExtra()[principal.APIKeyRawNameExtra]; len(got) != 1 || got[0] != "" {
+		t.Fatalf("raw name for unnamed key = %v, want empty", got)
+	}
 	if !ok || attribution.ID != created.ID || attribution.Name != wantName {
 		t.Fatalf("attribution = %#v, %v; want key %d named %q", attribution, ok, created.ID, wantName)
 	}
@@ -122,5 +128,40 @@ func TestOnlyClaudeCredentialsEnableDeferredMCPAuthorization(t *testing.T) {
 				t.Fatalf("Claude environment group = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+// X-Obot-Api-Key authenticates only LLM proxy requests: the LLM proxy strips it before
+// forwarding, but on other routes, such as MCP connections, it would reach an upstream server.
+func TestAPIKeyAuthenticatorReadsObotAPIKeyHeaderOnlyOnTheLLMProxy(t *testing.T) {
+	_, client := newTokenRequestTestServer(t)
+	keyOwner, err := client.EnsureIdentityWithRole(t.Context(), &gatewaytypes.Identity{
+		ProviderUsername: "alice",
+		ProviderUserID:   "alice",
+		Email:            "alice@example.com",
+	}, "", types2.RoleBasic, gatewayclient.UserLimit{Unlimited: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := client.CreateAPIKey(t.Context(), keyOwner.ID, "Claude Code", "", nil, gatewaytypes.APIKeyScopes{CanAccessLLMProxy: true, MCPServerIDs: []string{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticate := func(path string) bool {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		req.Header.Set("Authorization", "Bearer sk-ant-oat01-subscription")
+		req.Header.Set(HeaderObotAPIKey, created.Key)
+		_, ok, err := NewAPIKeyAuthenticator(client).AuthenticateRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if !authenticate("/api/llm-proxy/v1/messages") {
+		t.Error("X-Obot-Api-Key didn't authenticate an LLM proxy request")
+	}
+	if authenticate("/mcp-connect/ms1example") {
+		t.Error("X-Obot-Api-Key authenticated an MCP connection")
 	}
 }

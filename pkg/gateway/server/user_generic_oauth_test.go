@@ -26,15 +26,12 @@ import (
 
 func TestGetCurrentUserContinuesWhenAuthProviderURLUnavailable(t *testing.T) {
 	gatewayClient := newGatewayTestClient(t)
-	emailVerified := true
 	gatewayUser, err := gatewayClient.EnsureIdentityWithRole(t.Context(), &gwtypes.Identity{
 		Email:                 "alice@example.com",
 		AuthProviderName:      "generic-oauth-auth-provider",
 		AuthProviderNamespace: system.DefaultNamespace,
 		ProviderUsername:      "alice@example.com",
 		ProviderUserID:        "studio-sub",
-		ProviderIssuer:        "https://studio.example.com/api/auth",
-		ProviderEmailVerified: &emailVerified,
 	}, "", apitypes.RoleBasic, gatewayclient.UserLimit{Unlimited: true})
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +85,6 @@ func TestGetCurrentUserIncludesRequestTimeAdminUplift(t *testing.T) {
 		AuthProviderNamespace: system.DefaultNamespace,
 		ProviderUsername:      "alice@example.com",
 		ProviderUserID:        "studio-sub",
-		ProviderIssuer:        "https://studio.example.com/api/auth",
 	}, "", apitypes.RoleBasic, gatewayclient.UserLimit{Unlimited: true})
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +151,7 @@ func newGatewayTestClient(t *testing.T) *gatewayclient.Client {
 			Role: apitypes.RoleBasic,
 		},
 	}).Build()
-	return gatewayclient.New(context.Background(), db, storageClient, nil, nil, nil, nil, time.Hour, 100, 1, 1, 1, true)
+	return gatewayclient.New(context.Background(), db, storageClient, nil, nil, time.Hour, 100, 1, 1, 1, true)
 }
 
 func contains(values []string, target string) bool {

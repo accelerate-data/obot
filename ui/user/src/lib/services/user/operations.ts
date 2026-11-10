@@ -57,7 +57,6 @@ import {
 	type McpServerResource,
 	type MCPServerTool,
 	type Model,
-	type ModelProviderList,
 	type OrgGroup,
 	type OrgGroupPage,
 	type OrgUser,
@@ -95,11 +94,24 @@ function mcpActionPath(id: string, legacyCollection = 'mcp-servers'): string {
 
 // Virtual MCPs
 
-export async function listVMCPs(opts?: { fetch?: Fetcher; all?: boolean }): Promise<VMCP[]> {
-	const response = (await doGet(
-		opts?.all ? '/vmcps?all=true' : '/vmcps',
-		opts
-	)) as ItemsResponse<VMCP>;
+export async function listVMCPs(opts?: {
+	fetch?: Fetcher;
+	all?: boolean;
+	minimal?: boolean;
+	dontLogErrors?: boolean;
+}): Promise<VMCP[]> {
+	const queryParams = new URLSearchParams();
+	if (opts?.all) {
+		queryParams.set('all', 'true');
+	}
+	if (opts?.minimal) {
+		queryParams.set('minimal', 'true');
+	}
+	const query = queryParams.toString();
+	const response = (await doGet(query ? `/vmcps?${query}` : '/vmcps', {
+		fetch: opts?.fetch,
+		dontLogErrors: opts?.dontLogErrors
+	})) as ItemsResponse<VMCP>;
 	return response.items ?? [];
 }
 
@@ -757,13 +769,6 @@ export async function listSingleOrRemoteMcpServerResources(
 export async function listModels(opts?: { fetch?: Fetcher }): Promise<Model[]> {
 	const response = (await doGet('/models', opts)) as ItemsResponse<Model>;
 	return response.items ?? [];
-}
-
-export async function listGlobalModelProviders(opts?: {
-	fetch?: Fetcher;
-}): Promise<ModelProviderList> {
-	const response = (await doGet('/model-providers', opts)) as ModelProviderList;
-	return response;
 }
 
 // Organization

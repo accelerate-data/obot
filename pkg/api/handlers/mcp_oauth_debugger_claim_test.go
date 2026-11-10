@@ -50,7 +50,7 @@ func newOAuthDebuggerClaimTestClient(t *testing.T, mcpID string) (*gateway.Clien
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway DB: %v", err)
 	}
-	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { _ = gatewayClient.Close() })
 	return gatewayClient, services.DB.DB
 }
@@ -75,7 +75,7 @@ func TestClaimAndExchangeOAuthDebuggerTokenIsOneUseAndExpiring(t *testing.T) {
 			ClientID: "dynamic-client",
 			Endpoint: oauth2.Endpoint{AuthURL: provider.URL + "/authorize", TokenURL: provider.URL},
 		}
-		if err := gatewayClient.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, OAuthDebuggerPendingStateMarker, "", state, "verifier-1", "", conf); err != nil {
+		if err := gatewayClient.CreateMCPOAuthPendingStateWithTunnel(t.Context(), "user-1", mcpID, mcpURL, "", OAuthDebuggerPendingStateMarker, "", state, "verifier-1", "", conf); err != nil {
 			t.Fatalf("create debugger pending state: %v", err)
 		}
 		return gatewayClient, database, &exchanges

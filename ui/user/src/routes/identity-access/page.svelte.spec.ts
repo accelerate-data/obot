@@ -5,13 +5,13 @@ import * as navigation from '$lib/navigation';
 import { Group } from '$lib/services';
 import type { AuthProvider } from '$lib/services/admin/types';
 import type { APIKey } from '$lib/services/api-keys/types';
+import { adminConfigStore } from '$lib/stores/adminConfig.svelte';
 import errors from '$lib/stores/errors.svelte';
 import { createMockProfile, preparePageData } from '../../tests/helpers/pageData';
 import {
 	getProfileResponse,
 	initiateTempLoginResponse,
 	listAuthProvidersResponse,
-	listExplicitRoleEmailsResponse,
 	listUsersResponse
 } from '../../tests/mocks/data';
 import { worker } from '../../tests/mocks/worker';
@@ -22,11 +22,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 import { page, userEvent } from 'vitest/browser';
 
-vi.mock('$app/navigation', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('$app/navigation')>();
+vi.mock('$app/navigation', () => {
 	return {
-		...actual,
-		replaceState: vi.fn()
+		goto: vi.fn(),
+		invalidate: vi.fn(),
+		invalidateAll: vi.fn(),
+		preloadCode: vi.fn(),
+		preloadData: vi.fn(),
+		beforeNavigate: vi.fn(),
+		afterNavigate: vi.fn(),
+		onNavigate: vi.fn(),
+		pushState: vi.fn(),
+		replaceState: vi.fn(),
+		disableScrollHandling: vi.fn()
 	};
 });
 
@@ -90,6 +98,76 @@ const oktaProvider: AuthProvider = {
 	}
 };
 
+const oneLoginProvider: AuthProvider = {
+	id: 'onelogin-auth-provider',
+	created: googleProvider.created,
+	type: 'authprovider',
+	name: 'OneLogin',
+	icon: '/admin/assets/onelogin_icon.png',
+	image: '',
+	port: 0,
+	configured: false,
+	missingConfigurationParameters: [],
+	missingEntitlements: [],
+	namespace: 'default',
+	requiredConfigurationParameters: [
+		{
+			name: 'OBOT_ONELOGIN_AUTH_PROVIDER_CLIENT_ID',
+			friendlyName: 'Client ID'
+		},
+		{
+			name: 'OBOT_ONELOGIN_AUTH_PROVIDER_ISSUER_URL',
+			friendlyName: 'Issuer URL'
+		}
+	],
+	optionalConfigurationParameters: [
+		{
+			name: 'OBOT_ONELOGIN_AUTH_PROVIDER_API_BASE_URL',
+			friendlyName: 'API Base URL'
+		},
+		{
+			name: 'OBOT_ONELOGIN_AUTH_PROVIDER_API_CLIENT_ID',
+			friendlyName: 'API Client ID',
+			description:
+				'Leave this and the client secret empty to provision users and groups through SCIM instead.'
+		},
+		{
+			name: 'OBOT_ONELOGIN_AUTH_PROVIDER_API_CLIENT_SECRET',
+			friendlyName: 'API Client Secret',
+			sensitive: true
+		}
+	],
+	scim: {
+		directoryParameters: [
+			'OBOT_ONELOGIN_AUTH_PROVIDER_API_CLIENT_ID',
+			'OBOT_ONELOGIN_AUTH_PROVIDER_API_CLIENT_SECRET'
+		],
+		issuerParameter: 'OBOT_ONELOGIN_AUTH_PROVIDER_ISSUER_URL'
+	}
+};
+
+// Microsoft Entra, set up for SCIM: it has no directory parameters, and a hidden choice parameter
+// that chooses SCIM-first setup, which the server lists only while the provider is not configured.
+const entraSCIMProvider: AuthProvider = {
+	...entraProvider,
+	configured: false,
+	missingConfigurationParameters: [],
+	missingEntitlements: [],
+	optionalConfigurationParameters: [
+		...(entraProvider.optionalConfigurationParameters ?? []),
+		{
+			name: 'OBOT_ENTRA_AUTH_PROVIDER_SCIM',
+			description: 'Set to true to provision users and groups through SCIM.',
+			hidden: true
+		}
+	],
+	scim: {
+		directoryParameters: [],
+		choiceParameter: 'OBOT_ENTRA_AUTH_PROVIDER_SCIM',
+		issuerParameter: 'OBOT_ENTRA_AUTH_PROVIDER_TENANT_ID'
+	}
+};
+
 function providerCard(name: string) {
 	return page.getByRole('heading', { name, exact: true }).locator('..');
 }
@@ -122,9 +200,9 @@ async function renderIdentityAccessPage({
 		profile.isBootstrapUser = () => true;
 	}
 
-	appPage.url.searchParams.set('view', view);
+	(appPage.url as URL).searchParams.set('view', view);
 	if (provider) {
-		appPage.url.searchParams.set('provider', provider);
+		(appPage.url as URL).searchParams.set('provider', provider);
 	}
 	// Layout's bootstrap splash would otherwise sit on top of the Auth Providers tab.
 	localStorage.setItem('seenSplashDialog', new Date().toISOString());
@@ -140,6 +218,7 @@ async function renderIdentityAccessPage({
 		profile
 	});
 
+	adminConfigStore.updateAuthProviders(authProviders);
 	return render(IdentityAccessPage, { data });
 }
 
@@ -161,9 +240,6 @@ function mockConfigureFlow(configuredProviders: AuthProvider[]) {
 		http.post(`/api/auth-providers/${googleProvider.id}/configure`, configureAuthProvider),
 		http.get('/api/auth-providers', () => HttpResponse.json({ items: configuredProviders })),
 		http.post('/api/setup/cancel-temp-login', () => new HttpResponse(null, { status: 404 })),
-		http.get('/api/setup/explicit-role-emails', () =>
-			HttpResponse.json(listExplicitRoleEmailsResponse)
-		),
 		http.post('/api/setup/initiate-temp-login', () => HttpResponse.json(initiateTempLoginResponse))
 	);
 
@@ -189,10 +265,7 @@ const localConfigured: AuthProvider = {
 	configured: true
 };
 
-function mockLocalOnboarding({
-	owners = null as string[] | null,
-	redirectUrl = initiateTempLoginResponse.redirectUrl
-} = {}) {
+function mockLocalOnboarding({ redirectUrl = initiateTempLoginResponse.redirectUrl } = {}) {
 	const initiateTempLogin = vi.fn(() =>
 		HttpResponse.json({ ...initiateTempLoginResponse, redirectUrl })
 	);
@@ -220,7 +293,6 @@ function mockLocalOnboarding({
 			return HttpResponse.json(user);
 		}),
 		http.post('/api/setup/cancel-temp-login', () => new HttpResponse(null, { status: 404 })),
-		http.get('/api/setup/explicit-role-emails', () => HttpResponse.json({ owners, admins: null })),
 		http.post('/api/setup/initiate-temp-login', initiateTempLogin)
 	);
 
@@ -254,9 +326,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-	appPage.url.searchParams.delete('view');
-	appPage.url.searchParams.delete('subview');
-	appPage.url.searchParams.delete('provider');
+	(appPage.url as URL).searchParams.delete('view');
+	(appPage.url as URL).searchParams.delete('subview');
+	(appPage.url as URL).searchParams.delete('provider');
 	if (window.location.hash) {
 		window.history.replaceState(null, '', window.location.pathname + window.location.search);
 	}
@@ -264,6 +336,52 @@ afterEach(() => {
 });
 
 describe('Identity & Access Page', () => {
+	it.each([
+		{ configured: true, staged: false, available: true },
+		{ configured: false, staged: false, available: false }
+	])(
+		'allows Local account management when configured=$configured and staged=$staged',
+		async ({ configured, staged, available }) => {
+			const email = 'pending-local@example.com';
+			const authProviders: AuthProvider[] = [
+				{ ...googleConfigured, configured: !configured },
+				{ ...localProvider, configured, staged }
+			];
+			worker.use(
+				http.get('*/api/auth-providers', () => HttpResponse.json({ items: authProviders })),
+				http.get('*/api/local-auth/users', () =>
+					HttpResponse.json({
+						items: [
+							{
+								id: 'pending-local',
+								email,
+								created: '2026-01-01T00:00:00Z',
+								requirePasswordChange: true
+							}
+						]
+					})
+				)
+			);
+			await renderIdentityAccessPage({
+				view: 'users',
+				groups: [Group.OWNER, Group.ADMIN],
+				authProviders
+			});
+			const createButton = page.getByRole('button', { name: 'Create New User', exact: true });
+			if (available) {
+				await expect.element(createButton).toBeVisible();
+				await expect.element(page.getByRole('row').filter({ hasText: email })).toBeVisible();
+				await createButton.click();
+				await expect.element(page.getByRole('dialog')).toBeVisible();
+			} else {
+				await expect.element(createButton).not.toBeInTheDocument();
+				await expect
+					.element(page.getByRole('row').filter({ hasText: email }))
+					.not.toBeInTheDocument();
+			}
+		}
+	);
+
 	describe('local bootstrap setup', () => {
 		const localConfigured: AuthProvider = {
 			...googleProvider,
@@ -282,7 +400,7 @@ describe('Identity & Access Page', () => {
 			}));
 			const initiate = vi.fn(() => HttpResponse.json(initiateTempLoginResponse));
 			const setPassword = vi.fn(() => new HttpResponse(null, { status: 204 }));
-			vi.mocked(replaceState).mockImplementation(() => {});
+			vi.mocked(replaceState).mockImplementation(() => Promise.resolve());
 
 			worker.use(
 				http.get('/api/auth-providers', () => HttpResponse.json({ items: [localConfigured] })),
@@ -303,10 +421,7 @@ describe('Identity & Access Page', () => {
 				}),
 				http.post('/api/local-auth/users/:id/password', setPassword),
 				http.post('/api/setup/initiate-temp-login', initiate),
-				http.post('/api/setup/cancel-temp-login', () => new HttpResponse(null, { status: 404 })),
-				http.get('/api/setup/explicit-role-emails', () =>
-					HttpResponse.json(listExplicitRoleEmailsResponse)
-				)
+				http.post('/api/setup/cancel-temp-login', () => new HttpResponse(null, { status: 404 }))
 			);
 
 			return { initiate, setPassword };
@@ -325,38 +440,19 @@ describe('Identity & Access Page', () => {
 			await expect.element(signIn).toHaveAttribute('href', initiateTempLoginResponse.redirectUrl);
 		});
 
-		it('prompts for the owner login after saving the initial account', async () => {
-			const { initiate } = mockLocalSetup([]);
+		it('opens domain settings for a configured local provider', async () => {
+			mockLocalSetup([]);
 			await renderIdentityAccessPage({ authProviders: [localConfigured], bootstrap: true });
 
 			await providerCard('Local').getByRole('button', { name: 'Modify', exact: true }).click();
 			const dialog = page.getByRole('dialog').filter({ hasText: 'Set Up Local' });
-			await dialog.getByLabelText('Email', { exact: true }).fill('owner@example.com');
-			await page.getByCSS('#local-user-password-draft').fill('initial-owner-password');
-			expect(initiate).not.toHaveBeenCalled();
-			await dialog.getByRole('button', { name: 'Save', exact: true }).click();
-
-			await expect.element(ownerLoginPrompt()).toBeVisible();
 			await expect
-				.element(page.getByRole('link', { name: /Sign in as owner@example.com/ }))
+				.element(dialog.getByText('Allowed Email Domains', { exact: true }))
 				.toBeVisible();
-		});
-
-		it('lets the bootstrap user reset a forgotten password from the owner login prompt', async () => {
-			const { setPassword } = mockLocalSetup(['owner@example.com']);
-			await renderIdentityAccessPage({ authProviders: [localConfigured], bootstrap: true });
-
-			await expect.element(ownerLoginPrompt()).toBeVisible();
-			await page.getByRole('button', { name: 'Click here' }).click();
-
-			const dialog = page.getByRole('dialog').filter({ hasText: 'Set Up Local' });
-			await expect.element(dialog.getByText('owner@example.com')).toBeVisible();
-			await dialog.getByRole('button', { name: 'Reset password' }).click();
-			await page.getByCSS('#reset-password-1').fill('a-password-i-will-remember');
-			await dialog.getByRole('button', { name: 'Save', exact: true }).click();
-
-			await vi.waitFor(() => expect(setPassword).toHaveBeenCalledOnce());
-			await expect.element(ownerLoginPrompt()).toBeVisible();
+			await expect
+				.element(dialog.getByRole('button', { name: 'Continue', exact: true }))
+				.not.toBeInTheDocument();
+			await expect.element(dialog.getByLabelText('Email', { exact: true })).not.toBeInTheDocument();
 		});
 
 		it('keeps explicit handoff for a legacy setup with multiple local accounts', async () => {
@@ -440,7 +536,7 @@ describe('Identity & Access Page', () => {
 			});
 
 			it('shows SCIM on its sub-tab', async () => {
-				appPage.url.searchParams.set('subview', 'scim');
+				(appPage.url as URL).searchParams.set('subview', 'scim');
 				await renderIdentityAccessPage({ groups: [Group.OWNER, Group.ADMIN] });
 
 				await expect
@@ -453,6 +549,93 @@ describe('Identity & Access Page', () => {
 					.element(subTabs().getByRole('link', { name: 'Providers', exact: true }))
 					.toHaveAttribute('href', '/identity-access?view=auth-providers');
 				await expect.element(providerCard('Google')).not.toBeInTheDocument();
+			});
+		});
+
+		describe('Keycloak realm configuration', () => {
+			const issuerParameter = 'OBOT_KEYCLOAK_AUTH_PROVIDER_ISSUER_URL';
+			const keycloakProvider: AuthProvider = {
+				...googleProvider,
+				id: CommonAuthProviderIds.KEYCLOAK,
+				name: 'Keycloak',
+				configured: false,
+				missingConfigurationParameters: [],
+				missingEntitlements: [],
+				requiredConfigurationParameters: [
+					{ name: issuerParameter, friendlyName: 'Realm Issuer URL' },
+					{ name: 'OBOT_KEYCLOAK_AUTH_PROVIDER_CLIENT_ID', friendlyName: 'Client ID' },
+					{
+						name: 'OBOT_KEYCLOAK_AUTH_PROVIDER_CLIENT_SECRET',
+						friendlyName: 'Client Secret',
+						sensitive: true
+					},
+					{
+						name: 'OBOT_KEYCLOAK_AUTH_PROVIDER_SERVICE_CLIENT_ID',
+						friendlyName: 'Directory Service Client ID'
+					},
+					{
+						name: 'OBOT_KEYCLOAK_AUTH_PROVIDER_SERVICE_CLIENT_SECRET',
+						friendlyName: 'Directory Service Client Secret',
+						sensitive: true
+					}
+				],
+				optionalConfigurationParameters: []
+			};
+
+			async function openKeycloakForm(provider: AuthProvider, values?: Record<string, string>) {
+				worker.use(
+					http.post(`/api/auth-providers/${provider.id}/reveal`, () =>
+						values ? HttpResponse.json(values) : HttpResponse.json(null, { status: 404 })
+					)
+				);
+				await renderIdentityAccessPage({
+					authProviders: [provider],
+					groups: [Group.OWNER, Group.ADMIN]
+				});
+				await providerCard('Keycloak')
+					.getByRole('button', { name: provider.configured ? 'Modify' : 'Configure', exact: true })
+					.click();
+				const dialog = page.getByRole('dialog').filter({ hasText: 'Set Up Keycloak' });
+				await expect
+					.element(dialog.getByLabelText('Realm Issuer URL', { exact: true }))
+					.toBeVisible();
+				return dialog;
+			}
+
+			it('submits a changed issuer for a configured Keycloak provider', async () => {
+				const configure = vi.fn<(body: Record<string, string>) => void>();
+				worker.use(
+					http.post(`/api/auth-providers/${keycloakProvider.id}/configure`, async ({ request }) => {
+						configure((await request.json()) as Record<string, string>);
+						return HttpResponse.json({ ...keycloakProvider, configured: true });
+					})
+				);
+				const values = {
+					[issuerParameter]: 'https://old.example.com/realms/employees',
+					OBOT_KEYCLOAK_AUTH_PROVIDER_CLIENT_ID: 'login-client',
+					OBOT_KEYCLOAK_AUTH_PROVIDER_CLIENT_SECRET: 'login-secret',
+					OBOT_KEYCLOAK_AUTH_PROVIDER_SERVICE_CLIENT_ID: 'directory-client',
+					OBOT_KEYCLOAK_AUTH_PROVIDER_SERVICE_CLIENT_SECRET: 'directory-secret'
+				};
+				const dialog = await openKeycloakForm({ ...keycloakProvider, configured: true }, values);
+				const issuer = dialog.getByLabelText('Realm Issuer URL', { exact: true });
+				await expect.element(issuer).not.toBeDisabled();
+				await issuer.fill('https://new.example.com/realms/employees');
+				await dialog.getByRole('button', { name: 'Confirm', exact: true }).click();
+				await vi.waitFor(() => {
+					expect(configure).toHaveBeenCalledExactlyOnceWith({
+						...values,
+						[issuerParameter]: 'https://new.example.com/realms/employees'
+					});
+				});
+			});
+
+			it('links the Keycloak setup documentation', async () => {
+				const dialog = await openKeycloakForm(keycloakProvider);
+
+				await expect
+					.element(dialog.getByRole('link', { name: 'the documentation', exact: true }))
+					.toHaveAttribute('href', 'https://docs.obot.ai/configuration/auth-providers/#keycloak');
 			});
 		});
 
@@ -1014,6 +1197,300 @@ describe('Identity & Access Page', () => {
 			});
 		});
 
+		describe('SCIM setup of the OneLogin provider', () => {
+			it('explains the choice the API credential makes', async () => {
+				await renderIdentityAccessPage({
+					authProviders: [oneLoginProvider],
+					groups: [Group.OWNER, Group.ADMIN]
+				});
+				await providerCard('OneLogin')
+					.getByRole('button', { name: 'Configure', exact: true })
+					.click();
+				await expect.element(page.getByLabelText('Issuer URL', { exact: true })).toBeVisible();
+
+				const choiceButton = (name: 'SCIM' | 'OneLogin API') =>
+					page.getByRole('radio', { name, exact: true });
+
+				await expect.element(choiceButton('SCIM')).toBeChecked();
+				await expect
+					.element(page.getByText(/OneLogin provisions users and groups through SCIM/))
+					.toBeVisible();
+				await expect
+					.element(page.getByLabelText('API Client ID', { exact: true }))
+					.not.toBeInTheDocument();
+				await expect
+					.element(page.getByLabelText('API Client Secret', { exact: true }))
+					.not.toBeInTheDocument();
+
+				// The API base URL is used only for directory synchronization, but it has a default, so it
+				// is not one of the credentials that choose it.
+				await page
+					.getByLabelText('API Base URL', { exact: true })
+					.fill('https://api.us.onelogin.com');
+				await expect.element(choiceButton('SCIM')).toBeChecked();
+
+				await choiceButton('OneLogin API').click();
+				await expect.element(choiceButton('OneLogin API')).toBeChecked();
+				await expect
+					.element(page.getByText(/Obot fetches each user's groups from OneLogin/))
+					.toBeVisible();
+				await expect.element(page.getByLabelText('API Client ID', { exact: true })).toBeVisible();
+				await expect
+					.element(page.getByLabelText('API Client Secret', { exact: true }))
+					.toBeVisible();
+			});
+		});
+
+		describe('SCIM setup of the Microsoft Entra provider', () => {
+			let configure = vi.fn<(body: Record<string, string>) => void>();
+
+			beforeEach(() => {
+				configure = vi.fn<(body: Record<string, string>) => void>();
+				worker.use(
+					http.post(
+						`/api/auth-providers/${entraSCIMProvider.id}/configure`,
+						async ({ request }) => {
+							configure((await request.json()) as Record<string, string>);
+							return HttpResponse.json(entraSCIMProvider);
+						}
+					)
+				);
+			});
+
+			async function openEntraForm(provider: AuthProvider, values?: Record<string, string>) {
+				worker.use(
+					http.post(`/api/auth-providers/${provider.id}/reveal`, () =>
+						values ? HttpResponse.json(values) : HttpResponse.json(null, { status: 404 })
+					)
+				);
+				await renderIdentityAccessPage({
+					authProviders: [provider],
+					groups: [Group.OWNER, Group.ADMIN]
+				});
+				const buttonName = provider.configured ? 'Modify' : 'Configure';
+				await providerCard('Microsoft Entra')
+					.getByRole('button', { name: buttonName, exact: true })
+					.click();
+				await expect.element(page.getByLabelText('Tenant ID', { exact: true })).toBeVisible();
+			}
+
+			function choiceButton(name: 'SCIM' | 'Microsoft Graph') {
+				return page.getByRole('radio', { name, exact: true });
+			}
+
+			function directoryIntegration() {
+				return page.getByRole('dialog').getByText('Directory integration:').locator('..');
+			}
+
+			async function fillRequiredFields() {
+				const dialog = page.getByRole('dialog');
+				await dialog.getByLabelText('Client ID', { exact: true }).fill('entra-client');
+				await dialog.getByLabelText('Client Secret', { exact: true }).fill('entra-secret');
+				await dialog.getByLabelText('Tenant ID', { exact: true }).fill('tenant');
+			}
+
+			async function confirm() {
+				await page.getByRole('button', { name: 'Confirm', exact: true }).click();
+			}
+
+			it('chooses SCIM by default, which it submits as its choice parameter', async () => {
+				await openEntraForm(entraSCIMProvider);
+
+				await expect.element(choiceButton('SCIM')).toBeChecked();
+				await expect.element(choiceButton('Microsoft Graph')).not.toBeChecked();
+				await expect
+					.element(page.getByText(/Microsoft Entra provisions users and groups through SCIM/))
+					.toBeVisible();
+
+				await fillRequiredFields();
+				await confirm();
+
+				await vi.waitFor(() => expect(configure).toHaveBeenCalledOnce());
+				expect(configure.mock.calls[0][0]).toMatchObject({
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_ID: 'entra-client',
+					OBOT_ENTRA_AUTH_PROVIDER_TENANT_ID: 'tenant',
+					OBOT_ENTRA_AUTH_PROVIDER_SCIM: 'true'
+				});
+			});
+
+			it('omits the choice parameter for Microsoft Graph, whose permissions it names', async () => {
+				await openEntraForm(entraSCIMProvider);
+
+				await choiceButton('Microsoft Graph').click();
+				await expect.element(choiceButton('Microsoft Graph')).toBeChecked();
+				await expect
+					.element(page.getByText(/GroupMember\.Read\.All and User\.Read\.All/))
+					.toBeVisible();
+
+				await fillRequiredFields();
+				await confirm();
+
+				await vi.waitFor(() => expect(configure).toHaveBeenCalledOnce());
+				const body = configure.mock.calls[0][0];
+				expect(body).toMatchObject({
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_ID: 'entra-client'
+				});
+				expect(body).not.toHaveProperty('OBOT_ENTRA_AUTH_PROVIDER_SCIM');
+			});
+
+			it('submits the choice parameter again once SCIM is chosen after Microsoft Graph', async () => {
+				await openEntraForm(entraSCIMProvider);
+
+				await choiceButton('Microsoft Graph').click();
+				await choiceButton('SCIM').click();
+				await expect.element(choiceButton('SCIM')).toBeChecked();
+
+				await fillRequiredFields();
+				await confirm();
+
+				await vi.waitFor(() => expect(configure).toHaveBeenCalledOnce());
+				expect(configure.mock.calls[0][0]).toMatchObject({
+					OBOT_ENTRA_AUTH_PROVIDER_SCIM: 'true'
+				});
+			});
+
+			// The stored configuration never holds the choice, so it chose Microsoft Graph.
+			it('chooses Microsoft Graph for a stored configuration that is not active', async () => {
+				await openEntraForm(entraSCIMProvider, {
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_ID: 'entra-client',
+					OBOT_ENTRA_AUTH_PROVIDER_TENANT_ID: 'tenant',
+					OBOT_AUTH_PROVIDER_EMAIL_DOMAINS: '*'
+				});
+
+				await expect.element(choiceButton('Microsoft Graph')).toBeChecked();
+				await expect.element(choiceButton('SCIM')).not.toBeChecked();
+				await expect
+					.element(page.getByText(/GroupMember\.Read\.All and User\.Read\.All/))
+					.toBeVisible();
+
+				await page
+					.getByRole('dialog')
+					.getByLabelText('Client Secret', { exact: true })
+					.fill('entra-secret');
+				await confirm();
+
+				await vi.waitFor(() => expect(configure).toHaveBeenCalledOnce());
+				expect(configure.mock.calls[0][0]).not.toHaveProperty('OBOT_ENTRA_AUTH_PROVIDER_SCIM');
+			});
+
+			// Without the stored configuration, the form would offer SCIM to a provider that chose
+			// Microsoft Graph, and the server would take a confirmation as choosing SCIM.
+			it('does not open the form when its stored configuration cannot be read', async () => {
+				errors.items = [];
+				worker.use(
+					http.post(`/api/auth-providers/${entraSCIMProvider.id}/reveal`, () =>
+						HttpResponse.json({ error: 'unavailable' }, { status: 500 })
+					)
+				);
+				await renderIdentityAccessPage({
+					authProviders: [entraSCIMProvider],
+					groups: [Group.OWNER, Group.ADMIN]
+				});
+				await providerCard('Microsoft Entra')
+					.getByRole('button', { name: 'Configure', exact: true })
+					.click();
+
+				await vi.waitFor(() => expect(errors.items).toHaveLength(1));
+				await expect
+					.element(page.getByLabelText('Tenant ID', { exact: true }))
+					.not.toBeInTheDocument();
+				await expect.element(choiceButton('SCIM')).not.toBeInTheDocument();
+				// The error is not for any other test.
+				errors.items = [];
+			});
+
+			it('shows Microsoft Graph as made once Microsoft Entra is configured', async () => {
+				const configured: AuthProvider = {
+					...entraSCIMProvider,
+					configured: true,
+					// The server lists the choice parameter only for a provider being set up.
+					optionalConfigurationParameters: entraProvider.optionalConfigurationParameters
+				};
+				await openEntraForm(configured, {
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_ID: 'entra-client',
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_SECRET: 'entra-secret',
+					OBOT_ENTRA_AUTH_PROVIDER_TENANT_ID: 'tenant',
+					OBOT_AUTH_PROVIDER_EMAIL_DOMAINS: '*'
+				});
+
+				await expect.element(choiceButton('SCIM')).not.toBeInTheDocument();
+				await expect.element(choiceButton('Microsoft Graph')).not.toBeInTheDocument();
+				await expect
+					.element(directoryIntegration().getByText('Microsoft Graph', { exact: true }))
+					.toBeVisible();
+				await expect
+					.element(page.getByText(/An Owner can move Microsoft Entra to SCIM/))
+					.toBeVisible();
+
+				await confirm();
+				await vi.waitFor(() => expect(configure).toHaveBeenCalledOnce());
+				expect(configure.mock.calls[0][0]).not.toHaveProperty('OBOT_ENTRA_AUTH_PROVIDER_SCIM');
+			});
+
+			// SCIM is chosen, so the form never sends the choice parameter, which the server would drop.
+			it('shows SCIM as made once Microsoft Entra has a SCIM connection', async () => {
+				const connected: AuthProvider = {
+					...entraSCIMProvider,
+					configured: true,
+					scimState: 'connected',
+					optionalConfigurationParameters: entraProvider.optionalConfigurationParameters,
+					scim: {
+						...entraSCIMProvider.scim!,
+						connectionIssuer: 'tenant'
+					}
+				};
+				await openEntraForm(connected, {
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_ID: 'entra-client',
+					OBOT_ENTRA_AUTH_PROVIDER_CLIENT_SECRET: 'entra-secret',
+					OBOT_ENTRA_AUTH_PROVIDER_TENANT_ID: 'tenant',
+					OBOT_AUTH_PROVIDER_EMAIL_DOMAINS: '*'
+				});
+
+				await expect.element(choiceButton('SCIM')).not.toBeInTheDocument();
+				await expect
+					.element(directoryIntegration().getByText('SCIM', { exact: true }))
+					.toBeVisible();
+				await expect
+					.element(page.getByText(/Its SCIM token, provisioning status, and enforcement/))
+					.toBeVisible();
+
+				await confirm();
+				await vi.waitFor(() => expect(configure).toHaveBeenCalledOnce());
+				expect(configure.mock.calls[0][0]).not.toHaveProperty('OBOT_ENTRA_AUTH_PROVIDER_SCIM');
+			});
+
+			it('warns about another tenant when the tenant ID of a SCIM connection changes', async () => {
+				await openEntraForm(
+					{
+						...entraSCIMProvider,
+						configured: true,
+						scimState: 'connected',
+						optionalConfigurationParameters: entraProvider.optionalConfigurationParameters,
+						scim: {
+							...entraSCIMProvider.scim!,
+							connectionIssuer: 'tenant'
+						}
+					},
+					{
+						OBOT_ENTRA_AUTH_PROVIDER_CLIENT_ID: 'entra-client',
+						OBOT_ENTRA_AUTH_PROVIDER_TENANT_ID: 'tenant'
+					}
+				);
+
+				await expect
+					.element(page.getByText(/belong to the Microsoft Entra tenant/))
+					.not.toBeInTheDocument();
+				await page.getByLabelText('Tenant ID', { exact: true }).fill('other-tenant');
+				await expect
+					.element(
+						page.getByText(/belong to the Microsoft Entra tenant they were provisioned from/)
+					)
+					.toBeVisible();
+				await expect.element(page.getByText(/Don't change the tenant ID/)).toBeVisible();
+				await expect.element(page.getByText(/custom domain/)).not.toBeInTheDocument();
+			});
+		});
+
 		describe('configure auth provider', () => {
 			it('bootstrap user sees owner handoff dialog after configuring', async () => {
 				const { configureAuthProvider } = mockConfigureFlow([googleConfigured]);
@@ -1061,7 +1538,7 @@ describe('Identity & Access Page', () => {
 					.toBeVisible();
 			});
 
-			it('bootstrap local setup with no explicit owners shows owner setup dialog', async () => {
+			it('bootstrap local setup shows owner setup dialog', async () => {
 				const { initiateTempLogin } = mockLocalOnboarding();
 				await renderIdentityAccessPage({
 					authProviders: [localProvider],
@@ -1076,32 +1553,6 @@ describe('Identity & Access Page', () => {
 				});
 				await expect
 					.element(page.getByRole('dialog').getByText('Next Step: Owner Setup', { exact: true }))
-					.toBeVisible();
-				await expect
-					.element(
-						page.getByRole('dialog').getByRole('link', { name: /Sign in as ada@example.com/ })
-					)
-					.toHaveAttribute('href', initiateTempLoginResponse.redirectUrl);
-			});
-
-			it('bootstrap local setup still prompts when explicit owners are preconfigured', async () => {
-				const { initiateTempLogin } = mockLocalOnboarding({ owners: ['owner@example.com'] });
-				await renderIdentityAccessPage({
-					authProviders: [localProvider],
-					bootstrap: true,
-					provider: CommonAuthProviderIds.LOCAL
-				});
-
-				await createInitialLocalUser();
-
-				await vi.waitFor(() => {
-					expect(initiateTempLogin).toHaveBeenCalledOnce();
-				});
-				await expect
-					.element(page.getByRole('dialog').getByText('Next Step: Owner Setup', { exact: true }))
-					.toBeVisible();
-				await expect
-					.element(page.getByRole('dialog').getByText('ada@example.com', { exact: true }))
 					.toBeVisible();
 				await expect
 					.element(
@@ -1345,8 +1796,11 @@ describe('Identity & Access Page', () => {
 				await renderAsOwner([localConfigured, verifiedGoogle]);
 
 				// The switch confirmation has to spell out both consequences, not just the sign-out.
-				await expect.element(page.getByText(/sessions\s+end/)).toBeVisible();
-				await expect.element(page.getByText(/will\s+not\s+transfer/)).toBeVisible();
+				const warning = page.getByText(
+					'Google becomes the only way to sign in, and Local sessions end. Its users and their work will not transfer.',
+					{ exact: true }
+				);
+				await expect.element(warning).toBeVisible();
 			});
 
 			it("says that switching deletes the outgoing provider's SCIM data, and how SCIM starts for the incoming one", async () => {

@@ -9,16 +9,17 @@
 	},
 	"scripts": {
 		"dev": "vite dev",
-		"build": "vite build",
+		"build": "svelte-kit sync && vite build",
 		"preview": "vite preview",
 		"test": "vitest run --browser.headless",
-		"i18n:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --strategy localStorage preferredLanguage baseLocale",
-		"check": "pnpm run i18n:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-		"check:watch": "pnpm run i18n:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"i18n:lint": "node --test tools/i18n-lint.test.js && node tools/i18n-lint.js",
+		"i18n:compile": "paraglide-js compile --project ./project.inlang --outdir ./src/lib/paraglide --emit-ts-declarations --strategy localStorage preferredLanguage baseLocale",
+		"check": "pnpm run i18n:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --config ./svelte.compiler.config.js",
+		"check:watch": "pnpm run i18n:compile && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --config ./svelte.compiler.config.js --watch",
 		"e2e:generic-oauth": "playwright test generic-oauth.spec.ts",
 		"e2e:static-oauth": "playwright test static-oauth-credentials.spec.ts",
 		"test:static-oauth": "node --experimental-strip-types --test src/lib/components/mcp/staticOAuthCredentialTestState.test.ts src/lib/components/mcp/staticOAuthCallerWiring.test.ts",
-		"lint": "prettier --check . && eslint .",
+		"lint": "pnpm run i18n:lint && prettier --check . && eslint .",
 		"format": "prettier --write .",
 		"ci": "npm run format && npm run lint && npm run check"
 	},
@@ -41,11 +42,11 @@
 		"@lucide/svelte": "^1.21.0",
 		"@milkdown/crepe": "^7.22.2",
 		"@milkdown/kit": "^7.22.2",
-		"@sveltejs/adapter-node": "^5.5.7",
+		"@sveltejs/adapter-node": "^6.0.0",
 		"@playwright/test": "1.62.1",
-		"@sveltejs/adapter-static": "^3.0.10",
-		"@sveltejs/kit": "^2.70.3",
-		"@sveltejs/vite-plugin-svelte": "^7.3.0",
+		"@sveltejs/adapter-static": "^4.0.0",
+		"@sveltejs/kit": "^3.1.0",
+		"@sveltejs/vite-plugin-svelte": "^7.3.1",
 		"@tailwindcss/vite": "^4.3.3",
 		"@trivago/prettier-plugin-sort-imports": "^6.0.2",
 		"@types/d3": "^7.4.3",
@@ -53,8 +54,8 @@
 		"@types/eslint": "^9.6.1",
 		"@types/node": "^24.13.3",
 		"@uiw/codemirror-theme-github": "^4.25.9",
-		"@vitest/browser-playwright": "^5.0.1",
-		"dompurify": "3.4.16",
+		"@vitest/browser-playwright": "^5.0.5",
+		"dompurify": "3.4.17",
 		"eslint": "^10.5.0",
 		"eslint-config-prettier": "^10.1.8",
 		"eslint-plugin-svelte": "^3.23.0",
@@ -75,14 +76,14 @@
 		"tailwindcss": "^4.3.3",
 		"typescript": "^6.0.2",
 		"typescript-eslint": "^8.61.0",
-		"vite": "^8.3.0",
-		"vitest": "^5.0.1",
+		"vite": "^8.3.3",
+		"vitest": "^5.0.5",
 		"vitest-browser-svelte": "^3.1.0"
 	},
 	"type": "module",
 	"dependencies": {
 		"@codemirror/lang-markdown": "^6.5.0",
-		"@modelcontextprotocol/sdk": "^1.31.0",
+		"@modelcontextprotocol/sdk": "^1.32.2",
 		"@oddbird/popover-polyfill": "^0.6.1",
 		"d3": "^7.9.0",
 		"d3-time-format": "^4.1.0",
@@ -96,5 +97,8 @@
 		"workerDirectory": [
 			"static"
 		]
+	},
+	"imports": {
+		"$lib": "src/lib"
 	}
 }

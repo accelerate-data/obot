@@ -14,7 +14,7 @@ Users still sign in through the Okta OIDC app described in
 [Okta](./auth-providers.md#okta). SCIM uses a second Okta app that only sends
 user and group changes to Obot. It is never used to sign in.
 
-SCIM is currently available for Okta only. Only an Owner can set it up.
+Only an Owner can set up SCIM.
 
 :::note Okta must be able to reach Obot
 Okta sends SCIM requests to Obot from Okta's own servers, so
@@ -181,7 +181,7 @@ You'll need your Obot URL, and the SCIM base URL and token from Obot.
    an app type, but this app is never used to sign in.
 3. Configure the app:
    - **App name:** Any name, such as `Obot SCIM`.
-   - **App's login page URL:** `https://<your-obot-url>/okta-scim`. This page
+   - **App's login page URL:** `https://<your-obot-url>/scim-provisioning`. This page
      tells anyone who opens the app to sign in through your regular Obot sign-in
      instead, since this app is used only for SCIM provisioning and not for sign-in.
    - **App visibility:** Select **Do not display application icon to users**.
@@ -197,6 +197,12 @@ You'll need your Obot URL, and the SCIM base URL and token from Obot.
      Updates**, and **Push Groups**. Leave the import options unselected.
    - **Authentication Mode:** **HTTP Header**, with the token from Obot as the
      bearer token.
+
+   :::important
+   The SCIM connector base URL must end with a trailing slash, such as
+   `https://<your-obot-url>/scim/v2/`. Obot shows it with the slash.
+   :::
+
 8. Select **Test Connector Configuration**, then **Save**.
 9. In the **Provisioning** tab, under **To App**, select **Edit**, enable
    **Create Users**, **Update User Attributes**, and **Deactivate Users**, and

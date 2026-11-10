@@ -32,7 +32,7 @@ and Google [authentication](../configuration/auth-providers.md). It supports up 
 ### Registering Obot Community
 
 Registration is free and unlocks the enterprise [auth providers](../configuration/auth-providers.md): Entra, Okta,
-JumpCloud, and Auth0. The 100 user and 100 device limits still apply.
+OneLogin, JumpCloud, Keycloak, and Auth0. The 100 user and 100 device limits still apply.
 
 To register, an administrator opens the **License** page, or the registration prompt shown when they configure one of
 those auth providers, and enters a name, an email address, and optionally a company. Obot sends those details with the
@@ -55,9 +55,10 @@ Add an Enterprise license key in one of two ways:
   way takes precedence over one stored in the database. The **License** page shows it as locked: you can't change,
   delete, or register over it in the UI.
 
-Deleting an Enterprise license key from the **License** page returns the installation to unregistered Obot Community.
-The page has no option to delete a registered Community key: replace it by adding an Enterprise key, or delete it with
-`DELETE /api/license`.
+Obot keeps a registered Community key when you add an Enterprise key over it. Deleting the Enterprise key from the
+**License** page returns the installation to registered Obot Community, or to unregistered Obot Community if it was
+never registered. The page has no option to delete a registered Community key: replace it by adding an Enterprise key,
+or delete it with `DELETE /api/license`.
 
 ## How Obot validates a license
 
@@ -83,16 +84,22 @@ Each check has one of three outcomes:
 |---|---|
 | The license service accepts the license | Obot applies the license's entitlements and saves them in the database |
 | The license service rejects the license | Obot removes the license's entitlements and the installation falls back to unregistered Obot Community. See [License compliance](#license-compliance). |
-| The license service can't be reached or doesn't give an answer | Obot keeps using the entitlements saved from the last successful check |
+| The license service can't be reached or doesn't give an answer | Obot keeps using the entitlements saved from the last successful check, until the license's last known expiration date |
 
 ### When the license service can't be reached
 
 A check that times out, fails on the network, or gets an error from the license service that isn't about the license
 itself doesn't change the license. Obot keeps using the entitlements saved from the last successful check, and tries
-again at the next scheduled check. There is no time limit on this fallback: the license keeps working through an
-outage of any length, until the license service answers again. That includes a license that expires during the
-outage. Obot doesn't track the expiration date itself, so it finds out the license expired at the first check that
-reaches the license service.
+again at the next scheduled check.
+
+Obot saves the license's expiration date with the entitlements, and the fallback lasts until that date, however
+long the license service is unreachable. A license with no expiration date keeps working for as long as the outage
+lasts. Changes made to the license while Obot can't reach the license service, such as a new expiration date, take
+effect at the next check that gets through.
+
+Obot compares the expiration date with the server's system clock at each check that fails, so an installation whose
+license expires during an outage falls back to unregistered Obot Community at the first failed check after that date.
+Once a check reaches the license service again, Obot applies its answer right away.
 
 This is the same whether the check happens at startup or while Obot is running. A failed check at startup doesn't
 prevent Obot from starting.
@@ -114,6 +121,9 @@ entitlements and treats the installation as unregistered Obot Community until a 
 The license service rejects a license when the key is invalid, expired, suspended, or revoked, or when the license
 has no installations left to activate. Obot acts on the rejection at the next check: within 24 hours, at the next
 restart, or when an administrator selects **Recheck License**. There is no grace period after a rejection.
+
+A rejected key stays in effect until an administrator replaces or deletes it, even when the installation has a
+registered Community key. Deleting it returns the installation to registered Obot Community.
 
 When an administrator adds a key in the admin UI that the license service rejects, Obot doesn't save it and shows
 "license key is invalid". The previous key, if any, stays in effect.
@@ -150,7 +160,7 @@ already have: no data, users, devices, or configuration. What it blocks depends 
 
 | Out of compliance when | What happens | How to fix it |
 |---|---|---|
-| An enterprise auth provider (Entra, Okta, JumpCloud, or Auth0) is configured and the license doesn't include it | **Limited functionality.** Obot returns `402 Payment Required` for MCP server connections (including OAuth authorization for MCP servers), the LLM gateway, the skills API, and device scan uploads from Obot Sentry. Users can still sign in. | Register Obot Community, add an Enterprise license key, or deconfigure the provider |
+| An enterprise auth provider (Entra, Okta, OneLogin, JumpCloud, Keycloak, or Auth0) is configured and the license doesn't include it | **Limited functionality.** Obot returns `402 Payment Required` for MCP server connections (including OAuth authorization for MCP servers), the LLM gateway, the skills API, and device scan uploads from Obot Sentry. Users can still sign in. | Register Obot Community, add an Enterprise license key, or deconfigure the provider |
 | There are more users than the user limit | Existing users keep working. Obot refuses to create new users, whether they sign in for the first time or are provisioned through SCIM. | Add an Enterprise license key, or delete users |
 | There are more enrolled devices than the device limit | Enrolled devices keep working. Obot refuses to enroll new devices. | Add an Enterprise license key, or remove devices |
 
@@ -165,14 +175,17 @@ provider without a license that includes it.
 - **An Enterprise license expires, or is revoked or suspended.** At the next check, the installation falls back to
   unregistered Obot Community. An installation with 250 users is then over the 100-user limit, and any configured
   enterprise auth provider is no longer covered.
-- **An administrator deletes the license key.** The effect is the same as a license that's no longer valid.
+- **An administrator deletes the license key.** The effect is the same as a license that's no longer valid, unless the
+  installation was registered first. A registered installation returns to registered Obot Community.
+- **The license expires while the license service is unreachable.** See
+  [When the license service can't be reached](#when-the-license-service-cant-be-reached).
 - **A license key was never validated**, for example on an air-gapped installation. See
   [When the license service can't be reached](#when-the-license-service-cant-be-reached).
 - **The installation grows** past the user or device limit of its license.
 
 :::note
 A license service outage doesn't put an installation out of compliance. Obot keeps the entitlements from the last
-successful check until the license service answers again. See
+successful check until the license's last known expiration date. See
 [When the license service can't be reached](#when-the-license-service-cant-be-reached).
 :::
 
@@ -194,8 +207,10 @@ Select **Resolve** in the banner, or go to the **License** page, and do one of t
 
 - **Register Obot Community.** This covers the enterprise auth providers, but not more than 100 users or devices.
 - **Add a valid Enterprise license key**, or contact [Obot](https://obot.ai/contact-us/) to renew one.
-- **Choose Downgrade** to deconfigure the enterprise auth providers. Users who signed in with those providers must
-  then sign in with a provider that's still configured.
+- **Switch to an auth provider the license covers**, such as Local, GitHub, or Google. See
+  [Switching between auth providers](../configuration/auth-providers.md#switching-between-auth-providers).
+- **Choose Downgrade** to deconfigure the enterprise auth provider. Only one auth provider can be configured at a
+  time, so no provider is configured afterwards: configure another one before users can sign in again.
 - **Delete users or remove devices** until you're within the limits.
 
 Nothing needs to be reconfigured afterwards. Obot applies a new or renewed license as soon as it validates the key,

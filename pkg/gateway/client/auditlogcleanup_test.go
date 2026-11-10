@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 	"uuid"
@@ -15,8 +16,14 @@ import (
 func newTestClient(t *testing.T) *Client {
 	t.Helper()
 
+	return newTestClientWithDSN(t, "sqlite://:memory:")
+}
+
+func newTestClientWithDSN(t *testing.T, dsn string) *Client {
+	t.Helper()
+
 	services, err := sservices.New(sservices.Config{
-		DSN: "sqlite://:memory:",
+		DSN: dsn,
 	})
 	if err != nil {
 		t.Fatalf("failed to create storage services: %v", err)
@@ -30,7 +37,13 @@ func newTestClient(t *testing.T) *Client {
 		t.Fatalf("failed to auto-migrate: %v", err)
 	}
 
+	// Unit tests flush directly without starting background persistence loops.
+	writeCtx, writeCancel := context.WithCancel(context.Background())
+	t.Cleanup(writeCancel)
+
 	return &Client{
+		auditWriteCtx:             writeCtx,
+		auditWriteCancel:          writeCancel,
 		db:                        db,
 		llmAuditEntries:           make(chan llmAuditEntry, 6),
 		llmAuditBatchSize:         3,
@@ -342,9 +355,36 @@ func TestRunRetentionCleanupDisabled(t *testing.T) {
 	insertAuditLog(t, c, now.AddDate(0, 0, -100))
 	insertAuditLog(t, c, now.AddDate(0, 0, -1))
 
-	// Both retention periods disabled means the function returns immediately.
-	// Call synchronously — if it ever blocks, the test timeout will catch it.
-	c.runRetentionCleanup(t.Context(), 0, 0)
+	expired := now.Add(-time.Minute)
+	future := now.Add(time.Hour)
+	for range 7 {
+		if err := c.db.WithContext(t.Context()).Create(&types.APIKey{ClaudeEnvironment: true, ExpiresAt: &expired}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, key := range []types.APIKey{
+		{
+			ClaudeEnvironment: true,
+			ExpiresAt:         &future,
+		},
+		{ClaudeEnvironment: true},
+		{ExpiresAt: &expired},
+	} {
+		if err := c.db.WithContext(t.Context()).Create(&key).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go c.runRetentionCleanup(ctx, 0, 0)
+	deadline := time.Now().Add(2 * time.Second)
+	for countAPIKeys(t, c) != 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("expired Claude keys were not cleaned up with audit retention disabled")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	if got := countAuditLogs(t, c); got != 2 {
 		t.Errorf("expected 2 audit logs (cleanup disabled), got %d", got)
@@ -390,6 +430,46 @@ func TestCleanupRetainedDataSkipsAPIKeysWhenAuditCleanupFails(t *testing.T) {
 	}
 	if got := countAPIKeys(t, c); got != 1 {
 		t.Fatalf("API keys after failed audit cleanup = %d, want 1", got)
+	}
+
+	c = newTestClient(t)
+	if err := c.db.WithContext(t.Context()).Create(&types.APIKey{
+		ClaudeEnvironment: true,
+		ExpiresAt:         &oldRevocation,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SaveClaudeWorkOrder(t.Context(), types.Credential{
+		Context: "substrate-agent",
+		Name:    "malformed-key",
+		Secrets: map[string]string{"keyID": "invalid"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	insertAuditLog(t, c, oldRevocation)
+	insertLLMAuditLog(t, c, oldRevocation)
+
+	err := c.cleanupRetainedData(t.Context(), now, 90, 30)
+	if err == nil || !strings.Contains(err.Error(), "delete expired Claude API keys") {
+		t.Fatalf("expected expired key cleanup error, got %v", err)
+	}
+	if got := countAuditLogs(t, c); got != 0 {
+		t.Fatalf("MCP audit logs after key cleanup failure = %d, want 0", got)
+	}
+	if got := countLLMAuditLogs(t, c); got != 0 {
+		t.Fatalf("LLM audit logs after key cleanup failure = %d, want 0", got)
+	}
+
+	if err := c.db.WithContext(t.Context()).Migrator().DropTable(&types.MCPAuditLog{}); err != nil {
+		t.Fatal(err)
+	}
+	insertLLMAuditLog(t, c, oldRevocation)
+	err = c.cleanupRetainedData(t.Context(), now, 90, 30)
+	if err == nil || !strings.Contains(err.Error(), "delete expired Claude API keys") || !strings.Contains(err.Error(), "delete old MCP audit logs") {
+		t.Fatalf("expected combined key and audit cleanup errors, got %v", err)
+	}
+	if got := countLLMAuditLogs(t, c); got != 0 {
+		t.Fatalf("LLM audit logs after key and MCP cleanup failures = %d, want 0", got)
 	}
 }
 

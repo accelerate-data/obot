@@ -1,7 +1,7 @@
-import { browser } from '$app/environment';
-import { goto as svelteGoTo, replaceState as svelteReplaceState } from '$app/navigation';
-import { resolve } from '$app/paths';
-import { navigating, page } from '$app/state';
+import { browser } from '$app/env';
+import { goto as svelteGoTo } from '$app/navigation';
+import { resolve as svelteResolve } from '$app/paths';
+import { navigating, page, type ReadonlyURL } from '$app/state';
 import { basePathFor } from './appBasePath';
 import type { InitSort } from './components/table/Table.svelte';
 
@@ -19,14 +19,16 @@ export function q(key: string): string {
 	return browser ? new URL(window.location.href).searchParams.get(key) || '' : '';
 }
 
-export function setFilterUrlParams(property: string, values: string[]) {
-	if (values.length === 0) {
-		page.url.searchParams.delete(property);
-	} else {
-		page.url.searchParams.set(property, values.join(','));
+export async function setFilterUrlParams(filters: Record<string, string[]>) {
+	const url = new URL(page.url.toString());
+	for (const [key, values] of Object.entries(filters)) {
+		if (values.length === 0) {
+			url.searchParams.delete(key);
+		} else {
+			url.searchParams.set(key, values.join(','));
+		}
 	}
-
-	replaceState(page.url, {});
+	return goto(url, { replace: true, reset: false, shallow: true });
 }
 
 export function getTableUrlParamsFilters() {
@@ -59,34 +61,31 @@ export function getTableUrlParamsSort(defaultSort?: InitSort) {
 
 export function setSortUrlParams(property?: string, direction?: 'asc' | 'desc') {
 	if (!property || !direction) {
-		page.url.searchParams.delete('sort');
-		page.url.searchParams.delete('sortDirection');
-		replaceState(page.url, {});
+		const url = new URL(page.url.toString());
+		url.searchParams.delete('sort');
+		url.searchParams.delete('sortDirection');
+		goto(url, { reset: false, replace: true, shallow: true });
 		return;
 	}
-	page.url.searchParams.set('sort', property);
-	page.url.searchParams.set('sortDirection', direction);
-	replaceState(page.url, {});
+	const url = new URL(page.url.toString());
+	url.searchParams.set('sort', property);
+	url.searchParams.set('sortDirection', direction);
+	goto(url, { reset: false, replace: true, shallow: true });
 }
 
 export function clearUrlParams(params = Array.from(page.url.searchParams.keys())) {
 	// Collect all keys first to avoid issues with modifying during iteration
+	const url = new URL(page.url.toString());
 	for (const key of params) {
-		page.url.searchParams.delete(key);
+		url.searchParams.delete(key);
 	}
-	replaceState(page.url, {});
+	goto(url, { reset: false, replace: true, shallow: true });
 }
 
 export function setSearchParamsToLocalStorage(pathname: string, searchParams: string) {
 	if (browser) {
 		localStorage.setItem(`page.searchParams.${pathname}`, searchParams);
 	}
-}
-
-export function replaceState(url: string | URL, state: object) {
-	const routeToUse =
-		url instanceof URL ? `/${url.pathname}${url.search ? `${url.search}` : ''}` : url;
-	svelteReplaceState(resolve(routeToUse as `/${string}`), state);
 }
 
 export function getSearchParamsFromLocalStorage(pathname: string): string | null {
@@ -97,10 +96,35 @@ export function getSearchParamsFromLocalStorage(pathname: string): string | null
 	return null;
 }
 
-export function goto(url: string | URL, state?: object) {
+type NavigationOptions = Partial<Parameters<typeof svelteGoTo>[1]> & {
+	replaceState?: boolean;
+	noScroll?: boolean;
+	keepFocus?: boolean;
+};
+
+export function goto(url: string | URL | ReadonlyURL, options: NavigationOptions = {}) {
 	const routeToUse =
-		url instanceof URL ? `/${url.pathname}${url.search ? `${url.search}` : ''}` : url;
-	svelteGoTo(resolve(routeToUse as `/${string}`), state);
+		typeof url === 'string' ? url : `/${url.pathname}${url.search ? `${url.search}` : ''}`;
+	const resolved = resolve(routeToUse);
+	const { replaceState, noScroll, keepFocus, ...rest } = options;
+	return svelteGoTo(
+		resolved as never,
+		{
+			...rest,
+			...(replaceState === undefined ? {} : { replace: replaceState }),
+			...(noScroll || keepFocus ? { reset: false } : {})
+		} as Parameters<typeof svelteGoTo>[1]
+	);
+}
+
+export function resolve(path: string, params?: Record<string, string | number>): string {
+	return (
+		svelteResolve as unknown as (path: string, params?: Record<string, string | number>) => string
+	)(path, params);
+}
+
+export function replaceState(url: string | URL, state: object = {}) {
+	return goto(url, { state, replace: true, reset: false, shallow: true });
 }
 
 export function appBasePath(): string {
@@ -124,13 +148,13 @@ export function setUrlParam(url: URL, key: string, value: string | null): void {
 }
 
 export function setUrlParamAndUpdateUrl(
-	url: string | URL,
+	url: string | URL | ReadonlyURL,
 	key: string,
 	value?: string | null
 ): void {
-	const newUrl = url instanceof URL ? new URL(url) : new URL(url, page.url);
+	const newUrl = url instanceof URL ? new URL(url) : new URL(url.toString());
 	setUrlParam(newUrl, key, value || null);
-	goto(newUrl, { replaceState: true, noScroll: true, keepFocus: true });
+	goto(newUrl, { reset: false, replace: true });
 }
 
 export function camelToSnakeCase(str: string): string {

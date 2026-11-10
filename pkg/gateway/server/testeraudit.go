@@ -29,7 +29,7 @@ type testerAuditReader struct {
 }
 
 // NewTesterAudit reuses gateway audit capture and persistence without invoking
-// gateway dispatch, token metering, or message policies. Caller identity comes
+// gateway dispatch, token metering, budgets or guardrails. Caller identity comes
 // from the inbound request and is never attached to the external request.
 func NewTesterAudit(c *client.Client, inbound *http.Request, user user.Info, body []byte) *TesterAudit {
 	if !c.LLMAuditLogEnabled() {
@@ -59,6 +59,7 @@ func (r *testerAuditReader) Read(p []byte) (int, error) {
 	n, err := r.Reader.Read(p)
 	r.recorder.captureResponseChunk(p[:n])
 
+	// Terminal events contain the complete response, so parsing shares the capture bound.
 	for _, b := range p[:n] {
 		if b == '\n' {
 			if !r.overflow {
@@ -67,7 +68,7 @@ func (r *testerAuditReader) Read(p []byte) (int, error) {
 
 			r.pending = r.pending[:0]
 			r.overflow = false
-		} else if len(r.pending) < 1<<20 {
+		} else if len(r.pending) < r.recorder.responseCaptureLimit {
 			r.pending = append(r.pending, b)
 		} else {
 			r.overflow = true
@@ -111,6 +112,14 @@ func (r *testerAuditReader) recordUsage(line []byte) {
 		return
 	}
 
+	if body := gjson.GetBytes(data, "response"); body.IsObject() {
+		r.recorder.mu.Lock()
+		if !r.recorder.responseCaptureFilled {
+			r.recorder.log.ResponseBody = bytes.Clone([]byte(body.Raw))
+			r.recorder.log.ResponseID = body.Get("id").String()
+		}
+		r.recorder.mu.Unlock()
+	}
 	usage := gjson.GetBytes(data, "response.usage")
 	if usage.IsObject() {
 		r.recorder.setTokenUsage(types.TokenUsage{

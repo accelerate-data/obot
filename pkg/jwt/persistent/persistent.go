@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MicahParks/jwkset"
 	"github.com/golang-jwt/jwt/v5"
@@ -29,6 +30,8 @@ import (
 
 const (
 	keyEnvVar = "JWK_KEY"
+	// Bound API-key display metadata before JWT encoding expands it into an HTTP header.
+	maxAPIKeyNameCharacters = 512
 )
 
 type TokenService struct {
@@ -48,11 +51,18 @@ type TokenContext struct {
 	UserName              string `json:"name"`
 	UserEmail             string `json:"email"`
 	OAuthScope            string `json:"scope"`
+	OAuthClientID         string `json:"client_id,omitempty"`
+	OAuthConnectionID     string `json:"obot_connection_id,omitempty"`
 	Picture               string `json:"picture"`
 	UserGroups            StringSlice
 	AuthProviderName      string
 	AuthProviderNamespace string
 	AuthProviderUserID    string
+
+	// Non-secret attribution retained across authenticated composite loopback calls.
+	APIKeyID      string `json:"api_key_id,omitempty"`
+	APIKeyName    string `json:"api_key_name,omitempty"`
+	APIKeyRawName string `json:"api_key_raw_name,omitempty"`
 
 	MCPID            string
 	AuthorizedMCPIDs StringSlice
@@ -211,10 +221,19 @@ func (t *TokenService) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		"mcp_id":                  {tokenContext.MCPID},
 		"resource":                {tokenContext.Audience},
 		"oauthScope":              {tokenContext.OAuthScope},
+		"oauth_client_id":         {tokenContext.OAuthClientID},
+		"oauth_connection_id":     {tokenContext.OAuthConnectionID},
 		"authorized_mcp_ids":      tokenContext.AuthorizedMCPIDs,
 	}
 	if tokenContext.MCPID != "" {
 		extra["authorized_mcp_ids"] = append(extra["authorized_mcp_ids"], tokenContext.MCPID)
+	}
+
+	// Only signed internal composite tokens propagate the originating API key.
+	if slices.Contains(tokenContext.UserGroups, apitypes.GroupCompositeMCP) && tokenContext.MCPID != "" {
+		extra[principal.APIKeyIDExtra] = []string{tokenContext.APIKeyID}
+		extra[principal.APIKeyNameExtra] = []string{tokenContext.APIKeyName}
+		extra[principal.APIKeyRawNameExtra] = []string{tokenContext.APIKeyRawName}
 	}
 
 	groups := tokenContext.UserGroups
@@ -270,6 +289,7 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 	tk, err := jwt.Parse(token, func(*jwt.Token) (any, error) {
 		t.lock.RLock()
 		defer t.lock.RUnlock()
+
 		return privateKey.Public(), nil
 	}, jwt.WithIssuer(t.serverURL))
 	if err != nil {
@@ -295,6 +315,7 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 		groups = strings.Split(userGroups, ",")
 		groups = slices.DeleteFunc(groups, func(s string) bool { return s == "" })
 	}
+
 	var authorizedMCPIDs StringSlice
 	if mcpIDs, ok := claims["AuthorizedMCPIDs"].(string); ok && mcpIDs != "" {
 		authorizedMCPIDs = StringSlice(strings.Split(mcpIDs, ","))
@@ -304,6 +325,7 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 	if iat, ok := claims["iat"].(float64); ok {
 		issuedAt = time.Unix(int64(iat), 0)
 	}
+
 	if exp, ok := claims["exp"].(float64); ok {
 		expiresAt = time.Unix(int64(exp), 0)
 	}
@@ -314,6 +336,7 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 				return val
 			}
 		}
+
 		return ""
 	}
 
@@ -325,14 +348,20 @@ func (t *TokenService) DecodeToken(ctx context.Context, token string) (*TokenCon
 		UserID:                getStringClaim("sub"),
 		Picture:               getStringClaim("picture"),
 		OAuthScope:            getStringClaim("scope"),
+		OAuthClientID:         getStringClaim("client_id"),
+		OAuthConnectionID:     getStringClaim("obot_connection_id"),
 		AuthProviderName:      getStringClaim("AuthProviderName"),
 		AuthProviderNamespace: getStringClaim("AuthProviderNamespace"),
 		AuthProviderUserID:    getStringClaim("AuthProviderUserID"),
 		MCPID:                 getStringClaim("MCPID"),
+		APIKeyID:              getStringClaim("api_key_id"),
+		APIKeyName:            getStringClaim("api_key_name"),
+		APIKeyRawName:         getStringClaim("api_key_raw_name"),
 		AuthorizedMCPIDs:      authorizedMCPIDs,
 		Namespace:             getStringClaim("Namespace"),
 		ModelProvider:         getStringClaim("ModelProvider"),
 		Model:                 getStringClaim("Model"),
+
 		// These fields were the latter names and changed the former.
 		// This makes this backwards compatible with older tokens.
 		UserName:  getStringClaim("name", "UserName"),
@@ -360,6 +389,18 @@ func (t *TokenService) NewToken(ctx context.Context, context TokenContext) (*jwt
 	if strings.HasPrefix(context.Picture, "data:") {
 		// Don't store the picture in the token if it is a base64 encoded image
 		context.Picture = ""
+	}
+	// Both initial composite tokens and background refreshes pass through here.
+	// Header-injection limits run after the loopback hop, so they cannot bound
+	// the Authorization header that carries this token.
+	if utf8.RuneCountInString(context.APIKeyRawName) > maxAPIKeyNameCharacters {
+		context.APIKeyRawName = ""
+	}
+	if utf8.RuneCountInString(context.APIKeyName) > maxAPIKeyNameCharacters {
+		context.APIKeyName = ""
+		if keyID, err := strconv.ParseUint(context.APIKeyID, 10, 0); err == nil && keyID != 0 {
+			context.APIKeyName = principal.MaskedAPIKeyName(context.UserID, uint(keyID))
+		}
 	}
 	context.Issuer = t.serverURL
 	if context.IssuedAt.IsZero() {

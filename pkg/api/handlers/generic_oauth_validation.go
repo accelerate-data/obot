@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,14 +10,12 @@ import (
 	"time"
 
 	"github.com/obot-platform/obot/apiclient/types"
-	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 )
 
 const (
-	GenericOAuthAuthProviderName        = "generic-oauth-auth-provider"
-	GenericOAuthIssuerEnvVar            = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
-	GenericOAuthEmailDomainsEnvVar      = "OBOT_AUTH_PROVIDER_EMAIL_DOMAINS"
-	GenericOAuthTrustEmailLinkingEnvVar = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING"
+	GenericOAuthAuthProviderName   = "generic-oauth-auth-provider"
+	GenericOAuthIssuerEnvVar       = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
+	GenericOAuthEmailDomainsEnvVar = "OBOT_AUTH_PROVIDER_EMAIL_DOMAINS"
 )
 
 type oidcDiscoveryDocument struct {
@@ -29,22 +26,8 @@ type oidcDiscoveryDocument struct {
 	UserInfoEndpoint      string `json:"userinfo_endpoint"`
 }
 
-func validateGenericOAuthConfigChange(ctx context.Context, gatewayClient *gateway.Client, providerName string, existingCredentialContexts []string, envVars map[string]string) error {
+func validateGenericOAuthConfigChange(ctx context.Context, providerName string, envVars map[string]string) error {
 	if err := validateGenericOAuthConfig(ctx, providerName, envVars); err != nil {
-		return types.NewErrBadRequest("%v", err)
-	}
-	if providerName != GenericOAuthAuthProviderName {
-		return nil
-	}
-
-	existing, err := gatewayClient.RevealCredential(ctx, existingCredentialContexts, providerName)
-	if err != nil {
-		if errors.As(err, &gateway.CredentialNotFoundError{}) {
-			return nil
-		}
-		return fmt.Errorf("failed to reveal existing generic OAuth credential: %w", err)
-	}
-	if err := requireGenericOAuthTrustReconfirmation(providerName, existing.Secrets[GenericOAuthIssuerEnvVar], envVars); err != nil {
 		return types.NewErrBadRequest("%v", err)
 	}
 	return nil
@@ -112,20 +95,4 @@ func genericOAuthIssuerAllowsHTTP(hostname, scheme string) bool {
 		return false
 	}
 	return hostname == "localhost" || hostname == "127.0.0.1" || hostname == "host.docker.internal"
-}
-
-func requireGenericOAuthTrustReconfirmation(providerName, existingIssuer string, envVars map[string]string) error {
-	if providerName != GenericOAuthAuthProviderName || existingIssuer == "" {
-		return nil
-	}
-
-	newIssuer := envVars[GenericOAuthIssuerEnvVar]
-	if newIssuer == existingIssuer {
-		return nil
-	}
-	if envVars[GenericOAuthTrustEmailLinkingEnvVar] == "true" {
-		return nil
-	}
-
-	return fmt.Errorf("issuer changed from %q to %q; account-linking trust must be re-confirmed", existingIssuer, newIssuer)
 }

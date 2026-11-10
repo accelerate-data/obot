@@ -1,9 +1,9 @@
 import { page as appPage } from '$app/state';
 import { CATALOG_SERVER_FIELD_IDS } from '$lib/constants';
-import { Group, type MessagePolicy } from '$lib/services';
+import { Group } from '$lib/services';
 import { mcpServersAndEntries } from '$lib/stores';
 import { createMockProfile, preparePageData } from '../../tests/helpers/pageData';
-import { createDeploymentsPageFixtures, getVersionResponse } from '../../tests/mocks/data';
+import { createDeploymentsPageFixtures } from '../../tests/mocks/data';
 import { worker } from '../../tests/mocks/worker';
 import type { PageData } from './$types';
 import McpServersPage from './+page.svelte';
@@ -18,12 +18,20 @@ vi.mock('$app/state', async (importOriginal) => {
 	return createAppState(actual);
 });
 
-vi.mock('$app/navigation', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('$app/navigation')>();
+vi.mock('$app/navigation', async () => {
 	const { applyTestGoto } = await import('../../tests/helpers/navigation.svelte');
 	return {
-		...actual,
-		goto: (url: string | URL) => applyTestGoto(url)
+		goto: (url: string | URL) => applyTestGoto(url),
+		invalidate: vi.fn(),
+		invalidateAll: vi.fn(),
+		preloadCode: vi.fn(),
+		preloadData: vi.fn(),
+		beforeNavigate: vi.fn(),
+		afterNavigate: vi.fn(),
+		onNavigate: vi.fn(),
+		pushState: vi.fn(),
+		replaceState: vi.fn(),
+		disableScrollHandling: vi.fn()
 	};
 });
 
@@ -85,16 +93,12 @@ function mockDeploymentsApis() {
 
 async function renderMcpServersPage({
 	view = 'deployments',
-	messagePolicies = [],
-	messagePoliciesEnabled = false,
 	groups = [Group.ADMIN]
 }: {
 	view?: string;
-	messagePolicies?: MessagePolicy[];
-	messagePoliciesEnabled?: boolean;
 	groups?: string[];
 } = {}) {
-	appPage.url.searchParams.set('view', view);
+	(appPage.url as URL).searchParams.set('view', view);
 	localStorage.setItem('seenSplashDialog', new Date().toISOString());
 	mockDeploymentsApis();
 	const data = await preparePageData<PageData>({
@@ -105,11 +109,7 @@ async function renderMcpServersPage({
 		systemCatalogEntries: [],
 		mcpTunnels: [],
 		tunnelConnections: undefined,
-		accessControlRules: [],
-		messagePolicies,
-		...(messagePoliciesEnabled
-			? { version: { ...getVersionResponse, messagePoliciesEnabled: true } }
-			: {})
+		accessControlRules: []
 	});
 	defaultCatalogRequests = 0;
 	const result = render(McpServersPage, { data });
@@ -163,8 +163,8 @@ async function expectMenuActions(
 }
 
 afterEach(() => {
-	appPage.url.searchParams.delete('view');
-	appPage.url.searchParams.delete('new');
+	(appPage.url as URL).searchParams.delete('view');
+	(appPage.url as URL).searchParams.delete('new');
 });
 
 it('imports OpenAPI from the type picker before opening configuration', async () => {
@@ -184,7 +184,7 @@ it('imports OpenAPI from the type picker before opening configuration', async ()
 	await page.getByRole('button', { name: /OpenAPI/ }).click();
 	await expect.element(page.getByRole('heading', { name: 'Import OpenAPI schema' })).toBeVisible();
 	await expect.element(page.getByCSS(`#${CATALOG_SERVER_FIELD_IDS.name}`)).not.toBeInTheDocument();
-	expect(appPage.url.searchParams.get('new')).not.toBe('openapi');
+	expect((appPage.url as URL).searchParams.get('new')).not.toBe('openapi');
 	await page.getByLabelText('Schema URL', { exact: true }).fill('https://example.com/schema.json');
 	await page.getByRole('button', { name: 'Import', exact: true }).click();
 	await expect
@@ -194,10 +194,90 @@ it('imports OpenAPI from the type picker before opening configuration', async ()
 		.element(page.getByLabelText('API request base URL', { exact: false }))
 		.toBeRequired();
 	await expect.element(page.getByCSS('#runtime-selector')).not.toBeInTheDocument();
-	expect(appPage.url.searchParams.get('new')).toBe('openapi');
+	expect((appPage.url as URL).searchParams.get('new')).toBe('openapi');
 });
 
 describe('MCP Servers Page', () => {
+	describe('filters tab', () => {
+		beforeEach(() => {
+			resetMcpServersAndEntriesStore();
+			worker.use(
+				http.get('/api/llm-gateway/guardrails', () =>
+					HttpResponse.json({ items: [{ id: 'gp1secrets', name: 'Secrets', type: 'secrets' }] })
+				),
+				http.get('/api/llm-gateway/guardrails/providers', () => HttpResponse.json({ items: [] })),
+				http.get('/api/llm-gateway/guardrail-policies', () => HttpResponse.json({ items: [] })),
+				http.get('/api/mcp-webhook-validations', () =>
+					HttpResponse.json({
+						items: [
+							{
+								id: 'f1',
+								name: 'No secrets',
+								guardrail: { guardrailIDs: ['gp1secrets'], action: 'redact' }
+							}
+						]
+					})
+				)
+			);
+		});
+
+		afterEach(() => {
+			(appPage.url as URL).searchParams.delete('new');
+		});
+
+		it('offers Create From Guardrail in the Add New Filter menu', async () => {
+			await renderMcpServersPage({ view: 'filters' });
+
+			await page.getByRole('button', { name: 'Add New Filter' }).click();
+
+			await expect
+				.element(page.getByRole('button', { name: 'Create Custom', exact: true }))
+				.toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Create From Built-in', exact: true }))
+				.toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Create From Guardrail', exact: true }))
+				.toBeEnabled();
+		});
+
+		it('has no Guardrails tab; guardrails are managed under LLM Gateway', async () => {
+			await renderMcpServersPage({ view: 'filters' });
+
+			await expect
+				.element(page.getByRole('button', { name: 'Filters', exact: true }))
+				.toBeVisible();
+			await expect
+				.element(page.getByRole('button', { name: 'Guardrails', exact: true }))
+				.not.toBeInTheDocument();
+		});
+
+		it('opens the guardrail filter form for new=guardrail', async () => {
+			(appPage.url as URL).searchParams.set('new', 'guardrail');
+			await renderMcpServersPage({ view: 'filters' });
+
+			// The layout title repeats the heading.
+			await expect
+				.element(page.getByRole('heading', { name: 'Create Guardrail Filter' }).last())
+				.toBeVisible();
+			await expect.element(page.getByRole('checkbox', { name: /Secrets/ })).toBeVisible();
+			await expect.element(page.getByLabelText('Webhook URL')).not.toBeInTheDocument();
+		});
+
+		it('opens the custom filter form for other new values', async () => {
+			(appPage.url as URL).searchParams.set('new', 'true');
+			await renderMcpServersPage({ view: 'filters' });
+
+			await expect
+				.element(page.getByRole('heading', { name: 'Create Filter', exact: true }).last())
+				.toBeVisible();
+			await expect.element(page.getByLabelText('Webhook URL')).toBeVisible();
+			await expect
+				.element(page.getByRole('heading', { name: 'Create Guardrail Filter' }))
+				.not.toBeInTheDocument();
+		});
+	});
+
 	describe('deployments tab', () => {
 		beforeEach(async () => {
 			resetMcpServersAndEntriesStore();
@@ -283,56 +363,6 @@ describe('MCP Servers Page', () => {
 	});
 });
 
-describe('message policies tab', () => {
-	const toolPolicy: MessagePolicy = {
-		id: 'tool-policy',
-		displayName: 'Block shell tools',
-		definition: 'Do not allow shell tools',
-		direction: 'tool-calls',
-		created: '2026-01-01T00:00:00Z',
-		subjects: []
-	};
-	const userPolicy: MessagePolicy = {
-		id: 'user-policy',
-		displayName: 'Block travel booking',
-		definition: 'Do not allow travel booking',
-		direction: 'user-message',
-		created: '2026-01-01T00:00:00Z',
-		subjects: []
-	};
-
-	afterEach(() => {
-		appPage.url.searchParams.delete('view');
-		appPage.url.searchParams.delete('new');
-	});
-
-	it('shows tool-call policies and hides user-message policies', async () => {
-		resetMcpServersAndEntriesStore();
-		await renderMcpServersPage({
-			view: 'ai-judge-policies',
-			messagePoliciesEnabled: true,
-			messagePolicies: [toolPolicy, userPolicy]
-		});
-
-		await expect.element(page.getByRole('button', { name: 'AI Judge Policies' })).toBeVisible();
-		await expect.element(page.getByRole('row', { name: /Block shell tools/ })).toBeVisible();
-		await expect
-			.element(page.getByRole('row', { name: /Block travel booking/ }))
-			.not.toBeInTheDocument();
-		await expect.element(page.getByRole('button', { name: 'Add AI Judge Policy' })).toBeVisible();
-	});
-
-	it('hides the tab when message policies are disabled', async () => {
-		resetMcpServersAndEntriesStore();
-		await renderMcpServersPage({ view: 'deployments' });
-		await waitForServersLoaded();
-
-		await expect
-			.element(page.getByRole('button', { name: 'AI Judge Policies' }))
-			.not.toBeInTheDocument();
-	});
-});
-
 it.each([
 	{ role: 'power user', groups: [Group.POWERUSER] },
 	{ role: 'power user plus', groups: [Group.POWERUSER_PLUS, Group.POWERUSER] },
@@ -340,7 +370,7 @@ it.each([
 	{ role: 'basic user', groups: [] }
 ])('does not open the direct OpenAPI creation URL for $role', async ({ groups }) => {
 	resetMcpServersAndEntriesStore();
-	appPage.url.searchParams.set('new', 'openapi');
+	(appPage.url as URL).searchParams.set('new', 'openapi');
 	await renderMcpServersPage({ view: 'entries', groups });
 	await expect
 		.element(page.getByRole('heading', { name: 'Import OpenAPI schema' }))
@@ -357,5 +387,5 @@ it('allows an owner to import OpenAPI from the type picker', async () => {
 	await page.getByRole('button', { name: 'Add MCP Server' }).click();
 	await page.getByRole('button', { name: /OpenAPI/ }).click();
 	await expect.element(page.getByRole('heading', { name: 'Import OpenAPI schema' })).toBeVisible();
-	expect(appPage.url.searchParams.get('new')).not.toBe('openapi');
+	expect((appPage.url as URL).searchParams.get('new')).not.toBe('openapi');
 });

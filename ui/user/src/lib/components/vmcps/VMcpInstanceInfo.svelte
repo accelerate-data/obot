@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { resolve } from '$app/paths';
 	import SubjectName from '$lib/components/admin/SubjectName.svelte';
 	import Table from '$lib/components/table/Table.svelte';
 	import { m } from '$lib/i18n';
@@ -7,6 +6,7 @@
 	import { isDeprecatedMCPServer } from '$lib/services/user/mcp';
 	import { vmcpComponentId, vmcpInstanceAuditLogsPath } from '$lib/services/vmcps/utils';
 	import { mcpServersAndEntries, profile } from '$lib/stores';
+	import { resolve } from '$lib/url';
 	import { getUserDisplayName, isDisabledUser, openUrl } from '$lib/utils';
 	import McpDeprecatedNotice from '../mcp/McpDeprecatedNotice.svelte';
 	import { ChevronRight, CircleAlert, Server } from '@lucide/svelte';
@@ -170,7 +170,7 @@
 						href={resolve(vmcpInstanceAuditLogsPath(vmcp.id, d.id) as `/${string}`)}
 						class="btn btn-link"
 					>
-						{m.vmcps_deployments_view_audit_logs()}
+						{m.core_view_audit_logs()}
 					</a>
 				{/if}
 			{/snippet}

@@ -2,6 +2,7 @@ package authz
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -49,6 +50,7 @@ var (
 	)
 
 	adminAndOwnerRules = []string{
+		"/api/registry-settings",
 		"/api/claude-organizations/",
 		"/api/claude-environments",
 		"/api/claude-environments/",
@@ -59,8 +61,6 @@ var (
 		"/api/mcp-tunnels/",
 		"/api/mcp-catalogs",
 		"/api/mcp-catalogs/",
-		"/api/model-info-source",
-		"/api/model-info-source/",
 		"GET /api/mcp-server-binding-secrets",
 		"/api/mcp-servers",
 		"/api/mcp-servers/",
@@ -104,16 +104,12 @@ var (
 		"/api/local-auth/users/",
 		"/api/model-providers",
 		"/api/model-providers/",
+		"/api/llm-gateway/",
 		"GET /api/bookstrap",
 		"/api/models",
 		"/api/models/",
 		"/api/model-access-policies",
 		"/api/model-access-policies/",
-		"/api/message-policies",
-		"/api/message-policies/",
-		"/api/message-policy-violations",
-		"/api/message-policy-violations/",
-		"GET /api/message-policy-violation-stats",
 		"DELETE /api/devices/scans/{scan_id}",
 		"/api/devices/scan-stats",
 		"/api/devices/mcp-servers/",
@@ -123,6 +119,8 @@ var (
 		"/api/devices/clients/",
 		"/api/mdm/configurations",
 		"/api/mdm/configurations/",
+		"GET /api/mdm/devices",
+		"DELETE /api/mdm/devices/",
 		"GET /api/enforcement-decisions",
 		"GET /api/enforcement-decisions/",
 		"/api/mdm/asset-source",
@@ -141,6 +139,7 @@ var (
 		"GET /api/active-users",
 		"GET /api/token-usage",
 		"GET /api/total-token-usage",
+		"GET /api/token-usage-stats",
 		"GET /api/tokens",
 		"DELETE /api/tokens/{id}",
 		"/api/oauth-apps",
@@ -197,6 +196,7 @@ var (
 		types.GroupAdmin: adminAndOwnerRules,
 		types.GroupOwner: append(slices.Clone(adminAndOwnerRules), ownerRules...),
 		types.GroupAuditor: {
+			"GET /api/llm-gateway/",
 			"GET /api/model-proxy",
 			"GET /api/model-proxy/usage",
 			"GET /api/admin-api-keys",
@@ -225,8 +225,6 @@ var (
 			"GET /api/mcp-servers/",
 			"GET /api/model-access-policies",
 			"GET /api/model-access-policies/",
-			"GET /api/message-policies",
-			"GET /api/message-policies/",
 			"GET /api/user-default-role-settings",
 			"GET /api/k8s-settings",
 			"GET /api/image-pull-secrets/capability",
@@ -254,9 +252,6 @@ var (
 			"GET /api/skill-repositories/",
 			"GET /api/skill-access-rules",
 			"GET /api/skill-access-rules/",
-			"GET /api/message-policy-violations",
-			"GET /api/message-policy-violations/",
-			"GET /api/message-policy-violation-stats",
 			"GET /api/enforcement-decisions",
 			"GET /api/enforcement-decisions/",
 			"GET /api/devices/scan-stats",
@@ -267,10 +262,12 @@ var (
 			"GET /api/devices/clients/",
 			"GET /api/mdm/configurations",
 			"GET /api/mdm/configurations/",
+			"GET /api/mdm/devices",
 			"GET /api/mdm/asset-source",
 			"GET /api/mdm/assets",
 			"GET /api/token-usage",
 			"GET /api/total-token-usage",
+			"GET /api/token-usage-stats",
 		},
 		anyGroup: {
 			"POST /api/claude-runners/spawn",
@@ -329,6 +326,16 @@ var (
 			"POST /api/api-keys/auth",
 		},
 
+		types.GroupBasic: {
+			"GET /v0.1",
+			"GET /v0.1/",
+		},
+
+		types.GroupMCP: {
+			"GET /v0.1",
+			"GET /v0.1/",
+		},
+
 		types.GroupAPI: {
 			"GET /api/claude-sessions",
 			"GET /api/claude-sessions/{session_id}",
@@ -337,6 +344,8 @@ var (
 			"PUT /api/claude-environments/{environment}/agent",
 			"DELETE /api/claude-environments/{environment}/agent",
 			"POST /api/token-request/verify",
+			// Whether Claude subscriptions may be used, for the gateway's setup instructions.
+			"GET /api/llm-gateway/settings",
 			"POST /api/local-agent-audit-logs",
 			"GET /api/models",
 			"GET /api/model-providers",
@@ -430,6 +439,7 @@ var (
 
 		MetricsGroup: {
 			"/debug/metrics",
+			"GET /api/llm-gateway/metrics",
 		},
 	}
 
@@ -445,15 +455,20 @@ var (
 	}
 )
 
+// RegistrySettingsReader supplies shared, request-time anonymous discovery policy.
+type RegistrySettingsReader interface {
+	AnonymousRegistryAccessEnabled(context.Context) (bool, error)
+}
+
 type Authorizer struct {
-	rules          []rule
-	cache          kclient.Client
-	uncached       kclient.Client
-	gatewayClient  *client.Client
-	apiResources   map[string]*pathMatcher
-	acrHelper      *accesscontrolrule.Helper
-	skillHelper    *skillaccessrule.Helper
-	registryNoAuth bool
+	registrySettings RegistrySettingsReader
+	rules            []rule
+	cache            kclient.Client
+	uncached         kclient.Client
+	gatewayClient    *client.Client
+	apiResources     map[string]*pathMatcher
+	acrHelper        *accesscontrolrule.Helper
+	skillHelper      *skillaccessrule.Helper
 }
 
 type rule struct {
@@ -464,22 +479,27 @@ type rule struct {
 // fake is a fake handler that does fake things
 type fake struct{}
 
-func NewAuthorizer(gatewayClient *client.Client, cache, uncached kclient.Client, devMode bool, acrHelper *accesscontrolrule.Helper, skillHelper *skillaccessrule.Helper, registryNoAuth bool) *Authorizer {
+func NewAuthorizer(gatewayClient *client.Client, cache, uncached kclient.Client, devMode bool, acrHelper *accesscontrolrule.Helper, skillHelper *skillaccessrule.Helper, registrySettings RegistrySettingsReader) *Authorizer {
 	apiBasedResources := make(map[string]*pathMatcher, len(apiResources))
 	for group, resources := range apiResources {
 		apiBasedResources[group] = newPathMatcher(resources...)
 	}
 
 	return &Authorizer{
-		rules:          defaultRules(devMode, registryNoAuth),
-		cache:          cache,
-		uncached:       uncached,
-		gatewayClient:  gatewayClient,
-		apiResources:   apiBasedResources,
-		acrHelper:      acrHelper,
-		skillHelper:    skillHelper,
-		registryNoAuth: registryNoAuth,
+		rules:            defaultRules(devMode),
+		registrySettings: registrySettings,
+		cache:            cache,
+		uncached:         uncached,
+		gatewayClient:    gatewayClient,
+		apiResources:     apiBasedResources,
+		acrHelper:        acrHelper,
+		skillHelper:      skillHelper,
 	}
+}
+
+// IsMCPRegistryRequest reports whether a request targets the MCP Registry API.
+func IsMCPRegistryRequest(req *http.Request) bool {
+	return req.URL.Path == "/v0.1" || strings.HasPrefix(req.URL.Path, "/v0.1/")
 }
 
 func (a *Authorizer) Authorize(req *http.Request, userInfo user.Info) bool {
@@ -525,6 +545,19 @@ func (a *Authorizer) Authorize(req *http.Request, userInfo user.Info) bool {
 		return ok
 	}
 
+	// Internal principals have already been restricted above. Anonymous grants
+	// apply only to registry discovery, and never override authenticated visibility.
+	if slices.Contains(userInfo.GetGroups(), UnauthenticatedGroup) &&
+		(req.Method == http.MethodGet || req.Method == http.MethodHead) && IsMCPRegistryRequest(req) &&
+		a.registrySettings != nil {
+		enabled, err := a.registrySettings.AnonymousRegistryAccessEnabled(req.Context())
+		if err != nil {
+			slog.Error("Denied anonymous registry discovery because settings could not be read", "error", err)
+			return false
+		}
+		return enabled
+	}
+
 	user := newUser(userInfo)
 	for _, r := range a.rules {
 		if r.group == anyGroup || slices.Contains(user.GetGroups(), r.group) {
@@ -545,37 +578,9 @@ func (a *Authorizer) get(ctx context.Context, key kclient.ObjectKey, obj kclient
 	return err
 }
 
-func defaultRules(devMode bool, registryNoAuth bool) []rule {
-	var (
-		f     = (*fake)(nil)
-		rules = rulesFromStatic(staticRules)
-	)
-
-	var registryRuleBasic, registryRuleMCPOAuth rule
-	if registryNoAuth {
-		registryRuleBasic = rule{
-			group: anyGroup,
-			mux:   http.NewServeMux(),
-		}
-		registryRuleMCPOAuth = rule{
-			group: anyGroup,
-			mux:   http.NewServeMux(),
-		}
-	} else {
-		registryRuleBasic = rule{
-			group: types.GroupBasic,
-			mux:   http.NewServeMux(),
-		}
-		registryRuleMCPOAuth = rule{
-			group: types.GroupMCP,
-			mux:   http.NewServeMux(),
-		}
-	}
-	registryRuleBasic.mux.Handle("GET /v0.1", f)
-	registryRuleBasic.mux.Handle("GET /v0.1/", f)
-	registryRuleMCPOAuth.mux.Handle("GET /v0.1", f)
-	registryRuleMCPOAuth.mux.Handle("GET /v0.1/", f)
-	rules = append(rules, registryRuleBasic, registryRuleMCPOAuth)
+func defaultRules(devMode bool) []rule {
+	f := (*fake)(nil)
+	rules := rulesFromStatic(staticRules)
 
 	if devMode {
 		for group := range devModeRules {

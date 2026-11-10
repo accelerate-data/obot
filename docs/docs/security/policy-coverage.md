@@ -12,7 +12,7 @@ Roles determine platform capabilities. Resource policies and profiles determine 
 | [Model policies](../functionality/model-access-policies.md) | Accessible models | A configured provider alone does not grant model access |
 | [Skill policies](../registries/publish-skills.md) | Skill discovery and installation | Administrators bypass these grants; downloaded copies remain |
 | [Authorization scopes](../functionality/agent-auth-scopes.md) | Programmatic credential capabilities | Cannot exceed the owning user's access |
-| [Sentry allowlists](../device-management/enforcement.md) | Supported local client tool calls | Experimental; client coverage and fail-closed behavior apply |
+| [Sentry allowlists](../device-management/enforcement.md) | Supported local client tool calls | Experimental; runs on the user's device; [limitations](../device-management/enforcement.md#limitations) and fail-closed behavior apply |
 
 
 Use a regular test account with the intended group membership to verify grants. Review broadly matching profiles and policies before concluding a narrow rule is ineffective. [User management](./authentication.md) describes administrative account controls.
@@ -90,9 +90,12 @@ Configure the default role for new users on the **Identity & Access > Roles** pa
 
 ### Pre-Assigning Roles {#user-roles-pre-assigning-roles}
 
-To grant admin or owner access to users before they log in, set these environment variables during deployment. See [Enabling Authentication](./authentication.md) for details.
+Obot does not assign roles based on email addresses. To give users a role before they log in, assign the role in Obot to a group that your identity provider supplies, such as a group pushed through [Okta SCIM](../configuration/okta-scim.md):
 
-```bash
-OBOT_SERVER_AUTH_ADMIN_EMAILS=admin@example.com,admin2@example.com
-OBOT_SERVER_AUTH_OWNER_EMAILS=owner@example.com
-```
+1. Navigate to **Identity & Access > Groups**
+2. Click **Add Assignment**
+3. Select the group and the role
+
+Members of the group get the role while they belong to it. The role is added to the role stored on each user, so it doesn't appear as a change to their own role. To change a user's own role instead, [update the user's role](#user-roles-updating-a-users-role) after they log in for the first time.
+
+To provision the first Owner of a deployment that uses the built-in Local provider, set `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_EMAIL`. See [Server Configuration](../configuration/server-configuration.md).

@@ -335,7 +335,7 @@ func newProviderTestGatewayClient(t *testing.T, storageClient kclient.Client) *g
 		_ = db.Close()
 	})
 
-	return gateway.New(context.Background(), db, storageClient, nil, nil, nil, nil, time.Hour, 1000, 90, 90, 90, true)
+	return gateway.New(context.Background(), db, storageClient, nil, nil, time.Hour, 1000, 90, 90, 90, true)
 }
 
 func (c *conflictOnceClient) Update(ctx context.Context, obj kclient.Object, opts ...kclient.UpdateOption) error {

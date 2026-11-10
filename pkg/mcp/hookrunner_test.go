@@ -13,12 +13,11 @@ import (
 type fakeHookMCPClient struct {
 	params *gomcp.CallToolParams
 	result *gomcp.CallToolResult
-	err    error
 }
 
 func (c *fakeHookMCPClient) CallTool(_ context.Context, params *gomcp.CallToolParams) (*gomcp.CallToolResult, error) {
 	c.params = params
-	return c.result, c.err
+	return c.result, nil
 }
 
 func TestMCPHookRunnerCallsConfiguredServerTool(t *testing.T) {

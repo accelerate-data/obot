@@ -3,7 +3,6 @@ package mcpgateway
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -19,8 +18,8 @@ import (
 	"github.com/obot-platform/obot/pkg/api/authz"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/utils"
 	"golang.org/x/oauth2"
-	"k8s.io/apiserver/pkg/authentication/user"
 )
 
 const (
@@ -88,8 +87,9 @@ func (h compositeComponentOAuthHandler) TokenSource(context.Context) (oauth2.Tok
 // Authorize fails so the component's challenge reaches the frontend client,
 // which is the only party able to complete the component's authorization.
 func (compositeComponentOAuthHandler) Authorize(_ context.Context, _ *http.Request, resp *http.Response) error {
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// A component can stall its error body indefinitely; fail authorization without draining it.
 	_ = resp.Body.Close()
+
 	return fmt.Errorf("component requires authorization: %s", resp.Status)
 }
 
@@ -116,11 +116,27 @@ func newCompositeLoopbackToken(ctx context.Context, tokens compositeTokenService
 	return token, expiresAt, nil
 }
 
-func compositeConfig(serverConfig mcp.ServerConfig, caller user.Info) *mmmcpconfig.Config {
+func compositeConfig(req api.Context, serverConfig mcp.ServerConfig) (*mmmcpconfig.Config, error) {
+	if len(serverConfig.Components) > 0 {
+		ids := make([]string, 0, len(serverConfig.Components))
+		for _, component := range serverConfig.Components {
+			ids = append(ids, component.ConnectID())
+		}
+
+		revision, err := req.GatewayClient.MCPOAuthDiscoveryRevision(req.Context(), req.User.GetUID(), ids)
+		if err != nil {
+			return nil, fmt.Errorf("read component OAuth discovery revision: %w", err)
+		}
+
+		// Consult shared state on each request so revocation also invalidates other replicas.
+		serverConfig.ConfigHash = utils.Digest([]string{serverConfig.ConfigHash, revision})
+	}
+
 	cfg := mcp.MMMCPConfig(serverConfig, nil)
 	cfg.PartialAuthorization = serverConfig.Runtime == types.RuntimeVMCP
-	cfg.DeferAuthorization = cfg.PartialAuthorization || authz.IsClaudeEnvironment(caller)
-	return cfg
+	cfg.DeferAuthorization = cfg.PartialAuthorization || authz.IsClaudeEnvironment(req.User)
+
+	return cfg, nil
 }
 
 func compositeAuthorizationURLs(lookup func(api.Context) ([]mmmcp.AuthorizationURL, error)) func(context.Context) ([]mmmcp.AuthorizationURL, error) {

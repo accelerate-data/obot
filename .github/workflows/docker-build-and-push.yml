@@ -27,6 +27,8 @@ on:
 jobs:
   build:
     runs-on: depot-ubuntu-22.04
+    outputs:
+      image-digest: ${{ steps.build-and-push.outputs.digest }}
 
     steps:
       - name: Checkout code
@@ -90,6 +92,7 @@ jobs:
             PROVIDERS_IMAGE=${{ env.PROVIDERS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
             ENCRYPTION_BINS_IMAGE=${{ env.ENCRYPTION_BINS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
             ENTERPRISE_PROVIDERS_IMAGE=${{ env.PROVIDERS_IMAGE }}:${{ env.PROVIDER_IMAGE_TAG }}
+            MODEL_DATA_URL=https://upgrade-server.obot.ai/v1/model-data
 
       # Publishing disabled: nothing is pushed, so the image cannot be signed,
       # tagged, or scanned from the registry. These steps are kept (guarded off)
@@ -144,6 +147,7 @@ jobs:
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ env.OBOT_IMAGE }}:${{ github.ref_name }}
+          trivyignores: .trivyignore.yaml
           skip-dirs: "**/venv"
           format: "sarif"
           output: "trivy-results.sarif"

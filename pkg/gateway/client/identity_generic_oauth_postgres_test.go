@@ -17,6 +17,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+const (
+	genericOAuthTestProviderName = "generic-oauth-auth-provider"
+)
+
 func TestEnsureIdentityGenericOAuthConcurrentlyAcrossPostgresClients(t *testing.T) {
 	scopedDSN, adminDB := newCredentialLockPostgresTest(t)
 	schema := postgresSearchPath(t, scopedDSN)
@@ -38,8 +42,8 @@ func TestEnsureIdentityGenericOAuthConcurrentlyAcrossPostgresClients(t *testing.
 		t.Fatalf("migrating PostgreSQL gateway tables for generic OAuth identities: %v", err)
 	}
 
-	clientA := newPostgresGenericOAuthTestClient(t, dbA, "https://issuer.example.com/", "true")
-	clientB := newPostgresGenericOAuthTestClient(t, dbB, "https://issuer.example.com/", "true")
+	clientA := newPostgresGenericOAuthTestClient(dbA)
+	clientB := newPostgresGenericOAuthTestClient(dbB)
 
 	lockTx := adminDB.WithContext(t.Context()).Begin()
 	if lockTx.Error != nil {
@@ -113,16 +117,14 @@ func TestEnsureIdentityGenericOAuthConcurrentlyAcrossPostgresClients(t *testing.
 	}
 }
 
-func newPostgresGenericOAuthTestClient(t *testing.T, database *gatewaydb.DB, issuer, trust string) *Client {
-	t.Helper()
-
-	client := &Client{
+func newPostgresGenericOAuthTestClient(database *gatewaydb.DB) *Client {
+	return &Client{
 		db: database,
 		storageClient: fake.NewClientBuilder().
 			WithScheme(storagescheme.Scheme).
 			WithObjects(
 				&v1.AuthProvider{
-					Name:      genericOAuthAuthProviderName,
+					Name:      genericOAuthTestProviderName,
 					Namespace: system.DefaultNamespace,
 				},
 				&v1.UserDefaultRoleSetting{
@@ -135,29 +137,15 @@ func newPostgresGenericOAuthTestClient(t *testing.T, database *gatewaydb.DB, iss
 			).
 			Build(),
 	}
-	if err := client.UpsertCredential(t.Context(), gatewaytypes.Credential{
-		Context: genericOAuthAuthProviderName,
-		Name:    genericOAuthAuthProviderName,
-		Secrets: map[string]string{
-			genericOAuthIssuerEnvVar:         issuer,
-			genericOAuthTrustEmailLinkingVar: trust,
-		},
-	}); err != nil {
-		t.Fatalf("seeding generic OAuth credential: %v", err)
-	}
-	return client
 }
 
 func newGenericOAuthConcurrentTestIdentity() *gatewaytypes.Identity {
-	emailVerified := true
 	return &gatewaytypes.Identity{
 		Email:                 "alice@example.com",
-		AuthProviderName:      genericOAuthAuthProviderName,
+		AuthProviderName:      genericOAuthTestProviderName,
 		AuthProviderNamespace: system.DefaultNamespace,
 		ProviderUsername:      "alice@example.com",
 		ProviderUserID:        "iss:https://issuer.example.com/|sub:alice",
-		ProviderIssuer:        "https://issuer.example.com/",
-		ProviderEmailVerified: &emailVerified,
 	}
 }
 

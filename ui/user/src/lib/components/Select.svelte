@@ -33,10 +33,21 @@
 		ariaLabelledby?: string;
 		ariaDescribedby?: string;
 		invalid?: boolean;
+		/**
+		 * Renders at most this many matching options, and asks to narrow the search for the rest.
+		 * The rest are only reachable by searching, so the cap applies only to a Select that has a
+		 * search input: one with searchInDropdown, or a multiple one that is not read-only.
+		 * Give capped options distinct labels: options that share a label cannot be told apart by any
+		 * search, so if more of them than the cap match, the rest are unreachable.
+		 */
+		maxRenderedOptions?: number;
 	}
 </script>
 
-<script lang="ts" generics="T extends { id: string | number; label: string; disabled?: boolean }">
+<script
+	lang="ts"
+	generics="T extends { id: string | number; label: string; disabled?: boolean; searchText?: string }"
+>
 	import { parseMultiValue, serializeMultiValue } from '$lib/multiValue';
 	import { ChevronDown, X, Check, SearchIcon } from '@lucide/svelte';
 	import { tick, type Snippet } from 'svelte';
@@ -70,7 +81,8 @@
 		displayCount,
 		ariaLabelledby,
 		ariaDescribedby,
-		invalid
+		invalid,
+		maxRenderedOptions
 	}: SelectProps<T> = $props();
 	const selectedValues = $derived.by(() => {
 		if (multiple) {
@@ -97,9 +109,40 @@
 	let input = $state<HTMLInputElement>();
 	let optionHighlightIndex = $state(-1);
 
+	// An option matches the query by its label, or by searchText: other names it is known by,
+	// such as a model's ID when its label is a display name.
 	let availableOptions = $derived(
-		options.filter((option) => option.label.toLowerCase().includes(query?.toLowerCase() ?? ''))
+		options.filter((option) =>
+			[option.label, option.searchText ?? ''].some((text) =>
+				text.toLowerCase().includes(query?.toLowerCase() ?? '')
+			)
+		)
 	);
+
+	// The options that are rendered. With thousands of options, rendering all of them makes the
+	// page slow and heavy, so maxRenderedOptions lists the first matches and asks for a narrower query.
+	// Options whose label or searchText is exactly the query come first, so that an option can be
+	// reached by typing it in full, even one whose text is part of more than the cap of others. That
+	// holds only for distinct labels, which is why the prop asks for them.
+	let hasSearchInput = $derived(searchInDropdown || (multiple && !readonly && !buttonReadOnly));
+	let renderedOptions = $derived.by(() => {
+		if (!maxRenderedOptions || !hasSearchInput || availableOptions.length <= maxRenderedOptions) {
+			return availableOptions;
+		}
+		const q = query?.toLowerCase() ?? '';
+		const isExact = (option: T) =>
+			q !== '' && [option.label, option.searchText ?? ''].some((text) => text.toLowerCase() === q);
+		return [
+			...availableOptions.filter(isExact),
+			...availableOptions.filter((option) => !isExact(option))
+		].slice(0, maxRenderedOptions);
+	});
+	let hiddenOptionCount = $derived(availableOptions.length - renderedOptions.length);
+
+	// The option list is only rendered while the dropdown is open: a closed dropdown is hidden, but
+	// its options would still be built and kept in the page. It is set on beforetoggle, which comes
+	// before the dropdown is shown, so an open dropdown is never painted without its options.
+	let open = $state(false);
 
 	let selectedOptions = $derived(
 		selectedValues
@@ -180,7 +223,7 @@
 			{id}
 			role="combobox"
 			aria-haspopup="listbox"
-			aria-expanded={popover?.matches(':popover-open') ?? false}
+			aria-expanded={open}
 			aria-controls={`${id}-popover`}
 			aria-invalid={invalid || undefined}
 			class={twMerge(
@@ -321,6 +364,7 @@
 			'default-scrollbar-thin dropdown-menu max-h-[300px] overflow-y-auto',
 			position === 'top' ? 'rounded-t-sm rounded-b-none' : 'rounded-t-none rounded-b-sm'
 		)}
+		onbeforetoggle={(e) => (open = e.newState === 'open')}
 	>
 		{#if searchInDropdown}
 			<div
@@ -332,10 +376,12 @@
 				{@render searchInput()}
 			</div>
 		{/if}
-		{#if availableOptions.length === 0}
+		{#if !open}
+			<!-- Options are rendered when the dropdown opens. -->
+		{:else if availableOptions.length === 0}
 			<div class="text-muted-content px-4 py-2 font-light">{m.core_no_options_available()}</div>
 		{:else}
-			{#each availableOptions as option, index (option.id)}
+			{#each renderedOptions as option, index (option.id)}
 				{@const isSelected = selectedValues.some((d) => d === option.id)}
 				{@const isHighlighted = optionHighlightIndex === index}
 
@@ -364,6 +410,11 @@
 					{/if}
 				</button>
 			{/each}
+			{#if hiddenOptionCount > 0}
+				<div class="text-muted-content px-4 py-2 text-xs font-light">
+					{m.core_select_more_options({ count: hiddenOptionCount })}
+				</div>
+			{/if}
 		{/if}
 	</div>
 </div>
@@ -409,7 +460,7 @@
 				e.stopPropagation();
 
 				if (e.key === 'ArrowDown') {
-					optionHighlightIndex = Math.min(optionHighlightIndex + 1, availableOptions.length - 1);
+					optionHighlightIndex = Math.min(optionHighlightIndex + 1, renderedOptions.length - 1);
 				} else if (e.key === 'ArrowUp') {
 					optionHighlightIndex = Math.max(optionHighlightIndex - 1, -1);
 				}
@@ -428,7 +479,7 @@
 			if (e.key === 'Enter') {
 				e.preventDefault();
 				e.stopPropagation();
-				const option = availableOptions[optionHighlightIndex];
+				const option = renderedOptions[optionHighlightIndex];
 				if (option) {
 					handleSelect(option);
 				}

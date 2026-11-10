@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"github.com/oasdiff/yaml"
 	mmmcpconfig "github.com/obot-platform/mmmcp/config"
 	"github.com/obot-platform/obot/apiclient/types"
+	"github.com/obot-platform/obot/pkg/mcp/attribution"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/obot-platform/obot/pkg/version"
 )
@@ -55,6 +57,7 @@ type backend interface {
 	// ensureServerDeployment validates before deployment, skips validation on cache hits,
 	// and returns the updated ServerConfig.
 	ensureServerDeployment(ctx context.Context, serverConfig ServerConfig) (ServerConfig, error)
+
 	// deployServer will deploy a server if it is not already deployed, and will not wait or do any readiness checks
 	deployServer(ctx context.Context, server ServerConfig) error
 	streamServerLogs(ctx context.Context, id string) (io.ReadCloser, error)
@@ -128,7 +131,7 @@ func ensureServerReady(ctx context.Context, url string, server ServerConfig) err
 		}
 		req.Header.Set("Accept", "application/json,text/event-stream")
 		req.Header.Set("Content-Type", "application/json")
-		copyHeaders(req.Header, server.PassthroughHeaderNames, server.PassthroughHeaderValues)
+		maps.Copy(req.Header, attribution.Configured(nil, server.PassthroughHeaderNames, server.PassthroughHeaderValues))
 
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -144,7 +147,7 @@ func ensureServerReady(ctx context.Context, url string, server ServerConfig) err
 				req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 				if err == nil {
 					req.Header.Set("Mcp-Session-Id", sessionID)
-					copyHeaders(req.Header, server.PassthroughHeaderNames, server.PassthroughHeaderValues)
+					maps.Copy(req.Header, attribution.Configured(nil, server.PassthroughHeaderNames, server.PassthroughHeaderValues))
 					_, _ = http.DefaultClient.Do(req)
 				}
 			}
@@ -162,7 +165,7 @@ func ensureServerReady(ctx context.Context, url string, server ServerConfig) err
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 		req.Header.Set("Accept", "text/event-stream")
-		copyHeaders(req.Header, server.PassthroughHeaderNames, server.PassthroughHeaderValues)
+		maps.Copy(req.Header, attribution.Configured(nil, server.PassthroughHeaderNames, server.PassthroughHeaderValues))
 
 		resp, err = http.DefaultClient.Do(req)
 		if err != nil {
@@ -211,6 +214,7 @@ func ensureHTTPGetOK(ctx context.Context, client *http.Client, url string, inter
 
 		var (
 			body []byte
+
 			// This must be a non-nil error because Go does weird things when you use %w with a nil error.
 			lastErr = errors.New("MCP server did not respond to health check")
 		)
@@ -223,6 +227,7 @@ func ensureHTTPGetOK(ctx context.Context, client *http.Client, url string, inter
 				return nil
 			case http.StatusServiceUnavailable:
 				lastErr = fmt.Errorf("service unavailable: %s", string(body))
+
 				// Older nanobot versions return 503 when tool listing permanently fails, but service mesh sidecars
 				// (e.g. Istio's envoy) also return 503 during startup. To avoid confusing the two, we don't treat 503
 				// as a permanent failure until we've seen consecutive 503 responses for this duration.
@@ -250,6 +255,7 @@ func ensureHTTPGetOK(ctx context.Context, client *http.Client, url string, inter
 
 			default:
 				lastErr = fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+
 				// A non-503 response (e.g. 425 TooEarly) means we're reaching the actual
 				// nanobot process, not a proxy. Reset the grace period so that any subsequent
 				// 503 gets a fresh window. The 500 window is deliberately NOT reset here: it
@@ -284,6 +290,10 @@ func ServerHookConfig(server ServerConfig) (Hooks, HookServerConfigs) {
 	hooks := hookDefinitions(server.Webhooks, replacer)
 	servers := make(HookServerConfigs, len(server.Webhooks))
 	for _, webhook := range server.Webhooks {
+		if webhook.Guardrail != nil {
+			// Guardrail filters run in-process and have no server.
+			continue
+		}
 		servers[webhookServerName(webhook, replacer)] = ServerConfig{
 			Runtime:              types.RuntimeRemote,
 			URL:                  webhook.URL,
@@ -303,21 +313,31 @@ func MMMCPConfig(server ServerConfig, env map[string][]byte) *mmmcpconfig.Config
 	if serverName == "" {
 		serverName = server.MCPServerName
 	}
+
 	config := &mmmcpconfig.Config{
 		Name:    serverName,
 		Version: version.Get().String(),
 	}
 
+	passthroughHeaders := slices.Clone(server.PassthroughHeaderNames)
 	if server.Runtime == types.RuntimeVMCP {
 		config.ToolSearch = server.ToolSearch
+		config.RequestScopedDiscovery = true
+
 		// Component connections are authenticated by the gateway's composite OAuth
 		// handler, not the frontend Authorization header: pooled sessions replay
 		// the headers of the request that opened them long after it expires.
-		passthroughHeaders := slices.Clone(server.PassthroughHeaderNames)
+		// Attribution was derived before the loopback and travels independently
+		// of Authorization. Each component gateway applies its own selections.
+		for _, name := range types.ObotHeaders() {
+			passthroughHeaders = append(passthroughHeaders, string(name))
+		}
 
 		servers := make([]mmmcpconfig.Server, 0, len(server.Components))
+
 		for _, component := range server.Components {
 			tools := make([]mmmcpconfig.ToolOverride, 0, len(component.Tools))
+
 			for _, tool := range component.Tools {
 				tools = append(tools, mmmcpconfig.ToolOverride{
 					Name:                tool.Name,
@@ -340,6 +360,7 @@ func MMMCPConfig(server ServerConfig, env map[string][]byte) *mmmcpconfig.Config
 		}
 
 		config.Servers = servers
+
 		return config
 	}
 
@@ -359,15 +380,23 @@ func MMMCPConfig(server ServerConfig, env map[string][]byte) *mmmcpconfig.Config
 
 	componentName := replacer.Replace(serverName)
 
+	headers := make(map[string]string)
+	for name, values := range attribution.Configured(server.Headers, nil, nil) {
+		if values[0] != "" {
+			headers[name] = values[0]
+		}
+	}
+
 	config.Servers = []mmmcpconfig.Server{{
 		Name:               componentName,
 		URL:                server.URL,
-		Headers:            keyValueSliceToMap(server.Headers),
-		PassthroughHeaders: server.PassthroughHeaderNames,
+		Headers:            headers,
+		PassthroughHeaders: passthroughHeaders,
 		Command:            server.Command,
 		Args:               slices.Clone(server.Args),
 		Env:                completeEnv,
 	}}
+
 	return config
 }
 
@@ -423,12 +452,25 @@ func hookDefinitions(webhooks []Webhook, replacer *strings.Replacer) Hooks {
 	definitions := make(Hooks, 0, len(webhooks))
 	for _, webhook := range webhooks {
 		webhookName := webhookServerName(webhook, replacer)
-		targetName := webhookName + "/" + webhook.ToolName
+		target := HookTarget{
+			Target:           webhookName + "/" + webhook.ToolName,
+			MutateDisallowed: !webhook.MutateAllowed,
+			Name:             webhook.DisplayName,
+		}
+		if webhook.Guardrail != nil {
+			// A guardrail filter's action, not allowedToMutate, decides whether it may
+			// change messages: redaction is its mutation.
+			target = HookTarget{
+				Target:    webhookName,
+				Name:      webhook.DisplayName,
+				Guardrail: &GuardrailTarget{FilterName: webhook.Name, Config: *webhook.Guardrail.DeepCopy()},
+			}
+		}
 
 		if len(webhook.Definitions) == 0 {
 			definitions = append(definitions, HookMapping{
 				Name:    "*",
-				Targets: []HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
+				Targets: []HookTarget{target},
 			})
 			continue
 		}
@@ -441,7 +483,7 @@ func hookDefinitions(webhooks []Webhook, replacer *strings.Replacer) Hooks {
 			if len(def.Identifiers) == 0 {
 				definitions = append(definitions, HookMapping{
 					Name:    method,
-					Targets: []HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
+					Targets: []HookTarget{target},
 				})
 			}
 			for _, id := range def.Identifiers {
@@ -452,7 +494,7 @@ func hookDefinitions(webhooks []Webhook, replacer *strings.Replacer) Hooks {
 				definitions = append(definitions, HookMapping{
 					Name:    method,
 					Params:  params,
-					Targets: []HookTarget{{Target: targetName, MutateDisallowed: !webhook.MutateAllowed}},
+					Targets: []HookTarget{target},
 				})
 			}
 		}
@@ -467,18 +509,4 @@ func webhookServerName(webhook Webhook, replacer *strings.Replacer) string {
 		name = replacer.Replace(webhook.DisplayName)
 	}
 	return name
-}
-
-func keyValueSliceToMap(values []string) map[string]string {
-	if len(values) == 0 {
-		return nil
-	}
-
-	result := make(map[string]string, len(values))
-	for _, value := range values {
-		if k, v, ok := strings.Cut(value, "="); ok && v != "" {
-			result[k] = v
-		}
-	}
-	return result
 }

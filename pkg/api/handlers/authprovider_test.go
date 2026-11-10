@@ -40,21 +40,21 @@ func (f *failProviderChangeCreateStorage) Create(ctx context.Context, obj kclien
 
 func TestEnsureNoPendingAuthProviderCleanup(t *testing.T) {
 	authProvider := v1.AuthProvider{
-		Name: "entra-auth-provider",
+		Name: "google-auth-provider",
 		Spec: v1.AuthProviderSpec{
 			AuthProviderManifest: clienttypes.AuthProviderManifest{
-				GroupIDPrefix: "entra/",
+				GroupIDPrefix: "google/",
 			},
 		},
 	}
 	req := api.Context{
-		Request: httptest.NewRequest(http.MethodPost, "/api/auth-providers/entra-auth-provider/configure", nil),
+		Request: httptest.NewRequest(http.MethodPost, "/api/auth-providers/google-auth-provider/configure", nil),
 		Storage: newFakeStorage(t,
 			&v1.AuthProviderCleanup{
-				Name:      name.SafeConcatName(system.AuthProviderCleanupPrefix, "entra-auth-provider"),
+				Name:      name.SafeConcatName(system.AuthProviderCleanupPrefix, "google-auth-provider"),
 				Namespace: system.DefaultNamespace,
 				Spec: v1.AuthProviderCleanupSpec{
-					AuthProviderName: "entra-auth-provider",
+					AuthProviderName: "google-auth-provider",
 				},
 			},
 		),
@@ -94,7 +94,7 @@ func TestEnsureNoPendingAuthProviderCleanupBlocksPrefixReuse(t *testing.T) {
 
 func TestConfigureAuthProviderStagesCredentialAndWaitsForChangeDeletion(t *testing.T) {
 	authProvider := &v1.AuthProvider{
-		Name:      "entra-auth-provider",
+		Name:      "google-auth-provider",
 		Namespace: system.DefaultNamespace,
 		Spec: v1.AuthProviderSpec{
 			AuthProviderManifest: clienttypes.AuthProviderManifest{
@@ -111,7 +111,7 @@ func TestConfigureAuthProviderStagesCredentialAndWaitsForChangeDeletion(t *testi
 	licenseProvider, err := license.NewProvider(t.Context(), nil, license.Config{})
 	require.NoError(t, err)
 	providerDispatcher := dispatcher.New(nil, storage, gatewayClient, licenseProvider, "", "", "")
-	request := httptest.NewRequest(http.MethodPost, "/api/auth-providers/entra-auth-provider/configure", bytes.NewBufferString(`{"CLIENT_SECRET":"secret","EMPTY":""}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/auth-providers/google-auth-provider/configure", bytes.NewBufferString(`{"CLIENT_SECRET":"secret","EMPTY":""}`))
 	request.SetPathValue("id", authProvider.Name)
 	req := api.Context{
 		ResponseWriter: httptest.NewRecorder(),
@@ -213,26 +213,6 @@ func TestStageGenericOAuthRejectsInvalidIssuerConfiguration(t *testing.T) {
 			require.ErrorContains(t, err, test.errorText)
 		})
 	}
-}
-
-func TestConfigureGenericOAuthIssuerChangeRequiresTrustReconfirmation(t *testing.T) {
-	newIssuer := newOIDCDiscoveryServer(t, "")
-	gatewayClient, err := callGenericOAuthAuthProviderChange(t, "configure", newIssuer, "https://old.example.com")
-	require.ErrorContains(t, err, "account-linking trust must be re-confirmed")
-
-	credential, err := gatewayClient.RevealCredential(t.Context(), []string{GenericOAuthAuthProviderName}, GenericOAuthAuthProviderName)
-	require.NoError(t, err)
-	assert.Equal(t, "https://old.example.com", credential.Secrets[GenericOAuthIssuerEnvVar])
-}
-
-func TestStageGenericOAuthIssuerChangeRequiresTrustReconfirmation(t *testing.T) {
-	newIssuer := newOIDCDiscoveryServer(t, "")
-	gatewayClient, err := callGenericOAuthAuthProviderChange(t, "stage", newIssuer, "https://old.example.com")
-	require.ErrorContains(t, err, "account-linking trust must be re-confirmed")
-
-	credential, err := gatewayClient.RevealCredential(t.Context(), []string{system.ReplacementAuthProviderCredentialContext}, GenericOAuthAuthProviderName)
-	require.NoError(t, err)
-	assert.Equal(t, "https://old.example.com", credential.Secrets[GenericOAuthIssuerEnvVar])
 }
 
 func callGenericOAuthAuthProviderChange(t *testing.T, action, issuer, existingIssuer string) (*gateway.Client, error) {

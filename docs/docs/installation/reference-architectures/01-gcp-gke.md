@@ -9,7 +9,7 @@ Deploying Obot to Google Kubernetes Engine follows the standard Helm workflow. A
 
 * GCP project
 * VPC Network
-* Google Cloud SQL instance running PostgreSQL 17+
+* Google Cloud SQL instance running PostgreSQL 17+.
 * VPC Network Peering between your VPC Network and the Cloud SQL instance
 * (Optional) Google Cloud KMS key for encrypting sensitive information
 * (Optional) IAM role with necessary permissions if you're using Google Cloud KMS for encryption
@@ -105,7 +105,7 @@ secret:
   # Optional: generated automatically when omitted from the chart-managed Secret
   OBOT_BOOTSTRAP_TOKEN: "<bootstrap password>"
 
-  # Optionally configure model providers
+  # Optional: configures the LLM gateway's OpenAI provider at startup
   OPENAI_API_KEY: "<your openai api key>"
 
 # Non-sensitive configuration
@@ -116,10 +116,6 @@ config:
 
   # Enable authentication
   OBOT_SERVER_ENABLE_AUTHENTICATION: true
-
-  # Optionally Preseed admin and owner users
-  OBOT_SERVER_AUTH_ADMIN_EMAILS: "<comma separated list of admin emails>"
-  OBOT_SERVER_AUTH_OWNER_EMAILS: "<comma separated list of owner emails>"
 
 ```
 

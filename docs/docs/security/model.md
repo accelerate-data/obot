@@ -17,7 +17,7 @@ Power User and Power User+ can deploy server code. Treat them as privileged role
 
 For production, review [Network and workload isolation](./isolation.md), [Credentials and encryption](./credentials.md), and [Policy coverage](./policy-coverage.md). Application encryption is disabled by default and protects selected fields when enabled, not the entire deployment.
 
-Device enforcement is experimental and has explicit [client and failure-mode limitations](../device-management/enforcement.md). Gateway policies do not govern traffic that bypasses the gateway.
+Device enforcement is experimental, runs on a device the user controls, and has explicit [client and failure-mode limitations](../device-management/enforcement.md#limitations). Gateway policies do not govern traffic that bypasses the gateway.
 
 The MCP Platform is Obot's unified management interface for deploying, managing, and operating MCP servers. It provides role-based access to server management, registries, audit logs, usage tracking, and platform administration.
 
@@ -53,6 +53,7 @@ Owners can assign the **Owner** and **Auditor** roles; Admins cannot. For more i
 - [MCP Access Policies](../mcp-gateway/access.md) - Control which servers are available to which users and groups
 - [Audit Logs and Usage](./audit-data.md) - Monitor activity and track consumption
 - [Filters](../functionality/filters.md) - Inspect and control MCP traffic
+- [Guardrails](../functionality/guardrails.md) - Block, redact or log sensitive or unwanted content in LLM traffic, and in MCP traffic with guardrail filters
 - [Server Scheduling](../operations/capacity.md) - Configure pod scheduling behavior for MCP servers
 - [Skills](../registries/publish-skills.md) - Manage skill sources and browse discoverable skills for agents
 - [Skill Access Policies](../registries/publish-skills.md) - Control which users and groups can access which skills

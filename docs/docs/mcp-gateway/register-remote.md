@@ -13,7 +13,7 @@ Register an existing HTTP MCP endpoint when the server runs outside Obot. Obot p
 
 For a complete provider-specific setup, see the [Slack MCP tutorial](../configuration/tutorials/slack-mcp-server.md).
 
-Obot blocks localhost, private-IP, and link-local remote destinations by default. Use a tunnel for private services when appropriate. Do not disable these protections globally just to make an arbitrary endpoint connect. See [Network isolation](../security/isolation.md) for the separate gateway and workload boundaries.
+Obot blocks localhost, private-IP, and link-local remote destinations by default. Use a tunnel for private services when appropriate. Do not disable these protections globally just to make an arbitrary endpoint connect. See [Network isolation](../security/isolation.md) for the separate gateway and workload boundaries. A remote server's URL is refused when it resolves to such an address; set `OBOT_SERVER_DISALLOW_PRIVATE_IPMCP=false` (or the `LOCALHOST` and `LINK_LOCAL` equivalents) only when that is intended. Guardrail services are different: they may be on a private network, as described in [Guardrails](../functionality/guardrails.md).
 
 ## Remote server {#mcp-servers-remote-server}
 
@@ -30,6 +30,10 @@ Remote MCP servers that conform to the MCP spec authentication schema will work 
 **Configuration**: Specify the remote URL endpoint. Additional options include connection restrictions for unconventional configurations, custom HTTP headers, and configuration values to send to the remote server.
 
 If Obot cannot directly reach a remote server, use an [MCP tunnel](./filters-tunnels.md#mcp-tunnels-create-an-mcp-tunnel) to route requests through a machine on the server's network. Keep the remote server's real HTTP or HTTPS URL and select the tunnel separately in **Advanced Configuration**.
+
+## Caller attribution headers
+
+Remote MCP servers support [caller attribution headers](./server-configuration.md#caller-attribution-headers). Use them to send selected information about the caller authenticated by Obot to the backend. See the shared configuration guide for setup, available headers, and limits.
 
 ## Localhost OAuth callbacks
 

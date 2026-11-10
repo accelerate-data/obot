@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -234,11 +235,8 @@ func (pm *Manager) ServeHTTP(user user.Info, w http.ResponseWriter, r *http.Requ
 		provider = param
 	}
 
-	// Save the redirect target for later.
-	rdParam := r.URL.Query().Get("rd")
-	if rdParam == "" {
-		rdParam = "/"
-	}
+	// Keep fallback sign-out redirects within Obot when no provider can handle the request.
+	rdParam := auth.SafeRedirectPath(r.URL.Query().Get("rd"))
 
 	// If no provider is set, just use the alphabetically first provider.
 	if provider == "" {
@@ -347,11 +345,19 @@ func (p *Proxy) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/oauth2/sign_out":
 	case "/oauth2/callback":
 	default:
-		http.Error(w, "not found", http.StatusNotFound)
-		return
+		if !isOAuth2StaticAsset(r.URL.Path) {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 	}
 
 	p.proxy.ServeHTTP(w, r)
+}
+
+func isOAuth2StaticAsset(urlPath string) bool {
+	return strings.HasPrefix(urlPath, "/oauth2/static/") &&
+		!strings.HasSuffix(urlPath, "/") &&
+		path.Clean(urlPath) == urlPath
 }
 
 func (p *Proxy) authenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
@@ -450,6 +456,7 @@ func checkStateResponse(statusCode int, body []byte) error {
 		for _, msg := range []string{
 			"record not found",
 			"session ticket cookie failed validation",
+			"cookie signature not valid",
 			"refreshing token returned 401",
 			"refreshing token returned 403",
 		} {

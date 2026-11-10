@@ -13,6 +13,14 @@ FROM base AS bin
 ARG OBOT_VERSION
 WORKDIR /app
 COPY . .
+# With MODEL_DATA_URL set, as CI sets it for the main and release images, the LLM gateway's
+# model prices and capabilities are downloaded and embedded in the binary (see
+# pkg/modeldata), and the build fails if they can't be. Without it, the image downloads them
+# when it starts.
+ARG MODEL_DATA_URL=
+RUN --mount=type=cache,target=/root/.cache/go-build \
+  --mount=type=cache,target=/root/go/pkg/mod \
+  MODEL_DATA_URL="${MODEL_DATA_URL}" go run ./tools/fetch-model-data
 RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
   --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/root/.cache/uv \
@@ -29,7 +37,7 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin
 WORKDIR /home/postgres
 
-RUN apk add --no-cache postgresql-17 postgresql-17-oci-entrypoint postgresql-17-client postgresql-17-contrib gosu ecpg-17 glibc-locale-en glibc-locale-posix posix-libc-utils
+RUN apk add --no-cache postgresql-18 postgresql-18-oci-entrypoint postgresql-18-client postgresql-18-contrib gosu glibc-locale-en glibc-locale-posix posix-libc-utils
 
 ENTRYPOINT [ "/usr/bin/docker-entrypoint.sh", "postgres" ]
 

@@ -6,6 +6,8 @@ title: "Add hosted MCP servers"
 
 Obot deploys and manages hosted MCP server workloads on Kubernetes or Docker. For production workloads, prefer a container image that packages the server and its dependencies together. Pin the image by digest to deploy the same artifact consistently across environments; rebuild and update it deliberately when dependencies change.
 
+See [MCP image maintenance](../security/mcp-images.md) for how Obot maintains its catalog images.
+
 ## Runtime Types
 
 - **[Node.js (npx)](./mcp-hosting.md#mcp-servers-npx-nodetypescript-based-mcp-servers)**: Run npm-packaged MCP servers via STDIO
@@ -107,6 +109,10 @@ Select the container runtime and provide:
 - **Command and arguments**: Any overrides needed to start the server.
 
 Declare environment variables and other required configuration fields, then choose how unresolved values are supplied when adding the entry to a vMCP.
+
+#### Caller attribution headers
+
+Containerized MCP servers support [caller attribution headers](../mcp-gateway/server-configuration.md#caller-attribution-headers) on both Docker and Kubernetes. See the shared configuration guide for setup, available headers, and limits.
 
 ### OpenAPI: Import an HTTP API
 

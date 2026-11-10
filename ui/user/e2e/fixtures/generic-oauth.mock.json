@@ -6,8 +6,7 @@
 		"clientId": "obot-e2e-client",
 		"clientSecret": "obot-e2e-secret",
 		"scope": "openid email profile",
-		"emailDomains": "example.com",
-		"trustEmailLinking": true
+		"emailDomains": "example.com"
 	},
 	"user": {
 		"subject": "studio-user-1",

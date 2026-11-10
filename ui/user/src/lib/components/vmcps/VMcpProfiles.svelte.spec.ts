@@ -15,12 +15,20 @@ vi.mock('$app/state', async (importOriginal) => {
 	return createAppState(actual);
 });
 
-vi.mock('$app/navigation', async (importOriginal) => {
-	const actual = await importOriginal<typeof import('$app/navigation')>();
+vi.mock('$app/navigation', async () => {
 	const { applyTestGoto } = await import('../../../tests/helpers/navigation.svelte');
 	return {
-		...actual,
-		goto: (url: string | URL) => applyTestGoto(url)
+		goto: (url: string | URL) => applyTestGoto(url),
+		invalidate: vi.fn(),
+		invalidateAll: vi.fn(),
+		preloadCode: vi.fn(),
+		preloadData: vi.fn(),
+		beforeNavigate: vi.fn(),
+		afterNavigate: vi.fn(),
+		onNavigate: vi.fn(),
+		pushState: vi.fn(),
+		replaceState: vi.fn(),
+		disableScrollHandling: vi.fn()
 	};
 });
 
@@ -117,7 +125,7 @@ function createVMcpWithDisabledTool(id: string) {
 
 describe('VMcpProfiles.svelte', () => {
 	afterEach(() => {
-		appPage.url.searchParams.delete('profile');
+		(appPage.url as URL).searchParams.delete('profile');
 	});
 	it.each<{
 		name: string;
@@ -233,7 +241,7 @@ describe('VMcpProfiles.svelte', () => {
 
 	it('opens the profile selected in the URL', async () => {
 		const vmcp = createVMcp('vmcp-profile-from-url');
-		appPage.url.searchParams.set('profile', 'default');
+		(appPage.url as URL).searchParams.set('profile', 'default');
 
 		render(VMcpProfiles, { vmcp, toolFlow: toolFlowStub() });
 

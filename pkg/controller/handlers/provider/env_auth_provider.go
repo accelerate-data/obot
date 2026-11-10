@@ -198,6 +198,8 @@ func applyGenericOAuthDefaults(providerID string, secrets map[string]string) {
 	if strings.TrimSpace(secrets[authProviderEmailDomainsEnv]) == "" {
 		secrets[authProviderEmailDomainsEnv] = "*"
 	}
+	// Inert since upstream obot#8415 removed email linking; it is supplied only because the
+	// published providers registry still lists it as required.
 	if strings.TrimSpace(secrets[genericOAuthTrustEmailLinkingEnvVar]) == "" {
 		secrets[genericOAuthTrustEmailLinkingEnvVar] = "false"
 	}

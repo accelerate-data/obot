@@ -13,7 +13,6 @@ type GenericOAuthFixture = {
 		clientSecret: string;
 		scope: string;
 		emailDomains: string;
-		trustEmailLinking: boolean;
 	};
 	user: {
 		subject: string;
@@ -272,9 +271,8 @@ async function configureGenericProvider(
 			OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_SECRET: fixture.provider.clientSecret,
 			OBOT_GENERIC_OAUTH_AUTH_PROVIDER_SCOPE: fixture.provider.scope,
 			OBOT_AUTH_PROVIDER_EMAIL_DOMAINS: fixture.provider.emailDomains,
-			OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING: String(
-				fixture.provider.trustEmailLinking
-			),
+			// Inert since upstream obot#8415, but the registry still requires it.
+			OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING: 'false',
 			PATH: process.env.PATH ?? ''
 		}
 	});

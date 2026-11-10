@@ -62,7 +62,7 @@ func newFenceClaimGatewayWithObjects(t *testing.T, objects ...kclient.Object) *g
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	client := gateway.New(t.Context(), db, storage, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	client := gateway.New(t.Context(), db, storage, staticOAuthTestEncryptionConfig(), nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	return client
 }
@@ -148,7 +148,7 @@ func TestStateManagerFencesCallbackWriteAfterProviderExchange(t *testing.T) {
 				tc.changeApp(t, client)
 			})
 			manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
-			require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "request-1", fenceClaimEntryName, "state-1", "verifier-1", "", fenceClaimConfig(provider, "client-1", "secret-1")))
+			require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "", "request-1", fenceClaimEntryName, "state-1", "verifier-1", "", fenceClaimConfig(provider, "client-1", "secret-1")))
 
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
@@ -174,7 +174,7 @@ func TestStateManagerRejectsLegacyStaticPendingState(t *testing.T) {
 	manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
 	// An empty catalog entry models a pending row created before the fence columns
 	// existed; it carries no generation, so a static-only entry must refuse it.
-	require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "request-1", "", "legacy-state", "verifier-1", "", fenceClaimConfig(provider, "client-1", "secret-1")))
+	require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "", "request-1", "", "legacy-state", "verifier-1", "", fenceClaimConfig(provider, "client-1", "secret-1")))
 
 	_, _, err := manager.createToken(t.Context(), "legacy-state", "code-1", "", "")
 	requireFenceClaimCallbackRejected(t, client, err, "legacy-state")
@@ -184,7 +184,7 @@ func TestStateManagerPreservesLegacyDynamicPendingState(t *testing.T) {
 	client := newFenceClaimGateway(t, false)
 	provider := newFenceClaimProvider(t, "dynamic-access", nil)
 	manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
-	require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "request-1", "", "legacy-dynamic", "verifier-1", "", fenceClaimConfig(provider, "dynamic-client", "dynamic-secret")))
+	require.NoError(t, manager.store(t.Context(), "user-1", fenceClaimMCPID, fenceClaimMCPURL, "", "request-1", "", "legacy-dynamic", "verifier-1", "", fenceClaimConfig(provider, "dynamic-client", "dynamic-secret")))
 
 	_, _, err := manager.createToken(t.Context(), "legacy-dynamic", "code-1", "", "")
 	require.NoError(t, err)
@@ -217,7 +217,7 @@ func TestStateManagerPersistsDirectDynamicAndCIMDCallbacks(t *testing.T) {
 			manager := newStateManager(client, fixedTokenClient(http.DefaultClient))
 			state := "legacy-direct-state"
 			if tc.legacy {
-				require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "request-1", "", state, "verifier-1", "", config))
+				require.NoError(t, manager.store(t.Context(), "user-1", mcpID, mcpURL, "", "request-1", "", state, "verifier-1", "", config))
 			} else {
 				handler := &mcpOAuthHandler{
 					gatewayClient: client, stateMgr: manager,

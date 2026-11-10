@@ -1,6 +1,6 @@
-import { base as routerBase } from '$app/paths';
+import { resolve } from '$app/paths';
 import { stripBasePath } from './lib/appBasePath';
-import type { Reroute } from '@sveltejs/kit';
+import type { Reroute } from '@sveltejs/kit/hooks';
 
 const ADMIN_MCP_SERVERS_PREFIX = '/admin/mcp-catalog';
 const ADMIN_MCP_DEPLOYMENTS_PREFIX = '/admin/mcp-deployments';
@@ -16,6 +16,8 @@ export const reroute: Reroute = ({ url }) => {
 	// already get that prefix as SvelteKit's base; the fallback shell that
 	// serves dynamic routes pins the base to "", so strip the prefix here for
 	// those or the browser path falls through to the not-found page.
+	// SvelteKit 3 no longer exports `base`; `resolve('/')` is `${base}/`.
+	const routerBase = resolve('/').replace(/\/$/, '');
 	const pathname = stripBasePath(url.pathname, routerBase);
 
 	if (pathname.startsWith(`${ADMIN_MCP_DEPLOYMENTS_PREFIX}/`)) {

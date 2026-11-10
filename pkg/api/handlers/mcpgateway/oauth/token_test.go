@@ -73,7 +73,7 @@ func newOAuthTokenTestServices(t *testing.T, objects ...kclient.Object) (storage
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
 
-	gatewayClient := gatewayclient.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gatewayClient := gatewayclient.New(t.Context(), db, storage, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
 	require.NoError(t, db.WithContext(t.Context()).Create(&gatewaytypes.User{
 		ID:       42,
@@ -327,4 +327,58 @@ func TestDoRefreshTokenRotatesTokenAndPreservesScope(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(errHTTP.Message), &oauthErr))
 	assert.Equal(t, "invalid_grant", string(oauthErr.Code))
 	assert.Equal(t, "Obot: refresh_token is invalid", oauthErr.Description)
+}
+
+func TestOpaqueScopesEchoAndRefreshWithoutChallengeRecords(t *testing.T) {
+	const code = "captured-code"
+	const scopes = "profile obot:upstream:deleted obot:upstream:unknown"
+	authRequest := &v1.OAuthAuthRequest{
+		Name:      "oauth-captured",
+		Namespace: system.DefaultNamespace,
+		Spec: v1.OAuthAuthRequestSpec{
+			ClientID:       "client",
+			Resource:       "https://obot.example.com/mcp-connect/" + system.VMCPPrefix + "test",
+			MCPID:          system.VMCPPrefix + "test",
+			Scope:          scopes,
+			UserID:         42,
+			HashedAuthCode: fmt.Sprintf("%x", sha256.Sum256([]byte(code))),
+		},
+	}
+	storage, gateway, tokens := newOAuthTokenTestServices(t, authRequest)
+	h := &handler{
+		baseURL:      "https://obot.example.com",
+		tokenService: tokens,
+	}
+	recorder := httptest.NewRecorder()
+	req := api.Context{
+		Request:        httptest.NewRequest(http.MethodPost, "/oauth/token", nil),
+		ResponseWriter: recorder,
+		Storage:        storage,
+		GatewayClient:  gateway,
+	}
+	client := v1.OAuthClient{
+		Name:      "client",
+		Namespace: system.DefaultNamespace,
+	}
+	require.NoError(t, h.doAuthorizationCode(req, client, code, ""))
+
+	var response types.OAuthToken
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&response))
+	require.Equal(t, scopes, response.Scope)
+
+	claims, err := tokens.DecodeToken(t.Context(), response.AccessToken)
+	require.NoError(t, err)
+	require.Equal(t, "client", claims.OAuthClientID)
+	require.Equal(t, scopes, claims.OAuthScope)
+
+	recorder = httptest.NewRecorder()
+	req.ResponseWriter = recorder
+	require.NoError(t, h.doRefreshToken(req, client, response.RefreshToken))
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&response))
+	require.Equal(t, scopes, response.Scope)
+
+	claims, err = tokens.DecodeToken(t.Context(), response.AccessToken)
+	require.NoError(t, err)
+	require.Equal(t, "client", claims.OAuthClientID)
+	require.Equal(t, scopes, claims.OAuthScope)
 }

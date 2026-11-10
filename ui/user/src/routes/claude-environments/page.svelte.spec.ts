@@ -6,20 +6,50 @@ import { getProfileResponse } from '../../tests/mocks/data';
 import { worker } from '../../tests/mocks/worker';
 import Sessions from './+page.svelte';
 import { http, HttpResponse } from 'msw';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { cleanup, render } from 'vitest-browser-svelte';
 import { page } from 'vitest/browser';
 
+vi.mock('$app/navigation', () => ({
+	goto: vi.fn(),
+	invalidate: vi.fn(),
+	invalidateAll: vi.fn(),
+	preloadCode: vi.fn(),
+	preloadData: vi.fn(),
+	beforeNavigate: vi.fn(),
+	afterNavigate: vi.fn(),
+	onNavigate: vi.fn(),
+	pushState: vi.fn(),
+	replaceState: vi.fn(),
+	disableScrollHandling: vi.fn()
+}));
+
+const sessionUrlKeys = [
+	'view',
+	'environment',
+	'sort',
+	'sortDirection',
+	'query',
+	'status',
+	'user',
+	'variant',
+	'showMySessionsOnly'
+];
+
+beforeEach(() => {
+	for (const key of sessionUrlKeys) (appPage.url as URL).searchParams.delete(key);
+});
+
 afterEach(() => {
 	cleanup();
-	appPage.url.searchParams.delete('view');
-	appPage.url.searchParams.delete('environment');
+	vi.restoreAllMocks();
+	for (const key of sessionUrlKeys) (appPage.url as URL).searchParams.delete(key);
 });
 
 it('shows session status and confirms workspace deletion', async () => {
 	await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: true } });
 	profile.initialize(createMockProfile([]));
-	appPage.url.searchParams.set('view', 'sessions');
+	(appPage.url as URL).searchParams.set('view', 'sessions');
 	const removed = vi.fn();
 	worker.use(
 		http.get('*/api/claude-sessions', () =>
@@ -70,14 +100,14 @@ it('shows session status and confirms workspace deletion', async () => {
 		.element(page.getByRole('link', { name: 'Open Slack thread' }))
 		.toHaveAttribute('href', 'https://acorn-io.slack.com/archives/C123/p123?thread_ts=1.23');
 	await expect
-		.element(page.getByRole('listitem').getByText('Last used', { exact: true }))
+		.element(page.getByRole('listitem').getByText('Last used:', { exact: true }))
 		.toBeVisible();
-	expect(document.querySelector('time')?.getAttribute('datetime')).toBe('2026-01-01T12:00:00Z');
+	await expect.element(page.getByCSS('time')).toHaveAttribute('datetime', '2026-01-01T12:00:00Z');
 	await expect
 		.element(page.getByText('https://github.com/obot-platform/obot', { exact: false }))
 		.toBeVisible();
 	await expect.element(page.getByText('main', { exact: true })).toBeVisible();
-	await page.getByRole('button', { name: 'Delete workspace', exact: true }).click();
+	await page.getByRole('button', { name: 'Delete session', exact: true }).click();
 	await expect
 		.element(
 			page.getByText(
@@ -86,7 +116,7 @@ it('shows session status and confirms workspace deletion', async () => {
 		)
 		.toBeVisible();
 	expect(removed).not.toHaveBeenCalled();
-	await page.getByRole('button', { name: 'Delete workspace', exact: true }).last().click();
+	await page.getByRole('button', { name: 'Delete session', exact: true }).last().click();
 	await vi.waitFor(() => expect(removed).toHaveBeenCalledTimes(1));
 	await expect
 		.element(
@@ -97,7 +127,7 @@ it('shows session status and confirms workspace deletion', async () => {
 
 it('shows all sessions with owner attribution', async () => {
 	await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: true } });
-	appPage.url.searchParams.set('view', 'sessions');
+	(appPage.url as URL).searchParams.set('view', 'sessions');
 	const requested = vi.fn();
 	worker.use(
 		http.get('*/api/users', () =>
@@ -150,9 +180,9 @@ it('shows all sessions with owner attribution', async () => {
 		.toBeVisible();
 	await expect.element(page.getByText('v0.3.0', { exact: true })).toBeVisible();
 	await expect
-		.element(page.getByRole('listitem').getByText('Last used', { exact: true }))
+		.element(page.getByRole('listitem').getByText('Last used:', { exact: true }))
 		.toBeVisible();
-	expect(document.querySelector('time')?.getAttribute('datetime')).toBe('2026-01-01T12:00:00Z');
+	await expect.element(page.getByCSS('time')).toHaveAttribute('datetime', '2026-01-01T12:00:00Z');
 	await expect.element(page.getByText('env-one', { exact: true })).toBeVisible();
 	await expect.element(page.getByText('Runner unavailable', { exact: true })).toBeVisible();
 	expect(requested).toHaveBeenCalledWith('true');
@@ -161,7 +191,7 @@ it('shows all sessions with owner attribution', async () => {
 it('loads only the current user’s sessions and hides the owner filter', async () => {
 	await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: true } });
 	profile.initialize(createMockProfile([]));
-	appPage.url.searchParams.set('view', 'sessions');
+	(appPage.url as URL).searchParams.set('view', 'sessions');
 	const requested = vi.fn();
 	worker.use(
 		http.get('*/api/claude-sessions', ({ request }) => {
@@ -183,7 +213,7 @@ it('loads only the current user’s sessions and hides the owner filter', async 
 
 async function renderTwoSessions() {
 	await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: true } });
-	appPage.url.searchParams.set('view', 'sessions');
+	(appPage.url as URL).searchParams.set('view', 'sessions');
 	worker.use(
 		http.get('*/api/users', () =>
 			HttpResponse.json({
@@ -279,7 +309,7 @@ it('filters sessions by status and owner, and sorts by name', async () => {
 
 it('lets admins request suspension and shows the pending state', async () => {
 	await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: true } });
-	appPage.url.searchParams.set('view', 'sessions');
+	(appPage.url as URL).searchParams.set('view', 'sessions');
 	let suspended = false;
 	worker.use(
 		http.get('*/api/claude-sessions', () =>
@@ -334,7 +364,7 @@ it.each(['sessions', 'all-sessions'])(
 	'hides disabled session views opened directly: %s',
 	async (view) => {
 		await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: false } });
-		appPage.url.searchParams.set('view', view);
+		(appPage.url as URL).searchParams.set('view', view);
 		const requested = vi.fn();
 		worker.use(
 			http.get('*/api/claude-environments', () => HttpResponse.json({ enabled: false })),
@@ -357,7 +387,7 @@ it.each(['sessions', 'all-sessions'])(
 
 it('opens the environment form when the environment query is set', async () => {
 	await preparePageData({ version: { engine: 'kubernetes', claudeEnvironmentsEnabled: true } });
-	appPage.url.searchParams.set('environment', 'new');
+	(appPage.url as URL).searchParams.set('environment', 'new');
 	vi.spyOn(UserService, 'listVMCPs').mockResolvedValue([]);
 	worker.use(
 		http.get('*/api/claude-environments', () =>

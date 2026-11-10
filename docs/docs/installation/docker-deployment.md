@@ -81,7 +81,7 @@ docker run -d \
 
 Once started, access Obot at http://localhost:8080.
 
-If you enabled authentication, use your bootstrap token to log in as the owner and set up an authentication provider. If you didn't supply a bootstrap token, a random one will be generated and can be found in the container's logs by searching for "Bootstrap token".
+If you enabled authentication, log in with your bootstrap token, create the owner account, and then set up an authentication provider. See [Setting up Authentication](../configuration/auth-providers.md#setting-up-authentication). If you didn't supply a bootstrap token, a random one will be generated and can be found in the container's logs by searching for "Bootstrap token".
 
 ### Preconfigure a Local owner
 
@@ -111,7 +111,7 @@ The Local provider is configured automatically. Bootstrap-token login is disable
 ## Next Steps
 
 1. **Configure Authentication**: Set up [auth providers](../security/authentication.md) for secure access
-2. **Configure Model Providers**: Configure [model providers](../configuration/model-providers.md) (OpenAI, Anthropic, etc.)
+2. **Add LLM Providers**: Add providers (OpenAI, Anthropic, etc.) under **LLM Gateway** → **Providers**. See [Configure providers and models](../configuration/model-providers.md).
 3. **Set Up MCP Servers**: Configure [MCP servers](../functionality/mcp-servers.md) for extended functionality
 
 ## Related Documentation

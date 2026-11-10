@@ -31,7 +31,7 @@ func TestCreateMCPOAuthPendingStateRejectsIncompleteStaticCredential(t *testing.
 			c := newFenceTestClient(t, true)
 			seedFenceTestCredential(t, c, fenceTestEntry, tc.secrets)
 
-			err := c.CreateMCPOAuthPendingState(t.Context(), fenceTestUser, fenceTestMCPID, fenceTestURL, "request-1", fenceTestEntry, "state-1", "verifier-1", "", &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"})
+			err := c.CreateMCPOAuthPendingStateWithTunnel(t.Context(), fenceTestUser, fenceTestMCPID, fenceTestURL, "", "request-1", fenceTestEntry, "state-1", "verifier-1", "", &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"})
 			if !errors.Is(err, ErrMCPOAuthCatalogCredentialChanged) {
 				t.Fatalf("create pending state error = %v, want catalog credential changed", err)
 			}
@@ -45,7 +45,7 @@ func TestCreateMCPOAuthPendingStateRejectsIncompleteStaticCredential(t *testing.
 func createFenceTestPendingState(t *testing.T, c *Client, catalogEntryName, state string) (*types.MCPOAuthPendingState, *oauth2.Config) {
 	t.Helper()
 	conf := &oauth2.Config{ClientID: "client-1", ClientSecret: "secret-1"}
-	if err := c.CreateMCPOAuthPendingState(t.Context(), fenceTestUser, fenceTestMCPID, fenceTestURL, "request-1", catalogEntryName, state, "verifier", "", conf); err != nil {
+	if err := c.CreateMCPOAuthPendingStateWithTunnel(t.Context(), fenceTestUser, fenceTestMCPID, fenceTestURL, "", "request-1", catalogEntryName, state, "verifier", "", conf); err != nil {
 		t.Fatalf("create pending state: %v", err)
 	}
 	pending, err := c.GetMCPOAuthPendingState(t.Context(), state)

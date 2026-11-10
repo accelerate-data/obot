@@ -63,7 +63,7 @@ func storeDynamicCallbackState(t *testing.T, gateway *gatewayclient.Client, toke
 			AuthStyle: oauth2.AuthStyleInParams,
 		},
 	}
-	if err := newStateManager(gateway, fixedTokenClient(http.DefaultClient)).store(t.Context(), "user", "mcp", "https://mcp.example/mcp", "", "", state, "pkce-verifier", "", conf); err != nil {
+	if err := newStateManager(gateway, fixedTokenClient(http.DefaultClient)).store(t.Context(), "user", "mcp", "https://mcp.example/mcp", "", "", "", state, "pkce-verifier", "", conf); err != nil {
 		t.Fatalf("store pending state: %v", err)
 	}
 }

@@ -41,7 +41,7 @@ func TestVMCPStaticOAuthFenceSupportsMoreComponentsThanPostgresLockPool(t *testi
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
 	storage := newVMCPTestStorage()
-	client := gateway.New(t.Context(), db, storage, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	client := gateway.New(t.Context(), db, storage, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	vmcp := staticOAuthVMCPForClaim()
 	component := vmcp.Spec.Manifest.Components[0]

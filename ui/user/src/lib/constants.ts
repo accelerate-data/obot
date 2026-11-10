@@ -14,10 +14,14 @@ export const UNAUTHORIZED_PATHS = new Set([
 	// Activation carries its setup token in the URL fragment, so redirecting an anonymous visitor
 	// away would discard the only browser-side copy of it.
 	'/activate',
-	// The login page of the Okta SCIM provisioning app, which explains to anyone who opens the app
-	// that it does not sign them in. Okta requires a separate app just to act as a SCIM provisioning
-	// container, and it needs a login URL, even though it will never be used for login. So we point
-	// it to this page.
+	// The login page of an identity provider's SCIM provisioning app, which explains to anyone who
+	// opens the app that it does not sign them in. Okta and OneLogin require a separate app just to
+	// act as a SCIM provisioning container, and it needs a login URL (Okta) or SAML URLs (OneLogin),
+	// even though it will never be used for login. So we point it to this page. Microsoft Entra
+	// needs none: it provisions through the enterprise app that Obot signs in with, and a separate
+	// provisioning app has no login URL to set.
+	'/scim-provisioning',
+	// The same page's first address, which existing Okta SCIM apps still use.
 	'/okta-scim'
 ]);
 
@@ -30,39 +34,15 @@ export const SCIM_VIEW_PATH = '/identity-access?view=auth-providers&subview=scim
 const scimViewParams = Array.from(new URL(SCIM_VIEW_PATH, 'http://localhost').searchParams);
 
 // Whether the query of a URL of Identity & Access selects the SCIM sub-tab, as SCIM_VIEW_PATH's does.
-export function isSCIMView(searchParams: URLSearchParams): boolean {
+export function isSCIMView(searchParams: Pick<URLSearchParams, 'get'>): boolean {
 	return scimViewParams.every(([key, value]) => searchParams.get(key) === value);
 }
 
 export const SEEN_SPLASH_DIALOG_KEY = 'seenSplashDialog';
 
 export const CommonModelProviderIds = {
-	OLLAMA: 'ollama-model-provider',
-	GENERIC_RESPONSES: 'generic-responses-model-provider',
-	GROQ: 'groq-model-provider',
-	VLLM: 'vllm-model-provider',
-	ANTHROPIC: 'anthropic-model-provider',
-	OPENAI: 'openai-model-provider',
-	AZURE_OPENAI: 'azure-openai-model-provider',
-	AMAZON_BEDROCK: 'amazon-bedrock-model-provider',
-	AMAZON_BEDROCK_API_KEY: 'amazon-bedrock-api-key-model-provider',
-	ANTHROPIC_BEDROCK: 'anthropic-bedrock-model-provider',
-	XAI: 'xai-model-provider',
-	DEEPSEEK: 'deepseek-model-provider',
-	GEMINI_VERTEX: 'gemini-vertex-model-provider',
-	GENERIC_OPENAI: 'generic-openai-model-provider',
-	AZURE: 'azure-model-provider',
-	AZURE_ENTRA: 'azure-entra-model-provider'
+	LLM_GATEWAY: 'llm-gateway-model-provider'
 };
-
-export const RecommendedModelProviders = [
-	CommonModelProviderIds.OPENAI,
-	CommonModelProviderIds.ANTHROPIC,
-	CommonModelProviderIds.AMAZON_BEDROCK,
-	CommonModelProviderIds.AMAZON_BEDROCK_API_KEY,
-	CommonModelProviderIds.AZURE,
-	CommonModelProviderIds.AZURE_ENTRA
-];
 
 export const PROJECT_MCP_SERVER_NAME = 'MCP Servers';
 export const DEFAULT_MCP_CATALOG_ID = 'default';
@@ -75,9 +55,11 @@ export const CommonAuthProviderIds = {
 	GITHUB: 'github-auth-provider',
 	GENERIC_OAUTH: 'generic-oauth-auth-provider',
 	OKTA: 'okta-auth-provider',
+	ONELOGIN: 'onelogin-auth-provider',
 	ENTRA: 'entra-auth-provider',
 	AUTH0: 'auth0-auth-provider',
 	JUMPCLOUD: 'jumpcloud-auth-provider',
+	KEYCLOAK: 'keycloak-auth-provider',
 	LOCAL: 'local-auth-provider'
 } as const;
 
@@ -458,6 +440,7 @@ export const MCP_FILTERS_FIELD_IDS = {
 	addFilterBtn: 'filter-add-button',
 	createCustomBtn: 'filter-create-custom-button',
 	createBuiltInBtn: 'filter-create-built-in-button',
+	createGuardrailBtn: 'filter-create-guardrail-button',
 	basicDetails: 'filter-basic-details',
 	runtimeFormDetails: 'filter-runtime-form-details',
 	filterSelectors: 'filter-selectors',

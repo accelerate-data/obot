@@ -148,7 +148,7 @@ func newSCIMServerTest(t *testing.T, authenticatedRateLimit int) *scimServerTest
 			},
 		}).
 		Build()
-	gateway := gclient.New(t.Context(), database, storage, nil, nil, nil, nil, time.Hour, 10, 0, 0, 0, false)
+	gateway := gclient.New(t.Context(), database, storage, nil, nil, time.Hour, 10, 0, 0, 0, false)
 	t.Cleanup(func() {
 		_ = gateway.Close()
 	})
@@ -171,7 +171,7 @@ func newSCIMServerTest(t *testing.T, authenticatedRateLimit int) *scimServerTest
 	s := &Server{
 		gatewayClient: gateway,
 		authenticator: authn.NewAuthenticator(chain),
-		authorizer:    authz.NewAuthorizer(gateway, nil, nil, false, nil, nil, false),
+		authorizer:    authz.NewAuthorizer(gateway, nil, nil, false, nil, nil, nil),
 		auditLogger:   logger,
 		rateLimiter:   limiter,
 		mux:           http.NewServeMux(),

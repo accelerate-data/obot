@@ -1,5 +1,10 @@
 import type { AdminService, UserService } from '$lib/services';
-import type { MCPCatalogEntryFieldManifest, ServerK8sSettings } from '$lib/services/admin/types';
+import type {
+	MCPCatalogEntryFieldManifest,
+	ServerK8sSettings,
+	TokenUsageStats
+} from '$lib/services/admin/types';
+import type { GatewayStatus } from '$lib/services/llm-gateway/gateway';
 import type { K8sServerDetail, MCPServerInstance } from '$lib/services/user/types';
 import { createMCPCatalogEntry, createMCPCatalogServer } from '../helpers/mcp';
 import { faker } from '@faker-js/faker';
@@ -260,11 +265,6 @@ export const getBootstrapStatusResponse = {
 	setupEnabled: true
 } satisfies Awaited<ReturnType<typeof UserService.getBootstrapStatus>>;
 
-export const listExplicitRoleEmailsResponse = {
-	owners: null,
-	admins: null
-} satisfies Awaited<ReturnType<typeof AdminService.listExplicitRoleEmails>>;
-
 export const initiateTempLoginResponse = {
 	redirectUrl: 'https://example.com/temp-login',
 	tokenId: 'temp-login-token'
@@ -351,6 +351,16 @@ export const listSingleOrRemoteMcpServersResponse = [] satisfies Awaited<
 	ReturnType<typeof UserService.listSingleOrRemoteMcpServers>
 >;
 
+// LLM gateway
+
+export const getGatewayStatusResponse = {
+	enabled: true,
+	ready: true,
+	hasProviders: false,
+	modelProviderName: 'llm-gateway-model-provider',
+	proxyPath: '/api/llm-proxy'
+} satisfies GatewayStatus;
+
 // Models
 
 export const listDefaultModelAliasesResponse = [] satisfies Awaited<
@@ -378,7 +388,6 @@ export const listUsersResponse = [
 		created: faker.date.past().toISOString(),
 		effectiveRole: getProfileResponse.effectiveRole,
 		email: getProfileResponse.email,
-		explicitRole: true,
 		groups: getProfileResponse.groups,
 		iconURL: getProfileResponse.iconURL,
 		id: userID,
@@ -502,7 +511,6 @@ export const getVersionResponse = {
 	licenseEntitlements: undefined,
 	mcpDefaultDenyAllEgress: false,
 	mcpNetworkPolicyEnabled: false,
-	messagePoliciesEnabled: false,
 	missingLicenseEntitlements: [],
 	obot: 'v0.0.0-dev',
 	sessionStore: 'cookie',
@@ -612,3 +620,25 @@ export function createDeploymentsPageFixtures() {
 		serverNoCatalogEntry
 	};
 }
+
+const emptyTokenUsageStatsTotals = {
+	requests: 0,
+	successes: 0,
+	fallbacks: 0,
+	avgDurationMs: 0,
+	inputTokens: 0,
+	outputTokens: 0,
+	totalTokens: 0,
+	totalSpend: 0
+};
+
+export const getTokenUsageStatsResponse: TokenUsageStats = {
+	start: '2026-10-01T00:00:00Z',
+	end: '2026-10-08T00:00:00Z',
+	bucketSeconds: 10800,
+	totals: emptyTokenUsageStatsTotals,
+	buckets: [],
+	providers: [],
+	topModelsByRequests: [],
+	topModelsBySpend: []
+};

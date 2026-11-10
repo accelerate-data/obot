@@ -200,13 +200,12 @@ func newUnauthenticatedStaticOAuthCallbackServer(t *testing.T, gateway *gatewayc
 		storage,
 		"default",
 		authn.NewAuthenticator(authn.Anonymous{}),
-		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, false),
+		authz.NewAuthorizer(gateway, storage, storage, false, nil, nil, nil),
 		nil,
 		auditLogger,
 		limiter,
 		"https://obot.example",
 		nil,
-		false,
 		licenseProvider,
 	)
 	h := &handler{staticOAuthHTTPClient: http.DefaultClient, oauthChecker: &MCPOAuthHandlerFactory{stateMgr: newStateManager(gateway, fixedTokenClient(http.DefaultClient))}}
@@ -511,7 +510,7 @@ func newStaticOAuthCallbackGatewayWithDB(t *testing.T) (*gatewayclient.Client, *
 	if err := database.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway database: %v", err)
 	}
-	return gatewayclient.New(t.Context(), database, nil, staticOAuthTestEncryptionConfig(), nil, nil, nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
+	return gatewayclient.New(t.Context(), database, nil, staticOAuthTestEncryptionConfig(), nil, time.Hour, 10, 0, 0, 0, false), services.DB.DB
 }
 
 func staticOAuthTestEncryptionConfig() *encryptionconfig.EncryptionConfiguration {

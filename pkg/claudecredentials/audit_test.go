@@ -12,6 +12,7 @@ import (
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	ext "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	api "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/clauderunner"
@@ -87,7 +88,7 @@ func TestEgressAuditStream(t *testing.T) {
 	first := &ext.ProcessingRequest{Attributes: map[string]*structpb.Struct{"audit": attrs}, Request: &ext.ProcessingRequest_RequestHeaders{RequestHeaders: auditHeaders(map[string]string{":method": "POST", ":authority": "example.com", ":scheme": "https", ":path": "/api?key=secret", "authorization": "Bearer secret"})}}
 	messages := []*ext.ProcessingRequest{
 		first,
-		{Request: &ext.ProcessingRequest_RequestBody{RequestBody: &ext.HttpBody{Body: []byte("request"), EndOfStream: true}}},
+		{Request: &ext.ProcessingRequest_RequestBody{RequestBody: &ext.HttpBody{Body: []byte(strings.Repeat("b", egressBodyLimit+1)), EndOfStream: true}}},
 		{Request: &ext.ProcessingRequest_ResponseHeaders{ResponseHeaders: auditHeaders(map[string]string{":status": "200", "set-cookie": "private"})}},
 		{Request: &ext.ProcessingRequest_ResponseBody{ResponseBody: &ext.HttpBody{Body: []byte(strings.Repeat("a", egressBodyLimit+1)), EndOfStream: true}}},
 	}
@@ -100,11 +101,14 @@ func TestEgressAuditStream(t *testing.T) {
 	require.NoError(t, processor.Process(stream))
 	require.NoError(t, gateway.FlushEgressAuditLogs())
 	require.Len(t, stream.sent, 4)
+	require.Nil(t, stream.sent[0].ModeOverride, "only upgrade requests change the processing mode")
 	entries, _, err := gateway.ListEgressAuditLogs(t.Context(), gclient.EgressAuditLogOptions{Limit: 1})
 	require.NoError(t, err)
 	entry, err := gateway.GetEgressAuditLog(t.Context(), entries[0].ID, true)
 	require.NoError(t, err)
 	require.Equal(t, "complete", entry.Outcome)
+	require.True(t, entry.RequestTruncated)
+	require.EqualValues(t, egressBodyLimit+1, entry.RequestBytes)
 	require.True(t, entry.ResponseTruncated)
 	require.EqualValues(t, egressBodyLimit+1, entry.ResponseBytes)
 	require.NotContains(t, string(entry.RequestHeaders), "secret")
@@ -112,6 +116,9 @@ func TestEgressAuditStream(t *testing.T) {
 	require.NotContains(t, entry.Path, "secret")
 	var body []byte
 	require.NoError(t, json.Unmarshal(entry.ResponseBody, &body))
+	require.Len(t, body, egressBodyLimit)
+
+	require.NoError(t, json.Unmarshal(entry.RequestBody, &body))
 	require.Len(t, body, egressBodyLimit)
 
 	// Direct actor calls and forged identities cannot write audit records.
@@ -142,6 +149,37 @@ func TestEgressAuditInterruptedResponse(t *testing.T) {
 	var body []byte
 	require.NoError(t, json.Unmarshal(entry.ResponseBody, &body))
 	require.Equal(t, "partial", string(body))
+}
+
+func TestEgressAuditUpgrade(t *testing.T) {
+	gateway, _ := newCredentialTestGateway(t)
+	inst := &v1.AgentInstance{Spec: v1.AgentInstanceSpec{UserID: "7", ClaudeSession: "session"}}
+	inst.Name, inst.Namespace = "acr-test", system.DefaultNamespace
+	processor := &AuditProcessor{Provider: &CredentialProvider{Gateway: gateway, Storage: fake.NewClientBuilder().WithScheme(storagescheme.Scheme).WithObjects(inst).Build()}}
+	ref := substrate.Ref(inst)
+	attrs, _ := structpb.NewStruct(map[string]any{"filter_state['dev.ate.actor.identity']": "spiffe://substrate-actor.local/ateom-for-actor/" + ref.Atespace + "/" + ref.Name})
+	// With bodies off, Envoy sends nothing after the 101 and ends the stream.
+	stream := &auditStream{ctx: auditContext(t), messages: []*ext.ProcessingRequest{
+		{Attributes: map[string]*structpb.Struct{"audit": attrs}, Request: &ext.ProcessingRequest_RequestHeaders{RequestHeaders: auditHeaders(map[string]string{":method": "GET", ":authority": "api.anthropic.com", ":path": "/v1/code/agent-proxy/ws", "connection": "Upgrade", "upgrade": "websocket"})}},
+		{Request: &ext.ProcessingRequest_ResponseHeaders{ResponseHeaders: auditHeaders(map[string]string{":status": "101", "upgrade": "websocket"})}},
+	}}
+	require.NoError(t, processor.Process(stream))
+	require.Len(t, stream.sent, 2)
+	mode := stream.sent[0].ModeOverride
+	require.NotNil(t, mode)
+	require.Equal(t, extprocv3.ProcessingMode_NONE, mode.GetRequestBodyMode())
+	require.Equal(t, extprocv3.ProcessingMode_NONE, mode.GetResponseBodyMode())
+	require.Equal(t, extprocv3.ProcessingMode_SKIP, mode.GetRequestTrailerMode())
+	require.Equal(t, extprocv3.ProcessingMode_SKIP, mode.GetResponseTrailerMode())
+	require.Equal(t, extprocv3.ProcessingMode_SEND, mode.GetResponseHeaderMode())
+
+	require.NoError(t, gateway.FlushEgressAuditLogs())
+	entries, _, err := gateway.ListEgressAuditLogs(t.Context(), gclient.EgressAuditLogOptions{Limit: 1})
+	require.NoError(t, err)
+	entry, err := gateway.GetEgressAuditLog(t.Context(), entries[0].ID, true)
+	require.NoError(t, err)
+	require.Equal(t, "complete", entry.Outcome)
+	require.Equal(t, 101, entry.ResponseStatus)
 }
 
 func TestAnthropicMCPEgress(t *testing.T) {

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	types2 "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/gateway/types"
@@ -50,29 +49,17 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		return nil, false, nil
 	}
 
-	extra := resp.User.GetExtra()
 	var (
 		gatewayUser  *types.User
 		authGroupIDs []string
 	)
-	if authProviderNamespace, authProviderName := cmp.Or(extra["auth_provider_namespace"]...), cmp.Or(extra["auth_provider_name"]...); authProviderNamespace != "" && authProviderName != "" {
-		var emailVerified *bool
-		if raw := cmp.Or(extra["auth_provider_email_verified"]...); raw != "" {
-			parsed, err := strconv.ParseBool(raw)
-			if err != nil {
-				return nil, false, fmt.Errorf("invalid auth_provider_email_verified value %q: %w", raw, err)
-			}
-			emailVerified = &parsed
-		}
-
+	if authProviderNamespace, authProviderName := cmp.Or(resp.User.GetExtra()["auth_provider_namespace"]...), cmp.Or(resp.User.GetExtra()["auth_provider_name"]...); authProviderNamespace != "" && authProviderName != "" {
 		identity := &types.Identity{
-			Email:                 cmp.Or(extra["email"]...),
+			Email:                 cmp.Or(resp.User.GetExtra()["email"]...),
 			AuthProviderName:      authProviderName,
 			AuthProviderNamespace: authProviderNamespace,
 			ProviderUsername:      resp.User.GetName(),
 			ProviderUserID:        resp.User.GetUID(),
-			ProviderIssuer:        cmp.Or(extra["auth_provider_issuer"]...),
-			ProviderEmailVerified: emailVerified,
 		}
 
 		userLimit, err := u.resolveUserLimit(req.Context())
@@ -103,6 +90,7 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 		return nil, false, nil
 	}
 
+	extra := resp.User.GetExtra()
 	extra["auth_provider_groups"] = authGroupIDs
 	// The admission check denies the request unless the user is active. The status comes from the user row that
 	// EnsureIdentity just read, and replaces anything the auth provider supplied.

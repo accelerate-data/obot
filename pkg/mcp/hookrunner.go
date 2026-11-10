@@ -53,6 +53,7 @@ func (r *SessionManagerHookRunner) RunHook(ctx context.Context, servers HookServ
 	if err != nil {
 		return nil, fmt.Errorf("failed to get client for MCP hook server %q: %w", serverName, err)
 	}
+
 	result, err := client.CallTool(ctx, &gomcp.CallToolParams{Name: toolName, Arguments: input})
 	if err != nil {
 		return nil, fmt.Errorf("failed to call MCP hook %q: %w", target, err)

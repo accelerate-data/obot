@@ -32,7 +32,7 @@ func createDynamicOAuthPendingState(t *testing.T, c *Client, mcpURL, state strin
 		},
 		RedirectURL: "https://obot.example/oauth/mcp/callback",
 	}
-	if err := c.CreateMCPOAuthPendingState(t.Context(), "user-1", "mcp-instance-1", mcpURL, "request-1", "", state, "pkce-verifier", "", conf); err != nil {
+	if err := c.CreateMCPOAuthPendingStateWithTunnel(t.Context(), "user-1", "mcp-instance-1", mcpURL, "", "request-1", "", state, "pkce-verifier", "", conf); err != nil {
 		t.Fatalf("create pending state: %v", err)
 	}
 	return conf

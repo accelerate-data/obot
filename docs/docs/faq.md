@@ -16,15 +16,15 @@ User management controls are under **Identity & Access**. Administrative control
 
 ### How do I assign roles to users before they log in?
 
-Currently, users must log in at least once before roles can be assigned. To pre-assign admin roles, set the `OBOT_SERVER_AUTH_ADMIN_EMAILS` environment variable during deployment. 
+Users must log in at least once before their own role can be changed. To give users a role before they log in, assign the role in Obot to a group that your identity provider supplies, on the **Identity & Access > Groups** page. See [Pre-Assigning Roles](./security/policy-coverage.md#user-roles-pre-assigning-roles).
 
 ### What are the differences between the open source and enterprise versions of Obot?
 
-There isn't an open source version separate from an enterprise version. Obot is fully open source under the MIT License, and every self-hosted edition, including Obot Enterprise, runs the same code from the same container image. The license key decides what applies. Obot Community is free, supports up to 100 users and 100 devices, and includes all model providers plus Local, GitHub, and Google authentication. Registering Obot Community is free and adds Entra, Okta, JumpCloud, and Auth0 authentication. Obot Enterprise removes the user and device limits and adds enterprise support. See [Editions and licensing](./enterprise/overview.md).
+There isn't an open source version separate from an enterprise version. Obot is fully open source under the MIT License, and every self-hosted edition, including Obot Enterprise, runs the same code from the same container image. The license key decides what applies. Obot Community is free, supports up to 100 users and 100 devices, and includes all LLM gateway providers plus Local, GitHub, and Google authentication. Registering Obot Community is free and adds Entra, Okta, OneLogin, JumpCloud, Keycloak, and Auth0 authentication. Obot Enterprise removes the user and device limits and adds enterprise support. See [Editions and licensing](./enterprise/overview.md).
 
 ### What happens if Obot can't validate its license?
 
-If the license service can't be reached, Obot keeps using the entitlements from the last successful check, with no time limit, until the license service answers again. If the license is rejected, for example because it expired, Obot falls back to the limits of unregistered Obot Community at the next check. See [License compliance](./enterprise/overview.md#license-compliance).
+If the license service can't be reached, Obot keeps using the entitlements from the last successful check until the license's last known expiration date. If the license is rejected, for example because it expired, Obot falls back to the limits of unregistered Obot Community at the next check. See [License compliance](./enterprise/overview.md#license-compliance).
 
 ## Integration & Troubleshooting
 

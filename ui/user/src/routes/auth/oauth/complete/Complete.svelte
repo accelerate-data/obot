@@ -1,6 +1,8 @@
 <script lang="ts">
 	import BetaLogo from '$lib/components/navbar/BetaLogo.svelte';
 	import { m } from '$lib/i18n';
+	import { navigateTo } from '$lib/navigation';
+	import { announceOAuthCompletion } from '$lib/services/mcp/oauth-completion';
 	import { CircleCheckBig } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
@@ -18,11 +20,16 @@
 		if (!redirectURL) return;
 
 		redirecting = true;
-		window.location.href = redirectURL;
+		navigateTo(redirectURL);
 	}
 
 	onMount(() => {
-		if (!redirectURL) return;
+		if (!redirectURL) {
+			// Every OAuth flow without a client redirect lands here, component logins included.
+			// Waiting pages only re-check what they launched, so announcing all of them is harmless.
+			announceOAuthCompletion();
+			return;
+		}
 
 		secondsRemaining = REDIRECT_DELAY_SECONDS;
 

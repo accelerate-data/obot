@@ -21,14 +21,11 @@ test('current documentation navigation and direct loads', async ({ page }) => {
     'Registries & Skills', 'Device Management (Sentry)', 'Claude Environments (experimental)', 'Security & Governance', 'Deploy & Operate', 'Architecture', 'Reference',
   ]);
   for (let i = 0; i < await categories.count(); i++) await visit(categories.nth(i));
-  // Cloud deployments is the only approved subgroup. Other references stay
-  // in page content rather than additional catch-all navigation groups.
-  await expect(page.locator('.theme-doc-sidebar-menu .menu__list-item-collapsible')).toHaveCount(11);
-  const cloud = page.locator('.theme-doc-sidebar-menu > li > ul > li').filter({
-    has: page.locator(':scope > .menu__list-item-collapsible > a', { hasText: 'Cloud deployments' }),
-  });
-  await expect(cloud).toHaveCount(1);
-  await expect(cloud.locator(':scope > ul > li > a')).toHaveText(['Amazon EKS', 'Azure AKS', 'Google GKE']);
+  // Nested groups are deliberate. Add one here only as an intended navigation
+  // change; other references stay in page content rather than catch-all groups.
+  await expect(page.locator('.theme-doc-sidebar-menu > li > ul .menu__list-item-collapsible > a')).toHaveText([
+    'MCP server configuration', 'Cloud deployments',
+  ]);
   const links = [...discovered];
   expect(links.length).toBeGreaterThan(0);
   for (const href of links) {
@@ -110,5 +107,70 @@ test('category titles navigate and separate controls expand without navigating',
     await title.click();
     expect(new URL(page.url()).pathname).toBe(route);
     await expect(page.locator('article').first()).toBeVisible();
+  }
+});
+
+test('Markdown links follow in-app navigation and documentation versions', async ({ page, request }) => {
+  await page.goto('/');
+  const markdown = page.getByRole('link', { name: 'View as Markdown', exact: true });
+  await expect(markdown).toHaveAttribute('href', `/${versions[0]}/index.md`);
+  // Click a real React navigation link rather than issuing another page.goto.
+  await page.locator('article a[href="/installation/docker-deployment/"]').first().click();
+  await expect(page).toHaveURL(/\/installation\/docker-deployment\/$/);
+  await expect(markdown).toHaveAttribute('href', `/${versions[0]}/installation/docker-deployment.md`);
+  await expect(page.locator('head link[rel="alternate"][type="text/markdown"]')).toHaveAttribute('href', new RegExp(`/${versions[0]}/installation/docker-deployment.md$`));
+  for (const [html, expected] of [['/next/', '/next/index.md'], [`/${versions[1]}/`, `/${versions[1]}/index.md`]]) {
+    await page.goto(html);
+    await expect(markdown).toHaveAttribute('href', expected);
+  }
+  for (const url of ['/index.md', `/${versions[0]}/index.md`, '/next/index.md', `/${versions[1]}/installation/docker-deployment.md`]) {
+    const response = await request.get(url);
+    expect(response.status()).toBe(200);
+    expect(response.headers()['content-type']).toContain('text/markdown');
+    expect(response.headers()['x-robots-tag']).toBe('noindex');
+    expect(await response.text()).toMatch(/^---\ntitle:/);
+  }
+  const alias = await request.get('/index.md');
+  const pinned = await request.get(`/${versions[0]}/index.md`);
+  expect(await alias.text()).toBe(await pinned.text());
+  const full = await request.get(`/${versions[0]}/llms-full.txt`);
+  expect(full.status()).toBe(200);
+  expect(full.headers()['content-type']).toContain('text/plain');
+  expect(full.headers()['x-robots-tag']).toBe('noindex');
+  const rootFull = await request.get('/llms-full.txt');
+  expect(rootFull.status()).toBe(200);
+  expect(rootFull.headers()['content-type']).toContain('text/plain');
+  expect(rootFull.headers()['x-robots-tag']).toBe('noindex');
+  expect(await rootFull.text()).toBe(await full.text());
+  const root = await request.get('/llms.txt');
+  expect(root.status()).toBe(200);
+  expect(root.headers()['x-robots-tag']).toBeUndefined();
+  const old = await request.get(`/${versions[1]}/llms.txt`);
+  expect(old.headers()['x-robots-tag']).toBe('noindex');
+  const missing = await request.get('/no-such-agent-doc.md');
+  expect(missing.status()).toBe(404);
+  // The 404 body is the HTML not-found page, so it must not be labeled as Markdown.
+  expect(missing.headers()['content-type']).toContain('text/html');
+});
+
+test('Markdown discovery is present in raw server-rendered HTML', async ({ page, request }) => {
+  for (const [route, markdown] of [
+    ['/', `/${versions[0]}/index.md`],
+    ['/next/', '/next/index.md'],
+    [`/${versions[1]}/`, `/${versions[1]}/index.md`],
+  ]) {
+    const response = await request.get(route);
+    expect(response.status()).toBe(200);
+    // DOMParser parses the HTTP body without executing scripts or hydration.
+    const links = await page.evaluate(html => {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      return {
+        alternate: doc.querySelector('head link[rel="alternate"][type="text/markdown"]')?.getAttribute('href'),
+        visible: Array.from(doc.querySelectorAll('a')).find(a => a.textContent === 'View as Markdown')?.getAttribute('href'),
+      };
+    }, await response.text());
+    expect(new URL(links.alternate!).pathname).toBe(markdown);
+    expect(links.visible).toBe(markdown);
+    expect((await request.get(markdown)).status()).toBe(200);
   }
 });

@@ -66,10 +66,7 @@ function mockSetupApis({
 			return HttpResponse.json(user);
 		}),
 		http.post('/api/setup/initiate-temp-login', initiateTempLogin),
-		http.post('/api/setup/cancel-temp-login', () => new HttpResponse(null, { status: 404 })),
-		http.get('/api/setup/explicit-role-emails', () =>
-			HttpResponse.json({ owners: null, admins: null })
-		)
+		http.post('/api/setup/cancel-temp-login', () => new HttpResponse(null, { status: 404 }))
 	);
 
 	return { createUser, initiateTempLogin };
@@ -156,6 +153,27 @@ describe('Setup page', () => {
 		const signIn = page.getByRole('link', { name: /Sign in as ada@example.com/ });
 		await expect.element(signIn).toBeVisible();
 		await expect.element(signIn).toHaveAttribute('href', initiateTempLoginResponse.redirectUrl);
+	});
+
+	it('opens user management without configuration when changing the owner account', async () => {
+		const owner = createdUser('owner@example.com');
+		mockSetupApis({ users: [owner] });
+		await renderSetupPage({
+			splashSeen: true,
+			eulaAccepted: true,
+			localProvider: localConfigured,
+			localUsers: [owner]
+		});
+
+		await page.getByRole('button', { name: 'Click here', exact: true }).click();
+
+		await expect.element(page.getByRole('heading', { name: 'Users', exact: true })).toBeVisible();
+		await expect
+			.element(page.getByRole('button', { name: 'Configuration', exact: true }))
+			.not.toBeInTheDocument();
+		await expect
+			.element(page.getByText('Allowed Email Domains', { exact: true }))
+			.not.toBeInTheDocument();
 	});
 
 	it('starts on owner sign-in when a local account already exists', async () => {

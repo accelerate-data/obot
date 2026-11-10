@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"slices"
 	"strings"
@@ -13,6 +12,9 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/maximhq/bifrost/core/providers/anthropic"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/streaming"
 	apitypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api/server/requestinfo"
 	"github.com/obot-platform/obot/pkg/gateway/client"
@@ -22,6 +24,7 @@ import (
 	"github.com/obot-platform/obot/pkg/principal"
 	"github.com/obot-platform/obot/pkg/system"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
@@ -32,17 +35,27 @@ const (
 )
 
 type llmAuditRecorder struct {
-	once                  sync.Once
-	log                   types.LLMAuditLog
-	responseStream        bytes.Buffer
+	finalResponse *schemas.BifrostResponse
+	observed      int
+	streamID      string
+	streamModel   string
+
+	once        sync.Once
+	mu          sync.Mutex
+	closed      bool
+	stream      bool
+	accumulator *streaming.Accumulator
+	captured    int
+	log         types.LLMAuditLog
+	// guardrailFindings, when set, returns what the LLM gateway's guardrails did to the
+	// request. It is read when the entry is written, once the response has been delivered.
+	guardrailFindings func() []apitypes.LLMAuditGuardrailFinding
+	// route, when set, returns how the LLM gateway served the request. It is read when the
+	// entry is written.
+	route                 func() llmRoute
+	responseJSON          bytes.Buffer
 	responseCaptureLimit  int
 	responseCaptureFilled bool
-}
-
-type llmAuditResponseBody struct {
-	body   io.ReadCloser
-	audit  *llmAuditRecorder
-	client *client.Client
 }
 
 func newLLMAuditRecorder(req *http.Request, user user.Info, responseCaptureLimit int) *llmAuditRecorder {
@@ -96,14 +109,6 @@ func (r *llmAuditRecorder) setRequestBody(body []byte) {
 	r.log.RequestBody = body
 }
 
-func (r *llmAuditRecorder) setPolicyModifiedRequestBody(body []byte) {
-	if r == nil {
-		return
-	}
-	r.log.PolicyModifiedRequestBody = body
-	r.log.MessagePolicyTriggered = len(body) > 0
-}
-
 func (r *llmAuditRecorder) setClientSessionID(dialect llmtypes.Dialect, headers http.Header, body []byte) {
 	if r == nil {
 		return
@@ -118,10 +123,25 @@ func (r *llmAuditRecorder) setReasoningEffort(modelProvider string, body []byte)
 	r.log.ReasoningEffort = extractLLMReasoningEffort(modelProvider, body)
 }
 
+func (r *llmAuditRecorder) setGuardrailFindings(findings func() []apitypes.LLMAuditGuardrailFinding) {
+	if r == nil {
+		return
+	}
+	r.guardrailFindings = findings
+}
+
+func (r *llmAuditRecorder) setRoute(route func() llmRoute) {
+	if r == nil {
+		return
+	}
+	r.route = route
+}
+
 func (r *llmAuditRecorder) recordResponse(resp *http.Response) {
 	if r == nil || resp == nil {
 		return
 	}
+	r.stream = strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 	r.log.ResponseStatus = resp.StatusCode
 	r.log.ResponseHeaders = redactedHeaders(resp.Header)
 }
@@ -137,19 +157,21 @@ func (r *llmAuditRecorder) captureResponseChunk(p []byte) {
 	if r == nil || len(p) == 0 {
 		return
 	}
-	if r.responseCaptureFilled {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.responseCaptureFilled {
 		return
 	}
-	remaining := r.responseCaptureLimit - r.responseStream.Len()
-	if remaining <= 0 {
+	r.captured += len(p)
+	if r.captured > r.responseCaptureLimit {
 		r.responseCaptureFilled = true
+		r.responseJSON.Reset()
+		r.discardAccumulator()
 		return
 	}
-	if len(p) > remaining {
-		p = p[:remaining]
-		r.responseCaptureFilled = true
+	if !r.stream {
+		_, _ = r.responseJSON.Write(p)
 	}
-	_, _ = r.responseStream.Write(p)
 }
 
 func (r *llmAuditRecorder) setTokenUsage(usage types.TokenUsage) {
@@ -158,6 +180,10 @@ func (r *llmAuditRecorder) setTokenUsage(usage types.TokenUsage) {
 	}
 	r.log.InputTokens = usage.InputTokens
 	r.log.OutputTokens = usage.OutputTokens
+	r.log.CacheReadTokens = usage.CacheReadTokens
+	r.log.CacheWriteTokens = usage.CacheWriteTokens
+	r.log.ReasoningTokens = usage.ThinkingTokens
+	r.log.Spend = usage.TotalSpend
 }
 
 func (r *llmAuditRecorder) finish(c *client.Client, err error) {
@@ -167,7 +193,19 @@ func (r *llmAuditRecorder) finish(c *client.Client, err error) {
 	r.once.Do(func() {
 		r.log.Duration = time.Since(r.log.CreatedAt).Milliseconds()
 		r.setOutcomeAndResponseStatus(err)
-		c.LogLLMAuditEntry(r.log, r.responseStream.Bytes())
+		if r.guardrailFindings != nil {
+			r.log.GuardrailFindings = r.guardrailFindings()
+		}
+		if r.route != nil {
+			route := r.route()
+			r.log.ServedProvider = route.Provider
+			r.log.ServedModel = route.Model
+			r.log.ProviderKey = route.Key
+			r.log.Fallback = route.Fallback
+			r.log.ClaudeSubscription = route.Subscription
+		}
+		r.finishBody()
+		c.LogLLMAuditEntry(r.log)
 	})
 }
 
@@ -175,49 +213,34 @@ func (r *llmAuditRecorder) setOutcomeAndResponseStatus(err error) {
 	if r == nil {
 		return
 	}
-	r.log.Outcome = types.LLMAuditOutcomeSuccess
-	r.log.Error = ""
+	r.log.Outcome, r.log.Error, r.log.ResponseStatus = llmOutcome(r.log.ResponseStatus, err)
+}
 
-	if r.log.ResponseStatus >= http.StatusBadRequest {
-		r.log.Outcome = types.LLMAuditOutcomeError
+// llmOutcome is the outcome of an LLM request (success, error or canceled), given the status
+// of its response, if it got one, and why it failed, if it did. It also returns the error
+// message and the response status, which comes from the error when there was no response.
+func llmOutcome(status int, err error) (outcome, message string, responseStatus int) {
+	outcome, responseStatus = types.LLMAuditOutcomeSuccess, status
+	if status >= http.StatusBadRequest {
+		outcome = types.LLMAuditOutcomeError
 	}
-
 	if err == nil {
-		return
+		return outcome, "", responseStatus
 	}
-	r.log.Error = err.Error()
-	r.log.Outcome = types.LLMAuditOutcomeError
+	message, outcome = err.Error(), types.LLMAuditOutcomeError
 	if errors.Is(err, context.Canceled) {
-		r.log.Outcome = types.LLMAuditOutcomeCanceled
+		outcome = types.LLMAuditOutcomeCanceled
 	}
-
-	if r.log.ResponseStatus == 0 {
+	if responseStatus == 0 {
 		if errHTTP := (*apitypes.ErrHTTP)(nil); errors.As(err, &errHTTP) {
-			r.log.ResponseStatus = errHTTP.Code
+			responseStatus = errHTTP.Code
 		} else if errStatus := (*apierrors.StatusError)(nil); errors.As(err, &errStatus) {
-			r.log.ResponseStatus = int(errStatus.ErrStatus.Code)
+			responseStatus = int(errStatus.ErrStatus.Code)
 		} else {
-			r.log.ResponseStatus = http.StatusInternalServerError
-		}
-
-		if r.log.ResponseStatus >= http.StatusBadRequest && r.log.Outcome != types.LLMAuditOutcomeCanceled {
-			r.log.Outcome = types.LLMAuditOutcomeError
+			responseStatus = http.StatusInternalServerError
 		}
 	}
-}
-
-func (r *llmAuditResponseBody) Read(p []byte) (int, error) {
-	n, err := r.body.Read(p)
-	if n > 0 {
-		r.audit.captureResponseChunk(p[:n])
-	}
-	return n, err
-}
-
-func (r *llmAuditResponseBody) Close() error {
-	err := r.body.Close()
-	r.audit.finish(r.client, err)
-	return err
+	return outcome, message, responseStatus
 }
 
 func redactedHeaders(headers http.Header) json.RawMessage {
@@ -280,11 +303,164 @@ func extractLLMClientSessionID(dialect llmtypes.Dialect, headers http.Header, bo
 
 func extractLLMReasoningEffort(modelProvider string, body []byte) string {
 	switch modelProvider {
-	case system.OpenAIModelProvider:
-		return gjson.GetBytes(body, "reasoning.effort").String()
-	case system.AnthropicModelProvider:
+	case system.LLMGatewayModelProvider:
+		if effort := gjson.GetBytes(body, "reasoning.effort").String(); effort != "" {
+			return effort
+		}
+		if effort := gjson.GetBytes(body, "reasoning_effort").String(); effort != "" {
+			return effort
+		}
 		return gjson.GetBytes(body, "output_config.effort").String()
 	default:
 		return ""
+	}
+}
+
+// observeResponseChunk assembles client-bound core chunks after guardrail replay.
+func (r *llmAuditRecorder) observeResponseChunk(chunk *schemas.BifrostStreamChunk, a *streaming.Accumulator) {
+	if r == nil || chunk == nil {
+		return
+	}
+	r.mu.Lock()
+	stopped := r.closed || r.responseCaptureFilled
+	r.mu.Unlock()
+	if stopped {
+		return
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return
+	}
+	id := gjson.GetBytes(data, "id").String()
+	model := gjson.GetBytes(data, "model").String()
+	if nested := gjson.GetBytes(data, "response.id").String(); nested != "" {
+		id = nested
+	}
+	if nested := gjson.GetBytes(data, "response.model").String(); nested != "" {
+		model = nested
+	}
+	typ := gjson.GetBytes(data, "type").String()
+	terminal := typ == "response.completed" || typ == "response.failed" || typ == "response.incomplete"
+	// Terminal events carry complete fields that incremental snapshots may not reconstruct.
+	var complete *schemas.BifrostResponsesResponse
+	if terminal && len(data) <= r.responseCaptureLimit && chunk.BifrostResponsesStreamResponse != nil && chunk.Response != nil {
+		if raw, err := json.Marshal(chunk.Response); err == nil {
+			var response schemas.BifrostResponsesResponse
+			if json.Unmarshal(raw, &response) == nil {
+				complete = &response
+			}
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Capture may have closed or overflowed while this chunk was serialized.
+	if r.closed || r.responseCaptureFilled {
+		return
+	}
+	if id != "" {
+		r.streamID = id
+	}
+	if model != "" {
+		r.streamModel = model
+	}
+	// Bound retained chunks even when the provider runs ahead of the proxy reader.
+	r.observed += len(data)
+	if r.observed > r.responseCaptureLimit {
+		r.responseCaptureFilled = true
+		r.discardAccumulator()
+		return
+	}
+	r.accumulator = a
+	ctx := schemas.NewBifrostContext(context.Background(), time.Time{})
+	ctx.SetValue(schemas.BifrostContextKeyAccumulatorID, r.log.ID)
+	ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, terminal)
+	resp := &schemas.BifrostResponse{ChatResponse: chunk.BifrostChatResponse, ResponsesStreamResponse: chunk.BifrostResponsesStreamResponse}
+	// Keep accumulation serialized with close/overflow so cleanup cannot be undone by a late chunk.
+	processed, err := a.ProcessStreamingResponse(ctx, resp, chunk.BifrostError)
+	if terminal && processed != nil {
+		r.finalResponse = processed.ToBifrostResponse()
+	}
+	if complete != nil {
+		r.finalResponse = &schemas.BifrostResponse{ResponsesResponse: complete}
+	}
+	if err != nil {
+		r.responseCaptureFilled = true
+		r.discardAccumulator()
+	}
+}
+
+// discardAccumulator requires r.mu to serialize cleanup with chunk accumulation.
+func (r *llmAuditRecorder) discardAccumulator() {
+	r.finalResponse = nil
+	if r.accumulator != nil {
+		r.accumulator.ForceCleanupStreamAccumulator(r.log.ID)
+		r.accumulator = nil
+	}
+}
+
+// finishBody closes capture under r.mu; response formatting uses only the detached state.
+func (r *llmAuditRecorder) finishBody() {
+	r.mu.Lock()
+	r.closed = true
+	accumulator, resp := r.accumulator, r.finalResponse
+	if accumulator != nil && resp == nil && !r.responseCaptureFilled {
+		resp = accumulator.GetAccumulatedResponse(r.log.ID)
+	}
+	var unary []byte
+	if accumulator == nil && !r.stream && !r.responseCaptureFilled {
+		unary = bytes.Clone(r.responseJSON.Bytes())
+	}
+	r.accumulator, r.finalResponse = nil, nil
+	r.mu.Unlock()
+	// Keep accumulator-owned data alive until serialization finishes. Closed capture
+	// prevents concurrent callbacks from adding chunks or cleaning up this detached state.
+	if accumulator != nil {
+		defer accumulator.ForceCleanupStreamAccumulator(r.log.ID)
+	}
+	if r.responseCaptureFilled {
+		r.log.ResponseBody = nil
+		return
+	}
+	if resp != nil {
+		var body any
+		switch {
+		case resp.ChatResponse != nil:
+			body = resp.ChatResponse
+		case resp.ResponsesResponse != nil:
+			body = resp.ResponsesResponse
+			if strings.HasSuffix(strings.TrimRight(r.log.RequestPath, "/"), "/messages") {
+				body = anthropic.ToAnthropicResponsesResponse(schemas.NewBifrostContext(context.Background(), time.Time{}), resp.ResponsesResponse)
+			}
+		}
+		if body != nil {
+			r.log.ResponseBody, _ = json.Marshal(body)
+		}
+		r.log.ResponseBody = stripEngineFields(r.log.ResponseBody)
+		if r.streamID != "" {
+			r.log.ResponseBody, _ = sjson.SetBytes(r.log.ResponseBody, "id", r.streamID)
+		}
+		if r.streamModel != "" {
+			r.log.ResponseBody, _ = sjson.SetBytes(r.log.ResponseBody, "model", r.streamModel)
+		}
+	} else if json.Valid(unary) {
+		r.log.ResponseBody = unary
+	}
+	if len(r.log.ResponseBody) > r.responseCaptureLimit {
+		r.log.ResponseBody = nil
+	}
+	if r.log.ResponseID == "" {
+		r.log.ResponseID = gjson.GetBytes(r.log.ResponseBody, "id").String()
+	}
+}
+
+func (r *llmAuditRecorder) captureStreamError(body []byte) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed && !r.responseCaptureFilled && len(body) <= r.responseCaptureLimit {
+		r.log.ResponseBody = bytes.Clone(body)
 	}
 }

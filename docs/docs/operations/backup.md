@@ -8,7 +8,7 @@ Back up the stores that hold your installation's state, together with the config
 
 | Store | Preserve |
 |---|---|
-| PostgreSQL | Platform configuration, identities, metadata, and retained database-backed audit records |
+| PostgreSQL | Platform configuration, identities, metadata, LLM gateway configuration and credentials, and retained database-backed audit records |
 | Deployment configuration | Image/chart versions, Helm values, runtime settings, and references to external secrets |
 | Encryption | Custom key material or access to the original cloud KMS keys, protected separately |
 

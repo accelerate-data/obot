@@ -13,7 +13,6 @@ import (
 
 type daemonStopper interface {
 	StopAuthProvider(namespace, authProviderName string)
-	StopModelProvider(namespace, modelProviderName string)
 }
 
 type licenseRefresher interface {
@@ -29,6 +28,7 @@ type Handler struct {
 	licenseProvider licenseRefresher
 }
 
+// New creates the handler.
 func New(dispatcher daemonStopper, licenseProvider licenseRefresher) *Handler {
 	return &Handler{
 		lastRevisions:   make(map[string]int64),
@@ -62,12 +62,7 @@ func (h *Handler) Reconcile(req router.Request, _ router.Response) error {
 			)
 			h.dispatcher.StopAuthProvider(revision.ProviderNamespace, revision.ProviderName)
 		case v1.ProviderTypeModel:
-			slog.Info("Stopping model provider daemon after synchronized configuration change",
-				"modelProvider", revision.ProviderName,
-				"namespace", revision.ProviderNamespace,
-				"revision", revision.Revision,
-			)
-			h.dispatcher.StopModelProvider(revision.ProviderNamespace, revision.ProviderName)
+			// Model providers were replaced by the LLM gateway; they have no daemon.
 		case v1.ProviderTypeLicense:
 			slog.Info("Refreshing license after synchronized license check",
 				"revision", revision.Revision,
@@ -75,6 +70,8 @@ func (h *Handler) Reconcile(req router.Request, _ router.Response) error {
 			if err := h.licenseProvider.Validate(req.Ctx); err != nil {
 				return fmt.Errorf("refresh license at revision %d: %w", revision.Revision, err)
 			}
+		case v1.ProviderTypeLLMGateway:
+			// Legacy revisions remain readable; resource watches now reconcile the gateway.
 		default:
 			return fmt.Errorf("provider daemon revision %q has invalid provider type %q", key, revision.ProviderType)
 		}

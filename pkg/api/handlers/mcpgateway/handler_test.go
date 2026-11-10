@@ -40,21 +40,28 @@ func TestVMCPToolSearchKeepsHealthyComponentWhenSiblingNeedsOAuth(t *testing.T) 
 	}))
 	defer pending.Close()
 
-	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil)
+	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	defer handler.Close()
 
-	cfg := compositeConfig(obotmcp.ServerConfig{
+	cfg, err := compositeConfig(api.Context{
+		Request:       httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp-connect/test", nil),
+		GatewayClient: newLocalAgentAuditLogTestGatewayClient(t),
+		User:          &user.DefaultInfo{UID: "7", Groups: []string{types.GroupMCP}},
+	}, obotmcp.ServerConfig{
 		Runtime:    types.RuntimeVMCP,
 		ToolSearch: true,
 		Components: []obotmcp.ComponentServer{
 			{DisplayName: "component", URL: upstream.URL},
 			{DisplayName: "pending", URL: pending.URL},
 		},
-	}, &user.DefaultInfo{UID: "7", Groups: []string{types.GroupMCP}})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	frontend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handler.composite.HTTPHandler().ServeHTTP(w, r.WithContext(mmmcp.ContextWithConfig(r.Context(), cfg)))
 	}))
@@ -130,7 +137,7 @@ func TestCompositeUpstreamClientIdentity(t *testing.T) {
 	})
 	upstream := httptest.NewServer(gomcp.NewStreamableHTTPHandler(func(*http.Request) *gomcp.Server { return server }, nil))
 	defer upstream.Close()
-	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil)
+	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +177,7 @@ func TestCompositeUpstreamClientIdentity(t *testing.T) {
 	}
 }
 
-func TestProxyRewritesUpstreamUnauthorized(t *testing.T) {
+func TestProxyAuthorizationResponseSanitization(t *testing.T) {
 	for _, tc := range []struct {
 		path   string
 		id     string
@@ -208,13 +215,21 @@ func TestProxyRewritesUpstreamUnauthorized(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			r := httptest.NewRequest(http.MethodPost, tc.path, nil)
 			r.SetPathValue("mcp_id", tc.id)
 			w := httptest.NewRecorder()
-			ctx := api.Context{Request: r, ResponseWriter: w, APIBaseURL: "https://obot.example/api"}
+			ctx := api.Context{
+				Request:        r,
+				ResponseWriter: w,
+				APIBaseURL:     "https://obot.example/api",
+			}
 			proxy := httputil.NewSingleHostReverseProxy(u)
 			proxy.ModifyResponse = func(resp *http.Response) error {
-				rewriteMCPAuthResponse(ctx, resp)
+				if resp.StatusCode == http.StatusUnauthorized {
+					replaceMCPAuthResponse(resp, mcpAuthRequiredResponse(ctx, false))
+				}
+
 				return nil
 			}
 			proxy.ServeHTTP(w, r)
@@ -224,14 +239,17 @@ func TestProxyRewritesUpstreamUnauthorized(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if resp.StatusCode != tc.status {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.status)
 			}
+
 			if tc.status == http.StatusUnauthorized {
 				want := `Bearer realm="Obot MCP Gateway", resource_metadata="https://obot.example/.well-known/oauth-protected-resource` + tc.path + `"`
 				if resp.Header.Get("WWW-Authenticate") != want {
 					t.Fatalf("challenge = %q, want %q", resp.Header.Get("WWW-Authenticate"), want)
 				}
+
 				if string(body) != "MCP server requires authentication\n" || resp.Header.Get("Set-Cookie") != "" {
 					t.Fatalf("upstream response leaked: headers=%v body=%q", resp.Header, body)
 				}
@@ -309,6 +327,7 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 			request.Header.Set("Cookie", "obot_access_token=local-session-secret")
 			request.Header.Set("Proxy-Authorization", "Bearer obot-proxy-token")
 			request.Header.Set("X-API-Key", "obot-api-key")
+			request.Header.Set("X-Obot-Api-Key", "ok1-obot-api-key")
 
 			response, err := http.DefaultClient.Do(request)
 			if err != nil {
@@ -335,7 +354,17 @@ func TestProxyStripsInboundGatewayCredentials(t *testing.T) {
 			if got.Get("X-API-Key") != tt.wantAPIKey {
 				t.Fatalf("X-API-Key = %q, want %q", got.Get("X-API-Key"), tt.wantAPIKey)
 			}
+			if got.Get("X-Obot-Api-Key") != "" {
+				t.Fatalf("X-Obot-Api-Key = %q, want empty", got.Get("X-Obot-Api-Key"))
+			}
 		})
+	}
+}
+
+func TestSanitizedMCPHeadersRedactsObotAPIKey(t *testing.T) {
+	got := sanitizedMCPHeaders(http.Header{"X-Obot-Api-Key": {"ok1-secret"}, "Accept": {"application/json"}})
+	if got.Get("X-Obot-Api-Key") != "[REDACTED]" || got.Get("Accept") != "application/json" {
+		t.Fatalf("headers = %v, want the Obot API key redacted", got)
 	}
 }
 

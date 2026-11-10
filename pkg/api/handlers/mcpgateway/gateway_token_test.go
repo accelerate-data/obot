@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/system"
@@ -138,18 +137,16 @@ func TestWithGatewayTokenReplacesInboundBearer(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://obot.test/mcp-connect/ms1server", nil)
 	req.Header.Set("Authorization", "Bearer studio-iat")
 
-	ctx := withGatewayToken(req.Context(), req, "scoped-gateway-token")
+	setGatewayToken(req, "scoped-gateway-token")
 
 	require.Equal(t, "Bearer scoped-gateway-token", req.Header.Get("Authorization"))
-	require.Equal(t, "scoped-gateway-token", nmcp.TokenFromContext(ctx))
 }
 
 func TestWithGatewayTokenRemovesInboundBearerWhenAuthenticationIsDisabled(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "http://obot.test/mcp-connect/ms1server", nil)
 	req.Header.Set("Authorization", "Bearer studio-iat")
 
-	ctx := withGatewayToken(req.Context(), req, "")
+	setGatewayToken(req, "")
 
 	require.Empty(t, req.Header.Get("Authorization"))
-	require.Empty(t, nmcp.TokenFromContext(ctx))
 }

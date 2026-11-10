@@ -56,7 +56,7 @@ func TestLocalhostCallbackFailuresPreserveRequest(t *testing.T) {
 			db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 			require.NoError(t, err)
 			require.NoError(t, db.AutoMigrate())
-			gw := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+			gw := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 			t.Cleanup(func() { require.NoError(t, gw.Close()) })
 			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -69,7 +69,7 @@ func TestLocalhostCallbackFailuresPreserveRequest(t *testing.T) {
 			if tt.failPersistence {
 				require.NoError(t, services.DB.DB.Migrator().DropTable(&gatewaytypes.MCPOAuthToken{}))
 			}
-			require.NoError(t, state.storeWithTunnel(t.Context(), "1", "connection", provider.URL, "", "auth-request", "", "state", "verifier", "", conf))
+			require.NoError(t, state.store(t.Context(), "1", "connection", provider.URL, "", "auth-request", "", "state", "verifier", "", conf))
 			requestID, mcpID, err := state.createToken(t.Context(), "state", "code", "", "")
 			require.Error(t, err)
 			require.Equal(t, "auth-request", requestID)
@@ -93,7 +93,7 @@ func TestLocalhostCallbackFailuresPreserveRequest(t *testing.T) {
 				},
 			}
 			require.NoError(t, fixture.storage.Create(t.Context(), authRequest))
-			require.NoError(t, state.storeWithTunnel(t.Context(), "1", "connection", provider.URL, "", authRequest.Name, "", "callback-state", "verifier", "", conf))
+			require.NoError(t, state.store(t.Context(), "1", "connection", provider.URL, "", authRequest.Name, "", "callback-state", "verifier", "", conf))
 			req.Request = httptest.NewRequest(http.MethodGet, "/oauth/mcp/callback?state=callback-state&code=code&error="+url.QueryEscape(tt.callbackError), nil)
 			response := httptest.NewRecorder()
 			req.ResponseWriter = response

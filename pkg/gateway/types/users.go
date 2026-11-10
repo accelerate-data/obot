@@ -19,6 +19,9 @@ const (
 	// UserDisabledReasonSCIMUnprovisioned means SCIM was enforced for the user's auth provider before the
 	// identity provider provisioned the user.
 	UserDisabledReasonSCIMUnprovisioned UserDisabledReason = "scim_unprovisioned"
+	// UserDisabledReasonSCIMDeleted means the identity provider deleted the user through SCIM. The user is deleted in
+	// the same transaction, so the reason shows only until their data is cleaned up.
+	UserDisabledReasonSCIMDeleted UserDisabledReason = "scim_deleted"
 )
 
 var (
@@ -38,7 +41,6 @@ type User struct {
 	HashedUsername string      `json:"-" gorm:"unique"`
 	Email          string      `json:"email"`
 	HashedEmail    string      `json:"-"`
-	VerifiedEmail  *bool       `json:"verifiedEmail,omitempty"`
 	Role           types2.Role `json:"role"`
 	IconURL        string      `json:"iconURL"`
 	Timezone       string      `json:"timezone"`
@@ -71,7 +73,7 @@ type UserQuery struct {
 // Valid reports whether r is a known disable reason.
 func (r UserDisabledReason) Valid() bool {
 	switch r {
-	case UserDisabledReasonSCIMInactive, UserDisabledReasonSCIMUnprovisioned:
+	case UserDisabledReasonSCIMInactive, UserDisabledReasonSCIMUnprovisioned, UserDisabledReasonSCIMDeleted:
 		return true
 	default:
 		return false
@@ -100,11 +102,11 @@ func (u User) ManagementSource() types2.UserManagementSource {
 	return types2.UserManagementSourceObot
 }
 
-func ConvertUser(u *User, roleFixed bool, authProviderName string) *types2.User {
-	return ConvertUserWithEffectiveRole(u, roleFixed, authProviderName, u.Role)
+func ConvertUser(u *User, authProviderName string) *types2.User {
+	return ConvertUserWithEffectiveRole(u, authProviderName, u.Role)
 }
 
-func ConvertUserWithEffectiveRole(u *User, roleFixed bool, authProviderName string, effectiveRole types2.Role) *types2.User {
+func ConvertUserWithEffectiveRole(u *User, authProviderName string, effectiveRole types2.Role) *types2.User {
 	if u == nil {
 		return nil
 	}
@@ -123,7 +125,6 @@ func ConvertUserWithEffectiveRole(u *User, roleFixed bool, authProviderName stri
 		Role:                   u.Role,
 		EffectiveRole:          effectiveRole,
 		Groups:                 groups,
-		ExplicitRole:           roleFixed,
 		IconURL:                u.IconURL,
 		Timezone:               u.Timezone,
 		CurrentAuthProvider:    authProviderName,

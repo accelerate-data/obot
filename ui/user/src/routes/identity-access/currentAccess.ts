@@ -1,6 +1,7 @@
 import { m } from '$lib/i18n';
 import {
 	AdminService,
+	UserService,
 	type AccessControlRule,
 	type AccessControlRuleSubject,
 	type VMCP
@@ -358,7 +359,7 @@ export async function loadCurrentAccess(
 			return matchPolicies(
 				models,
 				target,
-				(policy) => `/models/access-policies/${policy.id}`,
+				(policy) => `/models/profiles/${policy.id}`,
 				(policy) =>
 					(policy.models ?? []).map(({ id }) => ({
 						type: id === EVERYTHING_RESOURCE_ID ? 'selector' : 'model',
@@ -376,7 +377,7 @@ export async function loadCurrentAccess(
 			);
 		}
 		case 'vmcps': {
-			const vmcps = await AdminService.listAllVMCPs();
+			const vmcps = await UserService.listVMCPs({ all: true, minimal: true });
 			return matchVmcpProfiles(vmcps, target);
 		}
 	}

@@ -4,6 +4,20 @@ status: draft
 
 # Generic OAuth Provider Support
 
+> **Email linking superseded (v0.28.0, VD-7833).** Upstream obot#8415 removed email-based identity
+> linking: sign-in never matches an existing user by email, and identities match on provider plus
+> subject. The email-linking rules in this document describe the pre-v0.28.0 fork. The
+> issuer-change re-confirmation of `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING` is removed.
+> The setting itself is inert: Obot still accepts it (default `false`) because the published providers
+> registry declares it as required. Retiring it from providers, then Obot and the Studio installers,
+> is a VD-7833 follow-up.
+>
+> **Issuer binding is not implemented.** The identity key is the provider name plus a hash of the
+> provider user ID, which is the plain OIDC `sub`; it carries no issuer. The issuer-bound storage
+> and issuer-change rules below are the intended design, not the as-built behaviour. Until VD-7860
+> adds the issuer to the identity key, do not repoint a configured generic provider at a different
+> IdP: a user there whose `sub` matches an existing identity signs in as that user.
+
 ## Overview
 
 Obot should support one native generic OAuth / OpenID Connect auth provider. The provider appears as a first-class auth provider in the admin UI and API, but it still follows the existing Obot convention of one registry-backed provider instance per provider type.
@@ -17,8 +31,8 @@ The goal is Langfuse-style custom provider support: an admin can configure an is
 - A single built-in generic provider registry entry named `generic-oauth-auth-provider`.
 - API and UI support for configuring the generic provider through the existing auth provider flow.
 - OIDC issuer discovery from `/.well-known/openid-configuration`.
-- A precise trust model for email/account linking.
-- Issuer-bound identity storage so the same provider type can be safely reconfigured.
+- A trust model for email/account linking (superseded in v0.28.0: nothing links by email).
+- Issuer-bound identity storage so the same provider type can be safely reconfigured (not implemented; VD-7860).
 - A provider daemon contract for OIDC security, profile mapping, validation, and runtime errors.
 - Documentation for configuring common OIDC providers.
 - Backend, provider/runtime, UI, and route-level tests for provider configuration and login wiring.
@@ -40,7 +54,7 @@ The goal is Langfuse-style custom provider support: an admin can configure an is
 | Required fields are display name, issuer URL, client ID, client secret, and email domains. | These match the Langfuse-style configuration model and give admins the minimum operator-controlled inputs for a standard OIDC login. Email domains remain the primary Obot-side access gate. |
 | Scope defaults to `openid email profile`. | This is the common baseline for OIDC login and can be overridden for providers that require custom scopes. |
 | Make trusted email linking an explicit provider configuration value. | The provider is first-class, but the trust decision should be visible to admins and bound to the configured issuer, not hidden in a hardcoded provider-name allowlist. |
-| Persist issuer identity with Obot identities. | OIDC `sub` values are only unique within an issuer. Generic provider identities need issuer binding to avoid collisions after reconfiguration. |
+| Persist issuer identity with Obot identities. | OIDC `sub` values are only unique within an issuer. Generic provider identities need issuer binding to avoid collisions after reconfiguration. Not implemented: the identity key has no issuer (VD-7860). |
 | Preserve the existing one-configured-provider rule. | `AuthProviderHandler.Configure` currently rejects configuring a second provider. This feature adds a provider type; it does not change active-provider cardinality. |
 | Defer generic group mapping. | Vendor-specific group APIs belong in dedicated providers. Standard group-claim mapping can be added later with a separate design and tests. |
 | Validate the issuer before reporting the provider as usable. | Generic configuration has more typo and compatibility risk than GitHub/Google. Admins need synchronous validation or an explicit test action before login depends on the provider. |
@@ -72,7 +86,7 @@ generic OIDC provider daemon
 proxy and gateway complete login through provider daemon
         │
         ▼
-identity is stored with provider name + issuer fingerprint + subject
+identity is stored with provider name + subject (issuer fingerprint planned, VD-7860)
 ```
 
 The existing auth provider API remains the primary surface. The generic provider appears in `GET /api/auth-providers` with provider metadata and configuration parameters. Admins configure it through `POST /api/auth-providers/generic-oauth-auth-provider/configure`.
@@ -113,7 +127,6 @@ The registry entry should expose these required parameters:
 | Client ID | `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID` | OAuth/OIDC client ID. |
 | Client Secret | `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_SECRET` | OAuth/OIDC client secret. Sensitive. |
 | Email Domains | `OBOT_AUTH_PROVIDER_EMAIL_DOMAINS` | Existing shared auth-provider access-control field. Empty values should be rejected for the generic provider. Use `*` only when the admin intentionally allows all domains trusted by the issuer. |
-| Trust Email Linking | `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING` | Whether this issuer can link logins to existing Obot users by email. Defaults to `true` for the generic provider, but must be re-confirmed when the issuer changes. |
 
 The registry entry should expose these optional parameters:
 
@@ -151,6 +164,8 @@ Configuration validation must verify:
 
 ## Identity and Account Linking
 
+> Superseded for email linking since v0.28.0; see the note at the top of this document.
+
 Generic OAuth can be trusted for email/account linking because admins are intentionally configuring the issuer as their login authority. That trust is explicit provider configuration, defaults to enabled for `generic-oauth-auth-provider`, and is scoped to the configured issuer.
 
 Generic identities must be bound to both:
@@ -162,10 +177,7 @@ Current identities are keyed by provider namespace/name and provider user ID. Th
 
 Account linking rules:
 
-- For generic OAuth, a login can link to an existing Obot user by email only when `trustedForEmailLinking` is enabled for the same provider and issuer trust boundary.
-- If the ID token or userinfo response includes `email_verified=false`, Obot must not link by email.
-- If `email_verified=true`, Obot can link by email subject to email-domain restrictions and the trust setting.
-- If `email_verified` is absent, Obot can link by email only when `trustedForEmailLinking` is enabled; the docs must call this out as an issuer-level trust decision.
+- Obot does not link accounts by email (upstream obot#8415). A login binds only on auth provider plus provider user ID.
 - Reconfiguring the generic provider to a different issuer must not allow the new issuer to claim identities or sessions created by the previous issuer.
 
 The provider daemon should return stable identity fields:
@@ -181,11 +193,12 @@ The provider daemon should return stable identity fields:
 
 Changing the issuer URL for `generic-oauth-auth-provider` is a trust-boundary change, not a routine credential edit.
 
+None of the rules in this section are implemented: Obot validates the new issuer but keeps existing identities and sessions. VD-7860 tracks issuer binding.
+
 When the configured issuer changes, Obot should:
 
 - Stop the existing provider daemon.
 - Treat the new issuer as a distinct identity namespace.
-- Require the admin to re-confirm `trustedForEmailLinking` for the new issuer before email-based account linking is enabled.
 - Avoid linking the new issuer's `sub` values to identities from the previous issuer.
 - Invalidate or require reauthentication for sessions created under the previous issuer.
 - Emit or preserve enough audit context for operators to understand that the login authority changed.
@@ -210,9 +223,7 @@ The UI should make these constraints visible:
 
 - Email domains are required for generic OAuth.
 - `*` allows every email domain accepted by the issuer.
-- Trusting account linking lets this issuer attach logins to existing Obot users with matching verified or issuer-trusted email addresses.
 - Changing the issuer changes the identity trust boundary.
-- Changing the issuer requires re-confirming account-linking trust.
 - The callback URL must be copied exactly into the external provider.
 
 The generic provider should sort with the common auth providers. The existing auth-provider page already uses a preferred-order list; adding the generic provider there is sufficient if the current alphabetical fallback does not place it appropriately.
@@ -280,10 +291,7 @@ Backend tests should cover:
 - Configure/reveal/deconfigure round-trips generic provider credentials.
 - Configure validation rejects missing email domains, invalid issuers, issuer mismatch, and unreachable discovery documents.
 - The one-configured-provider rule still rejects configuring generic OAuth when another provider is configured.
-- Generic OAuth is treated as trusted for identity linking only when `trustedForEmailLinking` is enabled for the same issuer boundary.
 - Reconfiguring the generic provider to a different issuer does not allow identity takeover through matching `sub` or email.
-- Reconfiguring the generic provider to a different issuer requires re-confirming `trustedForEmailLinking`.
-- `email_verified=false` prevents email-based linking.
 - Existing sessions are invalidated or forced to reauthenticate when the issuer changes.
 
 Provider/runtime tests should cover:

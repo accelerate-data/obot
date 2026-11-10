@@ -47,4 +47,9 @@ describe('stripBasePath against SvelteKit’s router base', () => {
 	it('strips the prefix when the router base is empty', () => {
 		expect(stripBasePath('/obot/vmcps')).toBe('/vmcps');
 	});
+
+	it('strips the prefix when server rendering reports a relative router base', () => {
+		expect(stripBasePath('/obot/vmcps', '.')).toBe('/vmcps');
+		expect(stripBasePath('/obot/vmcps', '..')).toBe('/vmcps');
+	});
 });

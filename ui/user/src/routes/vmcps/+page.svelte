@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import Skeleton from '$lib/components/Skeleton.svelte';
 	import TabLayout, { type TabView } from '$lib/components/TabLayout.svelte';
 	import IconButton from '$lib/components/primitives/IconButton.svelte';
 	import ConnectAllVMcps from '$lib/components/vmcps/ConnectAllVMcps.svelte';
@@ -9,11 +10,12 @@
 	import VMcpList from '$lib/components/vmcps/VMcpList.svelte';
 	import VMcpListSettings from '$lib/components/vmcps/VMcpListSettings.svelte';
 	import { m } from '$lib/i18n';
-	import Loading from '$lib/icons/Loading.svelte';
+	import { localState } from '$lib/runes/localState.svelte';
 	import { Group, UserService, type OrgUser, type VMCP } from '$lib/services';
 	import { COMMON_AI_CLIENTS } from '$lib/services/user/constants';
 	import type {
 		VMcpListSettings as VMcpListSettingsType,
+		VMcpListVariant,
 		VMcpSortBy
 	} from '$lib/services/vmcps/types';
 	import {
@@ -23,10 +25,10 @@
 		sortVMcps,
 		resolveVMcpComponents
 	} from '$lib/services/vmcps/utils';
-	import { mcpServersAndEntries, profile, responsive, vmcpInstances } from '$lib/stores';
-	import { goto, setFilterUrlParams, setSortUrlParams, setUrlParamAndUpdateUrl } from '$lib/url';
+	import { errors, mcpServersAndEntries, profile, responsive, vmcpInstances } from '$lib/stores';
+	import { goto, setFilterUrlParams, setSortUrlParams } from '$lib/url';
 	import { Layers, Pencil, Plus } from '@lucide/svelte';
-	import { onMount, untrack } from 'svelte';
+	import { onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
 
 	let { data } = $props();
@@ -63,13 +65,25 @@
 			query: page.url.searchParams.get('query') || '',
 			componentFilterBy: page.url.searchParams.get('components') || '',
 			statusFilterBy: page.url.searchParams.get('status') || '',
-			creatorFilterBy: page.url.searchParams.get('creator') || '',
-			variant: (page.url.searchParams.get('variant') as 'grid' | 'table') || 'grid'
+			creatorFilterBy: page.url.searchParams.get('creator') || ''
 		};
 	}
 
-	let listedVMcps = $state<VMCP[]>(untrack(() => data?.vmcps ?? []));
-	let isLoading = $state(false);
+	const variantState = localState<VMcpListVariant>('@obot/vmcps/variant', 'grid', {
+		parse: (value) => {
+			if (!value) return null;
+			try {
+				const parsed = JSON.parse(value);
+				return parsed === 'grid' || parsed === 'table' ? parsed : null;
+			} catch {
+				return null;
+			}
+		}
+	});
+	const variant = $derived<VMcpListVariant>(variantState.current === 'table' ? 'table' : 'grid');
+
+	let listedVMcps = $state<VMCP[]>([]);
+	let isLoading = $state(true);
 	let filters = $state(getInitialFilters());
 	let vmcpList = $state<ReturnType<typeof VMcpList>>();
 	let users = $state<OrgUser[]>([]);
@@ -131,14 +145,33 @@
 		)
 	);
 
-	$effect(() => {
-		listedVMcps = data?.vmcps ?? [];
-	});
-
 	onMount(() => {
+		let active = true;
+
 		UserService.listUsersIncludeDeleted().then((response) => {
-			users = response;
+			if (active) users = response;
 		});
+
+		UserService.listVMCPs({
+			all: profile.current.hasAdminAccess?.(),
+			minimal: true,
+			dontLogErrors: true
+		})
+			.then((response) => {
+				if (active) listedVMcps = response;
+			})
+			.catch(() => {
+				if (!active) return;
+				listedVMcps = [];
+				errors.append(m.vmcps_failed_to_load_vmcps());
+			})
+			.finally(() => {
+				if (active) isLoading = false;
+			});
+
+		return () => {
+			active = false;
+		};
 	});
 
 	function vmcpComponents(vmcp: VMCP) {
@@ -154,7 +187,7 @@
 	}
 
 	function hideCreate() {
-		const url = new URL(page.url);
+		const url = new URL(page.url.toString());
 		url.searchParams.delete('new');
 		goto(url, { replaceState: true });
 	}
@@ -169,50 +202,55 @@
 	function handleChange(property: keyof VMcpListSettingsType, values: string[]) {
 		vmcpList?.resetSelection();
 
+		const filtersToSet: Record<string, string[]> = {};
 		switch (property) {
 			case 'showMyVMcpsOnly':
 				filters.showMyVMcpsOnly = values.includes('true');
-				setFilterUrlParams(property, values);
+				filtersToSet.showMyVMcpsOnly = values;
 				break;
 			case 'sortBy':
 				filters.sortBy = sortByValues.includes(values[0] as VMcpSortBy)
 					? (values[0] as VMcpSortBy)
 					: 'name';
-				setFilterUrlParams('sort', [filters.sortBy]);
+				filtersToSet.sort = [filters.sortBy];
 				break;
 			case 'sortDirection':
 				filters.sortDirection = values[0] === 'desc' ? 'desc' : 'asc';
-				setFilterUrlParams('sortDirection', [filters.sortDirection]);
+				filtersToSet.sortDirection = [filters.sortDirection];
 				break;
 			case 'query':
 				filters.query = values[0] || '';
-				setUrlParamAndUpdateUrl(page.url, 'query', values[0] || null);
+				filtersToSet.query = values[0] ? [values[0]] : [];
 				break;
 			case 'componentFilterBy':
 				filters.componentFilterBy = values.join(',');
-				setFilterUrlParams('components', values);
+				filtersToSet.components = values;
 				break;
 			case 'statusFilterBy':
 				filters.statusFilterBy = values.join(',');
-				setFilterUrlParams('status', values);
+				filtersToSet.status = values;
 				break;
 			case 'creatorFilterBy':
 				filters.creatorFilterBy = values.join(',');
-				setFilterUrlParams('creator', values);
-				break;
-			case 'variant':
-				filters.variant = values[0] as 'grid' | 'table';
-				setFilterUrlParams('variant', values);
+				filtersToSet.creator = values;
 				break;
 		}
+		setFilterUrlParams(filtersToSet);
+	}
+
+	function handleVariantChange(next: VMcpListVariant) {
+		vmcpList?.resetSelection();
+		variantState.current = next;
 	}
 </script>
 
 {#if creating}
 	<VMcpDesigner
+		loading={isLoading}
 		onBack={hideCreate}
 		{usersMap}
-		isFirstVMcp={!listedVMcps.some((vmcp) => vmcp.creatorUserID === profile.current.id)}
+		isFirstVMcp={!isLoading &&
+			!listedVMcps.some((vmcp) => vmcp.creatorUserID === profile.current.id)}
 		workspaceId={data.workspaceId}
 	/>
 {:else}
@@ -235,6 +273,7 @@
 				<IconButton
 					class="btn-sm bg-base-200 hover:bg-base-400 dark:hover:bg-base-300"
 					tooltip={{ text: option.alt, placement: 'bottom' }}
+					disabled={isLoading}
 					onclick={() => openConnectAllDialog(option)}
 				>
 					<img src={option.icon} alt={option.alt} class="size-4 block dark:hidden" />
@@ -256,31 +295,43 @@
 {/snippet}
 
 {#snippet vmcpsView()}
-	{#if isLoading}
-		<Loading class="text-primary" />
-	{:else}
-		<VMcpListSettings
-			{filters}
-			onChange={handleChange}
-			{componentFilterOptions}
-			{creatorFilterOptions}
-		>
-			{#snippet actions()}
-				{#if sortedVMcps.length > 0 && filters.variant === 'grid' && !vmcpList?.isInSelectMode()}
-					<div in:fade>
-						<button class="btn btn-secondary" onclick={() => vmcpList?.toggleSelectMode()}>
-							<Pencil class="size-4" />
-							{m.vmcps_edit_mode()}
-						</button>
-					</div>
-				{/if}
-				{#if sortedVMcps.length > 0 && filters.variant === 'grid' && vmcpList?.isInSelectMode()}
-					<button class="btn btn-secondary" onclick={() => vmcpList?.toggleSelectAll()}>
-						{vmcpList?.isAllSelected() ? m.vmcps_deselect_all() : m.vmcps_select_all()}
+	<VMcpListSettings
+		{filters}
+		{variant}
+		onChange={handleChange}
+		onVariantChange={handleVariantChange}
+		{componentFilterOptions}
+		{creatorFilterOptions}
+	>
+		{#snippet actions()}
+			{#if sortedVMcps.length > 0 && variant === 'grid' && !vmcpList?.isInSelectMode()}
+				<div in:fade>
+					<button class="btn btn-secondary" onclick={() => vmcpList?.toggleSelectMode()}>
+						<Pencil class="size-4" />
+						{m.vmcps_edit_mode()}
 					</button>
-				{/if}
-			{/snippet}
-		</VMcpListSettings>
+				</div>
+			{/if}
+			{#if sortedVMcps.length > 0 && variant === 'grid' && vmcpList?.isInSelectMode()}
+				<button class="btn btn-secondary" onclick={() => vmcpList?.toggleSelectAll()}>
+					{vmcpList?.isAllSelected() ? m.vmcps_deselect_all() : m.vmcps_select_all()}
+				</button>
+			{/if}
+		{/snippet}
+	</VMcpListSettings>
+	{#if isLoading}
+		{#if variant === 'table'}
+			<Skeleton type="table" count={12} />
+		{:else}
+			<div class="@container">
+				<div class="grid grid-cols-1 items-start gap-4 @2xl:grid-cols-2 @5xl:grid-cols-3">
+					{#each Array.from({ length: 12 }) as _, i (i)}
+						<Skeleton type="card" class="h-44 w-full" />
+					{/each}
+				</div>
+			</div>
+		{/if}
+	{:else}
 		<VMcpList
 			bind:this={vmcpList}
 			items={sortedVMcps}
@@ -294,7 +345,7 @@
 				listedVMcps = listedVMcps.map((vmcp) => (vmcp.id === updated.id ? updated : vmcp));
 			}}
 			{usersMap}
-			variant={filters.variant}
+			{variant}
 			{filters}
 			onFilterChange={handleChange}
 			onSort={handleTableSort}
@@ -335,7 +386,7 @@
 {/snippet}
 
 {#snippet deploymentsView()}
-	<VMcpDeploymentsView vmcps={listedVMcps} {usersMap} />
+	<VMcpDeploymentsView vmcps={listedVMcps} {usersMap} vmcpsLoading={isLoading} />
 {/snippet}
 
 <ConnectAllVMcps bind:this={connectAllVMcpsDialog} {vmcps} />

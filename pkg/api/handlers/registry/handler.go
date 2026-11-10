@@ -8,537 +8,75 @@ import (
 	"strings"
 
 	"github.com/obot-platform/obot/apiclient/types"
-	"github.com/obot-platform/obot/pkg/accesscontrolrule"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authz"
-	gateway "github.com/obot-platform/obot/pkg/gateway/client"
-	"github.com/obot-platform/obot/pkg/mcp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apiserver/pkg/authentication/user"
+	"github.com/obot-platform/obot/pkg/vmcp"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type Handler struct {
-	acrHelper                 *accesscontrolrule.Helper
-	serverURL                 string
-	registryNoAuth            bool
-	mimeFetcher               *mimeFetcher
-	secretBindingAllowedLabel string
+	serverURL string
 }
 
-func NewHandler(acrHelper *accesscontrolrule.Helper, serverURL string, registryNoAuth bool, secretBindingAllowedLabel string, egress mcp.RemoteMCPURLValidationConfig) *Handler {
-	return &Handler{
-		acrHelper:                 acrHelper,
-		serverURL:                 serverURL,
-		registryNoAuth:            registryNoAuth,
-		mimeFetcher:               newMimeFetcher(egress),
-		secretBindingAllowedLabel: secretBindingAllowedLabel,
-	}
+func NewHandler(serverURL string) *Handler {
+	return &Handler{serverURL: serverURL}
 }
 
-// ListServers handles GET /v0.1/servers
+// ListServers handles GET /v0.1/servers.
 func (h *Handler) ListServers(req api.Context) error {
-	// Parse query parameters
-	cursor := req.URL.Query().Get("cursor")
-	limit := parseLimit(req.URL.Query().Get("limit"))
-	search := req.URL.Query().Get("search")
-
 	reverseDNS, err := ReverseDNSFromURL(h.serverURL)
 	if err != nil {
 		return fmt.Errorf("failed to generate reverse DNS: %w", err)
 	}
 
-	// Collect servers based on the request user.
-	var servers []types.RegistryServerResponse
-	if registryUserAuthenticated(req.User) {
-		servers, err = h.collectAccessibleServers(req, reverseDNS)
-	} else {
-		servers, err = h.collectAccessibleServersNoAuth(req, reverseDNS)
-	}
-	if err != nil {
-		return err
+	var list v1.VMCPList
+	if err := req.Storage.List(req.Context(), &list, kclient.InNamespace(system.DefaultNamespace)); err != nil {
+		return fmt.Errorf("failed to list vMCPs: %w", err)
 	}
 
-	// Apply search filter if provided
-	if search != "" {
-		servers = filterServersBySearch(servers, search)
+	definitions := make([]v1.VMCP, 0, len(list.Items))
+	search := strings.ToLower(req.URL.Query().Get("search"))
+	for _, item := range list.Items {
+		if !registryVMCPVisible(req, &item) {
+			continue
+		}
+		// Search the full manifest description before conversion truncates it.
+		if search != "" &&
+			!strings.Contains(strings.ToLower(FormatRegistryServerName(reverseDNS, item.Name)), search) &&
+			!strings.Contains(strings.ToLower(item.Spec.Manifest.DisplayName), search) &&
+			!strings.Contains(strings.ToLower(item.Spec.Manifest.Description), search) {
+			continue
+		}
+		definitions = append(definitions, item)
 	}
-
-	// Apply pagination
-	response := paginateServers(servers, cursor, limit)
-
-	return req.Write(response)
+	return req.Write(h.paginateVMCPs(definitions, reverseDNS, req.URL.Query().Get("cursor"), parseLimit(req.URL.Query().Get("limit"))))
 }
 
-func registryUserAuthenticated(u user.Info) bool {
-	return u != nil && !slices.Contains(u.GetGroups(), authz.UnauthenticatedGroup)
-}
-
-func (h *Handler) collectAccessibleServers(req api.Context, reverseDNS string) ([]types.RegistryServerResponse, error) {
-	var result []types.RegistryServerResponse
-	userID := req.User.GetUID()
-
-	// Track what we've already added for deduplication
-	addedCatalogEntries := make(map[string]bool) // catalog entry ID -> true
-
-	// Step 1: List all user's own personal MCPServers (userID matches)
-	personalServers, credMap, err := h.listPersonalServers(req, userID)
-	if err != nil {
-		return nil, err
+// Registry visibility follows consumption permissions, including for administrators.
+// Anonymous discovery deliberately publishes only shared definitions with an explicit
+// wildcard profile, without interpreting anonymous user IDs or groups as grants.
+func registryVMCPVisible(req api.Context, definition *v1.VMCP) bool {
+	// Empty drafts cannot accept connections through the advertised remote.
+	if len(definition.Spec.Manifest.Components) == 0 {
+		return false
 	}
-
-	for _, server := range personalServers {
-		slug := server.Name
-
-		if err := mcp.RefreshSecretBindingStatus(req.Context(), req.LocalK8sClient, req.ObotNamespace, &server, h.secretBindingAllowedLabel); err != nil {
-			// Skip servers whose secret bindings cannot be checked
-			continue
-		}
-		converted, err := ConvertMCPServerToRegistry(req.Context(), server, credMap[server.Name], h.serverURL, slug, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// Skip servers that can't be converted
-			continue
-		}
-		result = append(result, converted)
-
-		// Track catalog entry for deduplication
-		if server.Spec.MCPServerCatalogEntryName != "" {
-			addedCatalogEntries[server.Spec.MCPServerCatalogEntryName] = true
-		}
+	if req.User != nil && req.UserIsAuthenticated() {
+		return authz.UserCanReadVMCP(req.User, definition)
 	}
-
-	// Step 2: List catalog entries in default catalog with access
-	catalogEntries, err := h.listCatalogEntriesInCatalog(req, system.DefaultCatalog, addedCatalogEntries)
-	if err != nil {
-		return nil, err
+	if definition.IsPersonal() {
+		return false
 	}
-
-	for _, entry := range catalogEntries {
-		converted, err := ConvertMCPServerCatalogEntryToRegistry(req.Context(), entry, h.serverURL, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// If conversion fails, just skip the entry
-			continue
-		}
-		result = append(result, converted)
-	}
-
-	// Step 3: List servers in default catalog with access
-	catalogServers, credMap, err := h.listServersInCatalog(req, system.DefaultCatalog)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, server := range catalogServers {
-		slug := server.Name
-
-		if err := mcp.RefreshSecretBindingStatus(req.Context(), req.LocalK8sClient, req.ObotNamespace, &server, h.secretBindingAllowedLabel); err != nil {
-			// Skip servers whose secret bindings cannot be checked
-			continue
-		}
-		converted, err := ConvertMCPServerToRegistry(req.Context(), server, credMap[server.Name], h.serverURL, slug, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// If conversion fails, just skip the server
-			continue
-		}
-		result = append(result, converted)
-	}
-
-	// Step 4: List catalog entries in PowerUserWorkspaces with access
-	workspaceEntries, err := h.listCatalogEntriesInWorkspaces(req, addedCatalogEntries)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, entry := range workspaceEntries {
-		converted, err := ConvertMCPServerCatalogEntryToRegistry(req.Context(), entry, h.serverURL, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// If conversion fails, just skip the entry
-			continue
-		}
-		result = append(result, converted)
-	}
-
-	// Step 5: List servers in PowerUserWorkspaces with access
-	workspaceServers, credMap, err := h.listServersInWorkspaces(req)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, server := range workspaceServers {
-		slug := server.Name
-
-		if err := mcp.RefreshSecretBindingStatus(req.Context(), req.LocalK8sClient, req.ObotNamespace, &server, h.secretBindingAllowedLabel); err != nil {
-			// Skip servers whose secret bindings cannot be checked
-			continue
-		}
-		converted, err := ConvertMCPServerToRegistry(req.Context(), server, credMap[server.Name], h.serverURL, slug, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// If conversion fails, just skip the server
-			continue
-		}
-		result = append(result, converted)
-	}
-
-	return result, nil
-}
-
-// collectAccessibleServersNoAuth returns only default catalog items with wildcard ACR access
-func (h *Handler) collectAccessibleServersNoAuth(req api.Context, reverseDNS string) ([]types.RegistryServerResponse, error) {
-	var result []types.RegistryServerResponse
-
-	// Step 1: List catalog entries in default catalog
-	var entryList v1.MCPServerCatalogEntryList
-	if err := req.Storage.List(req.Context(), &entryList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.mcpCatalogName": system.DefaultCatalog,
-		}),
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list catalog entries: %w", err)
-	}
-
-	// Filter for wildcard ACR access
-	for _, entry := range entryList.Items {
-		hasWildcardAccess, err := h.acrHelper.HasWildcardAccessToMCPServerCatalogEntryInCatalog(
-			entry.Name,
-			system.DefaultCatalog,
-		)
-		if err != nil || !hasWildcardAccess {
-			continue
-		}
-
-		converted, err := ConvertMCPServerCatalogEntryToRegistry(req.Context(), entry, h.serverURL, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// If conversion fails, just skip the entry
-			continue
-		}
-		result = append(result, converted)
-	}
-
-	// Step 2: List multi-user servers in default catalog
-	var serverList v1.MCPServerList
-	if err := req.Storage.List(req.Context(), &serverList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.mcpCatalogID": system.DefaultCatalog,
-		}),
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list catalog servers: %w", err)
-	}
-
-	// Filter for wildcard ACR access and non-templates
-	for _, server := range serverList.Items {
-		// Skip templates and components
-		if server.Spec.Template || server.Spec.CompositeName != "" || server.Spec.VMCPComponentID != "" {
-			continue
-		}
-
-		hasWildcardAccess, err := h.acrHelper.HasWildcardAccessToMCPServerInCatalog(
-			server.Name,
-			system.DefaultCatalog,
-		)
-		if err != nil || !hasWildcardAccess {
-			continue
-		}
-
-		slug := server.Name
-
-		// Get credentials
-		credEnv := h.getCredentialsForServer(req, server, server.Spec.UserID)
-
-		if err := mcp.RefreshSecretBindingStatus(req.Context(), req.LocalK8sClient, req.ObotNamespace, &server, h.secretBindingAllowedLabel); err != nil {
-			// Skip servers whose secret bindings cannot be checked
-			continue
-		}
-		converted, err := ConvertMCPServerToRegistry(req.Context(), server, credEnv, h.serverURL, slug, reverseDNS, h.mimeFetcher)
-		if err != nil {
-			// If conversion fails, just skip the server
-			continue
-		}
-		result = append(result, converted)
-	}
-
-	return result, nil
-}
-
-// Helper methods for each step
-
-func (h *Handler) listPersonalServers(req api.Context, userID string) ([]v1.MCPServer, map[string]map[string]string, error) {
-	var serverList v1.MCPServerList
-
-	if err := req.Storage.List(req.Context(), &serverList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.userID":               userID,
-			"spec.mcpCatalogID":         "",
-			"spec.powerUserWorkspaceID": "",
-		}),
-	}); err != nil {
-		return nil, nil, fmt.Errorf("failed to list personal servers: %w", err)
-	}
-
-	// Filter out template and component servers
-	var servers []v1.MCPServer
-	for _, server := range serverList.Items {
-		if !server.Spec.Template && server.Spec.CompositeName == "" && server.Spec.VMCPComponentID == "" {
-			servers = append(servers, server)
-		}
-	}
-
-	// Get credentials for all servers
-	credMap, err := h.getCredentialsForServers(req, servers, userID)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return servers, credMap, nil
-}
-
-func (h *Handler) listCatalogEntriesInCatalog(
-	req api.Context,
-	catalogID string,
-	exclude map[string]bool,
-) ([]v1.MCPServerCatalogEntry, error) {
-	var entryList v1.MCPServerCatalogEntryList
-
-	if err := req.Storage.List(req.Context(), &entryList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.mcpCatalogName": catalogID,
-		}),
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list catalog entries: %w", err)
-	}
-
-	var result []v1.MCPServerCatalogEntry
-	for _, entry := range entryList.Items {
-		// Skip if already added via user's personal server
-		if exclude[entry.Name] {
-			continue
-		}
-
-		// Check access
-		hasAccess, err := h.acrHelper.UserHasAccessToMCPServerCatalogEntryInCatalog(
-			req.User,
-			entry.Name,
-			catalogID,
-		)
-		if err != nil || !hasAccess {
-			continue
-		}
-
-		result = append(result, entry)
-	}
-
-	return result, nil
-}
-
-func (h *Handler) listServersInCatalog(
-	req api.Context,
-	catalogID string,
-) ([]v1.MCPServer, map[string]map[string]string, error) {
-	var serverList v1.MCPServerList
-
-	if err := req.Storage.List(req.Context(), &serverList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-		FieldSelector: fields.SelectorFromSet(map[string]string{
-			"spec.mcpCatalogID": catalogID,
-		}),
-	}); err != nil {
-		return nil, nil, fmt.Errorf("failed to list catalog servers: %w", err)
-	}
-
-	var result []v1.MCPServer
-	for _, server := range serverList.Items {
-		// Skip templates and components
-		if server.Spec.Template || server.Spec.CompositeName != "" || server.Spec.VMCPComponentID != "" {
-			continue
-		}
-
-		// Check access
-		hasAccess, err := h.acrHelper.UserHasAccessToMCPServerInCatalog(
-			req.User,
-			server.Name,
-			catalogID,
-		)
-		if err != nil || !hasAccess {
-			continue
-		}
-
-		result = append(result, server)
-	}
-
-	// Get credentials
-	credMap, err := h.getCredentialsForServers(req, result, "")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return result, credMap, nil
-}
-
-func (h *Handler) listCatalogEntriesInWorkspaces(
-	req api.Context,
-	exclude map[string]bool,
-) ([]v1.MCPServerCatalogEntry, error) {
-	// List ALL workspaces (not pre-filtered)
-	var workspaceList v1.PowerUserWorkspaceList
-	if err := req.Storage.List(req.Context(), &workspaceList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to list workspaces: %w", err)
-	}
-
-	var result []v1.MCPServerCatalogEntry
-
-	// For each workspace, list catalog entries and filter by ACR access
-	for _, workspace := range workspaceList.Items {
-		var entryList v1.MCPServerCatalogEntryList
-
-		if err := req.Storage.List(req.Context(), &entryList, &kclient.ListOptions{
-			Namespace: system.DefaultNamespace,
-			FieldSelector: fields.SelectorFromSet(map[string]string{
-				"spec.powerUserWorkspaceID": workspace.Name,
-			}),
-		}); err != nil {
-			continue
-		}
-
-		for _, entry := range entryList.Items {
-			// Skip if already added
-			if exclude[entry.Name] {
-				continue
+	for _, profile := range definition.Spec.Manifest.Profiles {
+		for _, subject := range profile.Subjects {
+			if subject.Type == types.SubjectTypeSelector && subject.ID == "*" {
+				return true
 			}
-
-			// Check access for this specific entry
-			hasAccess, err := h.acrHelper.UserHasAccessToMCPServerCatalogEntryInWorkspace(
-				req.Context(),
-				req.User,
-				entry.Name,
-				workspace.Name,
-			)
-			if err != nil || !hasAccess {
-				continue
-			}
-
-			result = append(result, entry)
 		}
 	}
-
-	return result, nil
-}
-
-func (h *Handler) listServersInWorkspaces(
-	req api.Context,
-) ([]v1.MCPServer, map[string]map[string]string, error) {
-	// List ALL workspaces (not pre-filtered)
-	var workspaceList v1.PowerUserWorkspaceList
-	if err := req.Storage.List(req.Context(), &workspaceList, &kclient.ListOptions{
-		Namespace: system.DefaultNamespace,
-	}); err != nil {
-		return nil, nil, fmt.Errorf("failed to list workspaces: %w", err)
-	}
-
-	var result []v1.MCPServer
-
-	// For each workspace, list servers and filter by ACR access
-	for _, workspace := range workspaceList.Items {
-		var serverList v1.MCPServerList
-
-		if err := req.Storage.List(req.Context(), &serverList, &kclient.ListOptions{
-			Namespace: system.DefaultNamespace,
-			FieldSelector: fields.SelectorFromSet(map[string]string{
-				"spec.powerUserWorkspaceID": workspace.Name,
-			}),
-		}); err != nil {
-			continue
-		}
-
-		for _, server := range serverList.Items {
-			// Skip templates and components
-			if server.Spec.Template || server.Spec.CompositeName != "" || server.Spec.VMCPComponentID != "" {
-				continue
-			}
-
-			// Check access for this specific server
-			hasAccess, err := h.acrHelper.UserHasAccessToMCPServerInWorkspace(
-				req.User,
-				server.Name,
-				workspace.Name,
-				server.Spec.UserID,
-			)
-			if err != nil || !hasAccess {
-				continue
-			}
-
-			result = append(result, server)
-		}
-	}
-
-	// Get credentials for each server.
-	credMap := make(map[string]map[string]string)
-	for _, server := range result {
-		credMap[server.Name] = h.getCredentialsForServer(req, server, server.Spec.UserID)
-	}
-
-	return result, credMap, nil
-}
-
-// Credential retrieval helpers
-
-func (h *Handler) getCredentialsForServers(
-	req api.Context,
-	servers []v1.MCPServer,
-	userID string,
-) (map[string]map[string]string, error) {
-	if len(servers) == 0 {
-		return make(map[string]map[string]string), nil
-	}
-
-	// Build credential contexts
-	credCtxs := make([]string, 0, len(servers))
-	for _, server := range servers {
-		credCtxs = append(credCtxs, server.CredentialContext(cmp.Or(userID, server.Spec.UserID)))
-	}
-
-	// List credentials
-	creds, err := req.GatewayClient.ListCredentials(req.Context(), gateway.ListCredentialsOptions{
-		CredentialContexts: credCtxs,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list credentials: %w", err)
-	}
-
-	// Reveal and build map
-	credMap := make(map[string]map[string]string)
-	for _, cred := range creds {
-		if _, ok := credMap[cred.Name]; !ok {
-			revealed, err := req.GatewayClient.RevealCredential(req.Context(), []string{cred.Context}, cred.Name)
-			if err != nil {
-				// Skip if credential not found
-				continue
-			}
-			credMap[cred.Name] = revealed.Secrets
-		}
-	}
-
-	return credMap, nil
-}
-
-func (h *Handler) getCredentialsForServer(
-	req api.Context,
-	server v1.MCPServer,
-	userID string,
-) map[string]string {
-	revealed, err := req.GatewayClient.RevealCredential(req.Context(), []string{server.CredentialContext(userID)}, server.Name)
-	if err != nil {
-		// Return empty map if not found
-		return make(map[string]string)
-	}
-
-	return revealed.Secrets
+	return false
 }
 
 // Pagination and filtering helpers
@@ -558,68 +96,33 @@ func parseLimit(limitStr string) int {
 	return limit
 }
 
-func filterServersBySearch(servers []types.RegistryServerResponse, search string) []types.RegistryServerResponse {
-	search = strings.ToLower(search)
-	var result []types.RegistryServerResponse
-
-	for _, server := range servers {
-		// Substring match on name, title, or description
-		if strings.Contains(strings.ToLower(server.Server.Name), search) ||
-			strings.Contains(strings.ToLower(server.Server.Title), search) ||
-			strings.Contains(strings.ToLower(server.Server.Description), search) {
-			result = append(result, server)
+func (h *Handler) paginateVMCPs(definitions []v1.VMCP, reverseDNS, cursor string, limit int) types.RegistryServerList {
+	slices.SortStableFunc(definitions, func(i, j v1.VMCP) int {
+		if result := cmp.Compare(i.CreationTimestamp.Unix(), j.CreationTimestamp.Unix()); result != 0 {
+			return result
 		}
-	}
-
-	return result
-}
-
-func paginateServers(servers []types.RegistryServerResponse, cursor string, limit int) types.RegistryServerList {
-	// Sort servers by creation timestamp
-	slices.SortStableFunc(servers, func(i, j types.RegistryServerResponse) int {
-		return int(i.CreatedAtUnix - j.CreatedAtUnix)
+		return strings.Compare(i.Name, j.Name)
 	})
 
-	// Simple cursor-based pagination using server name as cursor
-	startIdx := 0
+	start := 0
 	if cursor != "" {
-		// Find the position after the cursor
-		for i, server := range servers {
-			if server.Server.Name == cursor {
-				startIdx = i + 1
+		for i, definition := range definitions {
+			if FormatRegistryServerName(reverseDNS, definition.Name) == cursor {
+				start = i + 1
 				break
 			}
 		}
 	}
-
-	// Get the page
-	endIdx := startIdx + limit
-	endIdx = min(endIdx, len(servers))
-
-	page := servers[startIdx:endIdx]
-	if page == nil {
-		// This prevents an error from showing up in VSCode when the result is empty.
-		page = []types.RegistryServerResponse{}
+	end := min(start+limit, len(definitions))
+	metadata := &types.RegistryServerListMetadata{Count: end - start}
+	if end < len(definitions) {
+		metadata.NextCursor = FormatRegistryServerName(reverseDNS, definitions[end-1].Name)
 	}
-
-	// Build response
-	response := types.RegistryServerList{
-		Servers: page,
+	servers := make([]types.RegistryServerResponse, 0, end-start)
+	for _, definition := range definitions[start:end] {
+		servers = append(servers, ConvertVMCPToRegistry(definition, h.serverURL, reverseDNS))
 	}
-
-	// Add metadata if there are more results
-	if endIdx < len(servers) {
-		response.Metadata = &types.RegistryServerListMetadata{
-			NextCursor: page[len(page)-1].Server.Name,
-			Count:      len(page),
-		}
-	} else {
-		response.Metadata = &types.RegistryServerListMetadata{
-			Count: len(page),
-		}
-	}
-
-	return response
+	return types.RegistryServerList{Servers: servers, Metadata: metadata}
 }
 
 // ListServerVersions handles GET /v0.1/servers/{serverName}/versions
@@ -640,7 +143,7 @@ func (h *Handler) ListServerVersions(req api.Context) error {
 	// Find the server
 	server, err := h.findServerByName(req, actualServerName, reverseDNS)
 	if err != nil {
-		return h.notFoundError("Server not found")
+		return err
 	}
 
 	// Return as a ServerList with single item (only "latest" version exists)
@@ -682,119 +185,33 @@ func (h *Handler) GetServerVersion(req api.Context) error {
 	// Find the server
 	server, err := h.findServerByName(req, actualServerName, reverseDNS)
 	if err != nil {
-		return h.notFoundError("Server not found")
+		return err
 	}
 
 	return req.Write(server)
 }
 
-// findServerByName searches for a server by name and checks user access
-func (h *Handler) findServerByName(req api.Context, serverName string, reverseDNS string) (types.RegistryServerResponse, error) {
-	// Determine type based on prefix
-	if system.IsMCPServerID(serverName) {
-		// MCPServer - check ownership or ACR permissions
-		return h.findMCPServer(req, serverName, reverseDNS)
-	}
-	// MCPServerCatalogEntry - check ACR permissions
-	return h.findMCPServerCatalogEntry(req, serverName, reverseDNS)
-}
-
-// findMCPServer looks up an MCPServer and checks ownership or ACR permissions
-func (h *Handler) findMCPServer(req api.Context, serverName, reverseDNS string) (types.RegistryServerResponse, error) {
-	var server v1.MCPServer
-	err := req.Get(&server, serverName)
+// findServerByName resolves current IDs and migrated definition aliases, applying
+// the same visibility checks as listing. Instances are never registry entries.
+func (h *Handler) findServerByName(req api.Context, serverName, reverseDNS string) (types.RegistryServerResponse, error) {
+	expectedDNS, err := ReverseDNSFromURL(h.serverURL)
 	if err != nil {
-		return types.RegistryServerResponse{}, fmt.Errorf("server not found")
+		return types.RegistryServerResponse{}, err
 	}
-
-	// Skip templates and components
-	if server.Spec.Template || server.Spec.CompositeName != "" || server.Spec.VMCPComponentID != "" {
-		return types.RegistryServerResponse{}, fmt.Errorf("server not found")
+	if reverseDNS != expectedDNS || system.IsVMCPInstanceID(serverName) {
+		return types.RegistryServerResponse{}, h.notFoundError("Server not found")
 	}
-
-	// Check access based on server location
-	var (
-		slug    string
-		credEnv map[string]string
-	)
-
-	// Get the credentials for the server. We ignore errors if we get any,
-	// as we can still convert the server anyway and display it.
-	// Worst-case scenario is that a server that is configured will show up without a connect URL.
-	if server.Spec.IsOwnedBy(req.User.GetUID()) && server.Spec.IsSingleUser() {
-		// Personal server - user owns it
-		slug = server.Name
-		credEnv = h.getCredentialsForServer(req, server, req.User.GetUID())
-	} else if server.Spec.MCPCatalogID != "" {
-		// Catalog server - check ACR
-		hasAccess, err := h.acrHelper.UserHasAccessToMCPServerInCatalog(
-			req.User,
-			server.Name,
-			server.Spec.MCPCatalogID,
-		)
-		if err != nil || !hasAccess {
-			return types.RegistryServerResponse{}, fmt.Errorf("server not found")
-		}
-		slug = server.Name
-		credEnv = h.getCredentialsForServer(req, server, server.Spec.UserID)
-	} else if server.Spec.PowerUserWorkspaceID != "" {
-		// Workspace server - check ACR
-		hasAccess, err := h.acrHelper.UserHasAccessToMCPServerInWorkspace(
-			req.User,
-			server.Name,
-			server.Spec.PowerUserWorkspaceID,
-			server.Spec.UserID,
-		)
-		if err != nil || !hasAccess {
-			return types.RegistryServerResponse{}, fmt.Errorf("server not found")
-		}
-		slug = server.Name
-		credEnv = h.getCredentialsForServer(req, server, server.Spec.UserID)
-	} else {
-		return types.RegistryServerResponse{}, fmt.Errorf("server not found")
-	}
-
-	if err := mcp.RefreshSecretBindingStatus(req.Context(), req.LocalK8sClient, req.ObotNamespace, &server, h.secretBindingAllowedLabel); err != nil {
-		return types.RegistryServerResponse{}, fmt.Errorf("failed to resolve secret bindings: %w", err)
-	}
-	return ConvertMCPServerToRegistry(req.Context(), server, credEnv, h.serverURL, slug, reverseDNS, h.mimeFetcher)
-}
-
-// findMCPServerCatalogEntry looks up an MCPServerCatalogEntry and checks ACR permissions
-func (h *Handler) findMCPServerCatalogEntry(req api.Context, entryName string, reverseDNS string) (types.RegistryServerResponse, error) {
-	var entry v1.MCPServerCatalogEntry
-	err := req.Get(&entry, entryName)
+	definition, instance, err := vmcp.ResolveID(req.Context(), req.Storage, serverName)
 	if err != nil {
-		return types.RegistryServerResponse{}, fmt.Errorf("catalog entry not found")
-	}
-
-	// Check access based on entry location
-	if entry.Spec.MCPCatalogName != "" {
-		// Catalog entry - check ACR
-		hasAccess, err := h.acrHelper.UserHasAccessToMCPServerCatalogEntryInCatalog(
-			req.User,
-			entry.Name,
-			entry.Spec.MCPCatalogName,
-		)
-		if err != nil || !hasAccess {
-			return types.RegistryServerResponse{}, fmt.Errorf("catalog entry not found")
+		if apierrors.IsNotFound(err) {
+			return types.RegistryServerResponse{}, h.notFoundError("Server not found")
 		}
-	} else if entry.Spec.PowerUserWorkspaceID != "" {
-		// Workspace entry - check ACR
-		hasAccess, err := h.acrHelper.UserHasAccessToMCPServerCatalogEntryInWorkspace(
-			req.Context(),
-			req.User,
-			entry.Name,
-			entry.Spec.PowerUserWorkspaceID,
-		)
-		if err != nil || !hasAccess {
-			return types.RegistryServerResponse{}, fmt.Errorf("catalog entry not found")
-		}
-	} else {
-		return types.RegistryServerResponse{}, fmt.Errorf("catalog entry not found")
+		return types.RegistryServerResponse{}, err
 	}
-
-	return ConvertMCPServerCatalogEntryToRegistry(req.Context(), entry, h.serverURL, reverseDNS, h.mimeFetcher)
+	if definition == nil || instance != nil || !registryVMCPVisible(req, definition) {
+		return types.RegistryServerResponse{}, h.notFoundError("Server not found")
+	}
+	return ConvertVMCPToRegistry(*definition, h.serverURL, expectedDNS), nil
 }
 
 // notFoundError returns a standard 404 error response in the format:

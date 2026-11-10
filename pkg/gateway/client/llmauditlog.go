@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	gatewayllmaudit "github.com/obot-platform/obot/pkg/gateway/llmaudit"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"gorm.io/gorm"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -29,22 +28,24 @@ var (
 )
 
 type llmAuditEntry struct {
-	log            types.LLMAuditLog
-	responseStream []byte
+	log types.LLMAuditLog
 }
 
 type LLMAuditLogOptions struct {
-	WithSensitiveFields    bool
-	HideModelsRequests     bool
-	APIKeyID               []uint
-	UserID                 []string
-	ModelProvider          []string
-	TargetModel            []string
-	RequestPath            []string
-	ResponseStatus         []int
-	Outcome                []string
-	UserAgent              []string
-	ClientSessionID        []string
+	WithSensitiveFields bool
+	HideModelsRequests  bool
+	APIKeyID            []uint
+	UserID              []string
+	ModelProvider       []string
+	TargetModel         []string
+	ServedProvider      []string
+	RequestPath         []string
+	ResponseStatus      []int
+	Outcome             []string
+	UserAgent           []string
+	ClientSessionID     []string
+	// MessagePolicyTriggered filters on the message policy flag of rows recorded before
+	// message policies became guardrails. Only scheduled exports that set it use it.
 	MessagePolicyTriggered []bool
 	Query                  string
 	StartTime              time.Time
@@ -59,7 +60,7 @@ func (c *Client) LLMAuditLogEnabled() bool {
 	return c != nil && c.llmAuditEnabled
 }
 
-func (c *Client) LogLLMAuditEntry(auditLog types.LLMAuditLog, responseStream []byte) {
+func (c *Client) LogLLMAuditEntry(auditLog types.LLMAuditLog) {
 	if !c.LLMAuditLogEnabled() {
 		return
 	}
@@ -71,7 +72,7 @@ func (c *Client) LogLLMAuditEntry(auditLog types.LLMAuditLog, responseStream []b
 	// Never let audit logging block an LLM request. A full channel means the
 	// writer is behind for long enough that keeping request latency matters more.
 	select {
-	case c.llmAuditEntries <- llmAuditEntry{log: auditLog, responseStream: responseStream}:
+	case c.llmAuditEntries <- llmAuditEntry{log: auditLog}:
 	default:
 		slog.Warn("dropping LLM audit log: buffer is full")
 	}
@@ -111,6 +112,8 @@ func (c *Client) GetLLMAuditLogs(ctx context.Context, opts LLMAuditLogOptions) (
 		"user_id":           {},
 		"model_provider":    {},
 		"target_model":      {},
+		"served_provider":   {},
+		"served_model":      {},
 		"request_path":      {},
 		"response_status":   {},
 		"outcome":           {},
@@ -171,19 +174,6 @@ func (c *Client) GetLLMAuditLogFilterOptions(ctx context.Context, option string,
 		db = db.Order(option).Limit(opts.Limit)
 	}
 
-	if option == "message_policy_triggered" {
-		var values []bool
-		if err := db.Select(option).Scan(&values).Error; err != nil {
-			return nil, err
-		}
-
-		result := make([]string, 0, len(values))
-		for _, value := range values {
-			result = append(result, strconv.FormatBool(value))
-		}
-		return result, nil
-	}
-
 	var result []string
 	return result, db.Select(option).Scan(&result).Error
 }
@@ -222,25 +212,21 @@ func (c *Client) runLLMAuditPersistenceLoop(ctx context.Context, batchSize int, 
 	defer ticker.Stop()
 
 	batch := make([]llmAuditEntry, 0, batchSize)
+	// Hand the local partial batch to CloseContext after this loop has been joined.
+	defer func() { c.llmAuditPartial = batch }()
+
 	for {
 		select {
 		case <-ctx.Done():
-			for {
-				batch = c.drainQueuedLLMAuditEntries(batch, batchSize)
-				if len(batch) < batchSize {
-					c.flushLLMAuditBatch(batch)
-					return
-				}
-				batch = c.flushLLMAuditBatch(batch)
-			}
+			return
 		case entry := <-c.llmAuditEntries:
 			batch = append(batch, entry)
 			batch = c.drainQueuedLLMAuditEntries(batch, batchSize)
 			if len(batch) >= batchSize {
-				batch = c.flushLLMAuditBatch(batch)
+				batch = c.flushLLMAuditBatch(ctx, batch)
 			}
 		case <-ticker.C:
-			batch = c.flushLLMAuditBatch(batch)
+			batch = c.flushLLMAuditBatch(ctx, batch)
 		}
 	}
 }
@@ -255,7 +241,7 @@ func applyLLMAuditLogOptions(db *gorm.DB, opts LLMAuditLogOptions) *gorm.DB {
 		if db.Name() == "postgres" {
 			like = "ILIKE"
 		}
-		query := `user_id %[1]s ? OR model_provider %[1]s ? OR model_id %[1]s ? OR target_model %[1]s ? OR request_path %[1]s ? OR response_id %[1]s ? OR outcome %[1]s ? OR error %[1]s ? OR request_id %[1]s ? OR user_agent %[1]s ? OR client_session_id %[1]s ? OR client_ip %[1]s ?`
+		query := `user_id %[1]s ? OR model_provider %[1]s ? OR model_id %[1]s ? OR target_model %[1]s ? OR served_provider %[1]s ? OR served_model %[1]s ? OR provider_key %[1]s ? OR request_path %[1]s ? OR response_id %[1]s ? OR outcome %[1]s ? OR error %[1]s ? OR request_id %[1]s ? OR user_agent %[1]s ? OR client_session_id %[1]s ? OR client_ip %[1]s ?`
 		args := make([]any, strings.Count(query, "%[1]s ?"))
 		for i := range args {
 			args[i] = searchTerm
@@ -277,6 +263,9 @@ func applyLLMAuditLogOptions(db *gorm.DB, opts LLMAuditLogOptions) *gorm.DB {
 	}
 	if len(opts.TargetModel) > 0 {
 		db = db.Where("target_model IN (?)", opts.TargetModel)
+	}
+	if len(opts.ServedProvider) > 0 {
+		db = db.Where("served_provider IN (?)", opts.ServedProvider)
 	}
 	if len(opts.RequestPath) > 0 {
 		db = db.Where("request_path IN (?)", opts.RequestPath)
@@ -317,17 +306,23 @@ func (c *Client) drainQueuedLLMAuditEntries(batch []llmAuditEntry, batchSize int
 	return batch
 }
 
-func (c *Client) flushLLMAuditBatch(batch []llmAuditEntry) []llmAuditEntry {
+func (c *Client) flushLLMAuditBatch(ctx context.Context, batch []llmAuditEntry) []llmAuditEntry {
 	if len(batch) == 0 {
 		return batch
 	}
-	if err := c.persistLLMAuditLogs(batch); err != nil {
+	if err := c.writeAuditLogs(ctx, func(ctx context.Context) error {
+		return c.persistLLMAuditLogs(ctx, batch)
+	}); err != nil {
 		slog.Error("Failed to persist LLM audit logs", "error", err)
+		if ctx.Err() != nil {
+			// Shutdown cancellation leaves the batch available for the final shared-budget drain.
+			return batch
+		}
 	}
 	return batch[:0]
 }
 
-func (c *Client) persistQueuedLLMAuditLogs() error {
+func (c *Client) persistQueuedLLMAuditLogs(ctx context.Context) error {
 	if c.llmAuditEntries == nil {
 		return nil
 	}
@@ -336,49 +331,41 @@ func (c *Client) persistQueuedLLMAuditLogs() error {
 	if batchSize <= 0 {
 		batchSize = defaultLLMAuditLogBatchSize
 	}
-	batch := make([]llmAuditEntry, 0, batchSize)
+	batch := c.llmAuditPartial
+	defer func() { c.llmAuditPartial = batch }()
+
 	for {
-		select {
-		case entry := <-c.llmAuditEntries:
-			batch = append(batch, entry)
-			if len(batch) >= batchSize {
-				if err := c.persistLLMAuditLogs(batch); err != nil {
-					return err
-				}
-				batch = batch[:0]
-			}
-		default:
-			return c.persistLLMAuditLogs(batch)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+
+		batch = c.drainQueuedLLMAuditEntries(batch, batchSize)
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := c.persistLLMAuditLogs(ctx, batch); err != nil {
+			return err
+		}
+		batch = nil
 	}
 }
 
-func (c *Client) persistLLMAuditLogs(entries []llmAuditEntry) error {
+func (c *Client) persistLLMAuditLogs(ctx context.Context, entries []llmAuditEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(entries) == 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	logs := make([]types.LLMAuditLog, len(entries))
 	for i, entry := range entries {
 		logs[i] = entry.log
 		logs[i].CreatedAt = logs[i].CreatedAt.UTC()
-		aggregateLLMAuditResponse(&logs[i], entry.responseStream)
 	}
 	return c.insertLLMAuditLogs(ctx, logs)
-}
-
-func aggregateLLMAuditResponse(log *types.LLMAuditLog, responseStream []byte) {
-	if log == nil || len(responseStream) == 0 {
-		return
-	}
-	accumulator := gatewayllmaudit.NewResponseAccumulator(log.ModelProvider, log.RequestPath)
-	accumulator.Write(responseStream)
-	log.ResponseBody = accumulator.JSON()
-	if log.ResponseID == "" {
-		log.ResponseID = accumulator.ResponseID()
-	}
 }
 
 func (c *Client) insertLLMAuditLogs(ctx context.Context, logs []types.LLMAuditLog) error {

@@ -67,11 +67,11 @@ func TestReconcileStopsOnlyProvidersWithNewRevisions(t *testing.T) {
 
 	require.NoError(t, handler.Reconcile(router.Request{Object: daemonSync}, nil))
 	assert.Equal(t, 1, stopper.authStops["default/entra"])
-	assert.Equal(t, 1, stopper.modelStops["default/openai"])
+	assert.Zero(t, stopper.modelStops["default/openai"], "model providers have no daemon")
 
 	require.NoError(t, handler.Reconcile(router.Request{Object: daemonSync}, nil))
 	assert.Equal(t, 1, stopper.authStops["default/entra"])
-	assert.Equal(t, 1, stopper.modelStops["default/openai"])
+	assert.Zero(t, stopper.modelStops["default/openai"], "model providers have no daemon")
 
 	authRevision := daemonSync.Spec.Revisions["auth/default/entra"]
 	authRevision.Revision++
@@ -84,8 +84,8 @@ func TestReconcileStopsOnlyProvidersWithNewRevisions(t *testing.T) {
 	}
 	require.NoError(t, handler.Reconcile(router.Request{Object: daemonSync}, nil))
 	assert.Equal(t, 2, stopper.authStops["default/entra"])
-	assert.Equal(t, 1, stopper.modelStops["default/openai"])
-	assert.Equal(t, 1, stopper.modelStops["default/anthropic"])
+	assert.Zero(t, stopper.modelStops["default/openai"], "model providers have no daemon")
+	assert.Zero(t, stopper.modelStops["default/anthropic"], "model providers have no daemon")
 
 	authRevision.Revision = 1
 	daemonSync.Spec.Revisions["auth/default/entra"] = authRevision
@@ -217,4 +217,23 @@ func TestReconcileRetriesFailedLicenseRefresh(t *testing.T) {
 	refresher.err = nil
 	require.NoError(t, handler.Reconcile(req, nil))
 	assert.Equal(t, 2, refresher.refreshes)
+}
+
+func TestReconcileAcknowledgesLegacyLLMGatewayRevision(t *testing.T) {
+	handler := New(newRecordingStopper(), &recordingLicenseRefresher{})
+	req := router.Request{
+		Object: &v1.ProviderSync{
+			UID: types.UID("sync-1"),
+			Spec: v1.ProviderSyncSpec{
+				Revisions: map[string]v1.ProviderRevision{
+					"llm-gateway/default/llm-gateway-model-provider": {
+						ProviderType: v1.ProviderTypeLLMGateway,
+						Revision:     1,
+					},
+				},
+			},
+		},
+	}
+	require.NoError(t, handler.Reconcile(req, nil))
+	require.Equal(t, int64(1), handler.lastRevisions["sync-1/llm-gateway/default/llm-gateway-model-provider"])
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -530,11 +531,6 @@ func TestSignInLeavesTheSCIMProfileAlone(t *testing.T) {
 	conn, _ := createTestSCIMConnection(t, c, true)
 	provisioned := provisionTestSCIMUser(t, c, conn, "00u-provisioned", "scim@example.com")
 
-	// Explicit roles of a provisioned user follow the email SCIM stored, as every other check of explicit roles does,
-	// not the one the identity provider asserts at sign-in.
-	c.emailsWithExplicitRoles = map[string]apitypes.Role{
-		"login@example.com": apitypes.RoleOwner,
-	}
 	user, err := c.EnsureIdentity(ctx, signInIdentity("00u-provisioned", "login@example.com"), "", unlimited)
 	if err != nil {
 		t.Fatalf("failed to sign in: %v", err)
@@ -543,27 +539,6 @@ func TestSignInLeavesTheSCIMProfileAlone(t *testing.T) {
 	if user.ID != provisioned.UserID || stored.Email != "scim@example.com" || stored.Username != "00u-provisioned" || stored.DisplayName != "SCIM Name" {
 		t.Fatalf("sign-in changed the SCIM profile: %+v", stored)
 	}
-	if stored.Role.HasRole(apitypes.RoleOwner) {
-		t.Fatalf("sign-in applied the explicit role of the asserted email rather than the SCIM email: role %d", stored.Role)
-	}
-
-	c.emailsWithExplicitRoles = map[string]apitypes.Role{
-		"scim@example.com": apitypes.RoleOwner,
-	}
-	if _, err := c.EnsureIdentity(ctx, signInIdentity("00u-provisioned", "login@example.com"), "", unlimited); err != nil {
-		t.Fatalf("failed to sign in: %v", err)
-	}
-	stored = storedLifecycleUser(t, c, provisioned.UserID)
-	if !stored.Role.HasRole(apitypes.RoleOwner) {
-		t.Fatalf("sign-in did not apply the explicit role of the SCIM email: role %d", stored.Role)
-	}
-	// Demoting the user is refused for the same email.
-	if _, err := c.UpdateUser(ctx, true, &types.User{Role: apitypes.RoleBasic}, fmtUserID(provisioned.UserID)); err == nil {
-		t.Fatal("a user with an explicit role was demoted")
-	} else if _, ok := errors.AsType[*ExplicitRoleError](err); !ok {
-		t.Fatalf("UpdateUser() failed with %v, want an ExplicitRoleError", err)
-	}
-	c.emailsWithExplicitRoles = nil
 
 	// A user SCIM has not provisioned still gets the profile the sign-in asserts.
 	if _, err := c.EnsureIdentity(ctx, signInIdentity("00u-unbound", "renamed@example.com"), "", unlimited); err != nil {
@@ -1015,8 +990,18 @@ func TestSignInThroughAnotherProviderLeavesTheSCIMProfileAlone(t *testing.T) {
 	conn, _ := createTestSCIMConnection(t, c, true)
 	provisioned := provisionTestSCIMUser(t, c, conn, "00u-provisioned", "person@example.com")
 
-	// A user whose email was never marked unverified matches a verified provider's sign-in by email.
-	if err := c.db.WithContext(ctx).Model(new(types.User)).Where("id = ?", provisioned.UserID).UpdateColumn("verified_email", nil).Error; err != nil {
+	// The user also has an identity of another provider, whose sign-in asserts its own profile.
+	googleIdentity := &types.Identity{
+		AuthProviderNamespace: system.DefaultNamespace,
+		AuthProviderName:      "google-auth-provider",
+		ProviderUsername:      "person-google",
+		ProviderUserID:        "google-1",
+		HashedProviderUserID:  hash.String("google-1"),
+		Email:                 "person@example.com",
+		HashedEmail:           hash.String("person@example.com"),
+		UserID:                provisioned.UserID,
+	}
+	if err := c.db.WithContext(ctx).Create(googleIdentity).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -1255,5 +1240,88 @@ func TestSCIMGroupSubjectCleanupClaims(t *testing.T) {
 	}
 	if failed.Attempts != 1 || failed.LastError != "conflict" {
 		t.Fatalf("the failed cleanup = %+v", failed)
+	}
+}
+
+func TestNormalizeSCIMUserProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile types.SCIMUserProfile
+		want    types.SCIMUserProfile
+	}{
+		{
+			name: "empty addresses are absent",
+			profile: types.SCIMUserProfile{
+				Addresses: []types.SCIMAddress{},
+			},
+			want: types.SCIMUserProfile{},
+		},
+		{
+			name: "an empty enterprise extension is absent",
+			profile: types.SCIMUserProfile{
+				EnterpriseUser: &types.SCIMEnterpriseUser{},
+			},
+			want: types.SCIMUserProfile{},
+		},
+		{
+			name: "an enterprise extension with only an empty manager is absent",
+			profile: types.SCIMUserProfile{
+				EnterpriseUser: &types.SCIMEnterpriseUser{
+					Manager: &types.SCIMManager{},
+				},
+			},
+			want: types.SCIMUserProfile{},
+		},
+		{
+			name: "an empty manager is absent",
+			profile: types.SCIMUserProfile{
+				EnterpriseUser: &types.SCIMEnterpriseUser{
+					Department: "Sales",
+					Manager:    &types.SCIMManager{},
+				},
+			},
+			want: types.SCIMUserProfile{
+				EnterpriseUser: &types.SCIMEnterpriseUser{
+					Department: "Sales",
+				},
+			},
+		},
+		{
+			name: "a manager is kept",
+			profile: types.SCIMUserProfile{
+				EnterpriseUser: &types.SCIMEnterpriseUser{
+					Manager: &types.SCIMManager{
+						Value: "manager-1",
+					},
+				},
+			},
+			want: types.SCIMUserProfile{
+				EnterpriseUser: &types.SCIMEnterpriseUser{
+					Manager: &types.SCIMManager{
+						Value: "manager-1",
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeSCIMUserProfile(tt.profile); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("normalizeSCIMUserProfile() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeSCIMUserProfileLeavesItsArgumentAlone(t *testing.T) {
+	profile := types.SCIMUserProfile{
+		EnterpriseUser: &types.SCIMEnterpriseUser{
+			Department: "Sales",
+			Manager:    &types.SCIMManager{},
+		},
+	}
+	normalizeSCIMUserProfile(profile)
+	if profile.EnterpriseUser.Manager == nil {
+		t.Fatal("normalizeSCIMUserProfile() changed the profile it was given")
 	}
 }

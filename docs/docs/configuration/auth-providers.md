@@ -38,7 +38,6 @@ Add these settings to the environment file used by your [Docker deployment](../i
 ```dotenv
 OBOT_SERVER_ENABLE_AUTHENTICATION=true
 OBOT_BOOTSTRAP_TOKEN=<random-bootstrap-secret>
-OBOT_SERVER_AUTH_OWNER_EMAILS=owner@company.com
 ```
 
 Generate the bootstrap secret with `openssl rand -hex 32`. Keep the environment file private.
@@ -50,12 +49,6 @@ Generate the bootstrap secret with `openssl rand -hex 32`. Keep the environment 
 config:
   # Required: Enable authentication
   OBOT_SERVER_ENABLE_AUTHENTICATION: "true"
-
-  # Required: Set the owner email (can also be configured in the UI later)
-  OBOT_SERVER_AUTH_OWNER_EMAILS: "owner@company.com"
-
-  # Optional: Set additional admin emails
-  OBOT_SERVER_AUTH_ADMIN_EMAILS: "admin1@company.com,admin2@company.com"
 
 secret:
   # Optional: generated automatically when omitted from the chart-managed Secret
@@ -69,21 +62,33 @@ secret:
 |----------|----------|-------------|
 | `OBOT_SERVER_ENABLE_AUTHENTICATION` | Yes | Enables authentication |
 | `OBOT_BOOTSTRAP_TOKEN` | No | Token used for bootstrap login while no auth provider is configured or no non-bootstrap owner user exists. If not set, a token will be generated and printed to the logs. |
-| `OBOT_SERVER_AUTH_OWNER_EMAILS` | No | Email address that will have owner access after logging in via the auth provider. If not set, the bootstrap user will be prompted to log in via the auth provider and set themselves as the owner. |
-| `OBOT_SERVER_AUTH_ADMIN_EMAILS` | No | Additional email addresses that will have admin access |
 | `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_EMAIL` | No | Initial local-auth owner's email. Must be set with the setup token. |
 | `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN` | No | At least 32 characters of high-entropy, randomly generated secret material used to activate the initial owner. Store as a secret; `openssl rand -hex 32` is the recommended generator. |
 | `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN_EXPIRATION_HOURS` | No | Setup-link validity in hours. Defaults to `168`. |
 
 ### Step 2: Start Obot and Login {#enabling-authentication-step-2-start-obot-and-login}
 
-Start (or restart) your Obot deployment with the new environment variables. Navigate to your Obot installation and use the bootstrap token to login. Open **Identity & Access** to continue setup.
+Start (or restart) your Obot deployment with the new environment variables. Navigate to your Obot installation and log in with the bootstrap token. Obot then walks you through creating the owner account:
+
+1. Accept the license agreement.
+2. In **Set Up Owner Account**, create the owner as a [Local](#local) account, with an email address and password.
+3. Sign in with that account. You continue as the owner, and the bootstrap login is no longer needed.
+
+If you [preconfigured a Local owner](../installation/docker-deployment.md#preconfigure-a-local-owner), there is no bootstrap login. Activate the owner from the setup link instead.
 
 ### Step 3: Configure Authentication Provider {#enabling-authentication-step-3-configure-authentication-provider}
 
-1. Go to **Identity & Access > Auth Providers**
-2. Click **Configure** on your desired provider. Local, GitHub, and Google are available without registration; Entra, Okta, JumpCloud, and Auth0 require free Obot Community registration or an Enterprise license.
-3. Follow the provider-specific configuration steps
+Local is now the active provider. To use Local accounts, you're done; see [Local](#local) to manage them.
+
+To use a different provider, switch to it:
+
+1. Go to **Identity & Access > Auth Providers**.
+2. Click **Configure** on the provider. Local, GitHub, and Google are available without registration; Entra, Okta, OneLogin, JumpCloud, Keycloak, and Auth0 require free Obot Community registration or an Enterprise license.
+3. Configure the provider, sign in with it to verify your account, and complete the switch. See [Switching Between Auth Providers](#switching-between-auth-providers) for each step.
+
+:::important
+The account you sign in with during the switch becomes the owner. The Local owner account doesn't carry over, so switch before you set up anything as the Local owner.
+:::
 
 For detailed provider configuration, see the [Auth Providers](./auth-providers.md) documentation.
 
@@ -92,10 +97,9 @@ For detailed provider configuration, see the [Auth Providers](./auth-providers.m
 Once you have configured an authentication provider:
 
 1. Users can login using the configured authentication provider
-2. Users with emails matching `OBOT_SERVER_AUTH_OWNER_EMAILS` will have owner access
-3. Users with emails matching `OBOT_SERVER_AUTH_ADMIN_EMAILS` will have admin access
+2. Each identity from an auth provider is its own user. Obot does not combine identities from different auth providers into one user, even when they share an email address.
 
-Note that you can always assign the owner or admin role to additional users through the User pages.
+Owners and admins can assign the admin role to additional users through the User pages. Only owners can assign the owner role.
 
 ### Troubleshooting {#enabling-authentication-troubleshooting}
 
@@ -110,6 +114,19 @@ Note that you can always assign the owner or admin role to additional users thro
 - Verify callback URLs match between Obot and your OAuth provider
 - Check that client ID and secret are correct
 - Ensure proper scopes and permissions are configured
+
+#### Locked Out After Changing Provider Settings {#locked-out-after-changing-provider-settings}
+
+Changes to the active auth provider take effect immediately. If the provider can't start with the new settings, such as an issuer it can't reach or rejects, nobody can sign in, even when the dialog reports that the change couldn't be saved.
+
+To recover:
+
+1. Remove both `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_EMAIL` and `OBOT_SERVER_LOCAL_AUTH_INITIAL_OWNER_SETUP_TOKEN` from the deployment configuration if they are still set. These initial Local-owner provisioning variables disable bootstrap authentication even when force-enabled; removing only one prevents Obot from starting.
+2. Restart Obot with `OBOT_SERVER_FORCE_ENABLE_BOOTSTRAP=true`. Open Obot in a private or incognito window, or clear your browser's cookies for Obot first, and sign in with the bootstrap token. A browser that is still signed in from before the lockout shows an error instead of the bootstrap token option.
+3. Fix the provider's settings in **Identity & Access > Auth Providers**.
+4. Restart Obot without `OBOT_SERVER_FORCE_ENABLE_BOOTSTRAP`.
+
+The provider's reason for failing is in the Obot server log.
 
 ## Next Steps {#enabling-authentication-next-steps}
 
@@ -138,20 +155,6 @@ supplied by `OBOT_BOOTSTRAP_TOKEN`), and all future server launches will use tha
 `OBOT_BOOTSTRAP_TOKEN` can always be used to override the stored value.
 :::
 
-### Preconfiguring Owner & Admin Users
-
-If you want to preconfigure owner or admin users, you can set the `OBOT_SERVER_AUTH_OWNER_EMAILS` or `OBOT_SERVER_AUTH_ADMIN_EMAILS` environment variable, respectively.
-This is a comma-separated list of email addresses that will be granted owner or admin access when they log in,
-regardless of which auth provider they used. Email matching is case-insensitive.
-
-Users can be given the administrator role by other owners or admins in the Users section of the UI.
-Users whose email addresses are in configured list will automatically have the administrator role,
-and the role cannot be revoked from them.
-
-Similarly, users can be given the owner role by other owners in the Users section of the UI.
-Users whose email addresses are in configured list will automatically have the owner role,
-and the role cannot be revoked from them.
-
 ## Access Control
 
 ### Restricting Access by Email Domain
@@ -170,7 +173,7 @@ You can:
 | Providers | Availability |
 |-----------|--------------|
 | Local, GitHub, Google | Available in every edition, without registration |
-| Entra, Okta, JumpCloud, Auth0 | Require free Obot Community registration or an Enterprise license |
+| Entra, Okta, OneLogin, JumpCloud, Keycloak, Auth0 | Require free Obot Community registration or an Enterprise license |
 
 To register or add an Enterprise license key, use the **License** page in the admin UI. If the license later becomes invalid, these providers stay configured but Obot limits functionality until it's resolved. See [License compliance](../enterprise/overview.md#license-compliance).
 
@@ -189,11 +192,11 @@ To set it up:
 1. Go to Admin -> Auth Providers and configure the **Local** provider, setting the email domains that local users are allowed to have (`*` allows any domain).
 2. During bootstrap setup, create your first local account. Bootstrap can create only one account at a time.
 3. Save the account and sign in with its email and password. It becomes **Owner** automatically, and you continue in the same session without confirming a handoff or signing in again.
-4. After signing in as Owner, use **Modify** on the Local provider card to create additional users. Assign their roles from the Users page after their first sign-in.
+4. After signing in as Owner, head to the **Users** section to create additional users. You can assign their roles after their first sign-in.
 
-The first bootstrap-created account's password is ready to use by default. You can select the option to require a password change before completing setup. Other new and administrator-reset local passwords require a password change at next sign-in by default; the administrator can turn this off in the user management dialog. Until the change is complete, the backend restricts that session to the password-change flow. A successful change signs out the user's other sessions while preserving the current one.
+The first bootstrap-created account's password is ready to use by default. You can select the option to require a password change before completing setup. Other new and administrator-reset local passwords require a password change at next sign-in by default; the administrator can turn this off in the users management. Until the change is complete, the backend restricts that session to the password-change flow. A successful change signs out the user's other sessions while preserving the current one.
 
-Local users cannot currently rotate their password voluntarily after completing a required change. An administrator must reset it from **Manage Users**; the user will then be prompted to choose a new password at their next sign-in.
+Local users cannot currently rotate their password voluntarily after completing a required change. An administrator must reset it from the **Users** page; the user will then be prompted to choose a new password at their next sign-in.
 
 Deleting a local user prevents them from signing in again, but it does not delete the Obot user account they created by signing in. Delete that from the Users page, as you would for any other user.
 
@@ -211,6 +214,21 @@ You can view the source code for Google provider in this [repo](https://github.c
 
 ### Entra
 
+Obot can get users and groups from Entra in one of two ways:
+
+- **SCIM:** Entra's provisioning service sends Obot only the users and groups you assign to the app. Skip the **application** permissions below, and follow [Provision users and groups from Microsoft Entra ID with SCIM](./entra-scim.md).
+- **Microsoft Graph:** Obot reads each user's groups from Microsoft Graph when they sign in. Follow all the steps below, and when you configure Entra in Obot, set **Directory integration** to **Microsoft Graph**. The **application** permissions are only needed for this option.
+
+:::tip Create the app as an enterprise app if you may use SCIM
+Only an app created under **Enterprise applications** can provision users with SCIM. An app created under **App registrations**, as described below, can't, so you would need a second app for provisioning. To use one app for both sign-in and provisioning:
+
+1. Go to **Entra ID > Enterprise apps > New application > Create your own application**, select **Integrate any other application you don't find in the gallery (Non-gallery)**, and select **Create**. Don't set up **Single sign-on** on the new app; see the troubleshooting note below.
+2. Go to **App registrations**, and open the registration with the same name, which Entra created with the app. If you don't see it under **Owned applications**, look under **All applications**.
+3. Under **Authentication**, select **Add Redirect URI** (**Add a platform** in the older view), select **Web**, enter the redirect URI provided in Obot's Auth Provider configuration dialog, and select **Configure**.
+4. On the registration's **Overview** page, check that **Supported account types** allows accounts in this organizational directory only.
+5. Continue below from the **API permissions** step, skipping the new registration form.
+:::
+
 Within the [Microsoft Entra admin center](https://entra.microsoft.com), go to App registrations and click New registration.
 
 Under Supported account types, ensure `Accounts in this organizational directory only` is selected. In the Redirect URI section, set the platform to `Web` and enter the redirect URI provided in Obot's Auth Provider configuration dialog.
@@ -224,7 +242,7 @@ Next, go to the API permissions tab and add the following **delegated** permissi
 - `User.Read`
 - `ProfilePhoto.Read.All` *requires admin approval*
 
-Then add the following **application** permissions:
+If Obot will read groups from Microsoft Graph, rather than use SCIM, then add the following **application** permissions:
 
 - `GroupMember.Read.All` *requires admin approval*
 - `User.Read.All` *requires admin approval*
@@ -361,6 +379,59 @@ You can now return to Obot and finish configuring JumpCloud. Use the table below
 The JumpCloud user must resolve to an active, non-suspended JumpCloud system user. Suspended or inactive users will be blocked from logging in.
 :::
 
+### Keycloak {#keycloak}
+
+Use Keycloak 24 or later. Create two clients in the same realm: one lets users sign in to Obot, and the other lets Obot read users and groups for access control.
+
+#### Setup {#keycloak-setup}
+
+**Create the sign-in client**
+
+1. In Keycloak, create an **OpenID Connect** client for signing in to Obot.
+2. Enable **Client authentication** and **Standard flow**. Disable the other authentication flows and service accounts.
+3. Set **Valid redirect URIs** to the callback URL shown in Obot.
+4. In the client's **Client scopes**, make sure `profile`, `email`, and `offline_access` are available. Keep the default `profile` and `email` scopes.
+5. Assign users the `offline_access` realm role. If you restrict the client's role scope mappings, include this role.
+
+**Create the directory client**
+
+1. Create a second **OpenID Connect** client for reading users and groups.
+2. Enable **Client authentication** and **Service accounts roles**. Disable the other authentication flows.
+3. Assign the service account the **`view-users`** role from **`realm-management`**. This is the only role it needs.
+4. In the directory client's scope settings, turn **Full Scope Allowed** off and include **`view-users`** in the allowed roles. Keep the default `roles` client scope.
+
+**Set up email verification**
+
+By default, users must have a verified email address in Keycloak to sign in to Obot. Enable **Verify email** under **Realm settings > Login** to have users verify their addresses. For existing accounts, check their **Email verified** setting.
+
+If your organization does not verify email addresses, enable **Allow Unverified Emails** in Obot.
+
+:::important
+When allowing unverified emails, remember that email-domain restrictions depend on users having trustworthy email addresses.
+:::
+
+In **Identity & Access > Auth Providers**, configure **Keycloak**:
+
+| Obot field | Keycloak value |
+| --- | --- |
+| Realm Issuer URL | Realm URL, such as `https://id.example.com/realms/employees`; include `/auth` if used |
+| Client ID / Client Secret | Sign-in client credentials |
+| Directory Service Client ID / Secret | Directory client credentials |
+| Allowed E-Mail Domains | Allowed domains, or `*` for all domains |
+| Admin URL (optional) | Leave blank unless your Keycloak administrator provides a separate address for the Admin API. For example, `https://keycloak-admin.internal`; include `/auth` if used, but not `/admin` or `/realms`. |
+
+Changes to the Realm Issuer URL or Admin URL of the active provider take effect immediately. If Keycloak can't be reached or rejects the new value, nobody can sign in. See [Locked Out After Changing Provider Settings](#locked-out-after-changing-provider-settings).
+
+For optional avatars, map a `picture` user attribute to the OIDC `picture` claim in UserInfo. Use HTTPS URLs restricted to a trusted image host. See Keycloak's [avatar guide](https://www.keycloak.org/ui-customization/avatars).
+
+#### Sessions {#keycloak-sessions}
+
+**Token Refresh Duration** controls how often Obot refreshes authentication tokens for active sessions. The default is 1 hour.
+
+Set **Token Refresh Duration** shorter than the realm's **Access Token Lifespan**, under **Realm settings > Tokens**. Keycloak's default lifespan is 5 minutes, so a value such as `4m` works. If tokens expire before Obot refreshes them, updates to users' display names and avatars fail until the next refresh.
+
+Keep **Revoke Refresh Token** off in the realm, so that parallel refreshes from the same browser succeed.
+
 ### Auth0
 
 Create a **Regular Web Application** in the [Auth0 Dashboard](https://manage.auth0.com) by navigating to Applications > Applications > Create Application.
@@ -429,6 +500,45 @@ If your Auth0 tenant supports [Organizations](https://auth0.com/docs/manage-user
 4. Under the organization's **Connections** tab, enable the connections users should use to log in
 5. In **Applications > Applications**, select your Obot application
 6. Open the **Organizations** tab and configure the application to require organization membership
+
+### OneLogin
+
+In the OneLogin admin console, go to **Applications > Applications > Add App**, and add **OpenId Connect (OIDC)**. Configure it:
+
+| Tab | Setting | Value |
+|-----|---------|-------|
+| Configuration | Login Url | Your Obot URL, such as `https://obot.example.com` |
+| Configuration | Redirect URIs | The redirect URI displayed in Obot's Auth Provider configuration dialog |
+| SSO | Application Type | **Web** |
+| SSO | Token Endpoint, Authentication Method | **Basic** |
+| SSO | Refresh Token Timeout | How long users stay signed in to Obot without signing in to OneLogin again. Blank means 30 days. |
+| Access | Roles | The roles whose users may sign in to Obot. Users without one of these roles can't sign in. |
+
+Take note of the **Client ID**, **Client Secret**, and issuer URL on the **SSO** tab.
+
+Obot can get users and groups from OneLogin in one of two ways:
+
+- **SCIM:** OneLogin sends Obot only the users and roles you choose. Skip the API credential below, and follow [Provision users and groups from OneLogin with SCIM](./onelogin-scim.md).
+- **API credential:** Obot reads each user's roles from the OneLogin API when they sign in, and refreshes them periodically. Continue with the steps below.
+
+Go to **Developers > API Credentials > New Credential** and create a credential with the **Read users** scope. Take note of its **Client ID** and **Client Secret**.
+
+Obot uses OneLogin **roles** as groups. Each role appears in Obot as a group that you can use in roles and access policies. OneLogin's own groups are not used.
+
+You can now return to Obot and finish configuring OneLogin. Use the table below to determine the values to use for each field:
+
+| Obot | OneLogin |
+|------|----------|
+| Client ID | OIDC app Client ID |
+| Client Secret | OIDC app Client Secret |
+| Issuer URL | `https://<your-subdomain>.onelogin.com/oidc/2` |
+| API Client ID | API credential Client ID. Leave empty to use SCIM. |
+| API Client Secret | API credential Client Secret. Leave empty to use SCIM. |
+| API Base URL (Optional) | Defaults to `https://<your-subdomain>.onelogin.com`. Set it only to use a regional API host, such as `https://api.us.onelogin.com` or `https://api.eu.onelogin.com`. |
+
+:::important Removing a user's access
+OneLogin stops suspended, locked, and unlicensed users from signing in, but Obot keeps their existing access for a while: their browser session lasts until it next needs OneLogin, and their Obot API keys keep working. To remove someone's access immediately, delete them on Obot's **Users** page, or use [SCIM](./onelogin-scim.md).
+:::
 
 ## Switching Between Auth Providers
 

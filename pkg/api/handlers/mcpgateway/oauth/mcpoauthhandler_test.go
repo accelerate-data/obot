@@ -37,7 +37,7 @@ func TestStaticOAuthLookupUsesCurrentReferencedCredential(t *testing.T) {
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	gw := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gw := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gw.Close()) })
 	ref := system.MCPOAuthCredentialName("source")
 	for _, secret := range []string{"first-secret", "rotated-secret"} {
@@ -70,7 +70,7 @@ func TestCheckForMCPAuthDistinguishesMissingStaticCredentialsFromLookupFailure(t
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	gw := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gw := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gw.Close()) })
 
 	server := v1.MCPServer{
@@ -153,6 +153,10 @@ func (s *staticOAuthTokenStorage) GetTokenConfig(context.Context) (*oauth2.Confi
 }
 
 func (*staticOAuthTokenStorage) SetTokenConfig(context.Context, *oauth2.Config, *oauth2.Token) error {
+	return nil
+}
+
+func (*staticOAuthTokenStorage) RefreshTokenConfig(context.Context, *oauth2.Config, *oauth2.Token, *oauth2.Token) error {
 	return nil
 }
 

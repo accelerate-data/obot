@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import Confirm from '$lib/components/Confirm.svelte';
 	import CopyButton from '$lib/components/CopyButton.svelte';
@@ -9,18 +8,14 @@
 	import ProviderCard from '$lib/components/admin/ProviderCard.svelte';
 	import ProviderConfigure, {
 		type ParameterChoice,
+		type ParameterChoiceOption,
 		type ParameterNotice
 	} from '$lib/components/admin/ProviderConfigure.svelte';
 	import ProviderDeconfigureConfirm from '$lib/components/admin/ProviderDeconfigureConfirm.svelte';
 	import LicenseProviderDialog from '$lib/components/admin/license/LicenseProviderDialog.svelte';
 	import { describeGroupReference } from '$lib/components/admin/scim/groupReferences';
 	import IconButton from '$lib/components/primitives/IconButton.svelte';
-	import {
-		CommonAuthProviderIds,
-		PAGE_TRANSITION_DURATION,
-		RecommendedModelProviders,
-		SCIM_VIEW_PATH
-	} from '$lib/constants';
+	import { CommonAuthProviderIds, PAGE_TRANSITION_DURATION, SCIM_VIEW_PATH } from '$lib/constants';
 	import { HttpError, parseErrorContent } from '$lib/errors.js';
 	import { m } from '$lib/i18n';
 	import { reloadPage } from '$lib/navigation';
@@ -32,7 +27,7 @@
 	} from '$lib/services/admin/types.js';
 	import { errors, license, profile, version } from '$lib/stores';
 	import { adminConfigStore } from '$lib/stores/adminConfig.svelte.js';
-	import { clearUrlParams } from '$lib/url';
+	import { clearUrlParams, resolve } from '$lib/url';
 	import { TriangleAlert, Info, CircleAlert, ArrowLeft, Trash2 } from '@lucide/svelte';
 	import { untrack } from 'svelte';
 	import { fade } from 'svelte/transition';
@@ -85,6 +80,8 @@
 	let providerConfigure = $state<ReturnType<typeof ProviderConfigure>>();
 	let configuringAuthProvider = $state<AuthProvider>();
 	let configuringAuthProviderValues = $state<Record<string, string>>();
+	// Whether the configuring provider has a stored configuration, active or staged.
+	let configuringAuthProviderStored = $state(false);
 	let atLeastOneConfigured = $derived(authProviders.some((provider) => provider.configured));
 	let showInitialAuthProvider = $derived<string | null>(page.url.searchParams.get('provider'));
 	let stagedProvider = $derived(authProviders.find((provider) => provider.staged));
@@ -190,7 +187,6 @@
 
 	let setupLoading = $state(false);
 	let setupSignInDialog = $state<ReturnType<typeof ResponsiveDialog>>();
-	let explicitOwners = $state<string[]>([]);
 	let setupTempLoginUrl = $state('');
 	let setupLocalUserEmail = $state<string>();
 	let isLocalSetup = $derived(configuringAuthProvider?.id === CommonAuthProviderIds.LOCAL);
@@ -295,7 +291,9 @@
 			[CommonAuthProviderIds.OKTA]: 'okta',
 			[CommonAuthProviderIds.ENTRA]: 'entra',
 			[CommonAuthProviderIds.AUTH0]: 'auth0',
-			[CommonAuthProviderIds.JUMPCLOUD]: 'jumpcloud'
+			[CommonAuthProviderIds.JUMPCLOUD]: 'jumpcloud',
+			[CommonAuthProviderIds.ONELOGIN]: 'onelogin',
+			[CommonAuthProviderIds.KEYCLOAK]: 'keycloak'
 		};
 		return idRef[authProviderId as keyof typeof idRef]
 			? `https://docs.obot.ai/configuration/auth-providers/#${idRef[authProviderId as keyof typeof idRef]}`
@@ -318,8 +316,6 @@
 		}
 
 		try {
-			explicitOwners = (await AdminService.listExplicitRoleEmails())?.owners ?? [];
-
 			setupTempLoginUrl = (
 				await AdminService.initiateTempLogin(
 					configuringAuthProvider.id,
@@ -334,7 +330,8 @@
 		}
 	}
 
-	// Warns when the Org URL of a provider with a SCIM connection changes.
+	// Warns when the issuer parameter of a provider with a SCIM connection changes, such as Okta's Org
+	// URL or Microsoft Entra's tenant ID.
 	function scimParameterNotice(
 		parameter: ProviderParameter,
 		form: Record<string, string>
@@ -346,9 +343,15 @@
 		if (parameter.name === scim.issuerParameter && provider.scimState && scim.connectionIssuer) {
 			const value = (form[parameter.name] ?? '').trim().replace(/\/+$/, '');
 			if (value && value !== scim.connectionIssuer) {
+				// Microsoft Entra's issuer parameter is its tenant ID, which names the tenant rather than
+				// an address that can move.
+				const warning =
+					provider.id === CommonAuthProviderIds.ENTRA
+						? m.identity_access_auth_providers_scim_issuer_warning_entra
+						: m.identity_access_auth_providers_scim_issuer_warning;
 				return {
 					kind: 'warning',
-					text: m.identity_access_auth_providers_scim_issuer_warning({
+					text: warning({
 						name: provider.name,
 						issuer: scim.connectionIssuer
 					})
@@ -361,10 +364,13 @@
 
 	// While a provider that supports SCIM is set up, its directory parameters choose how it gets its
 	// users and groups: omitting them provisions through SCIM, and providing them fetches groups at
-	// sign-in. A provider with a SCIM connection, or a configured one, keeps the way it has, which
-	// only Enable and Enforce change, so its choice is shown as made, with a link to the SCIM tab
-	// where those happen. A provider staged in a switch gets no link: following it abandons the
-	// switch, and SCIM setup continues only after it.
+	// sign-in. A provider without directory parameters, such as Microsoft Entra, has a choice
+	// parameter instead, which the SCIM option sets. A stored configuration never holds that
+	// parameter, so one that is stored without a SCIM connection chose directory synchronization. A
+	// provider with a SCIM connection, or a configured one, keeps the way it has, which only Enable
+	// and Enforce change, so its choice is shown as made, with a link to the SCIM tab where those
+	// happen. A provider staged in a switch gets no link: following it abandons the switch, and SCIM
+	// setup continues only after it.
 	const scimParameterChoice = $derived.by((): ParameterChoice | undefined => {
 		const provider = configuringAuthProvider;
 		const scim = provider?.scim;
@@ -379,6 +385,12 @@
 			// ones that can be removed, and they are kept unless they are, so the choice leaves them to
 			// the optional configuration.
 			parameters: provider.scimState ? [] : scim.directoryParameters,
+			choiceParameter: scim.choiceParameter,
+			selected: scim.choiceParameter
+				? configuringAuthProviderStored
+					? 'with'
+					: 'without'
+				: undefined,
 			made,
 			link: linked ? { path: SCIM_VIEW_PATH, label: m.identity_access_scim_go_to() } : undefined,
 			without: {
@@ -387,14 +399,30 @@
 					? m.identity_access_auth_providers_scim_choice_scim_configured_description({ name })
 					: m.identity_access_auth_providers_scim_choice_scim_description({ name })
 			},
-			with: {
-				label: m.identity_access_auth_providers_scim_choice_api_label({ name }),
-				description: linked
-					? m.identity_access_auth_providers_scim_choice_api_configured_description({ name })
-					: m.identity_access_auth_providers_scim_choice_api_description({ name })
-			}
+			with: directoryChoiceOption(provider, !!linked)
 		};
 	});
+
+	// The directory synchronization option of the SCIM choice. Microsoft Entra reads groups from
+	// Microsoft Graph with the credentials it signs users in with, so its option names the Graph
+	// permissions that directory synchronization needs, rather than credentials of its own.
+	function directoryChoiceOption(provider: AuthProvider, linked: boolean): ParameterChoiceOption {
+		const name = provider.name;
+		if (provider.id === CommonAuthProviderIds.ENTRA) {
+			return {
+				label: m.identity_access_auth_providers_scim_choice_graph_label(),
+				description: linked
+					? m.identity_access_auth_providers_scim_choice_graph_configured_description({ name })
+					: m.identity_access_auth_providers_scim_choice_graph_description()
+			};
+		}
+		return {
+			label: m.identity_access_auth_providers_scim_choice_api_label({ name }),
+			description: linked
+				? m.identity_access_auth_providers_scim_choice_api_configured_description({ name })
+				: m.identity_access_auth_providers_scim_choice_api_description({ name })
+		};
+	}
 
 	async function handleRemoveResidualGroupData() {
 		if (!residualProvider) return;
@@ -478,9 +506,9 @@
 	}
 
 	// Saves the local auth provider's email-domain config. Returns an error message to show inside
-	// the local auth modal, or undefined on success. The local provider manages its own users, so
-	// unlike the OAuth providers it doesn't hand off to the owner-setup flow here — that happens
-	// when the modal closes with at least one user.
+	// the local auth modal, or undefined on success. Users are managed on the Users page, so unlike
+	// the OAuth providers this doesn't hand off to owner setup here — that happens when the modal
+	// closes with at least one local user.
 	async function handleLocalAuthConfigure(
 		form: Record<string, string>
 	): Promise<string | undefined> {
@@ -537,6 +565,7 @@
 		} catch (err) {
 			confirmSwitch = false;
 			switchError = parseErrorContent(err).message;
+			providerConfigure?.open();
 		} finally {
 			switching = false;
 		}
@@ -626,22 +655,27 @@
 		configureError = undefined;
 		clearResidualGroupData();
 		configuringAuthProvider = authProvider;
+		configuringAuthProviderStored = false;
 		try {
 			configuringAuthProviderValues = await AdminService.revealAuthProvider(authProvider.id);
+			configuringAuthProviderStored = true;
 		} catch (err) {
-			// if 404, ignore, it means no credentials are set
+			// A 404 means no configuration is stored. Any other error leaves the stored configuration
+			// unknown, so the form is not opened: it would show another provider's values, and, for a
+			// provider whose choice of SCIM the configuration does not hold, offer the wrong choice.
 			if (!(err instanceof HttpError) || err.statusCode !== 404) {
-				console.error('An error occurred while revealing auth provider credentials', err);
-			} else {
-				// no credentials set, set initial default value for allowed domains
-				configuringAuthProviderValues = {
-					OBOT_AUTH_PROVIDER_EMAIL_DOMAINS: '*'
-				};
+				errors.append(err);
+				configuringAuthProvider = undefined;
+				return;
 			}
+			// No configuration is stored, so the allowed email domains start at their default.
+			configuringAuthProviderValues = {
+				OBOT_AUTH_PROVIDER_EMAIL_DOMAINS: '*'
+			};
 		}
 
-		// A staged Local provider is past the step its own dialog covers, so resuming goes to the
-		// sign-in that proves it rather than back to editing users.
+		// A staged Local provider is past the settings this dialog edits, so resuming goes to the
+		// sign-in that proves it rather than back to the domain configuration.
 		if (authProvider.id === CommonAuthProviderIds.LOCAL && !authProvider.staged) {
 			setupTempLoginUrl = '';
 			localAuthConfigureOpen = true;
@@ -649,14 +683,6 @@
 		} else {
 			providerConfigure?.open();
 		}
-	}
-
-	function handleManageLocalUsers() {
-		const local = authProviders.find((provider) => provider.id === CommonAuthProviderIds.LOCAL);
-		if (!local) return;
-
-		setupSignInDialog?.close();
-		handleClickConfigure(local);
 	}
 
 	// Local's first step lives in its own dialog, so going back from the sign-in step has to hand
@@ -683,8 +709,8 @@
 			await prepareOwnerSetup();
 		}
 
-		// Local manages its users in its own dialog, so that dialog stands in for the first step of
-		// a switch. Without this handoff the settings stage and the flow stops there.
+		// Local's domain dialog is the first step of a switch. Without this handoff the settings
+		// stage and the flow stops there. Users for the sign-in are created on the Users page.
 		await refreshAuthProviders();
 		const local = authProviders.find(
 			(provider) => provider.id === CommonAuthProviderIds.LOCAL && provider.staged
@@ -737,7 +763,6 @@
 						: undefined}
 					provider={authProvider}
 					staged={authProvider.staged}
-					recommended={RecommendedModelProviders.includes(authProvider.id)}
 					onConfigure={() => handleClickConfigure(authProvider)}
 					onDeconfigure={activeProvider?.id === authProvider.id
 						? undefined
@@ -856,7 +881,7 @@
 	{/if}
 	<div class="grow"></div>
 	{#if switchStep === 'configure'}
-		<button class="btn" disabled={loading} onclick={() => providerConfigure?.close()}>
+		<button class="btn btn-ghost" disabled={loading} onclick={() => providerConfigure?.close()}>
 			{m.common_cancel()}
 		</button>
 		<button class="btn btn-primary" disabled={loading} onclick={submit}>{m.core_continue()}</button>
@@ -875,7 +900,14 @@
 			<ArrowLeft class="size-4" />
 			{m.identity_access_auth_providers_step_signin()}
 		</button>
-		<button class="btn btn-primary" disabled={switching} onclick={() => (confirmSwitch = true)}>
+		<button
+			class="btn btn-primary"
+			disabled={switching}
+			onclick={() => {
+				providerConfigure?.close();
+				confirmSwitch = true;
+			}}
+		>
 			{m.identity_access_auth_providers_switch_to({ name: `${configuringAuthProvider?.name}` })}
 		</button>
 	{/if}
@@ -968,15 +1000,14 @@
 
 <LocalAuthConfigure
 	required={!!showInitialAuthProvider}
+	switchingProvider={!!activeProvider && activeProvider.id !== CommonAuthProviderIds.LOCAL}
 	animate={showInitialAuthProvider ? 'slide' : undefined}
 	bind:this={localAuthConfigure}
 	provider={configuringAuthProvider}
 	values={configuringAuthProviderValues}
 	readonly={profile.current.isAdminReadonly?.()}
 	onConfigure={handleLocalAuthConfigure}
-	bootstrap={isBootstrapUser}
 	onClose={handleLocalAuthClose}
-	switching={atLeastOneConfigured && activeProvider?.id !== CommonAuthProviderIds.LOCAL}
 />
 
 <Confirm
@@ -992,7 +1023,10 @@
 	cancelText={m.common_cancel()}
 	loading={switching}
 	onsuccess={handleActivateStagedProvider}
-	oncancel={() => (confirmSwitch = false)}
+	oncancel={() => {
+		confirmSwitch = false;
+		providerConfigure?.open();
+	}}
 />
 
 <Confirm
@@ -1076,10 +1110,8 @@
 	<OwnerSetupPrompt
 		{isLocalSetup}
 		localUserEmail={setupLocalUserEmail}
-		{explicitOwners}
 		provider={configuringAuthProvider}
 		tempLoginUrl={setupTempLoginUrl}
-		onManageLocalUsers={isLocalSetup ? handleManageLocalUsers : undefined}
 		showTitle={false}
 	/>
 </ResponsiveDialog>

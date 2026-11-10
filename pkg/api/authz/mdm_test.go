@@ -12,7 +12,7 @@ import (
 // TestMDMRouteAuthorization checks which principals can read and which can
 // mutate the MDM configuration and asset routes.
 func TestMDMRouteAuthorization(t *testing.T) {
-	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, false)
+	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, nil)
 	users := []struct {
 		name      string
 		info      user.Info
@@ -54,6 +54,10 @@ func TestMDMRouteAuthorization(t *testing.T) {
 			info: &user.DefaultInfo{Name: "enroll", Groups: []string{types.GroupDeviceEnroll}},
 		},
 		{
+			name: "enrolled device",
+			info: &user.DefaultInfo{Name: "device:device-1", Groups: []string{types.GroupDeviceScans, types.GroupAuthenticated}},
+		},
+		{
 			name: "unauthenticated user",
 			info: &user.DefaultInfo{Name: "anonymous", Groups: []string{UnauthenticatedGroup}},
 		},
@@ -92,6 +96,12 @@ func TestMDMRouteAuthorization(t *testing.T) {
 			name:     "download rendered artifact",
 			method:   http.MethodGet,
 			path:     "/api/mdm/configurations/1/download/macos-jamf",
+			readOnly: true,
+		},
+		{
+			name:     "list all enrolled devices",
+			method:   http.MethodGet,
+			path:     "/api/mdm/devices",
 			readOnly: true,
 		},
 		{
@@ -141,6 +151,11 @@ func TestMDMRouteAuthorization(t *testing.T) {
 			method: http.MethodPost,
 			path:   "/api/mdm/asset-source/refresh",
 		},
+		{
+			name:   "delete enrolled device",
+			method: http.MethodDelete,
+			path:   "/api/mdm/devices/device-1",
+		},
 	}
 
 	for _, route := range routes {
@@ -162,7 +177,7 @@ func TestMDMRouteAuthorization(t *testing.T) {
 // TestMDMEnrollRouteAuthorization checks that only enrollment tokens can
 // reach the device enrollment route.
 func TestMDMEnrollRouteAuthorization(t *testing.T) {
-	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, false)
+	authorizer := NewAuthorizer(nil, nil, nil, false, nil, nil, nil)
 	users := []struct {
 		name    string
 		info    user.Info

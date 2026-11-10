@@ -34,7 +34,7 @@ func TestOAuthCallbackComponentCompletion(t *testing.T) {
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	client := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	client := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	state := newStateManager(client, fixedTokenClient(tokenServer.Client()))
 	h := handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: state}}
@@ -96,7 +96,7 @@ func TestOAuthCallbackComponentCompletion(t *testing.T) {
 				require.NoError(t, storage.Create(t.Context(), connection))
 				mcpID = connection.Name
 			}
-			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", authRequest.Name, "", "state", "verifier", "", &oauth2.Config{
+			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", "", authRequest.Name, "", "state", "verifier", "", &oauth2.Config{
 				ClientID: "client", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
 			}))
 			response := httptest.NewRecorder()
@@ -124,7 +124,7 @@ func TestOAuthCallbackComponentCompletionRedirect(t *testing.T) {
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	client := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	client := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	state := newStateManager(client, fixedTokenClient(http.DefaultClient))
 	h := handler{oauthChecker: &MCPOAuthHandlerFactory{stateMgr: state}, completionURL: completionURL}
@@ -182,7 +182,7 @@ func TestOAuthCallbackComponentCompletionRedirect(t *testing.T) {
 				require.NoError(t, storage.Create(t.Context(), connection))
 				mcpID = connection.Name
 			}
-			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", authRequest.Name, "", "state", "verifier", "", &oauth2.Config{
+			require.NoError(t, state.store(t.Context(), "1", mcpID, "https://upstream.example/mcp", "", authRequest.Name, "", "state", "verifier", "", &oauth2.Config{
 				ClientID: "client", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
 			}))
 			response := httptest.NewRecorder()
@@ -230,7 +230,7 @@ func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	client := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	client := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	state := newStateManager(client, fixedTokenClient(http.DefaultClient))
 
@@ -435,7 +435,7 @@ func TestOAuthCallbackInstanceCompletionRedirect(t *testing.T) {
 			authRequest := &v1.OAuthAuthRequest{Name: "oar1request", Namespace: system.DefaultNamespace, Spec: v1.OAuthAuthRequestSpec{RedirectURI: "https://client.example/callback"}}
 			storage := clientfake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(server, connection, authRequest).Build()
 			if !tt.skipStore {
-				require.NoError(t, state.store(t.Context(), "1", *cmp.Or(tt.storeMCPID, &connection.Name), "https://upstream.example/mcp", tt.authRequest, "", "st-4f9a2c71e8b3", "vf-9d3e6b2a7c10", "", &oauth2.Config{
+				require.NoError(t, state.store(t.Context(), "1", *cmp.Or(tt.storeMCPID, &connection.Name), "https://upstream.example/mcp", "", tt.authRequest, "", "st-4f9a2c71e8b3", "vf-9d3e6b2a7c10", "", &oauth2.Config{
 					ClientID: "client", ClientSecret: "cs-5e8f1a3b9d27", Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
 				}))
 			}
@@ -521,7 +521,7 @@ func TestStateManagerExchangesAuthorizationCodeWithStoredResource(t *testing.T) 
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
 
-	gatewayClient := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gatewayClient := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
 	stateManager := newStateManager(gatewayClient, fixedTokenClient(tokenServer.Client()))
 	conf := &oauth2.Config{
@@ -534,7 +534,7 @@ func TestStateManagerExchangesAuthorizationCodeWithStoredResource(t *testing.T) 
 		},
 	}
 
-	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "request", "", "state", verifier, resourceURL, conf))
+	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "", "request", "", "state", verifier, resourceURL, conf))
 	_, _, err = stateManager.createToken(t.Context(), "state", "authorization-code", "", "")
 	require.NoError(t, err)
 
@@ -545,7 +545,7 @@ func TestStateManagerExchangesAuthorizationCodeWithStoredResource(t *testing.T) 
 	require.Equal(t, verifier, form.Get("code_verifier"))
 
 	conf.Endpoint.AuthURL = "https://login.microsoftonline.com/tenant/oauth2/v2.0/authorize"
-	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "request", "", "entra-state", verifier, resourceURL, conf))
+	require.NoError(t, stateManager.store(t.Context(), "user", "mcp", mcpURL, "", "request", "", "entra-state", verifier, resourceURL, conf))
 	_, _, err = stateManager.createToken(t.Context(), "entra-state", "authorization-code", "", "")
 	require.NoError(t, err)
 	require.Empty(t, (<-tokenRequest).Get("resource"))
@@ -569,7 +569,7 @@ func TestOAuthCallbackExchangeUsesStoredTunnel(t *testing.T) {
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	gatewayClient := gatewayclient.New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gatewayClient := gatewayclient.New(t.Context(), db, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, gatewayClient.Close()) })
 
 	var tunnels []string
@@ -582,13 +582,66 @@ func TestOAuthCallbackExchangeUsesStoredTunnel(t *testing.T) {
 		Endpoint: oauth2.Endpoint{TokenURL: tokenServer.URL, AuthStyle: oauth2.AuthStyleInParams},
 	}
 
-	require.NoError(t, stateManager.storeWithTunnel(t.Context(), "user", "tunneled", "https://private.example/mcp", "private-tunnel", "request", "", "tunneled-state", "verifier", "", conf))
+	require.NoError(t, stateManager.store(t.Context(), "user", "tunneled", "https://private.example/mcp", "private-tunnel", "request", "", "tunneled-state", "verifier", "", conf))
 	_, _, err = stateManager.createToken(t.Context(), "tunneled-state", "authorization-code", "", "")
 	require.NoError(t, err)
 
-	require.NoError(t, stateManager.storeWithTunnel(t.Context(), "user", "direct", "https://public.example/mcp", "", "request", "", "direct-state", "verifier", "", conf))
+	require.NoError(t, stateManager.store(t.Context(), "user", "direct", "https://public.example/mcp", "", "request", "", "direct-state", "verifier", "", conf))
 	_, _, err = stateManager.createToken(t.Context(), "direct-state", "authorization-code", "", "")
 	require.NoError(t, err)
 
 	require.Equal(t, []string{"private-tunnel", ""}, tunnels)
+}
+
+func TestStateManagerRejectsOverlappingScopeReplacement(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"` + r.Form.Get("code") + `","token_type":"Bearer"}`))
+	}))
+	defer tokenServer.Close()
+
+	gateway := vmcpConsentGateway(t)
+	state := newStateManager(gateway, fixedTokenClient(tokenServer.Client()))
+	conf := &oauth2.Config{
+		ClientID: "client",
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   "https://provider.test/authorize",
+			TokenURL:  tokenServer.URL,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		Scopes: []string{"read"},
+	}
+
+	// Both browser flows start before either callback stores its new grant.
+	require.NoError(t, state.store(t.Context(), "user", "mcp", "https://provider.test/mcp", "", "first-request", "", "first-state", "verifier", "", conf))
+	conf.Scopes = []string{"write"}
+	require.NoError(t, state.store(t.Context(), "user", "mcp", "https://provider.test/mcp", "", "second-request", "", "second-state", "verifier", "", conf))
+
+	_, _, err := state.createToken(t.Context(), "first-state", "first-token", "", "")
+	require.NoError(t, err)
+	requestID, mcpID, err := state.createToken(t.Context(), "second-state", "second-token", "", "")
+	require.ErrorContains(t, err, "start a new authorization")
+	require.Equal(t, "second-request", requestID)
+	require.Equal(t, "mcp", mcpID)
+
+	stored, err := gateway.GetMCPOAuthToken(t.Context(), "user", "mcp", "https://provider.test/mcp")
+	require.NoError(t, err)
+	require.Equal(t, "first-token", stored.AccessToken)
+	require.Equal(t, "read", stored.Scopes)
+
+	conf.Scopes = []string{"write", "read"}
+	require.NoError(t, state.store(t.Context(), "user", "mcp", "https://provider.test/mcp", "", "retry-request", "", "retry-state", "verifier", "", conf))
+	_, _, err = state.createToken(t.Context(), "retry-state", "retry-token", "", "")
+	require.NoError(t, err)
+
+	stored, err = gateway.GetMCPOAuthToken(t.Context(), "user", "mcp", "https://provider.test/mcp")
+	require.NoError(t, err)
+	require.Equal(t, "retry-token", stored.AccessToken)
+	require.Equal(t, "write read", stored.Scopes)
 }

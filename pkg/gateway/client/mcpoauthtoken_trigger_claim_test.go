@@ -82,7 +82,7 @@ func newTriggerTestClient(t *testing.T, backend *recordingControllerBackend) *Cl
 			Spec:      v1.MCPServerInstanceSpec{UserID: triggerTestUser, MCPServerName: triggerTestServer},
 		}).
 		Build()
-	return New(t.Context(), db, storageClient, nil, backend, nil, nil, time.Hour, 1, 0, 0, 0, false)
+	return New(t.Context(), db, storageClient, nil, backend, time.Hour, 1, 0, 0, 0, false)
 }
 
 func wantOwningServerTriggers(t *testing.T, got []recordedControllerTrigger, serverName string) {
@@ -182,7 +182,7 @@ func TestNewWithoutControllerBackendLeavesTriggerUnset(t *testing.T) {
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 
-	c := New(t.Context(), db, nil, nil, nil, nil, nil, time.Hour, 1, 0, 0, 0, false)
+	c := New(t.Context(), db, nil, nil, nil, time.Hour, 1, 0, 0, 0, false)
 
 	require.Nil(t, c.mcpOAuthTokenTrigger)
 }

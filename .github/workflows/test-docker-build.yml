@@ -33,3 +33,25 @@ jobs:
           build-args: |
             PROVIDERS_IMAGE=${{ env.PROVIDERS_IMAGE }}
             ENCRYPTION_BINS_IMAGE=${{ env.ENCRYPTION_BINS_IMAGE }}
+
+      - name: Load AMD64 image for embedded PostgreSQL tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: obot:embedded-postgres-test
+          build-args: |
+            PROVIDERS_IMAGE=${{ env.PROVIDERS_IMAGE }}
+            ENCRYPTION_BINS_IMAGE=${{ env.ENCRYPTION_BINS_IMAGE }}
+
+      - name: Test embedded PostgreSQL startup and migration
+        timeout-minutes: 15
+        run: bash tools/test-embedded-postgres.sh obot:embedded-postgres-test
+
+      - name: Upload embedded PostgreSQL test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-postgres-test-logs
+          path: /tmp/obot-embedded-postgres-*/logs/

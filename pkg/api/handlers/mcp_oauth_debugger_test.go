@@ -65,7 +65,7 @@ func TestExchangeAndPersistOAuthDebuggerTokenForDirectDynamicAndCIMD(t *testing.
 					AuthURL: config.Endpoint.AuthURL, TokenURL: config.Endpoint.TokenURL,
 				}
 			} else {
-				if err := gatewayClient.CreateMCPOAuthPendingState(t.Context(), "user-1", mcpID, mcpURL, OAuthDebuggerPendingStateMarker, "", "new-state", "verifier-1", "", &config); err != nil {
+				if err := gatewayClient.CreateMCPOAuthPendingStateWithTunnel(t.Context(), "user-1", mcpID, mcpURL, "", OAuthDebuggerPendingStateMarker, "", "new-state", "verifier-1", "", &config); err != nil {
 					t.Fatalf("create debugger pending state: %v", err)
 				}
 				var err error
@@ -143,7 +143,7 @@ func newDirectOAuthDebuggerTestClient(t *testing.T, mcpID string) *gateway.Clien
 	if err := db.AutoMigrate(); err != nil {
 		t.Fatalf("migrate gateway DB: %v", err)
 	}
-	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, nil, nil, time.Hour, 10, 90, 90, 90, true)
+	gatewayClient := gateway.New(t.Context(), db, storageClient, nil, nil, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { _ = gatewayClient.Close() })
 	return gatewayClient
 }

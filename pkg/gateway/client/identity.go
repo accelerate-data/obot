@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
-	"strconv"
-	"strings"
 	"time"
 
 	types2 "github.com/obot-platform/obot/apiclient/types"
@@ -17,6 +15,7 @@ import (
 	"github.com/obot-platform/obot/pkg/auth"
 	"github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/hash"
+	"github.com/obot-platform/obot/pkg/scim/adapter"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"gorm.io/gorm"
@@ -27,22 +26,18 @@ import (
 )
 
 const (
-	genericOAuthAuthProviderName           = "generic-oauth-auth-provider"
-	genericOAuthIssuerEnvVar               = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER"
-	genericOAuthTrustEmailLinkingVar       = "OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING"
-	userCreationAdvisoryLockID       int64 = 0x6f626f7455736572 // "obotUser"
+	userCreationAdvisoryLockID int64 = 0x6f626f7455736572 // "obotUser"
 )
 
 var (
-	verifiedAuthProviders = []string{
-		"default/google-auth-provider",
-		"default/github-auth-provider",
-	}
-
 	identityGroupResource = schema.GroupResource{
 		Group:    "obot.obot.ai",
 		Resource: "identities",
 	}
+
+	// errSignInWithoutGroupLookupID refuses a sign-in that would create an identity or a user without a group lookup
+	// ID, while SCIM matches the auth provider's users by it. The auth provider reports the ID at the next sign-in.
+	errSignInWithoutGroupLookupID = errors.New("the auth provider did not report the ID that SCIM matches users by; sign in again")
 )
 
 // ensuredIdentity is what ensureIdentity found or created.
@@ -63,8 +58,10 @@ type scimSignInMode struct {
 	namespace, name string
 
 	connectionID string
-	enforced     bool
-	locked       bool
+	// adapterType is the connection's adapter type, which selects its rules.
+	adapterType string
+	enforced    bool
+	locked      bool
 }
 
 // signInUserRow is a user that a sign-in matched, with whether SCIM provisioned them: through any connection, and
@@ -77,8 +74,21 @@ type signInUserRow struct {
 
 // FindIdentitiesForUser finds all identities for the given user.
 func (c *Client) FindIdentitiesForUser(ctx context.Context, userID uint) ([]types.Identity, error) {
+	return c.FindIdentitiesForUserAndProvider(ctx, userID, "", "")
+}
+
+// FindIdentitiesForUserAndProvider finds a user's identities, filtering by each
+// nonempty provider field. API-key callers can omit both fields.
+func (c *Client) FindIdentitiesForUserAndProvider(ctx context.Context, userID uint, providerName, providerNamespace string) ([]types.Identity, error) {
+	query := c.db.WithContext(ctx).Where("user_id = ?", userID)
+	if providerName != "" {
+		query = query.Where("auth_provider_name = ?", providerName)
+	}
+	if providerNamespace != "" {
+		query = query.Where("auth_provider_namespace = ?", providerNamespace)
+	}
 	var identities []types.Identity
-	if err := c.db.WithContext(ctx).Where("user_id = ?", userID).Find(&identities).Error; err != nil {
+	if err := query.Find(&identities).Error; err != nil {
 		return nil, err
 	}
 
@@ -119,7 +129,6 @@ func (c *Client) HasSignedInOwner(ctx context.Context, authProviderName string) 
 }
 
 // EnsureIdentity ensures that the given identity exists in the database, and returns the user associated with it.
-// The user gets the explicit role of their email, which ensureIdentityUser applies.
 func (c *Client) EnsureIdentity(ctx context.Context, id *types.Identity, timezone string, userLimit UserLimit) (*types.User, error) {
 	return c.EnsureIdentityWithRole(ctx, id, timezone, types2.RoleUnknown, userLimit)
 }
@@ -128,12 +137,17 @@ func (c *Client) EnsureIdentity(ctx context.Context, id *types.Identity, timezon
 // If the user already exists with a superset of the given role, it will not be updated.
 func (c *Client) EnsureIdentityWithRole(ctx context.Context, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit) (*types.User, error) {
 	var ensured ensuredIdentity
-	verified := c.identityCanLinkByVerifiedEmail(ctx, id)
+
+	// A first sign-in may claim an identity that SCIM created by the group lookup ID, which the auth provider is asked
+	// for outside of any transaction.
+	if err := c.fetchSignInGroupLookupID(ctx, id); err != nil {
+		return nil, err
+	}
 
 	// Transaction #1: ensure the identity + user rows exist / are corrected, and read what we need.
 	err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
-		ensured, err = c.ensureIdentity(ctx, tx, id, timezone, role, userLimit, verified)
+		ensured, err = c.ensureIdentity(ctx, tx, id, timezone, role, userLimit)
 		return err
 	})
 	if err != nil {
@@ -225,12 +239,7 @@ func (c *Client) EncryptIdentities(ctx context.Context, force bool) error {
 // Once SCIM is enforced for the provider, sign-in requires a SCIM binding, and neither the identity nor the user is
 // ever created here. Before that, users are still created just in time. Either way, sign-in never overwrites the
 // profile of a user that SCIM has provisioned.
-func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit, verifiedOverride ...bool) (ensuredIdentity, error) {
-	verified := slices.Contains(verifiedAuthProviders, fmt.Sprintf("%s/%s", id.AuthProviderNamespace, id.AuthProviderName))
-	if len(verifiedOverride) > 0 {
-		verified = verifiedOverride[0]
-	}
-
+func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit) (ensuredIdentity, error) {
 	email := id.Email
 	providerUserID := id.ProviderUserID
 	providerUsername := id.ProviderUsername
@@ -249,7 +258,7 @@ func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Iden
 		namespace: id.AuthProviderNamespace,
 		name:      id.AuthProviderName,
 	}
-	user, created, roleRaised, err := c.ensureIdentityUser(ctx, tx, mode, id, timezone, role, userLimit, verified, email, providerUserID, providerUsername)
+	user, created, roleRaised, err := c.ensureIdentityUser(ctx, tx, mode, id, timezone, role, userLimit, email, providerUserID, providerUsername)
 	if err != nil {
 		return ensuredIdentity{}, err
 	}
@@ -261,9 +270,98 @@ func (c *Client) ensureIdentity(ctx context.Context, tx *gorm.DB, id *types.Iden
 	}, nil
 }
 
-func (m *scimSignInMode) set(connectionID string, state types.SCIMConnectionState) {
+// createSignInIdentityTx creates the identity of a first sign-in, or completes the migration of an identity that has
+// not been fully migrated yet, and reads it into id as stored. Once SCIM is enforced, sign-in never creates an identity.
+func (c *Client) createSignInIdentityTx(ctx context.Context, tx *gorm.DB, mode *scimSignInMode, id *types.Identity) error {
+	if mode.enforced {
+		return scimUnprovisionedSignInError(0)
+	}
+	// fetchSignInGroupLookupID requires the lookup ID only when it finds a connection, which it reads without the
+	// mode lock, so a connection created meanwhile is checked for here.
+	if mode.requiresGroupLookupID() && id.ProviderGroupLookupID == "" {
+		return errSignInWithoutGroupLookupID
+	}
+
+	// The identity does not exist.
+	// Before we try creating a new identity, we need to check if there is one that has not been fully migrated yet.
+	migratedIdentity := &types.Identity{
+		ProviderUsername:      id.ProviderUsername,
+		HashedProviderUserID:  hash.String(fmt.Sprintf("OBOT_PLACEHOLDER_%s", id.ProviderUsername)),
+		AuthProviderName:      id.AuthProviderName,
+		AuthProviderNamespace: id.AuthProviderNamespace,
+	}
+	if err := tx.First(migratedIdentity).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		// The identity does not exist, so create it.
+		if err := c.encryptIdentity(ctx, id); err != nil {
+			return fmt.Errorf("failed to encrypt identity: %w", err)
+		}
+		// A concurrent request may win this insert on a first sign-in.
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(id).Error; err != nil {
+			return err
+		}
+		// Read back whichever row won, so both racers continue with the same user ID.
+		if err := tx.Where(
+			"auth_provider_name = ? AND auth_provider_namespace = ? AND hashed_provider_user_id = ?",
+			id.AuthProviderName, id.AuthProviderNamespace, id.HashedProviderUserID,
+		).First(id).Error; err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else {
+		if err := c.encryptIdentity(ctx, id); err != nil {
+			return fmt.Errorf("failed to encrypt identity: %w", err)
+		}
+
+		// The migrated identity exists. We need to update it with the right provider_user_id, and the group lookup ID
+		// the sign-in fetched, if any.
+		updates := map[string]any{"provider_user_id": id.ProviderUserID, "hashed_provider_user_id": id.HashedProviderUserID}
+		if id.HashedProviderGroupLookupID != "" {
+			updates["provider_group_lookup_id"] = id.ProviderGroupLookupID
+			updates["hashed_provider_group_lookup_id"] = id.HashedProviderGroupLookupID
+		}
+		if err := tx.Model(&migratedIdentity).Where("hashed_provider_user_id = ?", migratedIdentity.HashedProviderUserID).Updates(updates).Error; err != nil {
+			return err
+		}
+
+		// Now we should be able to load the identity.
+		if err := tx.First(id).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *scimSignInMode) set(connectionID string, state types.SCIMConnectionState, adapterType string) {
 	m.connectionID = connectionID
+	m.adapterType = adapterType
 	m.enforced = connectionID != "" && state == types.SCIMConnectionStateEnforced
+}
+
+// requiresGroupLookupID reports whether a SCIM connection whose adapter matches users by group lookup ID manages the
+// sign-in's auth provider. Sign-in then never creates an identity or a user without a group lookup ID, which SCIM could
+// not find, and would provision as another user. It is only meaningful once the mode is locked.
+func (m *scimSignInMode) requiresGroupLookupID() bool {
+	if m.connectionID == "" {
+		return false
+	}
+	a, ok := m.adapter()
+	return ok && a.UserKey() == adapter.UserKeyGroupLookupID
+}
+
+// adapter returns the SCIM adapter whose rules apply to the sign-in, as signInAdapter does.
+func (m *scimSignInMode) adapter() (adapter.Adapter, bool) {
+	return signInAdapter(m.adapterType, m.name)
+}
+
+// signInAdapter returns the SCIM adapter whose rules apply to a sign-in through the named auth provider: that of its
+// SCIM connection, which recorded the adapter when it was created, or the registry's for the auth provider when it has
+// none. connectionAdapterType is the connection's adapter type, or empty when it has none.
+func signInAdapter(connectionAdapterType, authProviderName string) (adapter.Adapter, bool) {
+	if connectionAdapterType != "" {
+		return adapter.Lookup(connectionAdapterType)
+	}
+	return adapter.ForAuthProvider(authProviderName)
 }
 
 // lock takes the SCIM mode lock shared and reads the mode again, for a sign-in that is about to create an identity or
@@ -277,9 +375,9 @@ func (m *scimSignInMode) lock(tx *gorm.DB) error {
 		return err
 	}
 	if conn == nil {
-		m.set("", "")
+		m.set("", "", "")
 	} else {
-		m.set(conn.ID, conn.State)
+		m.set(conn.ID, conn.State, conn.AdapterType)
 	}
 	m.locked = true
 	return nil
@@ -290,11 +388,12 @@ func (m *scimSignInMode) lock(tx *gorm.DB) error {
 func identityWithSCIMModeTx(tx *gorm.DB, id *types.Identity, mode *scimSignInMode) (bool, error) {
 	var rows []struct {
 		types.Identity
-		SCIMConnectionID    *string
-		SCIMConnectionState *types.SCIMConnectionState
+		SCIMConnectionID          *string
+		SCIMConnectionState       *types.SCIMConnectionState
+		SCIMConnectionAdapterType *string
 	}
 	if err := tx.Model(new(types.Identity)).
-		Select("identities.*, scim_connections.id AS scim_connection_id, scim_connections.state AS scim_connection_state").
+		Select("identities.*, scim_connections.id AS scim_connection_id, scim_connections.state AS scim_connection_state, scim_connections.adapter_type AS scim_connection_adapter_type").
 		Joins("LEFT JOIN scim_connections ON scim_connections.auth_provider_namespace = identities.auth_provider_namespace AND scim_connections.auth_provider_name = identities.auth_provider_name").
 		Where("identities.auth_provider_name = ? AND identities.auth_provider_namespace = ? AND identities.hashed_provider_user_id = ?", id.AuthProviderName, id.AuthProviderNamespace, id.HashedProviderUserID).
 		Limit(1).
@@ -309,7 +408,11 @@ func identityWithSCIMModeTx(tx *gorm.DB, id *types.Identity, mode *scimSignInMod
 	*id = rows[0].Identity
 	id.AuthProviderGroups = groups
 	if rows[0].SCIMConnectionID != nil && rows[0].SCIMConnectionState != nil {
-		mode.set(*rows[0].SCIMConnectionID, *rows[0].SCIMConnectionState)
+		var adapterType string
+		if rows[0].SCIMConnectionAdapterType != nil {
+			adapterType = *rows[0].SCIMConnectionAdapterType
+		}
+		mode.set(*rows[0].SCIMConnectionID, *rows[0].SCIMConnectionState, adapterType)
 	}
 	return true, nil
 }
@@ -325,57 +428,22 @@ func scimUnprovisionedSignInError(userID uint) error {
 
 // ensureIdentityUser does the work of ensureIdentity. When SCIM is enforced for the identity's auth provider, sign-in
 // requires an identity whose live user the connection provisioned, and it never creates an identity or a user.
-func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scimSignInMode, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit, verified bool, email, providerUserID, providerUsername string) (*types.User, bool, bool, error) {
+func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scimSignInMode, id *types.Identity, timezone string, role types2.Role, userLimit UserLimit, email, providerUserID, providerUsername string) (*types.User, bool, bool, error) {
 	// See if the identity already exists.
 	if found, err := identityWithSCIMModeTx(tx, id, mode); err != nil {
 		return nil, false, false, fmt.Errorf("failed to look up identity: %w", err)
 	} else if !found {
-		// A first sign-in creates the identity, so the mode must hold until the transaction ends.
+		// A first sign-in claims the identity that SCIM created for the person, or creates one, so the mode must hold
+		// until the transaction ends.
 		if err := mode.lock(tx); err != nil {
 			return nil, false, false, err
 		}
-		if mode.enforced {
-			return nil, false, false, scimUnprovisionedSignInError(0)
-		}
-
-		// The identity does not exist.
-		// Before we try creating a new identity, we need to check if there is one that has not been fully migrated yet.
-		migratedIdentity := &types.Identity{
-			ProviderUsername:      id.ProviderUsername,
-			HashedProviderUserID:  hash.String(fmt.Sprintf("OBOT_PLACEHOLDER_%s", id.ProviderUsername)),
-			AuthProviderName:      id.AuthProviderName,
-			AuthProviderNamespace: id.AuthProviderNamespace,
-		}
-		if err = tx.First(migratedIdentity).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-			// The identity does not exist, so create it.
-			if err = c.encryptIdentity(ctx, id); err != nil {
-				return nil, false, false, fmt.Errorf("failed to encrypt identity: %w", err)
-			}
-			// A concurrent request may win this insert on a first sign-in.
-			if err = tx.Clauses(clause.OnConflict{DoNothing: true}).Create(id).Error; err != nil {
-				return nil, false, false, err
-			}
-			// Read back whichever row won, so both racers continue with the same user ID.
-			if err = tx.Where(
-				"auth_provider_name = ? AND auth_provider_namespace = ? AND hashed_provider_user_id = ?",
-				id.AuthProviderName, id.AuthProviderNamespace, id.HashedProviderUserID,
-			).First(id).Error; err != nil {
-				return nil, false, false, err
-			}
-		} else if err != nil {
+		claimed, err := c.claimSCIMIdentityTx(ctx, tx, mode, id)
+		if err != nil {
 			return nil, false, false, err
-		} else {
-			if err = c.encryptIdentity(ctx, id); err != nil {
-				return nil, false, false, fmt.Errorf("failed to encrypt identity: %w", err)
-			}
-
-			// The migrated identity exists. We need to update it with the right provider_user_id.
-			if err = tx.Model(&migratedIdentity).Where("hashed_provider_user_id = ?", migratedIdentity.HashedProviderUserID).Updates(map[string]any{"provider_user_id": id.ProviderUserID, "hashed_provider_user_id": id.HashedProviderUserID}).Error; err != nil {
-				return nil, false, false, err
-			}
-
-			// Now we should be able to load the identity.
-			if err = tx.First(id).Error; err != nil {
+		}
+		if !claimed {
+			if err := c.createSignInIdentityTx(ctx, tx, mode, id); err != nil {
 				return nil, false, false, err
 			}
 		}
@@ -401,20 +469,13 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 		updateIdentity = true
 	}
 
-	// A user that sign-in creates has the email the identity provider asserts, so its explicit role applies. An
-	// existing user replaces this one, and gets the explicit role of its own email below.
-	newUserRole := role
-	if r := c.HasExplicitRole(email); !newUserRole.HasRole(r) {
-		newUserRole = newUserRole.SwitchBaseRole(r)
-	}
 	user := &types.User{
 		ID:             id.UserID,
 		Username:       id.ProviderUsername,
 		HashedUsername: hash.String(id.ProviderUsername),
 		Email:          id.Email,
 		HashedEmail:    id.HashedEmail,
-		VerifiedEmail:  &verified,
-		Role:           newUserRole,
+		Role:           role,
 	}
 
 	var created, roleRaised, checkForExistingUser bool
@@ -429,11 +490,6 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 	if user.ID != 0 {
 		// Check for an existing user with this exact ID.
 		userQuery = userQuery.Where("users.id = ?", user.ID)
-		checkForExistingUser = true
-	} else if verified {
-		// Check for an existing user with this exact verified email address.
-		// We check for both true and null values, because the email might have been verified before we started tracking verified emails.
-		userQuery = userQuery.Where("users.hashed_email = ? and (users.verified_email = true or users.verified_email is null)", user.HashedEmail)
 		checkForExistingUser = true
 	}
 
@@ -453,10 +509,31 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 			if mode.enforced {
 				return nil, false, false, scimUnprovisionedSignInError(user.ID)
 			}
+			if user.ID != 0 {
+				if status, exists, err := userStatus(tx, user.ID); err != nil {
+					return nil, false, false, err
+				} else if exists && status == types2.UserStatusDeleted {
+					// The identity belongs to a user who has been deleted. Until the user's cleanup ends their sessions
+					// and removes the identity, a request with one of those sessions must be refused, not given a new
+					// user. Otherwise the identity would move to the new user, the cleanup would find no identity of the
+					// deleted user, and the sessions would never end.
+					return nil, false, false, &UserAccessDeniedError{
+						UserID: user.ID,
+						Status: types2.UserStatusDeleted,
+					}
+				}
+			}
+			if mode.requiresGroupLookupID() && id.ProviderGroupLookupID == "" {
+				// An identity without a lookup ID would get a user that SCIM cannot find.
+				return nil, false, false, errSignInWithoutGroupLookupID
+			}
 
 			// Clear user ID so that it can be auto-generated.
 			u.ID = 0
 			created = true
+			if err := grantInitialOwnerRole(tx, id, &u); err != nil {
+				return nil, false, false, err
+			}
 			if err = c.encryptUser(ctx, &u); err != nil {
 				return nil, false, false, fmt.Errorf("failed to encrypt user: %w", err)
 			}
@@ -485,19 +562,6 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 			var userChanged bool
 			if !user.Role.HasRole(role) {
 				user.Role = user.Role.SwitchBaseRole(role)
-				userChanged = true
-				roleRaised = true
-			}
-
-			// Explicit roles follow the user's email. SCIM writes the email of the users it has provisioned, and every
-			// other check of explicit roles reads the stored email, so for those users it is the one that counts, not
-			// the one the identity provider asserts at sign-in.
-			explicitRoleEmail := email
-			if rows[0].SCIMBound {
-				explicitRoleEmail = user.Email
-			}
-			if r := c.HasExplicitRole(explicitRoleEmail); !user.Role.HasRole(r) {
-				user.Role = user.Role.SwitchBaseRole(r)
 				userChanged = true
 				roleRaised = true
 			}
@@ -536,17 +600,6 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 				userChanged = true
 			}
 
-			// Update the verified email status if needed.
-			// This can happen in two cases:
-			// 1. The user was created before we started tracking verified emails (user.VerifiedEmail is nil)
-			// 2. The user was created before we started tracking verified emails, and associated with both a verified
-			//    and unverified auth provider. They logged in with the unverified provider and we marked the email as unverified,
-			//    but now they've logged in with the verified provider and we can mark the email as verified. (verified is true, but user.VerifiedEmail is false)
-			if user.VerifiedEmail == nil || (verified && !*user.VerifiedEmail) {
-				user.VerifiedEmail = &verified
-				userChanged = true
-			}
-
 			if profileChanged {
 				// Copy user so we don't have to decrypt
 				u = *user
@@ -565,7 +618,6 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 					"role":            user.Role,
 					"timezone":        user.Timezone,
 					"last_active_day": user.LastActiveDay,
-					"verified_email":  user.VerifiedEmail,
 				}).Error; err != nil {
 					return nil, false, false, err
 				}
@@ -586,12 +638,18 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 		if mode.enforced {
 			return nil, false, false, scimUnprovisionedSignInError(0)
 		}
+		if mode.requiresGroupLookupID() && id.ProviderGroupLookupID == "" {
+			return nil, false, false, errSignInWithoutGroupLookupID
+		}
 
 		// Creating a new user
 		created = true
 
 		// Copy the user so we don't have to decrypt
 		u := *user
+		if err := grantInitialOwnerRole(tx, id, &u); err != nil {
+			return nil, false, false, err
+		}
 		if err := c.encryptUser(ctx, &u); err != nil {
 			return nil, false, false, fmt.Errorf("failed to encrypt user: %w", err)
 		}
@@ -602,6 +660,7 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 		// Copy the values that were created instead of decrypting the whole object.
 		user.ID = u.ID
 		user.CreatedAt = u.CreatedAt
+		user.Role = u.Role
 	}
 
 	// Update the user ID saved on the identity if needed.
@@ -626,6 +685,29 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 	}
 
 	return user, created, roleRaised, nil
+}
+
+// grantInitialOwnerRole makes user, which sign-in is about to create for id, an Owner when id is the Local identity of
+// the provisioned initial owner. That account is the only one with a setup token, which it keeps until its password is
+// set. Every authenticated request ensures the identity, including those of the restricted setup session, so the user
+// is created while the token is still there. The grant is recorded on the account in tx, so it happens once: a user
+// created again for the account, such as after the first one was deleted, is not an Owner, even while the token is
+// still usable. Neither is a user of a Local account that an admin created.
+func grantInitialOwnerRole(tx *gorm.DB, id *types.Identity, user *types.User) error {
+	if user.Role.HasRole(types2.RoleOwner) || id.AuthProviderNamespace != system.DefaultNamespace || id.AuthProviderName != system.LocalAuthProvider || id.Email == "" {
+		return nil
+	}
+
+	result := tx.Model(new(types.LocalAuthUser)).
+		Where("hashed_email = ? AND setup_token_hash != '' AND owner_granted_at IS NULL", hash.String(NormalizeEmail(id.Email))).
+		UpdateColumn("owner_granted_at", time.Now())
+	if result.Error != nil {
+		return fmt.Errorf("failed to record the initial owner grant: %w", result.Error)
+	}
+	if result.RowsAffected > 0 {
+		user.Role = user.Role.SwitchBaseRole(types2.RoleOwner)
+	}
+	return nil
 }
 
 func (c *Client) createUser(tx *gorm.DB, user *types.User, userLimit UserLimit) error {
@@ -686,21 +768,8 @@ func newUserLimitError() error {
 // below opens its own short transaction, so no transaction is ever held while an HTTP call is in
 // flight. The identity + user rows are expected to already be committed by ensureIdentity.
 func (c *Client) ensureIdentityProviderData(ctx context.Context, id *types.Identity) error {
-	// Populate ProviderGroupLookupID from the auth provider's user info if not set.
-	// This is the provider-native user ID used for group lookups, which may differ from the
-	// OIDC sub claim stored in ProviderUserID (e.g. Entra returns an Azure AD GUID).
-	if id.ProviderGroupLookupID == "" {
-		// HTTP call, outside any transaction.
-		if lookupID, err := c.fetchProviderGroupLookupID(ctx); err != nil {
-			slog.Warn("failed to fetch provider group lookup ID", "error", err)
-		} else if lookupID != "" {
-			id.ProviderGroupLookupID = lookupID
-			if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-				return c.encryptAndUpdateIdentity(ctx, tx, *id)
-			}); err != nil {
-				return err
-			}
-		}
+	if err := c.ensureProviderGroupLookupID(ctx, id); err != nil {
+		return err
 	}
 
 	// Ensure groups and group memberships are up to date. ensureGroups makes its own HTTP call to
@@ -712,46 +781,228 @@ func (c *Client) ensureIdentityProviderData(ctx context.Context, id *types.Ident
 	return nil
 }
 
-func (c *Client) identityCanLinkByVerifiedEmail(ctx context.Context, id *types.Identity) bool {
-	if slices.Contains(verifiedAuthProviders, fmt.Sprintf("%s/%s", id.AuthProviderNamespace, id.AuthProviderName)) {
-		return true
+// ensureProviderGroupLookupID populates ProviderGroupLookupID from the auth provider's user info if it is not set, and
+// stores it. This is the provider-native user ID used for group lookups, which may differ from the OIDC sub claim
+// stored in ProviderUserID (e.g. Entra returns an Azure AD GUID). A failed fetch is logged, and the next sign-in tries
+// again. It must be called outside any open database transaction.
+func (c *Client) ensureProviderGroupLookupID(ctx context.Context, id *types.Identity) error {
+	if id.ProviderGroupLookupID != "" {
+		return nil
 	}
 
-	if id.AuthProviderNamespace != system.DefaultNamespace || id.AuthProviderName != genericOAuthAuthProviderName {
-		return false
+	// HTTP call, outside any transaction.
+	lookupID, err := c.fetchProviderGroupLookupID(ctx)
+	if err != nil {
+		slog.Warn("failed to fetch provider group lookup ID", "error", err)
+		return nil
 	}
-	if id.ProviderEmailVerified != nil && !*id.ProviderEmailVerified {
-		return false
-	}
-	if id.ProviderIssuer == "" {
-		return false
+	if lookupID == "" {
+		return nil
 	}
 
-	return c.genericOAuthTrustEmailLinking(ctx, id.ProviderIssuer)
+	return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return c.storeGroupLookupIDTx(ctx, tx, id, lookupID)
+	})
 }
 
-func (c *Client) genericOAuthTrustEmailLinking(ctx context.Context, issuer string) bool {
-	var authProvider v1.AuthProvider
-	if err := c.storageClient.Get(ctx, kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: genericOAuthAuthProviderName}, &authProvider); err != nil {
-		return false
+// storeGroupLookupIDTx stores the group lookup ID of the identity with id's key, unless it has one, and sets id's to
+// the stored one. The identity is read again under a row lock, and only its encrypted columns are written, so that
+// nothing that changed since id was read, such as the user it belongs to, is overwritten. When another sign-in stored
+// a lookup ID first, id gets that one, so that the caller's group lookups use the ID Obot has.
+func (c *Client) storeGroupLookupIDTx(ctx context.Context, tx *gorm.DB, id *types.Identity, lookupID string) error {
+	var identities []types.Identity
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", id.AuthProviderNamespace, id.AuthProviderName, id.HashedProviderUserID).
+		Limit(1).
+		Find(&identities).Error; err != nil {
+		return fmt.Errorf("failed to get identity: %w", err)
+	}
+	if len(identities) == 0 {
+		return nil
 	}
 
-	cred, err := c.RevealCredential(ctx, []string{authProvider.Name, system.GenericAuthProviderCredentialContext}, authProvider.Name)
-	if err != nil || cred.Secrets == nil {
-		return false
+	stored := &identities[0]
+	if err := c.decryptStoredIdentity(ctx, stored); err != nil {
+		return err
 	}
-	configuredIssuer := strings.TrimRight(strings.TrimSpace(cred.Secrets[genericOAuthIssuerEnvVar]), "/")
-	if configuredIssuer == "" || configuredIssuer != strings.TrimRight(strings.TrimSpace(issuer), "/") {
-		return false
+	if stored.ProviderGroupLookupID != "" {
+		id.ProviderGroupLookupID = stored.ProviderGroupLookupID
+		id.HashedProviderGroupLookupID = hash.String(stored.ProviderGroupLookupID)
+		return nil
+	}
+	stored.ProviderGroupLookupID = lookupID
+	if err := c.encryptIdentity(ctx, stored); err != nil {
+		return fmt.Errorf("failed to encrypt identity: %w", err)
+	}
+	if err := tx.Model(new(types.Identity)).
+		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", stored.AuthProviderNamespace, stored.AuthProviderName, stored.HashedProviderUserID).
+		UpdateColumns(identityEncryptedColumns(stored)).Error; err != nil {
+		return fmt.Errorf("failed to store the group lookup ID of identity: %w", err)
 	}
 
-	rawTrust := cred.Secrets[genericOAuthTrustEmailLinkingVar]
-	if rawTrust == "" {
-		return true
+	id.ProviderGroupLookupID = lookupID
+	id.HashedProviderGroupLookupID = hash.String(lookupID)
+	return nil
+}
+
+// fetchSignInGroupLookupID sets the group lookup ID (the ID for the user that Obot sends to the auth provider to look
+// up information about group memberships) of a first sign-in, for auth providers that match SCIM-provisioned users
+// by that value, e.g. Entra. It runs before the sign-in's transaction, which may claim the identity that SCIM created
+// by that ID, and does nothing when the sign-in's identity already exists. A first sign-in whose lookup ID cannot be
+// learned fails while a SCIM connection manages the auth provider, because it could duplicate a user that SCIM
+// provisioned; otherwise it is logged, and the ID is fetched again after sign-in.
+func (c *Client) fetchSignInGroupLookupID(ctx context.Context, id *types.Identity) error {
+	if id.ProviderGroupLookupID != "" || id.ProviderUserID == "" {
+		return nil
 	}
 
-	trusted, err := strconv.ParseBool(rawTrust)
-	return err == nil && trusted
+	db := c.db.WithContext(ctx)
+	conn, err := scimConnectionForAuthProviderTx(db, id.AuthProviderNamespace, id.AuthProviderName)
+	if err != nil {
+		return err
+	}
+	if a, ok := signInAdapter(adapter.ConnectionAdapterType(conn), id.AuthProviderName); !ok || a.UserKey() != adapter.UserKeyGroupLookupID {
+		return nil
+	}
+
+	var existing int64
+	if err := db.Model(new(types.Identity)).
+		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", id.AuthProviderNamespace, id.AuthProviderName, hash.String(id.ProviderUserID)).
+		Count(&existing).Error; err != nil {
+		return fmt.Errorf("failed to look up identity: %w", err)
+	}
+	if existing > 0 {
+		return nil
+	}
+
+	// HTTP call, outside any transaction.
+	lookupID, err := c.fetchProviderGroupLookupID(ctx)
+	if err == nil && lookupID != "" {
+		id.ProviderGroupLookupID = lookupID
+		return nil
+	}
+	if err == nil {
+		err = errors.New("the auth provider reported no ID for the user")
+	}
+	if conn != nil {
+		return fmt.Errorf("failed to fetch the provider group lookup ID of a first sign-in: %w", err)
+	}
+	slog.Warn("failed to fetch provider group lookup ID", "error", err)
+	return nil
+}
+
+// claimSCIMIdentityTx claims, for a first sign-in, the identity that SCIM created for the same person before they ever
+// signed in, through an auth provider whose adapter matches SCIM users by group lookup ID. Such an identity has a
+// pending key, because SCIM does not know the sign-in's subject. Claiming re-keys it to the sign-in's provider user
+// ID, reads it into id as stored, and gives its user the sign-in's username. It reports whether there was an identity
+// to claim.
+//
+// It takes the lock that a SCIM create of the same person takes, and holds it until the transaction ends, so that a
+// sign-in that finds nothing to claim and creates an identity cannot race the creation of another.
+func (c *Client) claimSCIMIdentityTx(ctx context.Context, tx *gorm.DB, mode *scimSignInMode, id *types.Identity) (bool, error) {
+	a, ok := mode.adapter()
+	if !ok || a.UserKey() != adapter.UserKeyGroupLookupID || id.ProviderGroupLookupID == "" {
+		return false, nil
+	}
+	if err := lockSCIMPersonTx(tx, id.AuthProviderNamespace, id.AuthProviderName, id.ProviderGroupLookupID); err != nil {
+		return false, err
+	}
+
+	pending, err := pendingSCIMIdentityTx(tx, id.AuthProviderNamespace, id.AuthProviderName, id.ProviderGroupLookupID)
+	if err != nil || pending == nil {
+		return false, err
+	}
+
+	claimed := *pending
+	// The encryption context includes the key, so the identity is decrypted with the pending key and encrypted again
+	// with the new one.
+	if err := c.decryptStoredIdentity(ctx, &claimed); err != nil {
+		return false, err
+	}
+	claimed.ProviderUserID = id.ProviderUserID
+	claimed.HashedProviderUserID = id.HashedProviderUserID
+	claimed.ProviderUsername = id.ProviderUsername
+	if err := c.encryptIdentity(ctx, &claimed); err != nil {
+		return false, fmt.Errorf("failed to encrypt identity: %w", err)
+	}
+	columns := identityEncryptedColumns(&claimed)
+	columns["hashed_provider_user_id"] = claimed.HashedProviderUserID
+	if err := tx.Model(new(types.Identity)).
+		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", pending.AuthProviderNamespace, pending.AuthProviderName, pending.HashedProviderUserID).
+		UpdateColumns(columns).Error; err != nil {
+		return false, fmt.Errorf("failed to claim the identity that SCIM created: %w", err)
+	}
+
+	if claimed.UserID != 0 {
+		if err := c.renameClaimedUserTx(ctx, tx, claimed.UserID, id.ProviderUsername); err != nil {
+			return false, err
+		}
+	}
+
+	groups := id.AuthProviderGroups
+	if err := tx.Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", id.AuthProviderNamespace, id.AuthProviderName, id.HashedProviderUserID).
+		First(id).Error; err != nil {
+		return false, fmt.Errorf("failed to read the claimed identity: %w", err)
+	}
+	id.AuthProviderGroups = groups
+	return true, nil
+}
+
+// pendingSCIMIdentityTx returns the identity that SCIM created for the person with the group lookup ID, which waits for
+// their first sign-in, or nil when there is none.
+func pendingSCIMIdentityTx(tx *gorm.DB, namespace, name, lookupID string) (*types.Identity, error) {
+	var pending []types.Identity
+	if err := tx.Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?",
+		namespace, name, hash.String(adapter.PendingProviderUserID(lookupID))).
+		Limit(1).
+		Find(&pending).Error; err != nil {
+		return nil, fmt.Errorf("failed to look up the identity that SCIM created: %w", err)
+	}
+	if len(pending) == 0 {
+		return nil, nil
+	}
+	return &pending[0], nil
+}
+
+// renameClaimedUserTx gives the live user whose identity a sign-in claimed the sign-in's username. The encryption
+// context of a user includes the hashed username, so every encrypted column is written again. A username that another
+// user has is refused with 409, since sign-in cannot choose another one.
+func (c *Client) renameClaimedUserTx(ctx context.Context, tx *gorm.DB, userID uint, username string) error {
+	var users []types.User
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND deleted_at IS NULL", userID).Limit(1).Find(&users).Error; err != nil {
+		return fmt.Errorf("failed to get user %d: %w", userID, err)
+	}
+	if len(users) == 0 {
+		// The user was deleted, so the sign-in does not reach them.
+		return nil
+	}
+
+	user := &users[0]
+	if err := c.decryptUser(ctx, user); err != nil {
+		return fmt.Errorf("failed to decrypt user: %w", err)
+	}
+	if user.Username == username {
+		return nil
+	}
+
+	var taken int64
+	if err := tx.Model(new(types.User)).Where("hashed_username = ? AND id != ?", hash.String(username), userID).Count(&taken).Error; err != nil {
+		return fmt.Errorf("failed to check username of user %d: %w", userID, err)
+	} else if taken > 0 {
+		return types2.NewErrHTTP(http.StatusConflict, fmt.Sprintf("another Obot user already has the username %q; an administrator must rename or delete them", username))
+	}
+
+	user.Username = username
+	user.HashedUsername = hash.String(username)
+	if err := c.encryptUser(ctx, user); err != nil {
+		return fmt.Errorf("failed to encrypt user: %w", err)
+	}
+	if err := tx.Model(user).
+		Select(slices.Concat(userEncryptedColumns, []string{"hashed_username"})).
+		Updates(user).Error; err != nil {
+		return fmt.Errorf("failed to rename user %d: %w", userID, err)
+	}
+	return nil
 }
 
 // fetchProviderGroupLookupID calls the auth provider's /obot-get-user-info endpoint
@@ -907,7 +1158,38 @@ func (c *Client) getDefaultRole(ctx context.Context) (types2.Role, error) {
 	return defaultRole.Spec.Role, nil
 }
 
+// identityEncryptedColumns returns the columns that encryptIdentity writes, with identity's values, for an update that
+// writes an identity encrypted again without the rest of its row. It must list every column that encryptIdentity
+// writes.
+func identityEncryptedColumns(identity *types.Identity) map[string]any {
+	return map[string]any{
+		"provider_username":               identity.ProviderUsername,
+		"email":                           identity.Email,
+		"provider_user_id":                identity.ProviderUserID,
+		"provider_group_lookup_id":        identity.ProviderGroupLookupID,
+		"hashed_provider_group_lookup_id": identity.HashedProviderGroupLookupID,
+		"icon_url":                        identity.IconURL,
+		"encrypted":                       identity.Encrypted,
+	}
+}
+
+// decryptStoredIdentity decrypts an identity read from the database, refusing one that is encrypted while encryption
+// is not configured, which decryptIdentity would leave encrypted.
+func (c *Client) decryptStoredIdentity(ctx context.Context, identity *types.Identity) error {
+	if identity.Encrypted && (c.encryptionConfig == nil || c.encryptionConfig.Transformers[identityGroupResource] == nil) {
+		return errors.New("identity is encrypted but encryption is not configured")
+	}
+	if err := c.decryptIdentity(ctx, identity); err != nil {
+		return fmt.Errorf("failed to decrypt identity: %w", err)
+	}
+	return nil
+}
+
 func (c *Client) encryptIdentity(ctx context.Context, identity *types.Identity) error {
+	// Every write of an identity encrypts it first, so the hash of the plaintext lookup ID is kept here, whether or not
+	// encryption is configured.
+	identity.HashedProviderGroupLookupID = hashOptional(identity.ProviderGroupLookupID)
+
 	if c.encryptionConfig == nil {
 		return nil
 	}

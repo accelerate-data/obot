@@ -26,6 +26,7 @@ import (
 	gclient "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/i18n"
 	"github.com/obot-platform/obot/pkg/license"
+	"github.com/obot-platform/obot/pkg/llm"
 	"github.com/obot-platform/obot/pkg/principal"
 	"github.com/obot-platform/obot/pkg/proxy"
 	"github.com/obot-platform/obot/pkg/scim"
@@ -64,13 +65,13 @@ type Server struct {
 	rateLimiter             *ratelimiter.RateLimiter
 	baseURL                 string
 	mcpOAuthScope           string
-	registryNoAuth          bool
 	providerEntitlementGate *license.ProviderEntitlementGate
 	// devUI is set when the UI is served by the Vite dev server (dev mode).
 	devUI bool
 
 	mux         *http.ServeMux
 	otelHandler http.Handler
+	middleware  []func(api.HandlerFunc) api.HandlerFunc
 	// scimHandler serves the SCIM endpoint, which HandleSCIM sets.
 	scimHandler http.Handler
 }
@@ -91,7 +92,14 @@ type statusWriter struct {
 	status int
 }
 
-func NewServer(storageClient storage.Client, gatewayClient *gclient.Client, localK8sClient kclient.Client, obotNamespace string, authn *authn.Authenticator, authz *authz.Authorizer, proxyManager *proxy.Manager, auditLogger audit.Logger, rateLimiter *ratelimiter.RateLimiter, baseURL string, oauthScopesSupported []string, registryNoAuth bool, licenseProvider *license.Provider) *Server {
+// tracingResponseWriter retains the writer below OTel's error-discarding Flush hook.
+type tracingResponseWriter struct {
+	http.ResponseWriter
+	original    http.ResponseWriter
+	wroteHeader bool
+}
+
+func NewServer(storageClient storage.Client, gatewayClient *gclient.Client, localK8sClient kclient.Client, obotNamespace string, authn *authn.Authenticator, authz *authz.Authorizer, proxyManager *proxy.Manager, auditLogger audit.Logger, rateLimiter *ratelimiter.RateLimiter, baseURL string, oauthScopesSupported []string, licenseProvider *license.Provider) *Server {
 	var scope string
 	if len(oauthScopesSupported) > 0 {
 		scope = fmt.Sprintf(", scope=\"%s\"", strings.Join(oauthScopesSupported, " "))
@@ -108,7 +116,6 @@ func NewServer(storageClient storage.Client, gatewayClient *gclient.Client, loca
 		mcpOAuthScope:           scope,
 		auditLogger:             auditLogger,
 		rateLimiter:             rateLimiter,
-		registryNoAuth:          registryNoAuth,
 		mux:                     http.NewServeMux(),
 		providerEntitlementGate: license.NewProviderEntitlementGate(licenseProvider, storageClient),
 	}
@@ -134,7 +141,18 @@ func authenticationError[T error](err error) (T, bool) {
 }
 
 func (s *Server) HandleFunc(pattern string, f api.HandlerFunc) {
+	for _, middleware := range slices.Backward(s.middleware) {
+		f = middleware(f)
+	}
 	s.mux.Handle(pattern, s.Wrap(f))
+}
+
+// WithMiddleware shares the server's mux and services, applying middleware only to
+// routes registered through the returned server. Parent middleware runs first.
+func (s *Server) WithMiddleware(middleware ...func(api.HandlerFunc) api.HandlerFunc) *Server {
+	scoped := *s
+	scoped.middleware = append(slices.Clone(s.middleware), middleware...)
+	return &scoped
 }
 
 // HandleSCIM serves the SCIM endpoint with f. SCIM requests bypass the mux, which would answer the base URL without a
@@ -177,12 +195,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // traced traces the requests that h serves, other than health checks and static assets.
 func traced(h http.Handler) http.Handler {
-	return otelhttp.NewHandler(
-		h,
-		"obot/http",
-		otelhttp.WithFilter(func(r *http.Request) bool {
-			return r.URL.Path != "/api/healthz" && !isStaticAssetPath(r.URL.Path)
+	handler := otelhttp.NewHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// OTel's httpsnoop wrapper exposes the original writer through Unwrap.
+			original := w.(interface{ Unwrap() http.ResponseWriter }).Unwrap()
+			h.ServeHTTP(&tracingResponseWriter{ResponseWriter: w, original: original}, r)
 		}),
+		"obot/http",
 		otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
 			if r.Pattern == "" {
 				return operation
@@ -190,6 +209,60 @@ func traced(h http.Handler) http.Handler {
 			return r.Pattern
 		}),
 	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Filter before adding the tracing writer so its Unwrap always refers to OTel.
+		if r.URL.Path == "/api/healthz" || isStaticAssetPath(r.URL.Path) {
+			h.ServeHTTP(w, r)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func (w *tracingResponseWriter) Flush() { _ = w.FlushError() }
+
+func (w *tracingResponseWriter) WriteHeader(status int) {
+	if !w.wroteHeader {
+		w.wroteHeader = true
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (w *tracingResponseWriter) Write(p []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *tracingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	// OTel does not instrument ReaderFrom; copy through Write and hide this method
+	// from io.Copy to avoid recursively calling ReadFrom.
+	return io.Copy(struct{ io.Writer }{w}, r)
+}
+
+func (w *tracingResponseWriter) FlushError() error {
+	// Commit through OTel for status accounting, then flush without its void hook.
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return http.NewResponseController(w.original).Flush()
+}
+
+func (w *tracingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *tracingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *tracingResponseWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
 }
 
 func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
@@ -205,6 +278,14 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 
 		// SCIM clients understand only SCIM responses, so every failure on a SCIM route is written as one.
 		isSCIM := scim.IsSCIMPath(req.URL.Path)
+		// LLM API clients and SDKs understand errors in their API's format, so every failure on the
+		// LLM proxy is written in the format of the request.
+		httpError := http.Error
+		if llm.IsProxyPath(req.URL.Path) {
+			httpError = func(w http.ResponseWriter, message string, code int) {
+				llm.WriteError(w, req, message, code)
+			}
+		}
 
 		user, err := s.authenticator.Authenticate(req)
 		if err != nil {
@@ -229,7 +310,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 
 			// Check if this is a FetchUserGroupsError which indicates an auth provider configuration issue
 			if fetchGroupsErr, ok := authenticationError[*gclient.FetchUserGroupsError](err); ok {
-				http.Error(rw, fmt.Sprintf("Authentication provider configuration error: %s. Please contact an administrator to fix the auth provider configuration.", fetchGroupsErr.Message), http.StatusInternalServerError)
+				httpError(rw, fmt.Sprintf("Authentication provider configuration error: %s. Please contact an administrator to fix the auth provider configuration.", fetchGroupsErr.Message), http.StatusInternalServerError)
 			} else if denied, ok := authenticationError[*gclient.UserAccessDeniedError](err); ok {
 				// End the browser session, so that the login page is reachable and can say why.
 				http.SetCookie(rw, &http.Cookie{
@@ -252,12 +333,12 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 					return
 				}
 				httpErr := denied.HTTPError()
-				http.Error(rw, httpErr.Message, httpErr.Code)
+				httpError(rw, httpErr.Message, httpErr.Code)
 			} else if lookupErr, ok := authenticationError[*gclient.UserAccessLookupError](err); ok {
 				slog.Error("Denied request because the user's status could not be checked", "userID", lookupErr.UserID, "error", lookupErr.Err)
-				http.Error(rw, "Unable to verify account status. Please try again.", http.StatusServiceUnavailable)
+				httpError(rw, "Unable to verify account status. Please try again.", http.StatusServiceUnavailable)
 			} else {
-				http.Error(rw, err.Error(), http.StatusUnauthorized)
+				httpError(rw, err.Error(), http.StatusUnauthorized)
 			}
 
 			return
@@ -274,7 +355,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 					if isSCIM {
 						scim.WriteError(rw, http.StatusTooManyRequests, err.Error())
 					} else {
-						http.Error(rw, err.Error(), http.StatusTooManyRequests)
+						httpError(rw, err.Error(), http.StatusTooManyRequests)
 					}
 					return
 				}
@@ -324,7 +405,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 		// rejected probes stay auditable and a cookie refresh is not lost to a blocked operation.
 		if cmp.Or(user.GetExtra()["password_change_required"]...) == "true" && !passwordChangeRequestAllowed(req, s.devUI) {
 			if req.Pattern != "/" {
-				http.Error(rw, "password change required", http.StatusForbidden)
+				httpError(rw, "password change required", http.StatusForbidden)
 			} else {
 				rd := req.URL.RequestURI()
 				http.Redirect(rw, req, "/change-password?rd="+url.QueryEscape(rd), http.StatusSeeOther)
@@ -347,8 +428,8 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 					})
 				}
 
-				// Only set WWW-Authenticate if not in no-auth mode
-				if strings.HasPrefix(req.URL.Path, "/v0.1") && !s.registryNoAuth {
+				// Challenge denied anonymous registry requests without reading settings again.
+				if !authenticated && authz.IsMCPRegistryRequest(req) {
 					rw.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="MCP Registry", resource_metadata="%s/.well-known/oauth-protected-resource/v0.1/servers"`, strings.TrimSuffix(s.baseURL, "/api")))
 				}
 
@@ -358,15 +439,15 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 				case isSCIM:
 					scim.WriteUnauthorized(rw)
 				case authenticated:
-					http.Error(rw, "forbidden", http.StatusForbidden)
+					httpError(rw, "forbidden", http.StatusForbidden)
 				default:
-					http.Error(rw, "unauthorized", http.StatusUnauthorized)
+					httpError(rw, "unauthorized", http.StatusUnauthorized)
 				}
 
 				return
 			}
 
-			if strings.HasPrefix(req.URL.Path, "/api/") {
+			if strings.HasPrefix(req.URL.Path, "/api/") || authz.IsMCPRegistryRequest(req) {
 				rw.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
 				rw.Header().Set("Pragma", "no-cache")
 				rw.Header().Set("Expires", "0")
@@ -383,7 +464,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 				ObotNamespace:  s.obotNamespace,
 			})
 		}
-		writeError := http.Error
+		writeError := httpError
 		if isSCIM {
 			writeError = func(w http.ResponseWriter, message string, code int) {
 				scim.WriteError(w, code, message)
@@ -490,7 +571,15 @@ func (w *headersResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func (w *headersResponseWriter) Flush() {
-	_ = http.NewResponseController(w.ResponseWriter).Flush()
+	_ = w.FlushError()
+}
+
+// FlushError preserves failures for ResponseController callers; http.Flusher cannot return them.
+func (w *headersResponseWriter) FlushError() error {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (w *headersResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
@@ -538,9 +627,12 @@ func (rw *responseWriter) WriteHeader(code int) {
 }
 
 func (rw *responseWriter) Flush() {
-	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
+	_ = rw.FlushError()
+}
+
+// FlushError keeps delivery failures visible through the API audit wrapper.
+func (rw *responseWriter) FlushError() error {
+	return http.NewResponseController(rw.ResponseWriter).Flush()
 }
 
 // Unwrap exposes the writer underneath to http.ResponseController. Without it a

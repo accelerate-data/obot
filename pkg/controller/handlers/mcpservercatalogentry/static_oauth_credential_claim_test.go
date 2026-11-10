@@ -60,7 +60,7 @@ func newClaimGateway(t *testing.T, storageClient kclient.WithWatch, backend *rec
 	database, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, database.AutoMigrate())
-	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, backend, nil, nil, time.Hour, 10, 0, 0, 0, false)
+	gateway := gatewayclient.New(t.Context(), database, storageClient, nil, backend, time.Hour, 10, 0, 0, 0, false)
 	t.Cleanup(func() { require.NoError(t, gateway.Close()) })
 	return gateway, services.DB.DB
 }

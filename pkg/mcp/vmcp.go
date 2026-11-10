@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"time"
@@ -194,6 +195,7 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 	// shift another one's tools.
 	allowedTools := vmcpaccess.InstanceGrant(user, *vmcp, *instance)
 	components := make([]ComponentServer, 0, len(configuredComponents))
+	injectObotHeaders := make(map[types.ObotHeader]struct{})
 	for _, component := range configuredComponents {
 		server, ok := serversByComponent[component.ID]
 		if !ok {
@@ -202,6 +204,11 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 		// A shared component is only reachable through its connection.
 		if vmcpaccess.IsMultiUser(component) && connections[component.ID] == "" {
 			continue
+		}
+		if types.SupportsObotHeaders(server.Spec.Manifest.Runtime) {
+			for _, header := range server.Spec.Manifest.InjectObotHeaders {
+				injectObotHeaders[header] = struct{}{}
+			}
 		}
 		connectID := server.Name
 		if connections[component.ID] != "" {
@@ -242,6 +249,7 @@ func (sm *SessionManager) serverConfigForVMCP(ctx context.Context, vmcp *v1.VMCP
 		OwnerUserID:          vmcp.Spec.UserID,
 		MCPServerNamespace:   vmcp.Namespace,
 		Components:           components,
+		InjectObotHeaders:    slices.Collect(maps.Keys(injectObotHeaders)),
 		Webhooks:             webhooks,
 		StartupTimeout:       types.DefaultStartupTimeoutSeconds * time.Second,
 		AuditLogMetadata: map[string]string{

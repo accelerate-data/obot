@@ -18,6 +18,15 @@ Obot is an open source AI governance platform with the following features:
 - **Frontend**: SvelteKit 5 with Vite, Tailwind CSS 4, TypeScript, CodeMirror 6, Milkdown (markdown editor)
 - **Documentation**: Docusaurus 3 (in `/docs`)
 
+## Bifrost Dependency Updates
+
+Gateway configuration persists Bifrost-shaped JSON. When updating or reviewing any
+`github.com/maximhq/bifrost/*` dependency, including Dependabot PRs, follow the
+[storage compatibility guidance](adr/2026-11-03-resource-backed-llm-configuration.md#bifrost-upgrade-compatibility).
+Record the compatibility assessment and any required migration in the PR;
+passing compilation and existing tests alone does not establish compatibility
+with previously stored configuration.
+
 ## Common Commands
 
 ### Development
@@ -64,6 +73,7 @@ The UI uses Paraglide JS. Each feature area has a catalog in `messages/<area>/{e
 ```bash
 make serve-docs       # Start local docs server
 ```
+When reviewing changes under docs/, read and follow docs/REVIEW.md. These rules apply only to documentation changes.
 
 ## Design Proposals and Architecture Decisions
 
@@ -108,6 +118,8 @@ make serve-docs       # Start local docs server
 
 ### MCP Server Types and Runtimes
 
+External user connections must go through a virtual MCP server (vMCP). Direct user connections to individual MCP servers are not supported. Internal vMCP-to-component connections are implementation details, not a standalone user connection or login flow.
+
 **Server Types:**
 - **Single-user**: No multitenancy - Obot deploys an instance per user. Stored as `MCPServerCatalogEntry` with runtime `npx`, `uvx`, or `containerized`
 - **Multi-user**: Supports multitenancy - one instance for all users. Stored as `MCPServer`
@@ -149,7 +161,7 @@ REST API handlers are in `/pkg/api/handlers/`. Each handler file corresponds to 
 
 ## Go Linting Configuration
 
-Uses golangci-lint (version pinned by `GOLANGCI_LINT_VERSION` in the Makefile) with these linters enabled: errcheck, govet, ineffassign, revive, staticcheck, thelper, unused, whitespace. Formatters: gofmt, goimports.
+Uses golangci-lint (version pinned by `GOLANGCI_LINT_VERSION` in the Makefile) with these linters enabled: errcheck, govet, ineffassign, revive, staticcheck, thelper, unused, whitespace. Formatters: goimports.
 
 ## Module Structure
 

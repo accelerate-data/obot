@@ -4,11 +4,105 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/obot-platform/obot/pkg/auth"
+	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
+	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
+	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
+	"github.com/obot-platform/obot/pkg/system"
 	"k8s.io/apiserver/pkg/authentication/user"
+	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestServeHTTPSignOutFallbackRedirect(t *testing.T) {
+	storageClient := fake.NewClientBuilder().
+		WithScheme(storagescheme.Scheme).
+		WithIndex(&v1.AuthProvider{}, "status.configured", func(o kclient.Object) []string {
+			return []string{o.(*v1.AuthProvider).Get("status.configured")}
+		}).
+		Build()
+	pm := NewProxyManager(dispatcher.New(nil, storageClient, nil, nil, "", "", ""))
+
+	for _, scenario := range []struct {
+		name    string
+		manager *Manager
+		user    user.DefaultInfo
+	}{
+		{
+			name: "auth disabled",
+		},
+		{
+			name:    "no configured provider",
+			manager: pm,
+		},
+		{
+			name:    "proxy creation fails",
+			manager: pm,
+			// The session names a deleted provider, so URLForAuthProvider fails its lookup.
+			user: user.DefaultInfo{
+				Extra: map[string][]string{
+					"auth_provider_namespace": {system.DefaultNamespace},
+					"auth_provider_name":      {"deleted-provider"},
+				},
+			},
+		},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name string
+				rd   string
+				want string
+			}{
+				{
+					name: "empty",
+					want: "/",
+				},
+				{
+					name: "local path",
+					rd:   "/admin?tab=users#details",
+					want: "/admin?tab=users#details",
+				},
+				{
+					name: "absolute URL",
+					rd:   "https://evil.example.com",
+					want: "/",
+				},
+				{
+					name: "protocol relative URL",
+					rd:   "//evil.example.com",
+					want: "/",
+				},
+				{
+					name: "backslash",
+					rd:   `/\evil.example.com`,
+					want: "/",
+				},
+				{
+					name: "tab",
+					rd:   "/\t/evil.example.com",
+					want: "/",
+				},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					req := httptest.NewRequest(http.MethodGet, "/oauth2/sign_out?rd="+url.QueryEscape(tt.rd), nil)
+					rec := httptest.NewRecorder()
+
+					scenario.manager.ServeHTTP(&scenario.user, rec, req)
+
+					if rec.Code != http.StatusFound {
+						t.Fatalf("status = %d, want %d", rec.Code, http.StatusFound)
+					}
+					if got := rec.Header().Get("Location"); got != tt.want {
+						t.Errorf("Location = %q, want %q", got, tt.want)
+					}
+				})
+			}
+		})
+	}
+}
 
 // The staged provider is allowed to beat the session's provider only for a browser carrying an
 // open verification. This covers the gate that decides that, before any provider lookup happens:
@@ -180,6 +274,13 @@ func TestCheckStateResponse(t *testing.T) {
 			wantInvalidSession: true,
 		},
 		{
+			name:               "OAuth provider rejects a Local session cookie",
+			statusCode:         http.StatusInternalServerError,
+			body:               "failed to get state: failed to load cookied session: cookie signature not valid\n",
+			wantErr:            true,
+			wantInvalidSession: true,
+		},
+		{
 			name:       "other provider error",
 			statusCode: http.StatusInternalServerError,
 			body:       "failed to get state: failed to load cookied session: error loading postgres session: connection refused\n",
@@ -201,6 +302,94 @@ func TestCheckStateResponse(t *testing.T) {
 			}
 			if got := errors.Is(err, ErrInvalidSession); got != tt.wantInvalidSession {
 				t.Errorf("errors.Is(err, ErrInvalidSession) = %v, want %v (err: %v)", got, tt.wantInvalidSession, err)
+			}
+		})
+	}
+}
+
+func TestProxyServeHTTPPathAllowlist(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	p, err := newProxy(system.DefaultNamespace, "test-auth-provider", upstream.URL, "")
+	if err != nil {
+		t.Fatalf("newProxy() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		path       string
+		wantStatus int
+	}{
+		{
+			name:       "start",
+			path:       "/oauth2/start",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "callback",
+			path:       "/oauth2/callback",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "error page stylesheet",
+			path:       "/oauth2/static/css/obot-error.min.css",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "error page logo",
+			path:       "/oauth2/static/images/obot-icon-grumpy-blue.svg",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "other static file",
+			path:       "/oauth2/static/css/bulma.min.css",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "static directory listing",
+			path:       "/oauth2/static/css/",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "static root directory listing",
+			path:       "/oauth2/static/",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "static prefix without trailing slash",
+			path:       "/oauth2/static",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "path traversal out of static",
+			path:       "/oauth2/static/../userinfo",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "unclean static path",
+			path:       "/oauth2/static//css/obot-error.min.css",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "unlisted path",
+			path:       "/oauth2/userinfo",
+			wantStatus: http.StatusNotFound,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			// Set the path directly, so that unclean paths reach serveHTTP as a client could send them.
+			req.URL.Path = tt.path
+			rec := httptest.NewRecorder()
+			p.serveHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
 			}
 		})
 	}

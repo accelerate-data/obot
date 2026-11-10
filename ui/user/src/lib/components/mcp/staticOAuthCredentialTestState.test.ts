@@ -1,4 +1,3 @@
-// @ts-expect-error Node runs this co-located TypeScript test directly and requires the extension.
 import * as staticOAuthCredentialTestState from './staticOAuthCredentialTestState.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
