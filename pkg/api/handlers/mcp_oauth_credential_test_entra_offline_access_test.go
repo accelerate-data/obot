@@ -71,3 +71,17 @@ func TestStaticOAuthAuthCodeURLLeavesOtherProvidersScopeAlone(t *testing.T) {
 		t.Fatalf("expected resource parameter for non-Entra provider, got %q", got)
 	}
 }
+
+func TestStaticOAuthAuthCodeURLRequestsOfflineAccessFromSovereignEntraClouds(t *testing.T) {
+	for _, host := range []string{"login.microsoftonline.us", "login.partner.microsoftonline.cn", "LOGIN.MICROSOFTONLINE.COM"} {
+		t.Run(host, func(t *testing.T) {
+			query := staticOAuthTestAuthURL(t, "https://"+host+"/tenant/oauth2/v2.0/authorize", []string{"api://app/.default"})
+			if got := query.Get("scope"); got != "api://app/.default offline_access" {
+				t.Fatalf("expected %s scope to gain offline_access, got %q", host, got)
+			}
+			if query.Has("resource") {
+				t.Fatalf("expected no resource parameter for %s, got %q", host, query.Get("resource"))
+			}
+		})
+	}
+}
