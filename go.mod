@@ -412,4 +412,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.1 // indirect
 )
 
-replace github.com/obot-platform/mmmcp => ../mmmcp-vd-7833
+replace github.com/obot-platform/mmmcp => github.com/accelerate-data/mmmcp v0.0.0-20261110103322-d6da8833edc8
