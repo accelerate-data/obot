@@ -17,7 +17,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-const genericOAuthTestProviderName = "generic-oauth-auth-provider"
+const (
+	genericOAuthTestProviderName = "generic-oauth-auth-provider"
+)
 
 func TestEnsureIdentityGenericOAuthConcurrentlyAcrossPostgresClients(t *testing.T) {
 	scopedDSN, adminDB := newCredentialLockPostgresTest(t)

@@ -27,6 +27,8 @@ import (
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+type failingControllerBackend struct{ err error }
+
 func TestVMCPConsentTargetUsesSelectedInstance(t *testing.T) {
 	vmcp, _ := vmcpConsentConfigurationTarget()
 	oldest := &v1.VMCPInstance{
@@ -236,8 +238,6 @@ func vmcpConsentRequest(storage storage.Client, gatewayClient *gatewayclient.Cli
 // failingControllerBackend makes every MCP OAuth credential-change
 // notification fail, so a test can observe a saved token whose controller
 // notification was lost.
-type failingControllerBackend struct{ err error }
-
 func (f failingControllerBackend) Trigger(context.Context, schema.GroupVersionKind, string, time.Duration) error {
 	return f.err
 }

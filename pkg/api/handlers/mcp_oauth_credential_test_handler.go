@@ -20,6 +20,12 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// staticOAuthDiscoveryTimeout bounds each metadata discovery request so an
+// unresponsive provider cannot hold the admin request open.
+const (
+	staticOAuthDiscoveryTimeout = 5 * time.Second
+)
+
 func (h *MCPCatalogHandler) verifyOAuthCredentialTestAccess(req api.Context) (*v1.MCPServerCatalogEntry, error) {
 	entry, err := verifyOAuthCredentialAccess(req, req.PathValue("catalog_id"), req.PathValue("workspace_id"), req.PathValue("entry_id"))
 	if err != nil {
@@ -112,10 +118,6 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	}
 	return req.Write(types.MCPServerOAuthCredentialTestStart{TestState: started.TestState, OAuthURL: oauthURL})
 }
-
-// staticOAuthDiscoveryTimeout bounds each metadata discovery request so an
-// unresponsive provider cannot hold the admin request open.
-const staticOAuthDiscoveryTimeout = 5 * time.Second
 
 // staticOAuthAuthCodeURL builds the authorization URL for a static OAuth test.
 // Entra only issues a refresh token when offline_access is requested

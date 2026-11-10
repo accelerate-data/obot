@@ -16,10 +16,6 @@ type hijackableRecorder struct {
 	hijacked bool
 }
 
-func (r *hijackableRecorder) Flush() {
-	r.flushed = true
-}
-
 type pushRecorder struct {
 	*httptest.ResponseRecorder
 	target string
@@ -28,6 +24,10 @@ type pushRecorder struct {
 func (r *pushRecorder) Push(target string, _ *http.PushOptions) error {
 	r.target = target
 	return nil
+}
+
+func (r *hijackableRecorder) Flush() {
+	r.flushed = true
 }
 
 func (r *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
