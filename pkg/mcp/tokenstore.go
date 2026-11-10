@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
@@ -26,12 +27,22 @@ type TokenStorage interface {
 }
 
 type globalTokenStore struct {
-	gatewayClient *gateway.Client
+	gatewayClient     *gateway.Client
+	refreshHTTPClient *http.Client
 }
 
 type tokenStore struct {
 	gatewayClient         *gateway.Client
+	refreshHTTPClient     *http.Client
 	userID, mcpID, mcpURL string
+	mu                    sync.Mutex
+	catalogEntry          catalogCredentialFence
+	catalogEntryCaptured  bool
+}
+
+type catalogCredentialFence struct {
+	entryName  string
+	generation string
 }
 
 // storageBackedTokenSource implements the oauth2.TokenSource interface to store new tokens in the TokenStorage.
@@ -46,18 +57,23 @@ type storageBackedTokenSource struct {
 	source oauth2.TokenSource
 }
 
-func NewGlobalTokenStore(gatewayClient *gateway.Client) GlobalTokenStore {
-	return &globalTokenStore{
+func NewGlobalTokenStore(gatewayClient *gateway.Client, opts ...GlobalTokenStoreOption) GlobalTokenStore {
+	g := &globalTokenStore{
 		gatewayClient: gatewayClient,
 	}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 func (g *globalTokenStore) ForUserAndMCP(userID, mcpID, mcpURL string) TokenStorage {
 	return &tokenStore{
-		gatewayClient: g.gatewayClient,
-		mcpID:         mcpID,
-		userID:        userID,
-		mcpURL:        mcpURL,
+		gatewayClient:     g.gatewayClient,
+		refreshHTTPClient: g.refreshHTTPClient,
+		mcpID:             mcpID,
+		userID:            userID,
+		mcpURL:            mcpURL,
 	}
 }
 
@@ -89,6 +105,20 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context) (*oauth2.Config, *oauth
 		conf.Scopes = strings.Split(mcpToken.Scopes, " ")
 	}
 
+	catalogEntryName := mcpToken.CatalogEntryName
+	if catalogEntryName == "" {
+		catalogEntryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, t.mcpURL, conf)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if err := t.gatewayClient.ValidateCatalogOAuthToken(ctx, t.mcpID, t.mcpURL, catalogEntryName, mcpToken.CatalogCredentialGeneration, conf); err != nil {
+		return nil, nil, err
+	}
+	t.mu.Lock()
+	t.catalogEntry = catalogCredentialFence{entryName: catalogEntryName, generation: mcpToken.CatalogCredentialGeneration}
+	t.catalogEntryCaptured = true
+	t.mu.Unlock()
+
 	token := &oauth2.Token{
 		AccessToken:  mcpToken.AccessToken,
 		RefreshToken: mcpToken.RefreshToken,
@@ -103,11 +133,34 @@ func (t *tokenStore) GetTokenConfig(ctx context.Context) (*oauth2.Config, *oauth
 func (t *tokenStore) RefreshTokenConfig(ctx context.Context, config *oauth2.Config, previous, token *oauth2.Token) error {
 	grantID, _ := previous.Extra("obot_grant_id").(string)
 
-	return t.gatewayClient.RefreshMCPOAuthToken(ctx, t.userID, t.mcpID, t.mcpURL, grantID, config, token)
+	// A refresh must not outlive a catalog credential rotation, so it carries the same fence as a replace.
+	fence, err := t.catalogCredentialFence(ctx, config)
+	if err != nil {
+		return err
+	}
+	return t.gatewayClient.RefreshMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, t.userID, t.mcpID, t.mcpURL, grantID, fence.entryName, fence.generation, config, token)
 }
 
 func (t *tokenStore) SetTokenConfig(ctx context.Context, config *oauth2.Config, token *oauth2.Token) error {
-	return t.gatewayClient.ReplaceMCPOAuthToken(ctx, t.userID, t.mcpID, t.mcpURL, "", config, token)
+	fence, err := t.catalogCredentialFence(ctx, config)
+	if err != nil {
+		return err
+	}
+	return t.gatewayClient.ReplaceMCPOAuthTokenWithCatalogCredentialGenerationFence(ctx, t.userID, t.mcpID, t.mcpURL, "", fence.entryName, fence.generation, config, token)
+}
+
+// catalogCredentialFence returns the catalog binding captured when the token was read,
+// resolving it from the current credential when the token was never read through this store.
+func (t *tokenStore) catalogCredentialFence(ctx context.Context, config *oauth2.Config) (catalogCredentialFence, error) {
+	t.mu.Lock()
+	fence, captured := t.catalogEntry, t.catalogEntryCaptured
+	t.mu.Unlock()
+	if captured {
+		return fence, nil
+	}
+	var err error
+	fence.entryName, err = t.gatewayClient.CatalogEntryForCurrentOAuthCredential(ctx, t.userID, t.mcpID, t.mcpURL, config)
+	return fence, err
 }
 
 func (t *tokenStore) DeleteTokenConfig(ctx context.Context) error {
@@ -123,17 +176,28 @@ func (t *tokenStore) TokenSource(ctx context.Context) (oauth2.TokenSource, error
 	if config == nil || token == nil {
 		return nil, nil
 	}
-	// Refreshes reuse the HTTP client the caller put in ctx with withOAuthHTTPClient, so
-	// they follow the same egress policy and network path as the rest of the connection.
+	// Use the server-specific client from ctx when available (including its tunnel),
+	// otherwise use the operator's configured policy for background refreshes.
 	httpClient, _ := ctx.Value(oauth2.HTTPClient).(*http.Client)
-	return newStorageBackedTokenSource(t, config, token, httpClient), nil
+	if httpClient == nil {
+		httpClient = t.refreshHTTPClient
+	}
+	return newStorageBackedTokenSourceWithClient(t, config, token, httpClient), nil
 }
 
-func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, httpClient *http.Client) oauth2.TokenSource {
+func newStorageBackedTokenSource(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, clients ...*http.Client) oauth2.TokenSource {
+	var httpClient *http.Client
+	if len(clients) > 0 {
+		httpClient = clients[0]
+	}
+	return newStorageBackedTokenSourceWithClient(tokenStorage, conf, tok, httpClient)
+}
+
+func newStorageBackedTokenSourceWithClient(tokenStorage TokenStorage, conf *oauth2.Config, tok *oauth2.Token, httpClient *http.Client) oauth2.TokenSource {
 	if httpClient == nil {
 		httpClient = strictEgressClient
 	}
-
+	httpClient = safehttp.NoRedirects(httpClient)
 	ctx := withOAuthHTTPClient(context.Background(), httpClient)
 
 	return oauth2.ReuseTokenSource(tok, &storageBackedTokenSource{

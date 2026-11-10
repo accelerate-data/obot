@@ -22,7 +22,8 @@ func TestSharedComponentConnectionLifecycle(t *testing.T) {
 		Spec: v1.VMCPSpec{
 			Manifest: types.VMCPManifest{
 				Components: []types.VMCPComponent{{
-					ID: "one",
+					ID:                      "one",
+					MCPServerCatalogEntryID: "entry-one",
 					CatalogEntry: types.MCPServerCatalogEntrySnapshot{
 						Manifest: types.MCPServerCatalogEntryManifest{
 							Name:    "one",
@@ -89,12 +90,22 @@ func TestSharedComponentConnectionLifecycle(t *testing.T) {
 			require.NotEqual(t, connections.Items[0].Spec.VMCPInstanceID, connections.Items[1].Spec.VMCPInstanceID)
 			for _, connection := range connections.Items {
 				require.Equal(t, servers.Items[0].Name, connection.Spec.MCPServerName)
+				require.Equal(t, "entry-one", connection.Spec.MCPServerCatalogEntryName)
 				require.Equal(t, "7", connection.Spec.UserID)
 				require.Contains(t, connection.Finalizers, v1.MCPServerInstanceFinalizer)
 				require.Contains(t, connection.DeleteRefs(), v1.Ref{ObjType: &v1.VMCPInstance{}, Name: connection.Spec.VMCPInstanceID})
 			}
 		}
 	}
+	var active v1.MCPServerInstanceList
+	require.NoError(t, client.List(t.Context(), &active))
+	require.Len(t, active.Items, 2)
+	stale := active.Items[0]
+	stale.Spec.MCPServerCatalogEntryName = ""
+	require.NoError(t, client.Update(t.Context(), &stale))
+	reconcile()
+	require.NoError(t, client.Get(t.Context(), kclient.ObjectKeyFromObject(&stale), &stale))
+	require.Equal(t, "entry-one", stale.Spec.MCPServerCatalogEntryName)
 
 	// Profile loss affects dedicated servers, while shared backing servers and connections remain.
 	var serversBefore v1.MCPServerList

@@ -1291,7 +1291,7 @@ func vmcpCatalogEntryForTest(id string) *v1.MCPServerCatalogEntry {
 	}
 }
 
-func TestLoadComponentSnapshotsRejectsNewServerWithoutStaticOAuth(t *testing.T) {
+func TestLoadComponentSnapshotsDefersOAuthReadinessToPersistenceFence(t *testing.T) {
 	entry := vmcpCatalogEntryForTest("entry")
 	entry.Spec.Manifest.RemoteConfig = &types.RemoteCatalogConfig{FixedURL: "https://example.com/mcp", StaticOAuthRequired: true}
 	for _, tt := range []struct {
@@ -1335,12 +1335,8 @@ func TestLoadComponentSnapshotsRejectsNewServerWithoutStaticOAuth(t *testing.T) 
 				Request: httptest.NewRequest(http.MethodPost, "/api/vmcps", nil),
 				Storage: storage,
 				User:    &user.DefaultInfo{UID: "user-1", Groups: []string{types.GroupAdmin}},
-			}, &manifest, "", existing, tt.rejectUnconfigured)
-			if tt.wantError {
-				require.ErrorContains(t, err, `MCP server "Stored entry" requires administrator OAuth configuration before it can be added to a vMCP`)
-			} else {
-				require.NoError(t, err)
-			}
+			}, &manifest, "", existing)
+			require.NoError(t, err, "snapshot loading does not decide credential readiness before acquiring the persistence fence")
 		})
 	}
 }
@@ -1359,7 +1355,7 @@ func TestVMCPCreateRejectsUnconfiguredStaticOAuthServer(t *testing.T) {
 		Storage:        storage,
 		User:           &user.DefaultInfo{UID: "user-1", Groups: []string{types.GroupAdmin}},
 	})
-	require.ErrorContains(t, err, "requires administrator OAuth configuration")
+	require.ErrorContains(t, err, "requires administrator static OAuth configuration")
 	var vmcps v1.VMCPList
 	require.NoError(t, storage.List(t.Context(), &vmcps))
 	require.Empty(t, vmcps.Items)
@@ -1396,6 +1392,10 @@ func TestVMCPComponentSnapshots(t *testing.T) {
 	storage := newVMCPTestStorage(entry)
 	handler := vmcpHandlerForTest(t, storage)
 	gatewayClient := newHandlerTestGateway(t)
+	require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+		Context: system.MCPOAuthCredentialName(entry.Name), Name: system.StaticOAuthCredentialName,
+		Secrets: map[string]string{"CLIENT_ID": "client", "CLIENT_SECRET": "secret", "GENERATION": "proved", "MCP_URL": entry.Spec.Manifest.RemoteConfig.FixedURL},
+	}))
 	u := &user.DefaultInfo{UID: "user-1"}
 	manifest := testVMCPManifest()
 	manifest.Components[0].MCPCatalogID = "forged-catalog"
@@ -1560,7 +1560,7 @@ func TestVMCPSnapshotLoadingPrunesDisallowedProfileTools(t *testing.T) {
 				Request: httptest.NewRequest(http.MethodPost, "/api/vmcps", nil),
 				Storage: storage,
 				User:    &user.DefaultInfo{UID: "user-1", Groups: []string{types.GroupAdmin}},
-			}, &manifest, "", nil, true); err != nil {
+			}, &manifest, "", nil); err != nil {
 				t.Fatal(err)
 			}
 			if err := manifest.Validate(); (err != nil) != tc.wantError {

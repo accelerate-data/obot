@@ -23,9 +23,10 @@ import (
 	obotmcp "github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/safehttp"
 	"golang.org/x/oauth2"
+	"k8s.io/apiserver/pkg/authentication/user"
 )
 
-func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
+func TestVMCPToolSearchKeepsHealthyComponentWhenSiblingNeedsOAuth(t *testing.T) {
 	var called atomic.Bool
 	server := gomcp.NewServer(&gomcp.Implementation{Name: "component", Version: "test"}, nil)
 	server.AddTool(&gomcp.Tool{Name: "echo", Description: "Echo a message", InputSchema: map[string]any{"type": "object"}}, func(_ context.Context, _ *gomcp.CallToolRequest) (*gomcp.CallToolResult, error) {
@@ -34,6 +35,10 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 	})
 	upstream := httptest.NewServer(gomcp.NewStreamableHTTPHandler(func(*http.Request) *gomcp.Server { return server }, nil))
 	defer upstream.Close()
+	pending := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer pending.Close()
 
 	handler, err := NewHandler(t.Context(), nil, nil, nil, nil, "", "", "", nil, nil, nil)
 	if err != nil {
@@ -42,14 +47,21 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 
 	defer handler.Close()
 
-	cfg := obotmcp.MMMCPConfig(obotmcp.ServerConfig{
+	cfg, err := compositeConfig(api.Context{
+		Request:       httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp-connect/test", nil),
+		GatewayClient: newLocalAgentAuditLogTestGatewayClient(t),
+		User:          &user.DefaultInfo{UID: "7", Groups: []string{types.GroupMCP}},
+	}, obotmcp.ServerConfig{
 		Runtime:    types.RuntimeVMCP,
 		ToolSearch: true,
-		Components: []obotmcp.ComponentServer{{
-			DisplayName: "component",
-			URL:         upstream.URL,
-		}},
-	}, nil)
+		Components: []obotmcp.ComponentServer{
+			{DisplayName: "component", URL: upstream.URL},
+			{DisplayName: "pending", URL: pending.URL},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	frontend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handler.composite.HTTPHandler().ServeHTTP(w, r.WithContext(mmmcp.ContextWithConfig(r.Context(), cfg)))
 	}))
@@ -64,7 +76,7 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 	defer session.Close()
 
 	listed, err := session.ListTools(t.Context(), nil)
-	if err != nil || len(listed.Tools) != 2 {
+	if err != nil || len(listed.Tools) != 3 {
 		t.Fatalf("listed tools = %#v, error = %v", listed, err)
 	}
 
@@ -73,7 +85,7 @@ func TestVMCPToolSearchThroughEmbeddedMMMCP(t *testing.T) {
 		listedNames[tool.Name] = true
 	}
 
-	if !listedNames["search_tools"] || !listedNames["call_tool"] {
+	if !listedNames["search_tools"] || !listedNames["call_tool"] || !listedNames["mmmcp_auth_status"] {
 		t.Fatalf("unexpected search-mode tools: %v", listedNames)
 	}
 
@@ -489,20 +501,22 @@ func TestMCPJSONRPCErrorPropagatesThroughTransport(t *testing.T) {
 	}
 }
 
-func TestCompositeLoopbackURLsUsesBackendTargetAndPublicAudience(t *testing.T) {
+func TestCompositeLoopbackURLsUsesBackendTargetAndLocalAudience(t *testing.T) {
 	const (
-		serverURL       = "https://obot.example.com/"
+		// The loopback base is Obot's self-reachable address, never the
+		// public ServerURL (VD-7416).
+		loopbackBaseURL = "http://localhost:8080/"
 		mcpServerName   = "mcp-composite"
 		internalBaseURL = "http://obot.obot-system.svc.cluster.local"
 	)
 
 	var transformedURL string
-	audienceURL, targetURL := compositeLoopbackURLs(serverURL, mcpServerName, func(rawURL string) string {
+	audienceURL, targetURL := compositeLoopbackURLs(loopbackBaseURL, mcpServerName, func(rawURL string) string {
 		transformedURL = rawURL
 		return internalBaseURL + "/mcp-connect-composite/" + mcpServerName
 	})
 
-	wantAudienceURL := "https://obot.example.com/mcp-connect-composite/mcp-composite"
+	wantAudienceURL := "http://localhost:8080/mcp-connect-composite/mcp-composite"
 	if audienceURL != wantAudienceURL {
 		t.Fatalf("audience URL = %q, want %q", audienceURL, wantAudienceURL)
 	}
@@ -512,6 +526,21 @@ func TestCompositeLoopbackURLsUsesBackendTargetAndPublicAudience(t *testing.T) {
 	wantTargetURL := "http://obot.obot-system.svc.cluster.local/mcp-connect-composite/mcp-composite"
 	if targetURL != wantTargetURL {
 		t.Fatalf("target URL = %q, want %q", targetURL, wantTargetURL)
+	}
+}
+
+func TestCompositeLoopbackURLsDoesNotStripSubpath(t *testing.T) {
+	// VD-7416: this helper preserves the base path by design (the backend
+	// transform also rewrites scheme+host only). A subpathed base therefore
+	// propagates /obot into the loopback target, where Obot's own mux has no
+	// route and denies the call at "/". The caller (router.go) must pass the
+	// prefix-free local address; this test pins the pass-through so a future
+	// reader does not mistake it for stripping.
+	audienceURL, _ := compositeLoopbackURLs("http://localhost:8080/obot", "vmcp123", func(rawURL string) string {
+		return rawURL
+	})
+	if audienceURL != "http://localhost:8080/obot/mcp-connect-composite/vmcp123" {
+		t.Fatalf("subpathed base must propagate unchanged, got %q", audienceURL)
 	}
 }
 

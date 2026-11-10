@@ -2,6 +2,7 @@ import { browser } from '$app/env';
 import { goto as svelteGoTo } from '$app/navigation';
 import { resolve as svelteResolve } from '$app/paths';
 import { navigating, page, type ReadonlyURL } from '$app/state';
+import { basePathFor } from './appBasePath';
 import type { InitSort } from './components/table/Table.svelte';
 
 export function qIsSet(key: string): boolean {
@@ -124,6 +125,18 @@ export function resolve(path: string, params?: Record<string, string | number>):
 
 export function replaceState(url: string | URL, state: object = {}) {
 	return goto(url, { state, replace: true, reset: false, shallow: true });
+}
+
+export function appBasePath(): string {
+	if (!browser) return '';
+	return basePathFor(window.location.pathname);
+}
+
+export function appPath(path: string): string {
+	const normalized = path.startsWith('/') ? path : `/${path}`;
+	const base = appBasePath();
+	if (!base || normalized === base || normalized.startsWith(`${base}/`)) return normalized;
+	return `${base}${normalized}`;
 }
 
 export function setUrlParam(url: URL, key: string, value: string | null): void {

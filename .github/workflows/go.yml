@@ -8,18 +8,15 @@ on:
     branches:
       - main
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
       - 'feat/*'
-    # Workflows for the ignored paths run their own job named lint, which branch protection requires.
-    paths-ignore:
-      - chart/**
-      - docs/**
-      - ui/user/**
 
 jobs:
   lint:
-    runs-on: depot-ubuntu-22.04
+    name: lint-go
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code

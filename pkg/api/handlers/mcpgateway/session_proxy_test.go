@@ -12,6 +12,7 @@ import (
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	"github.com/obot-platform/obot/pkg/jwt/persistent"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/storage"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -62,6 +63,11 @@ func newSessionProxyTestHandler(t *testing.T, client storage.Client, upstreamURL
 		mcpSessionManager: manager,
 		globalTokenStore:  tokens,
 		auditLogCollector: new(recordingProxyAuditCollector),
+		// The fork mints a per-request gateway token for remote servers whose
+		// config carries audiences; upstream has no such hop.
+		mintToken: func(context.Context, persistent.TokenContext) (string, error) {
+			return "test-gateway-token", nil
+		},
 	}
 }
 

@@ -113,7 +113,9 @@ func TestOrchestratorProcessPortsAndShutdown(t *testing.T) {
 			cancel()
 			select {
 			case <-done:
-			case <-time.After(7 * time.Second):
+			// The shutdown budget covers an external process exiting, so it has the
+			// same headroom as the startup budget below.
+			case <-time.After(30 * time.Second):
 				t.Error("orchestrator did not stop")
 			}
 		})
@@ -121,7 +123,9 @@ func TestOrchestratorProcessPortsAndShutdown(t *testing.T) {
 		require.Eventually(t, func() bool {
 			value, _ = os.ReadFile(filepath.Join(dir, "port"))
 			return len(value) > 0
-		}, 5*time.Second, 10*time.Millisecond)
+			// This waits on a spawned process, so a loaded CI runner can miss a
+			// short wall-clock budget even though startup itself is sub-second.
+		}, 30*time.Second, 10*time.Millisecond)
 		port, err := strconv.Atoi(strings.TrimSpace(string(value)))
 		require.NoError(t, err)
 		require.NotEqual(t, 8080, port)

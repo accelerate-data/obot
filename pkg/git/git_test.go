@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -729,4 +730,28 @@ func TestCloneBitbucketRepositoryTokenRetry(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShouldAbortRepositorySizeCheck(t *testing.T) {
+	t.Run("oversized repository", func(t *testing.T) {
+		assert.True(t, shouldAbortRepositorySizeCheck(t.Context(), errRepoTooLarge))
+	})
+
+	t.Run("cancelled clone context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		assert.True(t, shouldAbortRepositorySizeCheck(ctx, errors.New("metadata request failed")))
+	})
+
+	t.Run("expired clone context", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		assert.True(t, shouldAbortRepositorySizeCheck(ctx, context.DeadlineExceeded))
+	})
+
+	t.Run("transient metadata timeout", func(t *testing.T) {
+		assert.False(t, shouldAbortRepositorySizeCheck(t.Context(), context.DeadlineExceeded))
+	})
 }

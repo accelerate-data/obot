@@ -444,9 +444,7 @@ func testCapturedOAuthFlow(t *testing.T, componentCount int, checkPendingURL, du
 }
 
 func TestCapturedOAuthRecoversSavedTokenAfterNotificationFailure(t *testing.T) {
-	gateway := vmcpConsentGateway(t, func(context.Context, string) error {
-		return errors.New("controller notification failed")
-	})
+	gateway := vmcpConsentGateway(t, failingControllerBackend{err: errors.New("controller notification failed")})
 	requirement := v1.UpstreamOAuthRequirement{
 		Component:  "ms1component",
 		ConnectID:  "ms1component",

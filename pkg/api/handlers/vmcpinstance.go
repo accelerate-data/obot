@@ -104,9 +104,23 @@ func (*VMCPInstanceHandler) Create(req api.Context) error {
 			UserID:   req.User.GetUID(),
 		},
 	}
+	releaseOAuth, err := vmcpconfig.LockOAuthConnection(req.Context(), req.GatewayClient, req.Storage, &vmcp, &instance, req.User)
+	if err != nil {
+		return err
+	}
+	defer releaseOAuth()
+	// The definition was refreshed under the fence; access and selection must
+	// be checked against that version as well as the initial request snapshot.
+	if !authz.UserCanReadVMCP(req.User, &vmcp) {
+		return types.NewErrForbidden("access denied to VMCP %q", manifest.VMCPID)
+	}
+	if err := authz.ValidateVMCPToolSelection(req.User, &vmcp, manifest.ComponentSet); err != nil {
+		return err
+	}
 	if err := req.Create(&instance); err != nil {
 		return fmt.Errorf("failed to create VMCP instance: %w", err)
 	}
+	releaseOAuth()
 	return req.WriteCreated(convertVMCPInstance(instance))
 }
 

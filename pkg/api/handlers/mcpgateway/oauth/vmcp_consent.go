@@ -34,6 +34,16 @@ func vmcpConsentTarget(req api.Context, connectID string) (*v1.VMCP, *v1.VMCPIns
 		}
 	}
 	if instance == nil {
+		// Consent can create the connection before the runtime path sees it. Admit
+		// it under the same proof and provider fences as direct vMCP connection.
+		release, err := vmcpconfig.LockOAuthConnection(req.Context(), req.GatewayClient, req.Storage, vmcp, nil, req.User)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer release()
+		if !authz.UserCanConnectVMCP(req.User, vmcp) {
+			return nil, nil, types.NewErrForbidden("access denied to vMCP %q", vmcp.Name)
+		}
 		instance = &v1.VMCPInstance{
 			Finalizers:   []string{v1.VMCPInstanceFinalizer},
 			GenerateName: system.VMCPInstancePrefix,

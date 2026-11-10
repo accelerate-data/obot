@@ -123,6 +123,7 @@ func TestListToolsThroughSharedVMCPComponentConnection(t *testing.T) {
 	// The caller supplies the full identity; building the config needs no user lookup.
 	sm.gatewayClient = nil
 	parent.Spec.Manifest.Profiles[0].Subjects = []types.Subject{{Type: types.SubjectTypeObotGroup, ID: types.GroupAdmin}}
+	require.NoError(t, storage.Update(t.Context(), parent))
 	aggregate, err := sm.serverConfigForVMCP(t.Context(), parent, instance, admin)
 	require.NoError(t, err)
 	require.Len(t, aggregate.Components, 1)
@@ -131,6 +132,7 @@ func TestListToolsThroughSharedVMCPComponentConnection(t *testing.T) {
 	admin.Extra["obot_groups"] = types.RoleBasic.Groups()
 	// The VMCPInstance controller rechecks the instance when the user's role changes.
 	syncedVMCPInstanceForUser(instance, parent, admin)
+	require.NoError(t, storage.Update(t.Context(), instance))
 	aggregate, err = sm.serverConfigForVMCP(t.Context(), parent, instance, admin)
 	require.NoError(t, err)
 	require.Empty(t, aggregate.Components, "losing the admin role must revoke its tools")

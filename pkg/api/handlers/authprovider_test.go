@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/obot-platform/nah/pkg/name"
 	clienttypes "github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
+	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/gateway/server/dispatcher"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/license"
@@ -145,6 +147,190 @@ func TestConfigureAuthProviderStagesCredentialAndWaitsForChangeDeletion(t *testi
 
 	require.NoError(t, storage.Delete(t.Context(), &change))
 	require.NoError(t, <-errC)
+}
+
+func TestConfigureGenericOAuthRejectsInvalidIssuerConfiguration(t *testing.T) {
+	invalidDiscoveryIssuer := newOIDCDiscoveryServerWithDocument(t, func(issuer string) map[string]string {
+		return map[string]string{"issuer": issuer}
+	})
+
+	for _, test := range []struct {
+		name      string
+		issuer    string
+		errorText string
+	}{
+		{
+			name:      "malformed issuer",
+			issuer:    "not a url",
+			errorText: "must be a valid URL",
+		},
+		{
+			name:      "non-HTTPS issuer",
+			issuer:    "http://issuer.example.com",
+			errorText: "must use https",
+		},
+		{
+			name:      "invalid discovery document",
+			issuer:    invalidDiscoveryIssuer,
+			errorText: "missing required endpoints",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := callGenericOAuthAuthProviderChange(t, "configure", test.issuer, "")
+			require.ErrorContains(t, err, test.errorText)
+		})
+	}
+}
+
+func TestStageGenericOAuthRejectsInvalidIssuerConfiguration(t *testing.T) {
+	invalidDiscoveryIssuer := newOIDCDiscoveryServerWithDocument(t, func(issuer string) map[string]string {
+		return map[string]string{"issuer": issuer}
+	})
+
+	for _, test := range []struct {
+		name      string
+		issuer    string
+		errorText string
+	}{
+		{
+			name:      "malformed issuer",
+			issuer:    "not a url",
+			errorText: "must be a valid URL",
+		},
+		{
+			name:      "non-HTTPS issuer",
+			issuer:    "http://issuer.example.com",
+			errorText: "must use https",
+		},
+		{
+			name:      "invalid discovery document",
+			issuer:    invalidDiscoveryIssuer,
+			errorText: "missing required endpoints",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := callGenericOAuthAuthProviderChange(t, "stage", test.issuer, "")
+			require.ErrorContains(t, err, test.errorText)
+		})
+	}
+}
+
+func TestConfigureGenericOAuthIssuerChangeRequiresTrustReconfirmation(t *testing.T) {
+	newIssuer := newOIDCDiscoveryServer(t, "")
+	gatewayClient, err := callGenericOAuthAuthProviderChange(t, "configure", newIssuer, "https://old.example.com")
+	require.ErrorContains(t, err, "account-linking trust must be re-confirmed")
+
+	credential, err := gatewayClient.RevealCredential(t.Context(), []string{GenericOAuthAuthProviderName}, GenericOAuthAuthProviderName)
+	require.NoError(t, err)
+	assert.Equal(t, "https://old.example.com", credential.Secrets[GenericOAuthIssuerEnvVar])
+}
+
+func TestStageGenericOAuthIssuerChangeRequiresTrustReconfirmation(t *testing.T) {
+	newIssuer := newOIDCDiscoveryServer(t, "")
+	gatewayClient, err := callGenericOAuthAuthProviderChange(t, "stage", newIssuer, "https://old.example.com")
+	require.ErrorContains(t, err, "account-linking trust must be re-confirmed")
+
+	credential, err := gatewayClient.RevealCredential(t.Context(), []string{system.ReplacementAuthProviderCredentialContext}, GenericOAuthAuthProviderName)
+	require.NoError(t, err)
+	assert.Equal(t, "https://old.example.com", credential.Secrets[GenericOAuthIssuerEnvVar])
+}
+
+func callGenericOAuthAuthProviderChange(t *testing.T, action, issuer, existingIssuer string) (*gateway.Client, error) {
+	t.Helper()
+
+	authProvider := &v1.AuthProvider{
+		Name:      GenericOAuthAuthProviderName,
+		Namespace: system.DefaultNamespace,
+		Spec: v1.AuthProviderSpec{
+			AuthProviderManifest: clienttypes.AuthProviderManifest{
+				CommonProviderMetadata: clienttypes.CommonProviderMetadata{
+					RequiredConfigurationParameters: []clienttypes.ProviderConfigurationParameter{
+						{Name: GenericOAuthIssuerEnvVar},
+						{Name: GenericOAuthEmailDomainsEnvVar},
+					},
+				},
+			},
+		},
+	}
+	objects := []kclient.Object{authProvider}
+	if action == "configure" && existingIssuer != "" {
+		authProvider.Status.Configured = true
+	}
+	if action == "stage" {
+		objects = append(objects, &v1.AuthProvider{
+			Name:      "active-auth-provider",
+			Namespace: system.DefaultNamespace,
+			Status:    v1.AuthProviderStatus{Configured: true},
+		})
+	}
+
+	storage := newAuthProviderTestStorage(objects...)
+	gatewayClient := newHandlerTestGateway(t)
+	if action == "stage" {
+		require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+			Context: "active-auth-provider",
+			Name:    "active-auth-provider",
+		}))
+	}
+	if existingIssuer != "" {
+		credentialContext := GenericOAuthAuthProviderName
+		if action == "stage" {
+			credentialContext = system.ReplacementAuthProviderCredentialContext
+		}
+		require.NoError(t, gatewayClient.UpsertCredential(t.Context(), gatewaytypes.Credential{
+			Context: credentialContext,
+			Name:    GenericOAuthAuthProviderName,
+			Secrets: map[string]string{
+				GenericOAuthIssuerEnvVar:       existingIssuer,
+				GenericOAuthEmailDomainsEnvVar: "*",
+			},
+		}))
+	}
+
+	licenseProvider, err := license.NewProvider(t.Context(), nil, license.Config{})
+	require.NoError(t, err)
+	handler := NewAuthProviderHandler(dispatcher.New(nil, storage, gatewayClient, licenseProvider, "", "", ""), "", licenseProvider)
+	body, err := json.Marshal(map[string]string{
+		GenericOAuthIssuerEnvVar:       issuer,
+		GenericOAuthEmailDomainsEnvVar: "*",
+	})
+	require.NoError(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/api/auth-providers/"+GenericOAuthAuthProviderName+"/"+action, bytes.NewReader(body))
+	request.SetPathValue("id", GenericOAuthAuthProviderName)
+	req := api.Context{
+		ResponseWriter: httptest.NewRecorder(),
+		Request:        request,
+		Storage:        storage,
+		GatewayClient:  gatewayClient,
+	}
+
+	errC := make(chan error, 1)
+	go func() {
+		if action == "stage" {
+			errC <- handler.Stage(req)
+			return
+		}
+		errC <- handler.Configure(req)
+	}()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case err := <-errC:
+			return gatewayClient, err
+		case <-ticker.C:
+			change := &v1.ProviderConfigurationChange{}
+			if err := storage.Get(t.Context(), kclient.ObjectKey{Namespace: system.DefaultNamespace, Name: system.ProviderChangeAuthName}, change); err == nil {
+				require.NoError(t, storage.Delete(t.Context(), change))
+				return gatewayClient, <-errC
+			}
+		case <-timeout.C:
+			t.Fatal("auth provider change did not return or submit a configuration change")
+		}
+	}
 }
 
 func newAuthProviderTestStorage(objects ...kclient.Object) kclient.WithWatch {

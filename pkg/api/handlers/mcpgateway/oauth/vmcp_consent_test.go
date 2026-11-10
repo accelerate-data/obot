@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
@@ -20,6 +21,7 @@ import (
 	vmcpconfig "github.com/obot-platform/obot/pkg/vmcp"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/user"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -231,19 +233,31 @@ func vmcpConsentRequest(storage storage.Client, gatewayClient *gatewayclient.Cli
 	}
 }
 
-func vmcpConsentGateway(t *testing.T, tokenTriggers ...func(context.Context, string) error) *gatewayclient.Client {
+// failingControllerBackend makes every MCP OAuth credential-change
+// notification fail, so a test can observe a saved token whose controller
+// notification was lost.
+type failingControllerBackend struct{ err error }
+
+func (f failingControllerBackend) Trigger(context.Context, schema.GroupVersionKind, string, time.Duration) error {
+	return f.err
+}
+
+// vmcpConsentGateway takes the fork's controller backend rather than upstream's
+// bare trigger func: gatewayclient.New wraps it in mcptrigger.OwningServerTrigger
+// so a notification always carries the namespaced MCPServer key (VD-4889).
+func vmcpConsentGateway(t *testing.T, controllerBackends ...nahbackend.Trigger) *gatewayclient.Client {
 	t.Helper()
 	services, err := ssservices.New(ssservices.Config{DSN: "sqlite://:memory:"})
 	require.NoError(t, err)
 	db, err := gatewaydb.New(services.DB.DB, services.DB.SQLDB, true)
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate())
-	var trigger func(context.Context, string) error
-	if len(tokenTriggers) > 0 {
-		trigger = tokenTriggers[0]
+	var controllerBackend nahbackend.Trigger
+	if len(controllerBackends) > 0 {
+		controllerBackend = controllerBackends[0]
 	}
 
-	client := gatewayclient.New(t.Context(), db, nil, nil, trigger, time.Hour, 10, 90, 90, 90, true)
+	client := gatewayclient.New(t.Context(), db, nil, nil, controllerBackend, time.Hour, 10, 90, 90, 90, true)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	return client
 }

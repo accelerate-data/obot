@@ -2,14 +2,17 @@ package client
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
 	"sync"
 	"time"
 
+	nahbackend "github.com/obot-platform/nah/pkg/backend"
 	"github.com/obot-platform/obot/pkg/gateway/db"
 	"github.com/obot-platform/obot/pkg/gateway/types"
+	"github.com/obot-platform/obot/pkg/mcptrigger"
 	"golang.org/x/sync/singleflight"
 	"k8s.io/apiserver/pkg/server/options/encryptionconfig"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +61,10 @@ type Client struct {
 	enforcementPersistLock    sync.Mutex
 	enforcementBuffer         []types.EnforcementDecisionLog
 	kickEnforcementPersist    chan struct{}
+	credentialLocks           sync.Map
+	credentialLockPoolOnce    sync.Once
+	credentialLockPool        *sql.DB
+	credentialLockPoolErr     error
 	llmAuditEntries           chan llmAuditEntry
 	llmAuditBatchSize         int
 	llmAuditEnabled           bool
@@ -83,7 +90,7 @@ type Client struct {
 	claudeProvisionGateSlot chan struct{}
 }
 
-func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptionConfig *encryptionconfig.EncryptionConfiguration, mcpOAuthTokenTrigger func(context.Context, string) error, auditLogPersistenceInterval time.Duration, auditLogBatchSize, auditLogRetentionDays, llmAuditLogRetentionDays, deviceScanRetentionDays int, llmAuditEnabled bool) *Client {
+func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptionConfig *encryptionconfig.EncryptionConfiguration, controllerBackend nahbackend.Trigger, auditLogPersistenceInterval time.Duration, auditLogBatchSize, auditLogRetentionDays, llmAuditLogRetentionDays, deviceScanRetentionDays int, llmAuditEnabled bool) *Client {
 	auditLogBatchSize, initialCapacity := auditBatchCapacity(auditLogBatchSize)
 	c := &Client{
 		auditLogBatchSize:      auditLogBatchSize,
@@ -97,7 +104,6 @@ func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptio
 		enforcementBuffer:         make([]types.EnforcementDecisionLog, 0, min(initialCapacity, 2*defaultAuditLogBatchSize)),
 		kickEnforcementPersist:    make(chan struct{}, 1),
 		storageClient:             storageClient,
-		mcpOAuthTokenTrigger:      mcpOAuthTokenTrigger,
 		apiKeyCache:               make(map[[32]byte]apiKeyValidationCacheEntry),
 		apiKeyCacheTTL:            apiKeyValidationCacheTTL,
 		serviceAccountCache:       make(map[[32]byte]serviceAccountValidationCacheEntry),
@@ -113,6 +119,13 @@ func New(ctx context.Context, db *db.DB, storageClient kclient.Client, encryptio
 	}
 
 	c.startAuditLoops(ctx, auditLogPersistenceInterval)
+	if controllerBackend != nil {
+		// Callers without a controller backend (tests, and any caller that does
+		// not run controllers) have nothing to notify. Building the trigger here
+		// rather than accepting a callback leaves no call site that can enqueue
+		// a bare key or an MCPServerInstance name (VD-4889).
+		c.mcpOAuthTokenTrigger = mcptrigger.OwningServerTrigger(storageClient, controllerBackend)
+	}
 	go c.runPendingStateCleanup(ctx)
 	go c.runTokenCleanup(ctx)
 	go c.runAPIKeyCacheCleanup(ctx)
@@ -207,6 +220,11 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	var errs []error
 	if err := c.flushEgressAuditLogs(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("failed to persist egress audit logs: %w", err))
+	}
+	if c.credentialLockPool != nil {
+		if err := c.credentialLockPool.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close credential lock database: %w", err))
+		}
 	}
 	if err := c.persistMCPAuditLogsContext(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("failed to persist audit logs: %w", err))

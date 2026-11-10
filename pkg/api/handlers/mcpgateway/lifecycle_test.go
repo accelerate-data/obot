@@ -48,11 +48,14 @@ func TestCompositeLoopbackTokenRecordsCaller(t *testing.T) {
 	}
 }
 
-func TestCompositeAuthorizationDeferredOnlyForClaudeEnvironment(t *testing.T) {
+func TestCompositeAuthorizationPolicyForVMCPAndClaudeEnvironment(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		groups []string
-		want   bool
+		name        string
+		groups      []string
+		runtime     types.Runtime
+		wantDefer   bool
+		wantPartial bool
+		wantClaude  bool
 	}{
 		{
 			name:   "external MCP",
@@ -63,40 +66,49 @@ func TestCompositeAuthorizationDeferredOnlyForClaudeEnvironment(t *testing.T) {
 			groups: types.RoleAdmin.RoleGroups(),
 		},
 		{
-			name:   "Claude environment",
-			groups: []string{types.GroupMCP, types.GroupClaudeEnvironment},
-			want:   true,
+			name:       "Claude environment",
+			groups:     []string{types.GroupMCP, types.GroupClaudeEnvironment},
+			wantDefer:  true,
+			wantClaude: true,
+		},
+		{
+			name:        "vMCP for agent session",
+			groups:      []string{types.GroupMCP},
+			runtime:     types.RuntimeVMCP,
+			wantDefer:   true,
+			wantPartial: true,
+		},
+		{
+			name:        "vMCP for Claude environment",
+			groups:      []string{types.GroupMCP, types.GroupClaudeEnvironment},
+			runtime:     types.RuntimeVMCP,
+			wantDefer:   true,
+			wantPartial: true,
+			wantClaude:  true,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			caller := &user.DefaultInfo{
-				UID:    "7",
-				Groups: test.groups,
-			}
-			cfg, err := compositeConfig(api.Context{User: caller}, obotmcp.ServerConfig{})
+			caller := &user.DefaultInfo{UID: "7", Groups: test.groups}
+			serverConfig := obotmcp.ServerConfig{Runtime: test.runtime}
+			cfg, err := compositeConfig(api.Context{User: caller}, serverConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := cfg.DeferAuthorization; got != test.want {
-				t.Fatalf("defer authorization = %v, want %v", got, test.want)
+			if cfg.DeferAuthorization != test.wantDefer || cfg.PartialAuthorization != test.wantPartial {
+				t.Fatalf("authorization policy = defer:%v partial:%v, want defer:%v partial:%v", cfg.DeferAuthorization, cfg.PartialAuthorization, test.wantDefer, test.wantPartial)
 			}
-
-			// The signed identity must carry the opt-in across loopback and replica forwarding.
+			// The signed identity must preserve the Claude group across loopback forwarding.
 			token := compositeLoopbackTokenContext(caller, "https://obot.example/mcp-connect-composite/vmcp1", "vmcp1", []string{"component"}, "vmcpi1connection", time.Now())
-			if got := slices.Contains(token.UserGroups, types.GroupClaudeEnvironment); got != test.want {
-				t.Fatalf("loopback Claude group = %v, want %v", got, test.want)
+			if got := slices.Contains(token.UserGroups, types.GroupClaudeEnvironment); got != test.wantClaude {
+				t.Fatalf("loopback Claude group = %v, want %v", got, test.wantClaude)
 			}
-
-			forwarded := &user.DefaultInfo{
-				UID:    token.UserID,
-				Groups: token.UserGroups,
-			}
-			cfg, err = compositeConfig(api.Context{User: forwarded}, obotmcp.ServerConfig{})
+			forwarded := &user.DefaultInfo{UID: token.UserID, Groups: token.UserGroups}
+			forwardedConfig, err := compositeConfig(api.Context{User: forwarded}, serverConfig)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := cfg.DeferAuthorization; got != test.want {
-				t.Fatalf("forwarded defer authorization = %v, want %v", got, test.want)
+			if forwardedConfig.DeferAuthorization != test.wantDefer || forwardedConfig.PartialAuthorization != test.wantPartial {
+				t.Fatalf("forwarded authorization policy = defer:%v partial:%v, want defer:%v partial:%v", forwardedConfig.DeferAuthorization, forwardedConfig.PartialAuthorization, test.wantDefer, test.wantPartial)
 			}
 		})
 	}
@@ -115,8 +127,9 @@ func TestCompositeAuthorizationLookupUsesAuthenticatedRequest(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/mcp-connect-composite/vmcpi1user", nil)
 	request.SetPathValue("mcp_id", "vmcpi1user")
 	req := api.Context{Request: request, User: &user.DefaultInfo{UID: "42", Groups: []string{types.GroupMCP}}}
-	_, err = lookup(context.WithValue(t.Context(), compositeAPIContextKey{}, req))
-	require.Error(t, err)
+	links, err := lookup(context.WithValue(t.Context(), compositeAPIContextKey{}, req))
+	require.NoError(t, err)
+	require.Empty(t, links)
 	require.False(t, called)
 
 	req.User = &user.DefaultInfo{UID: "42", Groups: []string{types.GroupMCP, types.GroupClaudeEnvironment}}

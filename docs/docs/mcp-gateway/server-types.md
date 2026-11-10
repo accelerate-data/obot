@@ -106,6 +106,8 @@ Configuration determines whether a component can share a deployment:
 
 Obot makes this decision independently for every component. One vMCP can therefore use shared and per-user component deployments at the same time.
 
+A component that still needs a value a user has not supplied is left out of that user's connection until they supply it. Connecting exposes the components that are ready and omits the rest, so one component awaiting setup never blocks the others.
+
 Existing legacy single-user and multi-user connections remain available during the [vMCP transition](./publish.md#virtual-mcps-gitops-and-migration). Use vMCPs for new endpoints. Multiple components replace the former composite-server setup; `runtime: composite` is no longer supported in [catalog GitOps](../configuration/mcp-server-gitops.md).
 
 ## Tool search

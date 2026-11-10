@@ -20,12 +20,20 @@ describe('MCP server entry OAuth management', () => {
 		const deleted = vi.fn();
 		worker.use(
 			http.get('/api/mcp-catalogs/default/entries/salesforce/oauth-credentials', () =>
-				HttpResponse.json({ configured: true, clientID: 'salesforce-client' })
+				HttpResponse.json({
+					configured: true,
+					clientID: 'salesforce-client',
+					generation: 'reviewed-generation',
+					callbackURL: 'https://obot.example/oauth/callback'
+				})
 			),
-			http.delete('/api/mcp-catalogs/default/entries/salesforce/oauth-credentials', () => {
-				deleted();
-				return new HttpResponse(null, { status: 204 });
-			})
+			http.delete(
+				'/api/mcp-catalogs/default/entries/salesforce/oauth-credentials',
+				async ({ request }) => {
+					deleted(await request.json());
+					return new HttpResponse(null, { status: 204 });
+				}
+			)
 		);
 
 		render(McpServerEntryForm, { entry, id: 'default', entity: 'catalog', type: 'remote' });
@@ -34,7 +42,9 @@ describe('MCP server entry OAuth management', () => {
 		await expect.element(page.getByRole('button', { name: 'Clear Credentials' })).toBeVisible();
 		await page.getByRole('button', { name: 'Clear Credentials' }).click({ force: true });
 		await page.getByRole('button', { name: "Yes, I'm sure" }).click();
-		await vi.waitFor(() => expect(deleted).toHaveBeenCalledOnce());
+		await vi.waitFor(() =>
+			expect(deleted).toHaveBeenCalledWith({ expectedGeneration: 'reviewed-generation' })
+		);
 		await expect.element(page.getByText('Requires OAuth Config')).toBeVisible();
 	});
 });

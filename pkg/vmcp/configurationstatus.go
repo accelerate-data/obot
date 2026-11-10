@@ -39,6 +39,25 @@ func MissingRequiredConfiguration(component types.VMCPComponent, values map[stri
 	return slices.Compact(missing)
 }
 
+// ConfiguredComponents drops components that still need a userAllowed input the
+// user has not supplied. MissingRequiredConfiguration returns component-scoped
+// keys, so a component is unready only when one of its own keys is listed.
+func ConfiguredComponents(components []types.VMCPComponent, missing []string) []types.VMCPComponent {
+	// Build a new slice: callers can pass the manifest's own component slice.
+	configured := make([]types.VMCPComponent, 0, len(components))
+	for _, component := range components {
+		// A nil value map makes every required userAllowed key report as missing,
+		// which is the key set to intersect with.
+		if slices.ContainsFunc(MissingRequiredConfiguration(component, nil, true), func(key string) bool {
+			return slices.Contains(missing, key)
+		}) {
+			continue
+		}
+		configured = append(configured, component)
+	}
+	return configured
+}
+
 // ConfigurationCheckHash identifies the user configuration status of an instance.
 // Components must already be limited to those enabled for the instance user.
 func ConfigurationCheckHash(enabledComponents []types.VMCPComponent, configurationSyncHash string) string {

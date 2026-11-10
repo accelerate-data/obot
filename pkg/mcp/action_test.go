@@ -3,6 +3,8 @@ package mcp
 import (
 	"testing"
 
+	"github.com/obot-platform/obot/apiclient/types"
+
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	storagescheme "github.com/obot-platform/obot/pkg/storage/scheme"
 	"github.com/obot-platform/obot/pkg/system"
@@ -199,4 +201,17 @@ func TestCatalogNameForServerWhenSourceEntryIsDeleted(t *testing.T) {
 			require.Equal(t, tt.expectedCatalogName, catalogName)
 		})
 	}
+}
+
+func TestAddExtractedEnvVarsPreservesRemoteConfig(t *testing.T) {
+	server := &v1.MCPServer{Spec: v1.MCPServerSpec{Manifest: types.MCPServerManifest{
+		Runtime:      types.RuntimeRemote,
+		RemoteConfig: &types.RemoteRuntimeConfig{URL: "https://${EXISTING}.example.com/${DETECTED}"},
+		Config:       []types.MCPConfig{{Name: "Existing", Key: "EXISTING", Required: true, Usage: types.Header}},
+	}}}
+	addExtractedEnvVars(server)
+	require.ElementsMatch(t, []types.MCPConfig{
+		{Name: "Existing", Key: "EXISTING", Required: true, Usage: types.Header},
+		{Name: "DETECTED", Key: "DETECTED", Description: "Automatically detected variable", Required: true, Sensitive: true, Usage: types.Env},
+	}, server.Spec.Manifest.Config)
 }

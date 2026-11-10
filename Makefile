@@ -30,6 +30,11 @@ serve-docs:
 # Build the project
 
 GIT_TAG := $(shell git describe --tags --exact-match 2>/dev/null | xargs -I {} echo -X 'github.com/obot-platform/obot/pkg/version.Tag={}')
+# Fork release builds are merge commits rather than exact upstream tags.
+# The image workflow supplies the stable version recorded in sync metadata.
+ifneq ($(strip $(OBOT_VERSION)),)
+GIT_TAG := -X github.com/obot-platform/obot/pkg/version.Tag=$(OBOT_VERSION)
+endif
 GO_LD_FLAGS := "-s -w $(GIT_TAG)"
 # Obot does not load Kustomize Go plugins; omit their dynamic symbol overhead.
 GO_BUILD_TAGS := kustomize_disable_go_plugin_support

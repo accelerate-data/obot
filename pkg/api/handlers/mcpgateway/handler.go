@@ -26,6 +26,7 @@ import (
 	"github.com/obot-platform/mmmcp/component"
 	componenthttp "github.com/obot-platform/mmmcp/component/http"
 	mmmcpconfig "github.com/obot-platform/mmmcp/config"
+	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authz"
@@ -46,6 +47,7 @@ import (
 
 const (
 	maxJSONRPCErrorRequestBody = 1 << 20
+	gatewayTokenExpiration     = 5 * time.Minute
 )
 
 var (
@@ -64,7 +66,13 @@ type Handler struct {
 	guardrails                *guardrails.Engine
 	tunnelManager             *tunnel.Manager
 	secretBindingAllowedLabel string
-	serverURL                 string
+	// loopbackBaseURL is Obot's address as Obot itself can reach it
+	// (services.LocalServerURL). It must NOT be the public ServerURL: Studio
+	// serves Obot under the /obot subpath, which Obot's own mux does not
+	// route, so a loopback built from the public URL falls through to the
+	// "/" catch-all and is denied (VD-7416).
+	loopbackBaseURL string
+	mintToken       func(context.Context, persistent.TokenContext) (string, error)
 }
 
 // mcpResponse keeps the client response and its audit representation together.
@@ -185,8 +193,8 @@ func handleGenericToolCallError(req api.Context, audit *proxyAudit, callErr erro
 	return true
 }
 
-func compositeLoopbackURLs(serverURL, mcpServerName string, transform func(string) string) (audienceURL, targetURL string) {
-	audienceURL = fmt.Sprintf("%s/mcp-connect-composite/%s", strings.TrimSuffix(serverURL, "/"), mcpServerName)
+func compositeLoopbackURLs(loopbackBaseURL, mcpServerName string, transform func(string) string) (audienceURL, targetURL string) {
+	audienceURL = fmt.Sprintf("%s/mcp-connect-composite/%s", strings.TrimSuffix(loopbackBaseURL, "/"), mcpServerName)
 	return audienceURL, transform(audienceURL)
 }
 
@@ -194,7 +202,7 @@ func compositeSessionKey(serverConfig mcp.ServerConfig) string {
 	return tunnel.CompositeSessionKey(serverConfig.MCPServerName)
 }
 
-func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, globalTokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, auditLogCollector proxyAuditCollector, serverURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager, authorizationURLs func(api.Context) ([]mmmcp.AuthorizationURL, error), guardrailEngine *guardrails.Engine) (*Handler, error) {
+func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, globalTokenStore mcp.GlobalTokenStore, tokenService *persistent.TokenService, auditLogCollector proxyAuditCollector, loopbackBaseURL, dsn, secretBindingAllowedLabel string, tunnelManager *tunnel.Manager, authorizationURLs func(api.Context) ([]mmmcp.AuthorizationURL, error), guardrailEngine *guardrails.Engine) (*Handler, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var componentAuth componenthttp.OAuthHandlerProvider
@@ -223,6 +231,11 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, glob
 		return nil, fmt.Errorf("failed to create composite MCP server: %w", err)
 	}
 
+	mintToken := func(ctx context.Context, tokenContext persistent.TokenContext) (string, error) {
+		_, token, err := tokenService.NewToken(ctx, tokenContext)
+		return token, err
+	}
+
 	return &Handler{
 		ctx:                       ctx,
 		cancel:                    cancel,
@@ -235,7 +248,8 @@ func NewHandler(ctx context.Context, mcpSessionManager *mcp.SessionManager, glob
 		guardrails:                guardrailEngine,
 		tunnelManager:             tunnelManager,
 		secretBindingAllowedLabel: secretBindingAllowedLabel,
-		serverURL:                 serverURL,
+		loopbackBaseURL:           loopbackBaseURL,
+		mintToken:                 mintToken,
 	}, nil
 }
 
@@ -289,6 +303,17 @@ func (h *Handler) Proxy(req api.Context) error {
 		return err
 	}
 
+	// Composite control requests carry a signed loopback token with component
+	// scopes. Keep it across owner forwarding and MMMCP component authorization;
+	// a single-server gateway token cannot authenticate those internal hops.
+	if serverConfig.Runtime != types.RuntimeVMCP {
+		gatewayToken, err := h.gatewayToken(req.Context(), req.User, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig)
+		if err != nil {
+			return fmt.Errorf("failed to mint MCP gateway token: %w", err)
+		}
+		req.Request = req.WithContext(withGatewayToken(req.Context(), req.Request, gatewayToken))
+	}
+
 	isCompositeRequest := strings.HasSuffix(req.URL.Path, "/mcp-connect-composite/"+req.PathValue("mcp_id"))
 	if isCompositeRequest {
 		ownerMarkerPresent, ownerLocal := h.tunnelManager.ConsumeCompositeOwnerRequest(req.Request)
@@ -326,7 +351,7 @@ func (h *Handler) Proxy(req api.Context) error {
 		// The URL is changed to /mcp-connect-composite/{mcp_id} which comes back here and handles
 		// the multi-MCP server configuration (and calls no audit logs nor hooks).
 		if serverConfig.Runtime == types.RuntimeVMCP {
-			compositeAudienceURL, compositeTargetURL := compositeLoopbackURLs(h.serverURL, serverConfig.MCPServerName, h.mcpSessionManager.TransformObotHostname)
+			compositeAudienceURL, compositeTargetURL := compositeLoopbackURLs(h.loopbackBaseURL, serverConfig.MCPServerName, h.mcpSessionManager.TransformObotHostname)
 			serverConfig.URL = compositeTargetURL
 
 			authorizedMCPIDs := make([]string, 0, len(serverConfig.Components))
@@ -349,8 +374,7 @@ func (h *Handler) Proxy(req api.Context) error {
 			if err != nil {
 				return fmt.Errorf("failed to get HTTP client for token refresh: %w", err)
 			}
-
-			tokenSource, err = h.globalTokenStore.ForUserAndMCP(serverConfig.UserID, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig.URL).TokenSource(context.WithValue(h.ctx, oauth2.HTTPClient, refreshClient))
+			tokenSource, err = h.globalTokenStore.ForUserAndMCP(serverConfig.UserID, cmp.Or(serverConfig.MCPServerInstanceID, serverConfig.MCPServerName), serverConfig.URL).TokenSource(mcp.WithOAuthHTTPClient(h.ctx, refreshClient))
 			if err != nil {
 				return fmt.Errorf("failed to get token source: %w", err)
 			}
@@ -582,6 +606,54 @@ func isLoopbackHost(hostport string) bool {
 	}
 	ip, err := netip.ParseAddr(host)
 	return err == nil && ip.IsLoopback()
+}
+
+func (h *Handler) gatewayToken(ctx context.Context, authenticatedUser user.Info, mcpID string, server mcp.ServerConfig) (string, error) {
+	if len(server.Audiences) == 0 {
+		return "", nil
+	}
+	audience, err := gatewayAudience(server)
+	if err != nil {
+		return "", err
+	}
+	return h.mintToken(ctx, gatewayTokenContext(authenticatedUser, mcpID, audience, time.Now()))
+}
+
+func gatewayAudience(server mcp.ServerConfig) (string, error) {
+	expectedPath := "/mcp-connect/" + server.MCPServerName
+	for _, audience := range server.Audiences {
+		parsed, err := url.Parse(audience)
+		if err == nil && strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), expectedPath) {
+			return audience, nil
+		}
+	}
+	return "", fmt.Errorf("no exact audience for MCP server %s", server.MCPServerName)
+}
+
+func withGatewayToken(ctx context.Context, request *http.Request, gatewayToken string) context.Context {
+	if gatewayToken == "" {
+		request.Header.Del("Authorization")
+		return ctx
+	}
+	request.Header.Set("Authorization", "Bearer "+gatewayToken)
+	return nmcp.WithToken(ctx, gatewayToken)
+}
+
+func gatewayTokenContext(authenticatedUser user.Info, mcpID, audience string, now time.Time) persistent.TokenContext {
+	extra := authenticatedUser.GetExtra()
+	return persistent.TokenContext{
+		Audience:              audience,
+		IssuedAt:              persistent.NewTime(now),
+		ExpiresAt:             persistent.NewTime(now.Add(gatewayTokenExpiration)),
+		UserID:                authenticatedUser.GetUID(),
+		UserName:              authenticatedUser.GetName(),
+		UserEmail:             cmp.Or(extra["email"]...),
+		UserGroups:            []string{types.GroupMCP, types.GroupAuthenticated},
+		AuthProviderName:      cmp.Or(extra["auth_provider_name"]...),
+		AuthProviderNamespace: cmp.Or(extra["auth_provider_namespace"]...),
+		AuthProviderUserID:    cmp.Or(extra["auth_provider_user_id"]...),
+		MCPID:                 mcpID,
+	}
 }
 
 func rewriteProxyRequest(r *httputil.ProxyRequest, upstreamURL *url.URL) {

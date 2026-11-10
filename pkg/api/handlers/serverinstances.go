@@ -1,8 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
+
+	"github.com/obot-platform/obot/pkg/accesscontrolrule"
+	kuser "k8s.io/apiserver/pkg/authentication/user"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
@@ -12,10 +18,28 @@ import (
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-type ServerInstancesHandler struct{}
+// MCPInstanceResolver resolves an MCP server instance ID to the server and
+// config needed for an OAuth check. Satisfied by *mcp.SessionManager.
+type MCPInstanceResolver interface {
+	ServerForActionWithConnectIDAllowMissingConfig(ctx context.Context, id string, user kuser.Info) (string, v1.MCPServer, mcp.ServerConfig, []string, error)
+}
 
-func NewServerInstancesHandler() *ServerInstancesHandler {
-	return &ServerInstancesHandler{}
+type ServerInstancesHandler struct {
+	acrHelper         *accesscontrolrule.Helper
+	mcpOAuthChecker   MCPOAuthChecker
+	mcpSessionManager MCPInstanceResolver
+	serverURL         string
+	completionURL     string
+}
+
+func NewServerInstancesHandler(acrHelper *accesscontrolrule.Helper, mcpOAuthChecker MCPOAuthChecker, mcpSessionManager MCPInstanceResolver, serverURL, completionURL string) *ServerInstancesHandler {
+	return &ServerInstancesHandler{
+		acrHelper:         acrHelper,
+		mcpOAuthChecker:   mcpOAuthChecker,
+		mcpSessionManager: mcpSessionManager,
+		serverURL:         serverURL,
+		completionURL:     completionURL,
+	}
 }
 
 func (h *ServerInstancesHandler) ListServerInstances(req api.Context) error {
@@ -66,6 +90,73 @@ func (h *ServerInstancesHandler) GetServerInstance(req api.Context) error {
 	}
 
 	return req.Write(ConvertMCPServerInstance(instance, credEnv))
+}
+
+func (h *ServerInstancesHandler) ClearOAuthCredentials(req api.Context) error {
+	var mcpServerInstance v1.MCPServerInstance
+	if err := req.Get(&mcpServerInstance, req.PathValue("mcp_server_instance_id")); err != nil {
+		return err
+	}
+
+	if err := req.GatewayClient.DeleteMCPOAuthTokens(req.Context(), req.User.GetUID(), mcpServerInstance.Name); err != nil {
+		return fmt.Errorf("failed to delete OAuth credentials: %v", err)
+	}
+
+	req.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+func (h *ServerInstancesHandler) GetOAuthURL(req api.Context) error {
+	u, err := h.oauthURLForInstance(req)
+	if err != nil {
+		return err
+	}
+
+	return req.Write(map[string]string{"oauthURL": u})
+}
+
+func (h *ServerInstancesHandler) RedirectOAuthURL(req api.Context) error {
+	u, err := h.oauthURLForInstance(req)
+	if err != nil {
+		return err
+	}
+	if u == "" {
+		http.Redirect(req.ResponseWriter, req.Request, MCPOAuthCompletionRedirect(h.completionURL, url.Values{
+			"flow":   {"instance"},
+			"status": {"success"},
+			"mcp_id": {req.PathValue("mcp_server_instance_id")},
+		}), http.StatusFound)
+		return nil
+	}
+
+	http.Redirect(req.ResponseWriter, req.Request, u, http.StatusFound)
+	return nil
+}
+
+func (h *ServerInstancesHandler) oauthURLForInstance(req api.Context) (string, error) {
+	var instance v1.MCPServerInstance
+	if err := req.Get(&instance, req.PathValue("mcp_server_instance_id")); err != nil {
+		return "", err
+	}
+	if instance.Spec.UserID != req.User.GetUID() {
+		return "", types.NewErrNotFound("MCP server instance not found")
+	}
+
+	// allowMissingConfig: report OAuth state even when the instance is not yet
+	// fully configured (e.g. required headers unset) so the probe never 500s on
+	// a half-set-up instance. For remote catalog servers (NeedsURL=false) this
+	// is identical to the strict path.
+	_, server, serverConfig, _, err := h.mcpSessionManager.ServerForActionWithConnectIDAllowMissingConfig(req.Context(), instance.Name, req.User)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve MCP server instance: %w", err)
+	}
+
+	u, err := h.mcpOAuthChecker.CheckForMCPAuth(req, server, serverConfig, req.User.GetUID(), instance.Name, "")
+	if err != nil {
+		return "", fmt.Errorf("failed to get OAuth URL: %w", err)
+	}
+
+	return u, nil
 }
 
 func ConvertMCPServerInstance(instance v1.MCPServerInstance, credEnv map[string]string) types.MCPServerInstance {

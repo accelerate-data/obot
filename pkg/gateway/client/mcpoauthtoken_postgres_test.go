@@ -28,7 +28,7 @@ func TestReplaceMCPOAuthTokenConcurrentPostgres(t *testing.T) {
 	scopedDSN := postgresUserLimitTestDSN(t, dsn, schema)
 	first := &Client{db: newPostgresUserLimitTestDB(t, scopedDSN)}
 	second := &Client{db: newPostgresUserLimitTestDB(t, scopedDSN)}
-	require.NoError(t, first.db.WithContext(t.Context()).AutoMigrate(&types.MCPOAuthToken{}))
+	require.NoError(t, first.db.WithContext(t.Context()).AutoMigrate(&types.MCPOAuthToken{}, &types.MCPOAuthRevokedConnection{}))
 
 	for _, test := range []struct {
 		name   string

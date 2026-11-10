@@ -394,7 +394,11 @@ func TestCompositeOAuthRemovalInvalidatesDiscovery(t *testing.T) {
 
 	require.NoError(t, gateway.DeleteMCPOAuthTokens(t.Context(), "42", "ms1remote"))
 	response := list()
-	require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+	// The fork defers vMCP authorization (partial authorization): a component
+	// that loses its grant surfaces the authorization tool instead of a 401.
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.Contains(t, response.Body.String(), `"name":"mmmcp_auth_status"`)
+	require.NotContains(t, response.Body.String(), `"name":"protected"`)
 	require.Equal(t, int32(2), listCalls.Load(), "removed credentials must cause rediscovery")
 
 	saveToken()

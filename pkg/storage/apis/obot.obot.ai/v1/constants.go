@@ -14,6 +14,7 @@ const (
 	ModelAccessPolicyFinalizer     = "obot.obot.ai/model-access-policy"
 
 	ModelProviderSyncAnnotation         = "obot.ai/model-provider-sync"
+	AuthProviderSyncAnnotation          = "obot.ai/auth-provider-sync"
 	MCPCatalogSyncAnnotation            = "obot.ai/mcp-catalog-sync"
 	SystemMCPCatalogSyncAnnotation      = "obot.ai/system-mcp-catalog-sync"
 	SkillRepositorySyncAnnotation       = "obot.ai/skill-repository-sync"

@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -24,9 +25,15 @@ import (
 )
 
 const (
-	obotOAuthClientName  = "Obot MCP OAuth"
-	figmaMCPURL          = "https://mcp.figma.com/mcp"
-	figmaOAuthClientName = "Claude Code"
+	// vibedataOAuthClientName is the client_name a provider shows when it asks the
+	// user to approve Vibedata's access to an MCP server, both for dynamically
+	// registered clients and in the hosted Client ID Metadata Document.
+	vibedataOAuthClientName = "Vibedata"
+	figmaMCPURL             = "https://mcp.figma.com/mcp"
+	figmaOAuthClientName    = "Claude Code"
+	// obotOAuthCheckMCPClientName identifies the OAuth check to the MCP server
+	// itself, in the initialize request's clientInfo. Providers never see it.
+	obotOAuthCheckMCPClientName = "Obot MCP OAuth"
 )
 
 var (
@@ -84,7 +91,9 @@ func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManage
 // it has one, and otherwise with the admin's egress policy.
 func tokenExchangeClient(sessionManager *mcp.SessionManager) tokenClientFunc {
 	if sessionManager == nil {
-		return nil
+		return func(string) (*http.Client, error) {
+			return mcp.NewOAuthExchangeClient(mcp.RemoteMCPURLValidationConfig{}), nil
+		}
 	}
 	return func(tunnelName string) (*http.Client, error) {
 		return sessionManager.OAuthClientForServer(mcp.ServerConfig{TunnelName: tunnelName})
@@ -419,6 +428,21 @@ func staticOAuthMetadata(metadata mcp.OAuthMetadata, redirectURL string) (mcp.Au
 		"Obot MCP Gateway", redirectURL, registration.Scope), nil
 }
 
+// oauthCheckClientOption takes an oauthClientName that is empty unless a
+// downstream client initiated the flow. The provider is shown that name, or
+// Vibedata when there is none; ClientName only reaches the MCP server.
+func (f *MCPOAuthHandlerFactory) oauthCheckClientOption(oauthClientName string, tokenStorage mcp.TokenStorage, oauthHandler *mcpOAuthHandler) mcp.ClientOption {
+	return mcp.ClientOption{
+		OAuthClientName:               cmp.Or(oauthClientName, vibedataOAuthClientName),
+		OAuthRedirectURL:              oauthHandler.redirectURL,
+		OAuthClientIDMetadataDocument: f.clientMetadataForRedirect(oauthHandler.redirectURL),
+		ClientName:                    obotOAuthCheckMCPClientName,
+		TokenStorage:                  tokenStorage,
+		CallbackHandler:               oauthHandler,
+		ClientLookup:                  oauthHandler,
+	}
+}
+
 func (f *MCPOAuthHandlerFactory) newMCPOAuthHandler(gatewayClient *client.Client, userID, mcpID, mcpURL, tunnelName, oauthAuthRequestID, catalogEntryName string) *mcpOAuthHandler {
 	return &mcpOAuthHandler{
 		gatewayClient:      gatewayClient,
@@ -461,8 +485,7 @@ func (m *mcpOAuthHandler) NewState(ctx context.Context, conf *oauth2.Config, res
 	// callback arrives via a separate HTTP endpoint (oauthCallback) which looks up
 	// the pending state from the DB directly.
 	ch := make(chan mcp.CallbackPayload)
-
-	return state, ch, m.stateMgr.store(ctx, m.userID, m.mcpID, m.mcpURL, m.tunnelName, m.oauthAuthRequestID, state, verifier, resourceURL, conf, m.upstreamChallenge)
+	return state, ch, m.stateMgr.store(ctx, m.userID, m.mcpID, m.mcpURL, m.tunnelName, m.oauthAuthRequestID, m.catalogEntryName, state, verifier, resourceURL, conf, m.upstreamChallenge)
 }
 
 func (m *mcpOAuthHandler) Lookup(ctx context.Context) (string, string, error) {
@@ -525,13 +548,5 @@ func (f *MCPOAuthHandlerFactory) prepareUpstreamOAuth(req api.Context, mcpServer
 		return nil, mcp.ClientOption{}, err
 	}
 
-	return oauthHandler, mcp.ClientOption{
-		OAuthClientName:               oauthClientName,
-		OAuthRedirectURL:              oauthHandler.redirectURL,
-		OAuthClientIDMetadataDocument: f.clientMetadataForRedirect(oauthHandler.redirectURL),
-		ClientName:                    obotOAuthClientName,
-		TokenStorage:                  f.tokenStore.ForUserAndMCP(userID, mcpID, mcpServerConfig.URL),
-		CallbackHandler:               oauthHandler,
-		ClientLookup:                  oauthHandler,
-	}, nil
+	return oauthHandler, f.oauthCheckClientOption(oauthClientName, f.tokenStore.ForUserAndMCP(userID, mcpID, mcpServerConfig.URL), oauthHandler), nil
 }

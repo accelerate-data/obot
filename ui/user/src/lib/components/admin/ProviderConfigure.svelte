@@ -380,6 +380,7 @@
 
 	const booleanInputs = new Set([
 		'OBOT_AUTH_PROVIDER_ENABLE_LOGGING',
+		'OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING',
 		'OBOT_KEYCLOAK_AUTH_PROVIDER_INSECURE_ALLOW_UNVERIFIED_EMAIL'
 	]);
 </script>
@@ -558,6 +559,12 @@
 			{/if}
 			{#if note}
 				{@render note()}
+			{/if}
+
+			{#if provider.id === 'generic-oauth-auth-provider'}
+				<div class="notification-info p-3 text-sm font-light">
+					{m.identity_access_auth_providers_generic_issuer_warning()}
+				</div>
 			{/if}
 
 			{#if requiredConfigurationParameters.length > 0}

@@ -92,13 +92,31 @@ func DecodeCatalogFile[T any](path string) ([]T, bool, error) {
 		if err := yaml.Unmarshal(contents, &entries); err != nil {
 			return nil, true, err
 		}
+		MigrateDeprecatedCatalogFields(entries)
 		return entries, true, nil
 	}
 	var entry T
 	if err := yaml.Unmarshal(contents, &entry); err != nil {
 		return nil, false, err
 	}
-	return []T{entry}, false, nil
+	entries := []T{entry}
+	MigrateDeprecatedCatalogFields(entries)
+	return entries, false, nil
+}
+
+// MigrateDeprecatedCatalogFields folds the pre-vMCP catalog fields into Config
+// on every decoded entry, so entries written in the older schema deploy their
+// configuration. It is a no-op for entries already using the new schema.
+// Exported so catalog loading paths that decode YAML without DecodeCatalogFile
+// apply the same migration.
+func MigrateDeprecatedCatalogFields[T any](entries []T) {
+	for i := range entries {
+		if migrator, ok := any(&entries[i]).(interface {
+			MigrateDeprecatedCatalogFields()
+		}); ok {
+			migrator.MigrateDeprecatedCatalogFields()
+		}
+	}
 }
 
 func catalogPatterns(root string) []string {

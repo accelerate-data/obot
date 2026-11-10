@@ -238,9 +238,7 @@ func (sm *SessionManager) serverFromMCPServerInstance(ctx context.Context, insta
 	if err != nil {
 		return server, ServerConfig{}, nil, err
 	}
-	if instance.Spec.VMCPInstanceID != "" {
-		serverConfig.MCPServerInstanceID = instance.Name
-	}
+	serverConfig.MCPServerInstanceID = instance.Name
 
 	instanceCredEnv, err := sm.serverInstanceCredEnv(ctx, instance)
 	if err != nil {

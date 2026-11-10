@@ -42,6 +42,85 @@ func TestMissingRequiredConfiguration(t *testing.T) {
 	}
 }
 
+func TestConfiguredComponents(t *testing.T) {
+	// Both components declare the same key name, so only the component-scoped
+	// keys distinguish them.
+	needsUserInput := func(id string) types.VMCPComponent {
+		return types.VMCPComponent{
+			ID:            id,
+			Configuration: []types.VMCPConfigurationPolicy{{Key: "USER", Policy: types.VMCPConfigurationPolicyUserAllowed}},
+			CatalogEntry: types.MCPServerCatalogEntrySnapshot{Manifest: types.MCPServerCatalogEntryManifest{
+				Config: []types.MCPConfig{{Key: "USER", Required: true, Usage: types.File}},
+			}},
+		}
+	}
+	adminConfigured := types.VMCPComponent{
+		ID:            "admin",
+		Configuration: []types.VMCPConfigurationPolicy{{Key: "FIXED", Policy: types.VMCPConfigurationPolicyFixed}},
+		CatalogEntry: types.MCPServerCatalogEntrySnapshot{Manifest: types.MCPServerCatalogEntryManifest{
+			Config: []types.MCPConfig{{Key: "FIXED", Required: true, Usage: types.Env}},
+		}},
+	}
+
+	for _, tc := range []struct {
+		name       string
+		components []types.VMCPComponent
+		missing    []string
+		want       []string
+	}{
+		{
+			name:       "own required input missing",
+			components: []types.VMCPComponent{needsUserInput("one"), needsUserInput("two")},
+			missing:    []string{ConfigurationKey("one", "USER")},
+			want:       []string{"two"},
+		},
+		{
+			name:       "own required input supplied",
+			components: []types.VMCPComponent{needsUserInput("one"), needsUserInput("two")},
+			missing:    []string{ConfigurationKey("one", "OTHER")},
+			want:       []string{"one", "two"},
+		},
+		{
+			name:       "only another component's key missing",
+			components: []types.VMCPComponent{needsUserInput("one"), needsUserInput("two")},
+			missing:    []string{ConfigurationKey("two", "USER")},
+			want:       []string{"one"},
+		},
+		{
+			name:       "no required userAllowed input",
+			components: []types.VMCPComponent{adminConfigured},
+			missing:    []string{ConfigurationKey("admin", "FIXED")},
+			want:       []string{"admin"},
+		},
+		{
+			name:       "nothing missing keeps every component",
+			components: []types.VMCPComponent{needsUserInput("one"), adminConfigured},
+			want:       []string{"one", "admin"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for _, component := range ConfiguredComponents(tc.components, tc.missing) {
+				got = append(got, component.ID)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("configured components = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// Callers pass slices derived from other structures, so the input must not
+	// be reordered or truncated in place.
+	backing := []types.VMCPComponent{needsUserInput("one"), adminConfigured, needsUserInput("two")}
+	got := ConfiguredComponents(backing[:2], []string{ConfigurationKey("one", "USER")})
+	if len(got) != 1 || got[0].ID != "admin" {
+		t.Fatalf("configured components = %+v", got)
+	}
+	if backing[0].ID != "one" || backing[1].ID != "admin" || backing[2].ID != "two" {
+		t.Fatalf("mutated the caller's backing array: %+v", backing)
+	}
+}
+
 func TestMissingRequiredConfigurationFixedSecretBinding(t *testing.T) {
 	component := types.VMCPComponent{
 		ID: "gitlab",

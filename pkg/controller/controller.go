@@ -210,6 +210,10 @@ func (c *Controller) PostStart(ctx context.Context, client kclient.Client) {
 	}
 	go c.providerHandler.PollRegistries(ctx, client)
 
+	if err := c.providerHandler.EnsureAuthProviderEnvCredential(ctx, client); err != nil {
+		panic(fmt.Errorf("failed to ensure auth provider env credential: %w", err))
+	}
+
 	if err := c.services.PersistentTokenServer.EnsureJWK(ctx); err != nil {
 		panic(fmt.Errorf("failed to ensure JWK: %w", err))
 	}

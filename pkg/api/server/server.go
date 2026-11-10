@@ -31,6 +31,7 @@ import (
 	"github.com/obot-platform/obot/pkg/proxy"
 	"github.com/obot-platform/obot/pkg/scim"
 	"github.com/obot-platform/obot/pkg/storage"
+	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -86,6 +87,11 @@ type responseWriter struct {
 	auditLogger audit.Logger
 }
 
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
 // tracingResponseWriter retains the writer below OTel's error-discarding Flush hook.
 type tracingResponseWriter struct {
 	http.ResponseWriter
@@ -113,7 +119,7 @@ func NewServer(storageClient storage.Client, gatewayClient *gclient.Client, loca
 		mux:                     http.NewServeMux(),
 		providerEntitlementGate: license.NewProviderEntitlementGate(licenseProvider, storageClient),
 	}
-	s.otelHandler = traced(s.mux)
+	s.otelHandler = traced(accessLog(s.mux))
 	return s
 }
 
@@ -561,7 +567,7 @@ func (w *headersResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}
-	return io.Copy(w, r)
+	return io.Copy(w.ResponseWriter, r)
 }
 
 func (w *headersResponseWriter) Flush() {
@@ -577,11 +583,7 @@ func (w *headersResponseWriter) FlushError() error {
 }
 
 func (w *headersResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	h, ok := w.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
-	}
-	return h.Hijack()
+	return http.NewResponseController(w.ResponseWriter).Hijack()
 }
 
 func (w *headersResponseWriter) Push(target string, opts *http.PushOptions) error {
@@ -638,4 +640,41 @@ func (rw *responseWriter) FlushError() error {
 // wrapper hides the Hijacker the server provides.
 func (rw *responseWriter) Unwrap() http.ResponseWriter {
 	return rw.ResponseWriter
+}
+
+// accessLog emits one request-completion log per API request, carrying the
+// request context. It sits INSIDE the otelhttp handler so the context holds
+// the server span — the otel logrus bridge then stamps the record with the
+// span's trace id, which is what lets an operator join a log line to its
+// trace. Skips the same paths otelhttp does not trace, so health probes and
+// static assets stay out of the log stream.
+func accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/healthz" || isStaticAssetPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(sw, r)
+		route := r.Pattern
+		if route == "" {
+			route = r.URL.Path
+		}
+		logrus.WithContext(r.Context()).WithFields(logrus.Fields{
+			"method":     r.Method,
+			"route":      route,
+			"status":     sw.status,
+			"durationMs": time.Since(start).Milliseconds(),
+		}).Info("http request completed")
+	})
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }

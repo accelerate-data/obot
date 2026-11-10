@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/obot-platform/nah/pkg/apply"
@@ -41,6 +42,9 @@ import (
 )
 
 const (
+	catalogSyncInterval       = time.Hour
+	catalogSyncFailureBackoff = 30 * time.Second
+
 	// CatalogCredentialToolName is the fixed tool name used for the single
 	// credential that stores all source-URL tokens for a catalog. Each URL's
 	// token is stored as a key in the credential's Env map.
@@ -75,6 +79,10 @@ type Handler struct {
 	mcpBackend                string
 	mcpSessionManager         *mcp.SessionManager
 	openAPIImporter           openAPIImporter
+
+	// Catalogs this process has already synced. In memory on purpose: it empties on
+	// restart, which is when a fresh read is wanted.
+	startupSynced sync.Map
 }
 
 // userInfo is a wrapper around kuser.Info that includes the user's role.
@@ -115,11 +123,16 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 	validationOptions := h.remoteURLValidationConfig
 	validationOptions.ResourceMaximums = maximums
 
-	forceSync := mcpCatalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true" || mcpCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
+	requested := mcpCatalog.Annotations[v1.MCPCatalogSyncAnnotation] == "true"
+	// A catalog and a system catalog are both named "default", so qualify the key.
+	startupKey := "mcpcatalog/" + mcpCatalog.Namespace + "/" + mcpCatalog.Name
+	_, syncedSinceStart := h.startupSynced.Load(startupKey)
+	forceSync := requested || !syncedSinceStart
 	if !forceSync && !mcpCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(mcpCatalog.Status.LastSyncTime.Time)
-		if timeSinceLastSync < time.Hour {
-			resp.RetryAfter(time.Hour - timeSinceLastSync)
+		syncInterval := catalogRetryInterval(mcpCatalog.Status.SyncErrors)
+		if timeSinceLastSync < syncInterval {
+			resp.RetryAfter(syncInterval - timeSinceLastSync)
 			return nil
 		}
 	}
@@ -203,7 +216,7 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 
 	// We want to refresh this every hour.
 	// TODO(g-linville): make this configurable.
-	resp.RetryAfter(time.Hour)
+	resp.RetryAfter(catalogRetryInterval(mcpCatalog.Status.SyncErrors))
 
 	// I know we don't want to do apply anymore. But we were doing it before in a different place.
 	// Now we're doing it here. It's not important enough to change right now.
@@ -225,9 +238,17 @@ func (h *Handler) Sync(req router.Request, resp router.Response) error {
 			}
 		}
 
+		h.startupSynced.Store(startupKey, struct{}{})
 		syncCompleted = true
 		return nil
 	}
+	// Static OAuth credential writes check that their catalog entry still exists
+	// under this lock, so removal and apply must hold it too.
+	releaseCatalogMutationLock, err := h.gatewayClient.AcquireCredentialLock(req.Ctx, system.MCPStaticOAuthCatalogMutationLock)
+	if err != nil {
+		return fmt.Errorf("failed to coordinate catalog sync with static OAuth: %w", err)
+	}
+	defer releaseCatalogMutationLock()
 
 	// Missing entries cannot be reconciled safely from a partial desired set.
 	if len(mcpCatalog.Status.SyncErrors) > 0 {
@@ -280,6 +301,13 @@ func addSyncError(syncErrors map[string]string, sourceURL, errMsg string) {
 	} else {
 		syncErrors[sourceURL] = errMsg
 	}
+}
+
+func catalogRetryInterval(syncErrors map[string]string) time.Duration {
+	if len(syncErrors) > 0 {
+		return catalogSyncFailureBackoff
+	}
+	return catalogSyncInterval
 }
 
 func filterConflictingCatalogEntries(ctx context.Context, c kclient.Client, namespace string, objs []kclient.Object) ([]kclient.Object, map[string]string, error) {
@@ -453,11 +481,15 @@ func parseSourceRef(sourceID, catalogEntryID string) (refSourceID, entryKey stri
 func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 	systemCatalog := req.Object.(*v1.SystemMCPCatalog)
 
-	forceSync := systemCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] == "true" || systemCatalog.Annotations[forceSyncStartupAnnotation] != startupSyncGeneration
+	requested := systemCatalog.Annotations[v1.SystemMCPCatalogSyncAnnotation] == "true"
+	startupKey := "systemmcpcatalog/" + systemCatalog.Namespace + "/" + systemCatalog.Name
+	_, syncedSinceStart := h.startupSynced.Load(startupKey)
+	forceSync := requested || !syncedSinceStart
 	if !forceSync && !systemCatalog.Status.LastSyncTime.IsZero() {
 		timeSinceLastSync := time.Since(systemCatalog.Status.LastSyncTime.Time)
-		if timeSinceLastSync < time.Hour {
-			resp.RetryAfter(time.Hour - timeSinceLastSync)
+		syncInterval := catalogRetryInterval(systemCatalog.Status.SyncErrors)
+		if timeSinceLastSync < syncInterval {
+			resp.RetryAfter(syncInterval - timeSinceLastSync)
 			return nil
 		}
 	}
@@ -510,18 +542,14 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 	if err := req.Client.Status().Update(req.Ctx, systemCatalog); err != nil {
 		return fmt.Errorf("failed to update system catalog status: %w", err)
 	}
-	if forceSync {
+	if requested {
 		delete(systemCatalog.Annotations, v1.SystemMCPCatalogSyncAnnotation)
-		if systemCatalog.Annotations == nil {
-			systemCatalog.Annotations = make(map[string]string, 1)
-		}
-		systemCatalog.Annotations[forceSyncStartupAnnotation] = startupSyncGeneration
 		if err := req.Client.Update(req.Ctx, systemCatalog); err != nil {
 			return fmt.Errorf("failed to update system catalog: %w", err)
 		}
 	}
 
-	resp.RetryAfter(time.Hour)
+	resp.RetryAfter(catalogRetryInterval(systemCatalog.Status.SyncErrors))
 
 	app := apply.New(req.Client).WithOwnerSubContext(fmt.Sprintf("system-catalog-%s", systemCatalog.Name))
 	if len(systemCatalog.Status.SyncErrors) > 0 {
@@ -532,7 +560,12 @@ func (h *Handler) SyncSystem(req router.Request, resp router.Response) error {
 		app = app.WithPruneTypes(&v1.SystemMCPServerCatalogEntry{})
 	}
 
-	return app.Apply(req.Ctx, systemCatalog, toAdd...)
+	if err := app.Apply(req.Ctx, systemCatalog, toAdd...); err != nil {
+		return err
+	}
+
+	h.startupSynced.Store(startupKey, struct{}{})
+	return nil
 }
 
 func (h *Handler) readSystemMCPCatalog(ctx context.Context, catalogName, sourceURL, token string) ([]kclient.Object, error) {
@@ -548,17 +581,15 @@ func (h *Handler) readSystemMCPCatalog(ctx context.Context, catalogName, sourceU
 			continue
 		}
 
-		if err := catalogvalidation.ValidateConfigurationFields(item); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-
 		var entry types.SystemMCPServerCatalogEntryManifest
 		if err := yaml.Unmarshal(item, &entry); err != nil {
 			errs = append(errs, fmt.Errorf("invalid system catalog entry: %w", err))
 			continue
 		}
 
+		// Existing organization catalogs still use the legacy configuration schema.
+		// Migrate after typed decoding, before validation and deployment.
+		entry.MigrateDeprecatedCatalogFields()
 		if entry.Metadata["categories"] == "Official" {
 			delete(entry.Metadata, "categories")
 		}
@@ -571,7 +602,7 @@ func (h *Handler) readSystemMCPCatalog(ctx context.Context, catalogName, sourceU
 		}
 
 		catalogvalidation.NormalizeSystemManifest(&entry)
-		if err := mcp.ValidateSystemMCPServerCatalogEntryManifest(ctx, entry, mcp.ValidationOptions{}); err != nil {
+		if err := mcp.ValidateSystemMCPServerCatalogEntryManifest(ctx, entry, h.remoteURLValidationConfig); err != nil {
 			errs = append(errs, fmt.Errorf("failed to validate system catalog entry %s: %w", entry.Name, err))
 			continue
 		}
@@ -670,16 +701,14 @@ func (h *Handler) readMCPCatalog(ctx context.Context, catalogName, sourceURL, to
 			continue
 		}
 
-		if err := catalogvalidation.ValidateConfigurationFields(item); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-
 		var entry types.MCPServerCatalogEntryManifest
 		if err := yaml.Unmarshal(item, &entry); err != nil {
 			errs = append(errs, fmt.Errorf("invalid catalog entry: %w", err))
 			continue
 		}
+		// Existing organization catalogs still use the legacy configuration schema.
+		// Migrate after typed decoding, before validation and deployment.
+		entry.MigrateDeprecatedCatalogFields()
 		if entry.Metadata["categories"] == "Official" {
 			delete(entry.Metadata, "categories") // This shouldn't happen, but do this just in case.
 			// We don't want to mark random MCP servers from the catalog as official.
@@ -805,6 +834,7 @@ func readCatalogManifests[T any](ctx context.Context, httpClient *http.Client, s
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode catalog %s: %w", sourceURL, err)
 		}
+		catalogvalidation.MigrateDeprecatedCatalogFields(entries)
 		return entries, nil
 	}
 
@@ -829,6 +859,7 @@ func readCatalogManifests[T any](ctx context.Context, httpClient *http.Client, s
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode catalog %s: %w", sourceURL, err)
 	}
+	catalogvalidation.MigrateDeprecatedCatalogFields(entries)
 	return entries, nil
 }
 
@@ -876,7 +907,12 @@ func (h *Handler) SetUpDefaultMCPCatalog(ctx context.Context, c kclient.Client) 
 	var existing v1.MCPCatalog
 	if err := c.Get(ctx, router.Key(system.DefaultNamespace, system.DefaultCatalog), &existing); err == nil {
 		if i := slices.IndexFunc(existing.Spec.SourceURLs, func(url string) bool {
-			return url == "https://github.com/obot-platform/mcp-catalog"
+			switch url {
+			case "https://github.com/obot-platform/mcp-catalog", "catalog", "./catalog", "/catalog":
+				return true
+			default:
+				return false
+			}
 		}); i >= 0 {
 			existing.Spec.SourceURLs[i] = h.defaultCatalogPath
 			// Resync now so entries do not keep reporting the old source until the hourly sync.

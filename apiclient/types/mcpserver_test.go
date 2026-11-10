@@ -120,6 +120,26 @@ func TestServerUserConfig(t *testing.T) {
 	}
 }
 
+func TestCatalogRejectsUserConfigurationPolicy(t *testing.T) {
+	for _, userType := range []ServerUserType{"", ServerUserTypeSingleUser, ServerUserTypeMultiUser} {
+		for _, usage := range []Usage{Env, Header, File, DynamicFile, Interpolated} {
+			t.Run(string(userType)+"/"+string(usage), func(t *testing.T) {
+				manifest := MCPServerCatalogEntryManifest{
+					DeprecatedServerUserType: userType,
+					Config: []MCPConfig{{
+						Key:         "INPUT",
+						Usage:       usage,
+						UserAllowed: true,
+					}},
+				}
+				if err := manifest.ValidateConfig(); err == nil {
+					t.Fatal("catalog accepted deployment-only userAllowed")
+				}
+			})
+		}
+	}
+}
+
 func TestCatalogConfigurationRoundTrip(t *testing.T) {
 	config := []MCPConfig{}
 	for _, usage := range []Usage{Env, Header, File, DynamicFile, Interpolated} {
