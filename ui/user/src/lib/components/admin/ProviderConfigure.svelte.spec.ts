@@ -84,3 +84,42 @@ describe('ProviderConfigure Keycloak email verification', () => {
 		});
 	});
 });
+
+describe('ProviderConfigure generic OAuth email linking', () => {
+	const trustParameter = 'OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING';
+	const genericValues = {
+		OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER_URL: 'https://idp.example.com',
+		OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID: 'login-client'
+	};
+	const genericProvider: AuthProvider = {
+		...provider,
+		id: 'generic-oauth-auth-provider',
+		name: 'Custom OAuth / OIDC',
+		requiredConfigurationParameters: [
+			{ name: 'OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER_URL', friendlyName: 'Issuer URL' },
+			{ name: 'OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID', friendlyName: 'Client ID' },
+			{ name: trustParameter, friendlyName: 'Trust Email Linking' }
+		],
+		optionalConfigurationParameters: []
+	};
+
+	for (const saved of [undefined, 'true']) {
+		it(`hides the inert setting and submits false when ${saved ?? 'nothing'} was saved`, async () => {
+			const onConfigure = vi.fn(async () => undefined);
+			const dialog = await renderOpenDialog(ProviderConfigure, {
+				provider: genericProvider,
+				values: { ...genericValues, ...(saved === undefined ? {} : { [trustParameter]: saved }) },
+				onConfigure
+			});
+			await expect.element(dialog.getByLabelText('Client ID', { exact: true })).toBeVisible();
+			await expect.element(dialog.getByText('Trust Email Linking')).not.toBeInTheDocument();
+			await dialog.getByRole('button', { name: 'Confirm', exact: true }).click();
+			await vi.waitFor(() => {
+				expect(onConfigure).toHaveBeenCalledExactlyOnceWith({
+					...genericValues,
+					[trustParameter]: 'false'
+				});
+			});
+		});
+	}
+});

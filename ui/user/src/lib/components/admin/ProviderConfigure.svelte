@@ -157,6 +157,13 @@
 			(isAzureOpenAIProvider ? 'OBOT_AZURE_OPENAI_MODEL_PROVIDER_API_KEY' : undefined)
 	);
 
+	// Upstream obot#8415 stopped linking accounts by email, so this setting has no effect. The
+	// published providers registry still declares it required, and the configure API rejects a
+	// submission that omits a required parameter, so it is hidden here but always submitted.
+	const inertParameters = new Map([
+		['OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING', 'false']
+	]);
+
 	const requiredConfigurationParameters = $derived.by(() => {
 		if (isAzureOpenAIProvider) {
 			const allParams = [
@@ -194,13 +201,13 @@
 		}
 
 		return (provider?.requiredConfigurationParameters?.filter(
-			(p) => !p.hidden && !isChoiceParameter(p)
+			(p) => !p.hidden && !isChoiceParameter(p) && !inertParameters.has(p.name)
 		) ?? []) as ProviderParameter[];
 	});
 
 	const optionalConfigurationParameters = $derived.by(() => {
 		const optionalParams = (provider?.optionalConfigurationParameters?.filter(
-			(p) => !p.hidden && !isChoiceParameter(p)
+			(p) => !p.hidden && !isChoiceParameter(p) && !inertParameters.has(p.name)
 		) ?? []) as ProviderParameter[];
 
 		if (isAzureOpenAIProvider) {
@@ -366,6 +373,15 @@
 		if (parameterChoice?.choiceParameter && !parameterChoice.made && !choiceProvides) {
 			processedForm[parameterChoice.choiceParameter] = 'true';
 		}
+		for (const param of [
+			...(provider?.requiredConfigurationParameters ?? []),
+			...(provider?.optionalConfigurationParameters ?? [])
+		]) {
+			const value = inertParameters.get(param.name);
+			if (value !== undefined) {
+				processedForm[param.name] = value;
+			}
+		}
 
 		onConfigure(processedForm);
 	}
@@ -380,7 +396,6 @@
 
 	const booleanInputs = new Set([
 		'OBOT_AUTH_PROVIDER_ENABLE_LOGGING',
-		'OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING',
 		'OBOT_KEYCLOAK_AUTH_PROVIDER_INSECURE_ALLOW_UNVERIFIED_EMAIL'
 	]);
 </script>

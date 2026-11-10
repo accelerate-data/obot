@@ -15,8 +15,7 @@
 		"clientId": "obot-e2e-keycloak",
 		"clientSecret": "obot-e2e-keycloak-secret",
 		"scope": "openid email profile",
-		"emailDomains": "example.com",
-		"trustEmailLinking": true
+		"emailDomains": "example.com"
 	},
 	"user": {
 		"username": "keycloak.user@example.com",
