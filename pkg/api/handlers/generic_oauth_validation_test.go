@@ -131,25 +131,6 @@ func TestValidateGenericOAuthConfigAcceptsValidDiscovery(t *testing.T) {
 	}
 }
 
-func TestRequireGenericOAuthTrustReconfirmationRejectsIssuerChangeWithoutTrust(t *testing.T) {
-	err := requireGenericOAuthTrustReconfirmation(GenericOAuthAuthProviderName, "https://old.example.com", map[string]string{
-		GenericOAuthIssuerEnvVar: "https://new.example.com",
-	})
-	if err == nil {
-		t.Fatal("expected issuer change without trust confirmation to fail")
-	}
-}
-
-func TestRequireGenericOAuthTrustReconfirmationAllowsIssuerChangeWithTrust(t *testing.T) {
-	err := requireGenericOAuthTrustReconfirmation(GenericOAuthAuthProviderName, "https://old.example.com", map[string]string{
-		GenericOAuthIssuerEnvVar:            "https://new.example.com",
-		GenericOAuthTrustEmailLinkingEnvVar: "true",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func newOIDCDiscoveryServer(t *testing.T, overrideIssuer string) string {
 	t.Helper()
 

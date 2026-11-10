@@ -215,26 +215,6 @@ func TestStageGenericOAuthRejectsInvalidIssuerConfiguration(t *testing.T) {
 	}
 }
 
-func TestConfigureGenericOAuthIssuerChangeRequiresTrustReconfirmation(t *testing.T) {
-	newIssuer := newOIDCDiscoveryServer(t, "")
-	gatewayClient, err := callGenericOAuthAuthProviderChange(t, "configure", newIssuer, "https://old.example.com")
-	require.ErrorContains(t, err, "account-linking trust must be re-confirmed")
-
-	credential, err := gatewayClient.RevealCredential(t.Context(), []string{GenericOAuthAuthProviderName}, GenericOAuthAuthProviderName)
-	require.NoError(t, err)
-	assert.Equal(t, "https://old.example.com", credential.Secrets[GenericOAuthIssuerEnvVar])
-}
-
-func TestStageGenericOAuthIssuerChangeRequiresTrustReconfirmation(t *testing.T) {
-	newIssuer := newOIDCDiscoveryServer(t, "")
-	gatewayClient, err := callGenericOAuthAuthProviderChange(t, "stage", newIssuer, "https://old.example.com")
-	require.ErrorContains(t, err, "account-linking trust must be re-confirmed")
-
-	credential, err := gatewayClient.RevealCredential(t.Context(), []string{system.ReplacementAuthProviderCredentialContext}, GenericOAuthAuthProviderName)
-	require.NoError(t, err)
-	assert.Equal(t, "https://old.example.com", credential.Secrets[GenericOAuthIssuerEnvVar])
-}
-
 func callGenericOAuthAuthProviderChange(t *testing.T, action, issuer, existingIssuer string) (*gateway.Client, error) {
 	t.Helper()
 

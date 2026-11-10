@@ -7,8 +7,10 @@ status: draft
 > **Email linking superseded (v0.28.0, VD-7833).** Upstream obot#8415 removed email-based identity
 > linking: sign-in never matches an existing user by email, and identities match on provider plus
 > subject. The email-linking rules in this document describe the pre-v0.28.0 fork. The
-> `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING` value still exists and still gates an issuer
-> change, but it no longer enables any linking; retiring it is tracked as a VD-7833 follow-up.
+> issuer-change re-confirmation of `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING` is removed.
+> The setting itself is inert: Obot still accepts it (default `false`) because the published providers
+> registry declares it as required. Retiring it from providers, then Obot and the Studio installers,
+> is a VD-7833 follow-up.
 
 ## Overview
 
@@ -119,7 +121,6 @@ The registry entry should expose these required parameters:
 | Client ID | `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_ID` | OAuth/OIDC client ID. |
 | Client Secret | `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_CLIENT_SECRET` | OAuth/OIDC client secret. Sensitive. |
 | Email Domains | `OBOT_AUTH_PROVIDER_EMAIL_DOMAINS` | Existing shared auth-provider access-control field. Empty values should be rejected for the generic provider. Use `*` only when the admin intentionally allows all domains trusted by the issuer. |
-| Trust Email Linking | `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_TRUST_EMAIL_LINKING` | Whether this issuer can link logins to existing Obot users by email. Defaults to `true` for the generic provider, but must be re-confirmed when the issuer changes. |
 
 The registry entry should expose these optional parameters:
 
@@ -170,10 +171,7 @@ Current identities are keyed by provider namespace/name and provider user ID. Th
 
 Account linking rules:
 
-- For generic OAuth, a login can link to an existing Obot user by email only when `trustedForEmailLinking` is enabled for the same provider and issuer trust boundary.
-- If the ID token or userinfo response includes `email_verified=false`, Obot must not link by email.
-- If `email_verified=true`, Obot can link by email subject to email-domain restrictions and the trust setting.
-- If `email_verified` is absent, Obot can link by email only when `trustedForEmailLinking` is enabled; the docs must call this out as an issuer-level trust decision.
+- Obot does not link accounts by email (upstream obot#8415). A login binds only on auth provider plus provider user ID.
 - Reconfiguring the generic provider to a different issuer must not allow the new issuer to claim identities or sessions created by the previous issuer.
 
 The provider daemon should return stable identity fields:
@@ -193,7 +191,6 @@ When the configured issuer changes, Obot should:
 
 - Stop the existing provider daemon.
 - Treat the new issuer as a distinct identity namespace.
-- Require the admin to re-confirm `trustedForEmailLinking` for the new issuer before email-based account linking is enabled.
 - Avoid linking the new issuer's `sub` values to identities from the previous issuer.
 - Invalidate or require reauthentication for sessions created under the previous issuer.
 - Emit or preserve enough audit context for operators to understand that the login authority changed.
@@ -218,9 +215,7 @@ The UI should make these constraints visible:
 
 - Email domains are required for generic OAuth.
 - `*` allows every email domain accepted by the issuer.
-- Trusting account linking lets this issuer attach logins to existing Obot users with matching verified or issuer-trusted email addresses.
 - Changing the issuer changes the identity trust boundary.
-- Changing the issuer requires re-confirming account-linking trust.
 - The callback URL must be copied exactly into the external provider.
 
 The generic provider should sort with the common auth providers. The existing auth-provider page already uses a preferred-order list; adding the generic provider there is sufficient if the current alphabetical fallback does not place it appropriately.
@@ -288,10 +283,7 @@ Backend tests should cover:
 - Configure/reveal/deconfigure round-trips generic provider credentials.
 - Configure validation rejects missing email domains, invalid issuers, issuer mismatch, and unreachable discovery documents.
 - The one-configured-provider rule still rejects configuring generic OAuth when another provider is configured.
-- Generic OAuth is treated as trusted for identity linking only when `trustedForEmailLinking` is enabled for the same issuer boundary.
 - Reconfiguring the generic provider to a different issuer does not allow identity takeover through matching `sub` or email.
-- Reconfiguring the generic provider to a different issuer requires re-confirming `trustedForEmailLinking`.
-- `email_verified=false` prevents email-based linking.
 - Existing sessions are invalidated or forced to reauthenticate when the issuer changes.
 
 Provider/runtime tests should cover:
