@@ -91,7 +91,10 @@ func TestStaticOAuthCredentialTestStartsWithRealMetadataAndReturnsSafeStatus(t *
 	if authURL.Query().Get("state") == "" || authURL.Query().Get("state") == started["testState"] {
 		t.Fatalf("callback state was missing or reused the body-only test state: %s", authURL.RawQuery)
 	}
-	resourceURL := provider.URL + "/resource"
+	// The advertised resource is the server URL's parent, not the server URL
+	// itself, so the assertions prove the handler carries the metadata's resource.
+	// RFC 9728 discovery rejects a resource that is not the server URL or a parent.
+	resourceURL := provider.URL
 	if authURL.Query().Get("resource") != resourceURL {
 		t.Fatalf("authorization resource = %q, want %q", authURL.Query().Get("resource"), resourceURL)
 	}
@@ -563,7 +566,7 @@ func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
 			http.NotFound(w, req)
 		case "/.well-known/oauth-protected-resource":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"resource":              providerURL + "/resource",
+				"resource":              providerURL,
 				"authorization_servers": []string{providerURL},
 			})
 		case "/.well-known/oauth-authorization-server":
@@ -576,7 +579,7 @@ func newStaticOAuthTestProvider(t *testing.T) *httptest.Server {
 				"token_endpoint_auth_methods_supported": []string{"client_secret_basic"},
 			})
 		case "/authorize":
-			if req.URL.Query().Get("client_id") != "  static-client  " || req.URL.Query().Get("code_challenge") == "" || req.URL.Query().Get("code_challenge_method") != "S256" || req.URL.Query().Get("resource") != providerURL+"/resource" {
+			if req.URL.Query().Get("client_id") != "  static-client  " || req.URL.Query().Get("code_challenge") == "" || req.URL.Query().Get("code_challenge_method") != "S256" || req.URL.Query().Get("resource") != providerURL {
 				http.Error(w, "invalid authorization request", http.StatusBadRequest)
 				return
 			}

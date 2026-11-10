@@ -26,7 +26,6 @@ import (
 	"github.com/obot-platform/mmmcp/component"
 	componenthttp "github.com/obot-platform/mmmcp/component/http"
 	mmmcpconfig "github.com/obot-platform/mmmcp/config"
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	"github.com/obot-platform/obot/pkg/api/authz"
@@ -311,7 +310,7 @@ func (h *Handler) Proxy(req api.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to mint MCP gateway token: %w", err)
 		}
-		req.Request = req.WithContext(withGatewayToken(req.Context(), req.Request, gatewayToken))
+		setGatewayToken(req.Request, gatewayToken)
 	}
 
 	isCompositeRequest := strings.HasSuffix(req.URL.Path, "/mcp-connect-composite/"+req.PathValue("mcp_id"))
@@ -630,13 +629,12 @@ func gatewayAudience(server mcp.ServerConfig) (string, error) {
 	return "", fmt.Errorf("no exact audience for MCP server %s", server.MCPServerName)
 }
 
-func withGatewayToken(ctx context.Context, request *http.Request, gatewayToken string) context.Context {
+func setGatewayToken(request *http.Request, gatewayToken string) {
 	if gatewayToken == "" {
 		request.Header.Del("Authorization")
-		return ctx
+		return
 	}
 	request.Header.Set("Authorization", "Bearer "+gatewayToken)
-	return nmcp.WithToken(ctx, gatewayToken)
 }
 
 func gatewayTokenContext(authenticatedUser user.Info, mcpID, audience string, now time.Time) persistent.TokenContext {

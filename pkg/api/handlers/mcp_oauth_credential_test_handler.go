@@ -6,13 +6,15 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
+	"time"
 
-	nmcp "github.com/obot-platform/nanobot/pkg/mcp"
 	"github.com/obot-platform/obot/apiclient/types"
 	"github.com/obot-platform/obot/pkg/api"
 	gatewayclient "github.com/obot-platform/obot/pkg/gateway/client"
 	"github.com/obot-platform/obot/pkg/mcp"
+	"github.com/obot-platform/obot/pkg/safehttp"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
 	"github.com/obot-platform/obot/pkg/system"
 	"golang.org/x/oauth2"
@@ -51,16 +53,18 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 		return types.NewErrBadRequest("remote MCP URL is not allowed")
 	}
 	callbackURL := system.MCPOAuthCallbackURL(h.serverURL)
-	metadata, err := nmcp.GetOAuthMetadataWithBlockingConfig(req.Context(), nmcp.Server{BaseURL: fixedURL}, "Obot Static OAuth Test", callbackURL,
-		!h.remoteURLValidationConfig.AllowLocalhostMCP,
-		!h.remoteURLValidationConfig.AllowPrivateIPMCP,
-		!h.remoteURLValidationConfig.AllowLinkLocalMCP,
-	)
+	discoveryClient := safehttp.NewClient(safehttp.Options{
+		BlockLoopback:  !h.remoteURLValidationConfig.AllowLocalhostMCP,
+		BlockPrivateIP: !h.remoteURLValidationConfig.AllowPrivateIPMCP,
+		BlockLinkLocal: !h.remoteURLValidationConfig.AllowLinkLocalMCP,
+		Timeout:        staticOAuthDiscoveryTimeout,
+	})
+	metadata, err := mcp.GetOAuthMetadataWithClient(req.Context(), discoveryClient, mcp.ServerConfig{URL: fixedURL}, "Obot Static OAuth Test", callbackURL)
 	if err != nil {
 		return types.NewErrBadRequest("failed to discover OAuth metadata")
 	}
 
-	var authorizationServer nmcp.AuthorizationServerMetadata
+	var authorizationServer mcp.AuthorizationServerMetadata
 	if len(metadata.AuthorizationServerMetadata) == 0 || json.Unmarshal(metadata.AuthorizationServerMetadata, &authorizationServer) != nil || authorizationServer.AuthorizationEndpoint == "" || authorizationServer.TokenEndpoint == "" {
 		return types.NewErrBadRequest("OAuth provider metadata is incomplete")
 	}
@@ -70,7 +74,7 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	if err := validateStaticOAuthEndpoint(req.Context(), authorizationServer.TokenEndpoint, h.remoteURLValidationConfig); err != nil {
 		return types.NewErrBadRequest("OAuth token endpoint is not allowed")
 	}
-	var registration nmcp.ClientRegistrationMetadata
+	var registration mcp.ClientRegistrationMetadata
 	if len(metadata.ClientRegistration) > 0 && json.Unmarshal(metadata.ClientRegistration, &registration) != nil {
 		return types.NewErrBadRequest("OAuth provider metadata is incomplete")
 	}
@@ -102,11 +106,30 @@ func (h *MCPCatalogHandler) StartOAuthCredentialTest(req api.Context) error {
 	if err != nil {
 		return errors.New("failed to create static OAuth credential test")
 	}
-	oauthURL, err := nmcp.AuthCodeURL(conf, authorizationServer.AuthorizationEndpoint, resourceURL, started.CallbackState, verifier)
+	oauthURL, err := staticOAuthAuthCodeURL(conf, authorizationServer.AuthorizationEndpoint, resourceURL, started.CallbackState, verifier)
 	if err != nil {
 		return errors.New("failed to create static OAuth authorization URL")
 	}
 	return req.Write(types.MCPServerOAuthCredentialTestStart{TestState: started.TestState, OAuthURL: oauthURL})
+}
+
+// staticOAuthDiscoveryTimeout bounds each metadata discovery request so an
+// unresponsive provider cannot hold the admin request open.
+const staticOAuthDiscoveryTimeout = 5 * time.Second
+
+// staticOAuthAuthCodeURL builds the authorization URL for a static OAuth test.
+// Entra only issues a refresh token when offline_access is requested
+// explicitly (it ignores the access_type parameter), so a connection verified
+// without it breaks once the first access token expires (VD-4128). The scope is
+// widened on a copy so the stored configuration keeps the discovered scopes.
+func staticOAuthAuthCodeURL(conf *oauth2.Config, authorizationEndpoint, resourceURL, state, verifier string) (string, error) {
+	isEntra := mcp.OAuthResourceURL(authorizationEndpoint, "entra-probe") == ""
+	if isEntra && len(conf.Scopes) > 0 && !slices.Contains(conf.Scopes, "offline_access") {
+		widened := *conf
+		widened.Scopes = append(slices.Clone(conf.Scopes), "offline_access")
+		conf = &widened
+	}
+	return mcp.AuthCodeURL(conf, authorizationEndpoint, resourceURL, state, verifier)
 }
 
 func validateStaticOAuthEndpoint(ctx context.Context, rawURL string, config mcp.RemoteMCPURLValidationConfig) error {
