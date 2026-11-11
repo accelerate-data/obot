@@ -1472,14 +1472,24 @@ func backfillIdentityGroupLookupIDHashes(ctx context.Context, gatewayClient *cli
 }
 
 // backfillIdentityIssuerBinding binds generic OAuth identities keyed on a bare subject to the configured issuer, once.
-// It runs in the background because it reads every generic OAuth identity, and retries until it succeeds.
+// It runs in the background because it reads every generic OAuth identity, and retries until it succeeds. With no
+// issuer configured it keeps waiting for one, so the legacy identities are bound to the first issuer an administrator
+// configures without a restart, and the window in which another issuer could claim them stays closed.
 func backfillIdentityIssuerBinding(ctx context.Context, gatewayClient *client.Client) {
+	var waitingLogged bool
 	for {
 		err := gatewayClient.BackfillIdentityIssuerBinding(ctx)
-		if err == nil {
+		switch {
+		case err == nil:
 			return
+		case errors.Is(err, client.ErrGenericOAuthIssuerNotConfigured):
+			if !waitingLogged {
+				slog.Info("Waiting for the generic OAuth auth provider to have an issuer configured before binding generic OAuth identities to it")
+				waitingLogged = true
+			}
+		default:
+			slog.Warn("failed to bind generic OAuth identities to the configured issuer; retrying", "error", err)
 		}
-		slog.Warn("failed to bind generic OAuth identities to the configured issuer; retrying", "error", err)
 		select {
 		case <-ctx.Done():
 			return

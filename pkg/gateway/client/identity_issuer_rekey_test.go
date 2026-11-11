@@ -176,6 +176,35 @@ func TestClaimingTheSubjectKeyedIdentityKeepsTheSignInGroups(t *testing.T) {
 		"the groups of this sign-in are not stored on the identity, so reading it back must not drop them")
 }
 
+func TestClaimAfterAConcurrentRekeyResolvesTheRekeyedIdentity(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+	qualified := gatewaytypes.QualifyProviderUserID(issuerA, "alice")
+
+	id := genericOAuthSignIn(qualified)
+	id.HashedProviderUserID = hash.String(qualified)
+	id.AuthProviderGroups = []gatewaytypes.Group{{ID: "group-1", Name: "Group 1"}}
+	var claimed bool
+	require.NoError(t, c.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		// The backfill, or another sign-in, re-keys the legacy identity after this sign-in found no issuer-bound key.
+		var legacy gatewaytypes.Identity
+		if err := tx.Where("auth_provider_name = ? AND hashed_provider_user_id = ?", genericOAuthTestProviderName, hash.String("alice")).First(&legacy).Error; err != nil {
+			return err
+		}
+		if ok, err := c.rekeyIdentityTx(t.Context(), tx, legacy, qualified); err != nil || !ok {
+			return errors.Join(err, errors.New("the concurrent re-key did not apply"))
+		}
+		var err error
+		claimed, err = c.claimLegacyIssuerIdentityTx(t.Context(), tx, id)
+		return err
+	}))
+
+	require.True(t, claimed, "the sign-in resolves to the re-keyed identity rather than creating a duplicate user")
+	require.Equal(t, legacyUserID, id.UserID)
+	require.Equal(t, []gatewaytypes.Group{{ID: "group-1", Name: "Group 1"}}, id.AuthProviderGroups)
+}
+
 func TestSignInAfterTheBackfillNeverClaimsASubjectKeyedIdentity(t *testing.T) {
 	c := newIssuerBindingTestClient(t)
 	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
@@ -213,12 +242,34 @@ func TestBackfillWithNoConfiguredIssuerWaitsForOne(t *testing.T) {
 	c := newIssuerBindingTestClient(t)
 	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
 
-	require.NoError(t, c.BackfillIdentityIssuerBinding(t.Context()))
+	require.ErrorIs(t, c.BackfillIdentityIssuerBinding(t.Context()), ErrGenericOAuthIssuerNotConfigured,
+		"the caller must keep retrying, or the claim stays open to whichever issuer is configured later")
 
 	require.Equal(t, map[string]uint{"alice": legacyUserID}, storedProviderUserIDs(t, c))
 	done, err := c.identityIssuerBindingDone(c.db.WithContext(t.Context()))
 	require.NoError(t, err)
 	require.False(t, done, "the backfill must run again once an issuer is configured")
+}
+
+func TestBackfillRetriedAfterAnIssuerIsConfiguredBindsToThatIssuer(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	require.ErrorIs(t, c.BackfillIdentityIssuerBinding(t.Context()), ErrGenericOAuthIssuerNotConfigured)
+	configureGenericOAuthIssuer(t, c, issuerA)
+
+	require.NoError(t, c.BackfillIdentityIssuerBinding(t.Context()))
+
+	require.Equal(t, map[string]uint{gatewaytypes.QualifyProviderUserID(issuerA, "alice"): legacyUserID}, storedProviderUserIDs(t, c))
+	done, err := c.identityIssuerBindingDone(c.db.WithContext(t.Context()))
+	require.NoError(t, err)
+	require.True(t, done, "once recorded, a later issuer can no longer claim the legacy identities")
+}
+
+func TestBackfillWithNoConfiguredIssuerAfterItRanSucceeds(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	recordIssuerBinding(t, c)
+
+	require.NoError(t, c.BackfillIdentityIssuerBinding(t.Context()))
 }
 
 func TestBackfillLeavesAnIdentityWhoseIssuerBoundKeyIsTaken(t *testing.T) {
