@@ -235,7 +235,7 @@ func (c *Client) UserFromProviderUserID(ctx context.Context, providerNamespace, 
 		id := new(types.Identity)
 		err := tx.Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", providerNamespace, providerName, hash.String(providerUserID)).First(id).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			err = c.legacyIssuerIdentityTx(tx, providerNamespace, providerName, providerUserID, id)
+			err = c.legacyIssuerIdentityTx(ctx, tx, providerNamespace, providerName, providerUserID, id)
 		}
 		if err != nil {
 			return err

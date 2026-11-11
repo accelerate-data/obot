@@ -58,18 +58,36 @@ func (c *Client) rekeyIdentityTx(ctx context.Context, tx *gorm.DB, stored types.
 	return result.RowsAffected > 0, nil
 }
 
-// claimLegacyIssuerIdentityTx binds a generic OAuth identity keyed on the bare subject, which predates issuer binding, to
-// the sign-in's issuer, and reads it into id. It applies only until the backfill has run: afterwards a subject-keyed
-// identity was never bound to the configured issuer, and must not be claimed by whichever issuer signs in first.
-func (c *Client) claimLegacyIssuerIdentityTx(ctx context.Context, tx *gorm.DB, id *types.Identity) (bool, error) {
-	if id.AuthProviderName != types.GenericOAuthAuthProviderName {
-		return false, nil
+// legacyIssuerSubjectTx reports the subject of the issuer-bound providerUserID when an identity keyed on that bare
+// subject, which predates issuer binding, may still be resolved by it. That holds only for the generic OAuth provider,
+// only until the backfill has run, and only for the configured issuer: the backfill would bind such an identity to that
+// issuer, so no other issuer may claim it, before or after.
+func (c *Client) legacyIssuerSubjectTx(ctx context.Context, tx *gorm.DB, providerName, providerUserID string) (string, bool, error) {
+	if providerName != types.GenericOAuthAuthProviderName {
+		return "", false, nil
 	}
-	_, subject, ok := types.ParseQualifiedProviderUserID(id.ProviderUserID)
+	issuer, subject, ok := types.ParseQualifiedProviderUserID(providerUserID)
 	if !ok {
-		return false, nil
+		return "", false, nil
 	}
 	if done, err := c.identityIssuerBindingDone(tx); err != nil || done {
+		return "", false, err
+	}
+	configured, err := c.configuredGenericOAuthIssuer(ctx, tx)
+	if err != nil {
+		return "", false, err
+	}
+	if configured == "" || configured != issuer {
+		return "", false, nil
+	}
+	return subject, true, nil
+}
+
+// claimLegacyIssuerIdentityTx binds a generic OAuth identity keyed on the bare subject to the sign-in's issuer, and
+// reads it into id, under the condition of legacyIssuerSubjectTx.
+func (c *Client) claimLegacyIssuerIdentityTx(ctx context.Context, tx *gorm.DB, id *types.Identity) (bool, error) {
+	subject, ok, err := c.legacyIssuerSubjectTx(ctx, tx, id.AuthProviderName, id.ProviderUserID)
+	if err != nil || !ok {
 		return false, err
 	}
 
@@ -95,16 +113,14 @@ func (c *Client) claimLegacyIssuerIdentityTx(ctx context.Context, tx *gorm.DB, i
 }
 
 // legacyIssuerIdentityTx reads into id the generic OAuth identity keyed on the bare subject of the issuer-bound
-// providerUserID, under the same condition as claimLegacyIssuerIdentityTx but without re-keying it. It returns
+// providerUserID, under the condition of legacyIssuerSubjectTx but without re-keying it. It returns
 // gorm.ErrRecordNotFound when that condition does not hold or no such identity exists.
-func (c *Client) legacyIssuerIdentityTx(tx *gorm.DB, providerNamespace, providerName, providerUserID string, id *types.Identity) error {
-	_, subject, ok := types.ParseQualifiedProviderUserID(providerUserID)
-	if providerName != types.GenericOAuthAuthProviderName || !ok {
-		return gorm.ErrRecordNotFound
-	}
-	if done, err := c.identityIssuerBindingDone(tx); err != nil {
+func (c *Client) legacyIssuerIdentityTx(ctx context.Context, tx *gorm.DB, providerNamespace, providerName, providerUserID string, id *types.Identity) error {
+	subject, ok, err := c.legacyIssuerSubjectTx(ctx, tx, providerName, providerUserID)
+	if err != nil {
 		return err
-	} else if done {
+	}
+	if !ok {
 		return gorm.ErrRecordNotFound
 	}
 	return tx.Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", providerNamespace, providerName, hash.String(subject)).
@@ -123,18 +139,25 @@ func (c *Client) identityIssuerBindingDone(tx *gorm.DB) (bool, error) {
 // once, so existing users keep their accounts. It records nothing when no issuer is configured, so it runs again once
 // one is.
 func (c *Client) BackfillIdentityIssuerBinding(ctx context.Context) error {
-	issuer, err := c.configuredGenericOAuthIssuer(ctx)
-	if err != nil || issuer == "" {
+	issuer, err := c.configuredGenericOAuthIssuer(ctx, c.db.WithContext(ctx))
+	if err != nil {
 		return err
+	}
+	if issuer == "" {
+		if done, err := c.identityIssuerBindingDone(c.db.WithContext(ctx)); err != nil || done {
+			return err
+		}
+		slog.Warn("Deferred binding generic OAuth identities to an issuer, because the generic OAuth auth provider has no issuer configured")
+		return nil
 	}
 	return c.migrateIfNotRun(ctx, identityIssuerBindingMigrationName, func(tx *gorm.DB) error {
 		return c.backfillIdentityIssuerBinding(ctx, tx, issuer)
 	})
 }
 
-func (c *Client) configuredGenericOAuthIssuer(ctx context.Context) (string, error) {
+func (c *Client) configuredGenericOAuthIssuer(ctx context.Context, db *gorm.DB) (string, error) {
 	name := types.GenericOAuthAuthProviderName
-	cred, err := c.RevealCredential(ctx, []string{name, system.GenericAuthProviderCredentialContext}, name)
+	cred, err := c.revealCredential(ctx, db, []string{name, system.GenericAuthProviderCredentialContext}, name)
 	if err != nil && !errors.As(err, &CredentialNotFoundError{}) {
 		return "", fmt.Errorf("failed to reveal the credential of auth provider %q: %w", name, err)
 	}
@@ -178,7 +201,7 @@ func (c *Client) backfillIdentityIssuerBinding(ctx context.Context, tx *gorm.DB,
 			if ok {
 				rekeyed++
 			} else {
-				slog.Warn("Left a generic OAuth identity keyed on its subject, because an identity already has its issuer-bound key",
+				slog.Warn("Left a generic OAuth identity keyed on its bare subject, because another identity already has the issuer-bound key",
 					"namespace", stored.AuthProviderNamespace, "hashedProviderUserID", stored.HashedProviderUserID)
 			}
 		}

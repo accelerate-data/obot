@@ -141,6 +141,15 @@ func TestSelectedIDPUserID(t *testing.T) {
 			identities: []gatewaytypes.Identity{first},
 			provider:   "other",
 		},
+		{
+			name: "issuer-bound identity sends only the subject",
+			identities: []gatewaytypes.Identity{{
+				AuthProviderName:      gatewaytypes.GenericOAuthAuthProviderName,
+				AuthProviderNamespace: "default",
+				ProviderUserID:        gatewaytypes.QualifyProviderUserID("https://idp.example.com", "00u-alice"),
+			}},
+			want: "00u-alice",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			caller := headerTestCaller("42", "writer")

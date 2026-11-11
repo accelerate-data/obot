@@ -176,17 +176,17 @@ Generic identities must be bound to both:
 
 Identities are keyed by provider namespace/name and a hash of the provider user ID. For `generic-oauth-auth-provider`, the provider user ID carries the issuer: `iss:<normalized issuer>\nsub:<sub>`, where the issuer is trimmed and has trailing slashes removed (`pkg/gateway/types/identity_issuer_binding.go`). Encoding the issuer into the ID needs no schema change, and the same subject under two issuers hashes to two keys. Other providers keep the bare subject.
 
-The issuer comes from the `auth_provider_issuer` user extra, which the proxy copies from the provider session state and the OIDC JWT authenticator sets from the token's `iss`. A sign-in with no issuer extra stays keyed on the bare subject.
+The issuer comes from the `auth_provider_issuer` user extra, which the proxy copies from the provider session state and the OIDC JWT authenticator sets from the token's `iss`. The two paths derive the same key only when the JWT authenticator's configured issuer URL normalizes to the issuer the browser sign-in reports; otherwise one person gets two identities. A generic OAuth sign-in with no issuer extra is refused with 401, because keying it on the bare subject would resolve to an identity no issuer is bound to.
 
 Values that leave Obot use the subject alone (`ProviderSubject`): the auth provider's sessions table, the IdP user-ID attribution header, and the group lookup fallback. The vMCP revoke endpoint takes a bare subject in its path and resolves it under the issuer that authenticated the administrator.
 
-Upgrade: generic OAuth identities created before VD-7860 are keyed on the bare subject. A one-time background backfill (migration `identity_issuer_binding`) re-keys each one to the issuer configured at that time, read from `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER`; the row is decrypted and encrypted again, because its encryption context includes the key. An identity whose issuer-bound key is already taken is left alone and logged. Until the backfill is recorded, a sign-in whose qualified key has no row claims the subject-keyed row; afterwards a subject-keyed row is never claimed.
+Upgrade: generic OAuth identities created before VD-7860 are keyed on the bare subject. A one-time background backfill (migration `identity_issuer_binding`) re-keys each one to the issuer configured at that time, read from `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER`; the row is decrypted and encrypted again, because its encryption context includes the key. An identity whose issuer-bound key is already taken is left alone and logged. Until the backfill is recorded, a sign-in under the configured issuer whose qualified key has no row claims the subject-keyed row, because the backfill would bind that row to the same issuer. A sign-in under any other issuer, or with no issuer configured, never claims it, and after the backfill no sign-in does. The backfill runs in one transaction, so on a large identity table it can hold row locks that delay sign-ins until it commits.
 
 Limits:
 
-- Before the backfill runs, the first sign-in under any issuer can claim a subject-keyed identity. Do not repoint the provider during the upgrade itself.
-- With no issuer configured, the backfill records nothing and runs again at the next start.
-- A sign-in that carries no issuer extra stays keyed on the bare subject.
+- Repointing the provider to a new issuer before the backfill has run leaves subject-keyed identities unclaimed until the backfill binds them to the newly configured issuer. Do not repoint the provider during the upgrade itself.
+- With no issuer configured, the backfill records nothing, logs a warning, and retries every 10 seconds.
+- Generic OAuth has no SCIM adapter, so no generic OAuth identity is SCIM-pending and the backfill needs no SCIM exception.
 
 Account linking rules:
 

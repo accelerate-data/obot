@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"net/http"
 	"testing"
 
 	apitypes "github.com/obot-platform/obot/apiclient/types"
@@ -64,12 +65,7 @@ func signInGenericOAuth(t *testing.T, c *Client, providerUserID string) *gateway
 func insertLegacyGenericOAuthIdentity(t *testing.T, c *Client, subject string) uint {
 	t.Helper()
 
-	u := signInGenericOAuth(t, c, subject)
-	var stored gatewaytypes.Identity
-	require.NoError(t, c.db.WithContext(t.Context()).
-		Where("auth_provider_name = ? AND hashed_provider_user_id = ?", genericOAuthTestProviderName, hash.String(subject)).
-		First(&stored).Error)
-	return u.ID
+	return signInGenericOAuth(t, c, subject).ID
 }
 
 func configureGenericOAuthIssuer(t *testing.T, c *Client, issuer string) {
@@ -128,12 +124,56 @@ func TestSignInUnderAnotherIssuerWithACollidingSubjectIsASeparateUser(t *testing
 func TestSignInBeforeTheBackfillClaimsTheSubjectKeyedIdentity(t *testing.T) {
 	c := newIssuerBindingTestClient(t)
 	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
 
 	u := signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerA, "alice"))
 
 	require.Equal(t, legacyUserID, u.ID, "an existing user keeps their account across the upgrade")
 	require.Equal(t, map[string]uint{gatewaytypes.QualifyProviderUserID(issuerA, "alice"): legacyUserID}, storedProviderUserIDs(t, c),
 		"the claimed identity is re-keyed and re-encrypted under the issuer-bound ID")
+}
+
+func TestSignInBeforeTheBackfillUnderAnotherIssuerNeverClaimsTheSubjectKeyedIdentity(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+
+	u := signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerB, "alice"))
+
+	require.NotEqual(t, legacyUserID, u.ID, "only the configured issuer, which the backfill binds it to, may claim a subject-keyed identity")
+	require.Equal(t, map[string]uint{
+		"alice": legacyUserID,
+		gatewaytypes.QualifyProviderUserID(issuerB, "alice"): u.ID,
+	}, storedProviderUserIDs(t, c))
+}
+
+func TestSignInBeforeTheBackfillWithNoConfiguredIssuerNeverClaimsTheSubjectKeyedIdentity(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+
+	u := signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerA, "alice"))
+
+	require.NotEqual(t, legacyUserID, u.ID)
+}
+
+func TestClaimingTheSubjectKeyedIdentityKeepsTheSignInGroups(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+
+	id := genericOAuthSignIn(gatewaytypes.QualifyProviderUserID(issuerA, "alice"))
+	id.HashedProviderUserID = hash.String(id.ProviderUserID)
+	id.AuthProviderGroups = []gatewaytypes.Group{{ID: "group-1", Name: "Group 1"}}
+	var claimed bool
+	require.NoError(t, c.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		var err error
+		claimed, err = c.claimLegacyIssuerIdentityTx(t.Context(), tx, id)
+		return err
+	}))
+
+	require.True(t, claimed)
+	require.Equal(t, []gatewaytypes.Group{{ID: "group-1", Name: "Group 1"}}, id.AuthProviderGroups,
+		"the groups of this sign-in are not stored on the identity, so reading it back must not drop them")
 }
 
 func TestSignInAfterTheBackfillNeverClaimsASubjectKeyedIdentity(t *testing.T) {
@@ -211,7 +251,11 @@ func TestBackfillRunsOnce(t *testing.T) {
 func TestUserFromProviderUserIDFallsBackToTheSubjectKeyedIdentityOnlyBeforeTheBackfill(t *testing.T) {
 	c := newIssuerBindingTestClient(t)
 	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
 	qualified := gatewaytypes.QualifyProviderUserID(issuerA, "alice")
+
+	_, err := c.UserFromProviderUserID(t.Context(), system.DefaultNamespace, genericOAuthTestProviderName, gatewaytypes.QualifyProviderUserID(issuerB, "alice"))
+	require.True(t, errors.Is(err, gorm.ErrRecordNotFound), "another issuer must not resolve the subject-keyed identity; error = %v", err)
 
 	u, err := c.UserFromProviderUserID(t.Context(), system.DefaultNamespace, genericOAuthTestProviderName, qualified)
 	require.NoError(t, err)
@@ -244,14 +288,24 @@ func TestSignInProviderUserID(t *testing.T) {
 		authProvider string
 		info         user.Info
 		want         string
+		wantRefused  bool
 	}{
 		{name: "another auth provider keys on the subject", authProvider: "github-auth-provider", info: withIssuer, want: "alice"},
+		{name: "another auth provider with no issuer keys on the subject", authProvider: "github-auth-provider", info: withoutIssuer, want: "alice"},
 		{name: "generic OAuth binds the issuer", authProvider: genericOAuthTestProviderName, info: withIssuer, want: gatewaytypes.QualifyProviderUserID(issuerA, "alice")},
-		{name: "generic OAuth with no issuer keys on the subject", authProvider: genericOAuthTestProviderName, info: withoutIssuer, want: "alice"},
+		{name: "generic OAuth with no issuer is refused", authProvider: genericOAuthTestProviderName, info: withoutIssuer, wantRefused: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, signInProviderUserID(tt.authProvider, tt.info))
+			got, err := signInProviderUserID(tt.authProvider, tt.info)
+			if tt.wantRefused {
+				var httpErr *apitypes.ErrHTTP
+				require.ErrorAs(t, err, &httpErr)
+				require.Equal(t, http.StatusUnauthorized, httpErr.Code)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }

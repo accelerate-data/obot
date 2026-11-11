@@ -12,13 +12,17 @@ import (
 	"strconv"
 	"testing"
 
+	"github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/system"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 )
 
 func TestUserDecoratorKeepsAuthProviderMetadataAfterUIDDecoration(t *testing.T) {
-	const providerName = "generic-oauth-auth-provider"
+	const (
+		providerName = "generic-oauth-auth-provider"
+		issuer       = "https://idp.example.com"
+	)
 	c := newIdentityUserLimitTestClient(t)
 	decorator := NewUserDecorator(staticAuthenticator{
 		response: &authenticator.Response{
@@ -29,6 +33,7 @@ func TestUserDecoratorKeepsAuthProviderMetadataAfterUIDDecoration(t *testing.T) 
 					"email":                   {"alice@example.com"},
 					"auth_provider_name":      {providerName},
 					"auth_provider_namespace": {system.DefaultNamespace},
+					"auth_provider_issuer":    {issuer},
 				},
 			},
 		},
@@ -50,7 +55,7 @@ func TestUserDecoratorKeepsAuthProviderMetadataAfterUIDDecoration(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(identities) != 1 || identities[0].ProviderUserID != "studio-subject" {
+	if len(identities) != 1 || identities[0].ProviderUserID != types.QualifyProviderUserID(issuer, "studio-subject") {
 		t.Fatalf("expected the decorated user to own the studio-subject identity, got %+v", identities)
 	}
 	if got := resp.User.GetExtra()["auth_provider_name"]; len(got) != 1 || got[0] != providerName {

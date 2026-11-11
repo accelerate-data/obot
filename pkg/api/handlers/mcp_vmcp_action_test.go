@@ -404,6 +404,76 @@ func TestRevokeVMCPUserOAuthCredentialsKeepsAnotherProviderSubject(t *testing.T)
 	require.NoError(t, err)
 }
 
+// A generic OAuth identity is keyed on its issuer, so the path subject resolves only under the issuer that
+// authenticated the administrator, and never to the same subject from another issuer (VD-7860).
+func TestRevokeVMCPUserOAuthCredentialsResolvesGenericOAuthSubjectUnderAdminIssuer(t *testing.T) {
+	const (
+		adminIssuer = "https://idp.example.com"
+		subject     = "studio-departing-user"
+	)
+	for _, tt := range []struct {
+		name          string
+		grantIssuer   string
+		wantRevoked   bool
+		wantErrStatus int
+	}{
+		{name: "same issuer revokes the grant", grantIssuer: adminIssuer, wantRevoked: true},
+		// The subject resolves to the administrator's issuer's user, who has no connection to this vMCP; the other
+		// issuer's user, who does, is left alone.
+		{name: "other issuer keeps the grant", grantIssuer: "https://other-idp.example.com", wantErrStatus: http.StatusNotFound},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, storage, gatewayClient := newVMCPActionSessionManager(t, studioOffboardingDefaultRole())
+			adminIssuerUser := seedOffboardingUser(t, gatewayClient, gatewaytypes.QualifyProviderUserID(adminIssuer, subject), gatewaytypes.GenericOAuthAuthProviderName)
+			grantUser := adminIssuerUser
+			if tt.grantIssuer != adminIssuer {
+				grantUser = seedOffboardingUser(t, gatewayClient, gatewaytypes.QualifyProviderUserID(tt.grantIssuer, subject), gatewaytypes.GenericOAuthAuthProviderName)
+				require.NotEqual(t, adminIssuerUser, grantUser)
+			}
+
+			vmcp, instance, component, _ := vmcpActionObjects("vmcp1generic-issuer", grantUser, "component-a", false)
+			for _, object := range []kclient.Object{vmcp, instance, component} {
+				require.NoError(t, storage.Create(t.Context(), object))
+			}
+			require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(t.Context(), grantUser, component.Name, "https://mcp.example/", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "grant"}))
+
+			req := httptest.NewRequest(http.MethodDelete, "/api/vmcps/"+vmcp.Name+"/users/"+subject+"/oauth", nil)
+			req.SetPathValue("vmcp_id", vmcp.Name)
+			req.SetPathValue("user_id", subject)
+			err := (&MCPHandler{}).RevokeVMCPUserOAuthCredentials(api.Context{
+				ResponseWriter: httptest.NewRecorder(),
+				Request:        req,
+				Storage:        storage,
+				GatewayClient:  gatewayClient,
+				User: &kuser.DefaultInfo{
+					Name:   "generic-offboarding",
+					UID:    "999",
+					Groups: []string{types.GroupAuthenticated, types.GroupAdmin},
+					Extra: map[string][]string{
+						"auth_provider_name":      {gatewaytypes.GenericOAuthAuthProviderName},
+						"auth_provider_namespace": {system.DefaultNamespace},
+						"auth_provider_issuer":    {adminIssuer},
+					},
+				},
+			})
+			if tt.wantErrStatus != 0 {
+				var httpErr *types.ErrHTTP
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, tt.wantErrStatus, httpErr.Code)
+			} else {
+				require.NoError(t, err)
+			}
+
+			_, err = gatewayClient.GetMCPOAuthToken(t.Context(), grantUser, component.Name, "https://mcp.example/")
+			if tt.wantRevoked {
+				assert.ErrorIs(t, err, gorm.ErrRecordNotFound)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestRevokeVMCPUserOAuthCredentialsReportsMissingComponents(t *testing.T) {
 	_, storage, gatewayClient := newVMCPActionSessionManager(t, studioOffboardingDefaultRole())
 	targetUser := seedStudioOffboardingUser(t, gatewayClient, "studio-departing-user")

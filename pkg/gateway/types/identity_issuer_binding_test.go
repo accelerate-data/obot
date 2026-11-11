@@ -1,6 +1,10 @@
 package types
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/obot-platform/obot/pkg/oidcjwt"
+)
 
 func TestQualifyProviderUserIDBindsTheNormalizedIssuer(t *testing.T) {
 	tests := []struct {
@@ -70,5 +74,15 @@ func TestGroupLookupIDFallsBackToTheProviderSubject(t *testing.T) {
 	id := Identity{ProviderUserID: QualifyProviderUserID("https://idp.example.com", "alice")}
 	if got := id.GroupLookupID(); got != "alice" {
 		t.Fatalf("GroupLookupID() = %q, want the subject alice", got)
+	}
+}
+
+// The browser path keys an identity with NormalizeIssuer and the JWT path with oidcjwt.NormalizeIssuer; they derive the
+// same key only while the two agree.
+func TestNormalizeIssuerMatchesTheJWTPath(t *testing.T) {
+	for _, issuer := range []string{"", " ", "/", "https://idp.example.com", "  https://idp.example.com/  ", "https://idp.example.com//", "https://idp.example.com/tenant/"} {
+		if got, want := NormalizeIssuer(issuer), oidcjwt.NormalizeIssuer(issuer); got != want {
+			t.Fatalf("NormalizeIssuer(%q) = %q, but the JWT path normalizes it to %q", issuer, got, want)
+		}
 	}
 }
