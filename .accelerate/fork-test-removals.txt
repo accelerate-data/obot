@@ -107,9 +107,9 @@ pkg/mcp TestValidateCatalogEntryManifest_ContainerOAuth VD-7177 intentionally re
 
 # VD-7833 sync to upstream v0.28.0. Upstream #8415 (3886d6f8a, "Stop linking identities by
 # email and stop assigning roles by email") removed email-based account linking and dropped
-# users.verified_email; identity now binds on auth provider + provider user ID (plain `sub` for
-# generic OAuth; the key carries no issuer, VD-7860). The fork's trusted-issuer email linking has
-# nothing left to guard.
+# users.verified_email; identity now binds on auth provider + provider user ID (for generic OAuth
+# the provider user ID is bound to the issuer, VD-7860). The fork's trusted-issuer email linking
+# has nothing left to guard.
 pkg/gateway/client TestGenericOAuthLinksByEmailWhenIssuerTrustedAndEmailVerified VD-7833 upstream #8415 removed email account linking; no linking path remains
 pkg/gateway/client TestGenericOAuthDoesNotLinkWhenEmailVerifiedFalse VD-7833 upstream #8415 removed email account linking; sign-in never matches by email
 pkg/gateway/client TestGenericOAuthLinksWhenEmailVerifiedAbsentAndTrustEnabled VD-7833 upstream #8415 removed email account linking; no linking path remains
@@ -119,8 +119,8 @@ pkg/gateway/client TestUserDecoratorPassesGenericOAuthIssuerAndEmailVerified VD-
 pkg/gateway/client TestUserDecoratorRejectsInvalidEmailVerifiedValue VD-7833 upstream #8415 removed the Identity email-verified field; the decorator no longer parses it
 # VD-7833 review O1: TRUST_EMAIL_LINKING gated issuer changes only to decide whether email linking
 # could follow them; with email linking gone that gate is removed. It never addressed the remaining
-# issuer-change risk: the identity key has no issuer, so a colliding `sub` from a new IdP still signs
-# in as the existing user. That is tracked by VD-7860, not by this gate. The setting stays
+# issuer-change risk (a colliding `sub` from a new IdP signing in as an existing user); VD-7860
+# closes that by binding the issuer into the generic OAuth identity key. The setting stays
 # declared and inert (default "false") because the published providers registry still requires it;
 # issuer configuration is still validated (TestConfigureGenericOAuthRejectsInvalidIssuerConfiguration).
 pkg/api/handlers TestConfigureGenericOAuthIssuerChangeRequiresTrustReconfirmation VD-7833 O1 removed the trust-reconfirmation gate on issuer change; nothing is linked by email to protect
