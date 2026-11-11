@@ -412,15 +412,18 @@ func TestRevokeVMCPUserOAuthCredentialsResolvesGenericOAuthSubjectUnderAdminIssu
 		subject     = "studio-departing-user"
 	)
 	for _, tt := range []struct {
-		name          string
-		grantIssuer   string
-		wantRevoked   bool
-		wantErrStatus int
+		name            string
+		grantIssuer     string
+		omitAdminIssuer bool
+		wantRevoked     bool
+		wantErrStatus   int
 	}{
 		{name: "same issuer revokes the grant", grantIssuer: adminIssuer, wantRevoked: true},
 		// The subject resolves to the administrator's issuer's user, who has no connection to this vMCP; the other
 		// issuer's user, who does, is left alone.
 		{name: "other issuer keeps the grant", grantIssuer: "https://other-idp.example.com", wantErrStatus: http.StatusNotFound},
+		// No issuer-bound key can match an administrator authenticated without an issuer, so the request is refused.
+		{name: "administrator without an issuer is refused", grantIssuer: adminIssuer, omitAdminIssuer: true, wantErrStatus: http.StatusForbidden},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, storage, gatewayClient := newVMCPActionSessionManager(t, studioOffboardingDefaultRole())
@@ -437,6 +440,13 @@ func TestRevokeVMCPUserOAuthCredentialsResolvesGenericOAuthSubjectUnderAdminIssu
 			}
 			require.NoError(t, gatewayClient.ReplaceMCPOAuthToken(t.Context(), grantUser, component.Name, "https://mcp.example/", "", &oauth2.Config{}, &oauth2.Token{AccessToken: "grant"}))
 
+			extra := map[string][]string{
+				"auth_provider_name":      {gatewaytypes.GenericOAuthAuthProviderName},
+				"auth_provider_namespace": {system.DefaultNamespace},
+			}
+			if !tt.omitAdminIssuer {
+				extra["auth_provider_issuer"] = []string{adminIssuer}
+			}
 			req := httptest.NewRequest(http.MethodDelete, "/api/vmcps/"+vmcp.Name+"/users/"+subject+"/oauth", nil)
 			req.SetPathValue("vmcp_id", vmcp.Name)
 			req.SetPathValue("user_id", subject)
@@ -449,11 +459,7 @@ func TestRevokeVMCPUserOAuthCredentialsResolvesGenericOAuthSubjectUnderAdminIssu
 					Name:   "generic-offboarding",
 					UID:    "999",
 					Groups: []string{types.GroupAuthenticated, types.GroupAdmin},
-					Extra: map[string][]string{
-						"auth_provider_name":      {gatewaytypes.GenericOAuthAuthProviderName},
-						"auth_provider_namespace": {system.DefaultNamespace},
-						"auth_provider_issuer":    {adminIssuer},
-					},
+					Extra:  extra,
 				},
 			})
 			if tt.wantErrStatus != 0 {

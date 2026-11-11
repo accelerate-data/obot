@@ -1358,8 +1358,13 @@ func (m *MCPHandler) RevokeVMCPUserOAuthCredentials(req api.Context) error {
 	}
 	if providerName == gatewaytypes.GenericOAuthAuthProviderName {
 		// A generic OAuth identity is keyed on the issuer and the subject, and the path names only the subject, so the
-		// subject is resolved under the issuer that authenticated the administrator.
-		userID = gatewaytypes.QualifyProviderUserID(cmp.Or(req.User.GetExtra()["auth_provider_issuer"]...), userID)
+		// subject is resolved under the issuer that authenticated the administrator. Without that issuer no identity
+		// could match, so the request is refused rather than reported as not found.
+		issuer := cmp.Or(req.User.GetExtra()["auth_provider_issuer"]...)
+		if gatewaytypes.NormalizeIssuer(issuer) == "" {
+			return types.NewErrForbidden("administrator identity provider issuer is required for user offboarding")
+		}
+		userID = gatewaytypes.QualifyProviderUserID(issuer, userID)
 	}
 	target, err := req.GatewayClient.UserFromProviderUserID(req.Context(), providerNamespace, providerName, userID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {

@@ -178,14 +178,15 @@ Identities are keyed by provider namespace/name and a hash of the provider user 
 
 The issuer comes from the `auth_provider_issuer` user extra, which the proxy copies from the provider session state and the OIDC JWT authenticator sets from the token's `iss`. The two paths derive the same key only when the JWT authenticator's configured issuer URL normalizes to the issuer the browser sign-in reports; otherwise one person gets two identities. A generic OAuth sign-in with no issuer extra is refused with 401, because keying it on the bare subject would resolve to an identity no issuer is bound to.
 
-Values that leave Obot use the subject alone (`ProviderSubject`): the auth provider's sessions table, the IdP user-ID attribution header, and the group lookup fallback. The vMCP revoke endpoint takes a bare subject in its path and resolves it under the issuer that authenticated the administrator.
+Values that leave Obot use the subject alone (`ProviderSubject`): the auth provider's sessions table, the IdP user-ID attribution header, and the group lookup fallback. The vMCP revoke endpoint takes a bare subject in its path and resolves it under the issuer that authenticated the administrator; an administrator session with no issuer is refused with 403.
 
 Upgrade: generic OAuth identities created before VD-7860 are keyed on the bare subject. A one-time background backfill (migration `identity_issuer_binding`) re-keys each one to the issuer configured at that time, read from `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER`; the row is decrypted and encrypted again, because its encryption context includes the key. An identity whose issuer-bound key is already taken is left alone and logged. Until the backfill is recorded, a sign-in under the configured issuer whose qualified key has no row claims the subject-keyed row, because the backfill would bind that row to the same issuer. A sign-in under any other issuer, or with no issuer configured, never claims it, and after the backfill no sign-in does. The backfill runs in one transaction, so on a large identity table it can hold row locks that delay sign-ins until it commits.
 
 Limits:
 
 - Repointing the provider to a new issuer before the backfill has run leaves subject-keyed identities unclaimed until the backfill binds them to the newly configured issuer. Do not repoint the provider during the upgrade itself.
-- With no issuer configured, the backfill records nothing, logs a warning, and retries every 10 seconds.
+- With no issuer configured, the backfill records nothing, logs a warning, and retries every 10 seconds. It binds legacy identities to whichever issuer is configured first. An operator who removes the generic provider before the upgrade and later configures a different IdP therefore binds every legacy identity to that IdP, where a colliding subject signs in as the old user. Configure the original issuer first, or delete the legacy generic OAuth identities, before pointing the provider at a different IdP.
+- Browser sign-in depends on the provider daemon reporting `issuer` in its session state. A providers image that omits it refuses every generic OAuth browser sign-in with 401, so the pinned providers image must report it.
 - Generic OAuth has no SCIM adapter, so no generic OAuth identity is SCIM-pending and the backfill needs no SCIM exception.
 
 Account linking rules:
