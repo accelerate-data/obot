@@ -92,7 +92,7 @@ Authenticator-union semantics in Obot: each authenticator returns `(response, ok
 
 After successful validation, all JWTs go through one path:
 
-1. **Resolve or create the Obot user.** Use the same generic OAuth identity key the browser flow uses: `ProviderIssuer = <issuer>` and `ProviderUserID = "iss:<issuer>\x00sub:<sub>"`. If absent, create the record using the JWT's `email`, `email_verified`, `preferred_username`, `name`, and `picture` claims where present. Username selection follows the generic provider: prefer `preferred_username`, then `name`, then `email`, then `sub`.
+1. **Resolve or create the Obot user.** Use the same generic OAuth identity key the browser flow uses: `ProviderUserID = "iss:<normalized issuer>\nsub:<sub>"` (VD-7860). The authenticator sets the `auth_provider_issuer` extra, and the gateway's user decorator encodes it into the ID. If absent, create the record using the JWT's `email`, `email_verified`, `preferred_username`, `name`, and `picture` claims where present. Username selection follows the generic provider: prefer `preferred_username`, then `name`, then `email`, then `sub`.
 2. **Check the eligibility claim.** Configured name (default `eligible`). If absent or falsy, return a real error (401).
 3. **Derive groups from the roles claim.** The configured claim name defaults to `roles`. An owner-role match (default `["owner"]`) yields `types.RoleOwner.Groups()`. Otherwise, an admin-role match (default `["admin"]`) yields `types.RoleAdmin.Groups()` with `types.GroupOwner` removed. Otherwise the caller receives only `types.GroupAuthenticated`. Owner precedence keeps overlapping custom mappings deterministic.
 4. **Return `user.Info`** from the resolved/created Obot user with the derived groups. Include `auth_provider_user_id` in `Extra` for downstream setup/OAuth flows — same pattern the browser-flow authenticator uses.
@@ -112,7 +112,7 @@ The claim name is configured (default `roles`). Expected shape: array of role st
 
 ### Identity mapping with the existing OIDC provider
 
-The existing `generic-oauth-auth-provider` (browser flow) normalizes the configured issuer by trimming trailing slashes, then creates Obot users keyed by `ProviderIssuer = <normalized issuer>` and `ProviderUserID = "iss:<normalized issuer>\x00sub:<sub>"` through the identity layer at `pkg/gateway/client/identity.go`. This authenticator reuses the same lookup-or-create call and exact provider-user-ID shape. Order of events is not important: a service-identity JWT may create the Obot user record before any browser login, or vice versa. Subsequent events for the same user resolve to the same record.
+The existing `generic-oauth-auth-provider` (browser flow) normalizes the configured issuer by trimming trailing slashes, then creates Obot users keyed by `ProviderUserID = "iss:<normalized issuer>\nsub:<sub>"` through the identity layer at `pkg/gateway/client/identity.go` (encoding in `pkg/gateway/types/identity_issuer_binding.go`). This authenticator reuses the same lookup-or-create call and exact provider-user-ID shape. Order of events is not important: a service-identity JWT may create the Obot user record before any browser login, or vice versa. Subsequent events for the same user resolve to the same record.
 
 Email and display fields are display values only, not identity keys.
 

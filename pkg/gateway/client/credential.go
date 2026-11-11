@@ -229,13 +229,19 @@ func (e CredentialNotFoundError) Error() string {
 
 // RevealCredential returns the first credential matching name in the ordered list of contexts.
 func (c *Client) RevealCredential(ctx context.Context, contexts []string, name string) (types.Credential, error) {
+	return c.revealCredential(ctx, c.db.WithContext(ctx), contexts, name)
+}
+
+// revealCredential is RevealCredential through db, so a caller inside a transaction reads with it rather than waiting
+// for a second connection.
+func (c *Client) revealCredential(ctx context.Context, db *gorm.DB, contexts []string, name string) (types.Credential, error) {
 	var credential types.Credential
 	if len(contexts) == 0 {
 		return credential, CredentialNotFoundError{Contexts: contexts, Name: name}
 	}
 
 	for _, credentialContext := range contexts {
-		if err := c.db.WithContext(ctx).Where("context = ? AND name = ?", credentialContext, name).First(&credential).Error; err != nil {
+		if err := db.Where("context = ? AND name = ?", credentialContext, name).First(&credential).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				continue
 			}

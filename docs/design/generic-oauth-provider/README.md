@@ -12,11 +12,10 @@ status: draft
 > registry declares it as required. Retiring it from providers, then Obot and the Studio installers,
 > is a VD-7833 follow-up.
 >
-> **Issuer binding is not implemented.** The identity key is the provider name plus a hash of the
-> provider user ID, which is the plain OIDC `sub`; it carries no issuer. The issuer-bound storage
-> and issuer-change rules below are the intended design, not the as-built behaviour. Until VD-7860
-> adds the issuer to the identity key, do not repoint a configured generic provider at a different
-> IdP: a user there whose `sub` matches an existing identity signs in as that user.
+> **Issuer binding (VD-7860).** A generic OAuth identity is keyed on the issuer as well as the
+> subject: its provider user ID is `iss:<normalized issuer>\nsub:<sub>` before hashing, so a
+> subject from another issuer resolves to a separate user. See
+> [Issuer-bound identity key](#issuer-bound-identity-key) for the upgrade backfill and its limits.
 
 ## Overview
 
@@ -32,7 +31,7 @@ The goal is Langfuse-style custom provider support: an admin can configure an is
 - API and UI support for configuring the generic provider through the existing auth provider flow.
 - OIDC issuer discovery from `/.well-known/openid-configuration`.
 - A trust model for email/account linking (superseded in v0.28.0: nothing links by email).
-- Issuer-bound identity storage so the same provider type can be safely reconfigured (not implemented; VD-7860).
+- Issuer-bound identity storage so the same provider type can be safely reconfigured (VD-7860).
 - A provider daemon contract for OIDC security, profile mapping, validation, and runtime errors.
 - Documentation for configuring common OIDC providers.
 - Backend, provider/runtime, UI, and route-level tests for provider configuration and login wiring.
@@ -54,7 +53,7 @@ The goal is Langfuse-style custom provider support: an admin can configure an is
 | Required fields are display name, issuer URL, client ID, client secret, and email domains. | These match the Langfuse-style configuration model and give admins the minimum operator-controlled inputs for a standard OIDC login. Email domains remain the primary Obot-side access gate. |
 | Scope defaults to `openid email profile`. | This is the common baseline for OIDC login and can be overridden for providers that require custom scopes. |
 | Make trusted email linking an explicit provider configuration value. | The provider is first-class, but the trust decision should be visible to admins and bound to the configured issuer, not hidden in a hardcoded provider-name allowlist. |
-| Persist issuer identity with Obot identities. | OIDC `sub` values are only unique within an issuer. Generic provider identities need issuer binding to avoid collisions after reconfiguration. Not implemented: the identity key has no issuer (VD-7860). |
+| Persist issuer identity with Obot identities. | OIDC `sub` values are only unique within an issuer. Generic provider identities need issuer binding to avoid collisions after reconfiguration. The issuer is encoded into the provider user ID before hashing (VD-7860). |
 | Preserve the existing one-configured-provider rule. | `AuthProviderHandler.Configure` currently rejects configuring a second provider. This feature adds a provider type; it does not change active-provider cardinality. |
 | Defer generic group mapping. | Vendor-specific group APIs belong in dedicated providers. Standard group-claim mapping can be added later with a separate design and tests. |
 | Validate the issuer before reporting the provider as usable. | Generic configuration has more typo and compatibility risk than GitHub/Google. Admins need synchronous validation or an explicit test action before login depends on the provider. |
@@ -86,7 +85,7 @@ generic OIDC provider daemon
 proxy and gateway complete login through provider daemon
         │
         ▼
-identity is stored with provider name + subject (issuer fingerprint planned, VD-7860)
+identity is stored with provider name + hash of (normalized issuer, subject)
 ```
 
 The existing auth provider API remains the primary surface. The generic provider appears in `GET /api/auth-providers` with provider metadata and configuration parameters. Admins configure it through `POST /api/auth-providers/generic-oauth-auth-provider/configure`.
@@ -173,12 +172,30 @@ Generic identities must be bound to both:
 - Provider resource identity: `default/generic-oauth-auth-provider`.
 - Issuer identity: canonical issuer URL or a stable issuer fingerprint derived from the validated discovery document.
 
-Current identities are keyed by provider namespace/name and provider user ID. The implementation should add issuer binding for generic OAuth identities, either by adding an issuer/fingerprint field to the identity model or by including a canonical issuer component in the generic provider user ID before hashing. The implementation plan must choose one approach and include migration/backward-compatibility handling.
+### Issuer-bound identity key
+
+Identities are keyed by provider namespace/name and a hash of the provider user ID. For `generic-oauth-auth-provider`, the provider user ID carries the issuer: `iss:<normalized issuer>\nsub:<sub>`, where the issuer is trimmed and has trailing slashes removed (`pkg/gateway/types/identity_issuer_binding.go`). Encoding the issuer into the ID needs no schema change, and the same subject under two issuers hashes to two keys. Other providers keep the bare subject.
+
+The issuer comes from the `auth_provider_issuer` user extra, which the proxy copies from the provider session state and the OIDC JWT authenticator sets from the token's `iss`. The two paths derive the same key only when the JWT authenticator's configured issuer URL normalizes to the issuer the browser sign-in reports; otherwise one person gets two identities. A generic OAuth sign-in with no issuer extra is refused with 401, because keying it on the bare subject would resolve to an identity no issuer is bound to.
+
+Values that leave Obot use the subject alone (`ProviderSubject`): the auth provider's sessions table, the IdP user-ID attribution header, and the group lookup fallback. The vMCP revoke endpoint takes a bare subject in its path and resolves it under the issuer that authenticated the administrator; an administrator session with no issuer is refused with 403.
+
+Gateway bearer tokens (`AuthToken` rows) record the provider user ID their user signed in with, which for tokens issued before VD-7860 is the bare subject. The token reviewer (`GatewayTokenSignIn`, `pkg/gateway/client/gateway_token_sign_in.go`) takes the issuer from the token's own user: the issuer of that user's identity with the token's subject. The configured issuer is never used for an identity that is already bound, so repointing the provider cannot move a token onto another user's identity. An identity still keyed on the bare subject gets the configured issuer only while the backfill could still bind it there: before the backfill has run, and while no other identity holds that issuer-bound key. The backfill leaves an identity bare when its issuer-bound key is taken, and that key belongs to someone else, so such a token gets no issuer. A token gets no issuer, and is refused with 401, when its user has no identity with its subject, when those identities are bound to more than one issuer, or when its bare identity can no longer be bound.
+
+Upgrade: generic OAuth identities created before VD-7860 are keyed on the bare subject. A one-time background backfill (migration `identity_issuer_binding`) re-keys each one to the issuer configured at that time, read from `OBOT_GENERIC_OAUTH_AUTH_PROVIDER_ISSUER`; the row is decrypted and encrypted again, because its encryption context includes the key. An identity whose issuer-bound key is already taken is left alone and logged. Until the backfill is recorded, a sign-in under the configured issuer whose qualified key has no row claims the subject-keyed row, because the backfill would bind that row to the same issuer. A sign-in under any other issuer, or with no issuer configured, never claims it, and after the backfill no sign-in does. The backfill runs in one transaction, so on a large identity table it can hold row locks that delay sign-ins until it commits.
+
+Limits:
+
+- Repointing the provider to a new issuer before the backfill has run leaves subject-keyed identities unclaimed until the backfill binds them to the newly configured issuer. Do not repoint the provider during the upgrade itself.
+- With no issuer configured, the backfill records nothing, logs once that it is waiting for an issuer, and retries every 10 seconds without a restart. It binds legacy identities to whichever issuer is configured first. An operator who removes the generic provider before the upgrade and later configures a different IdP therefore binds every legacy identity to that IdP, where a colliding subject signs in as the old user. Configure the original issuer first, or delete the legacy generic OAuth identities, before pointing the provider at a different IdP.
+- A backfill that keeps failing, for example on an identity that cannot be decrypted, records nothing and retries every 10 seconds. Until it succeeds, the lazy claim and the gateway-token binding stay open to the configured issuer, so repointing the provider at a different IdP in that window lets that IdP's colliding subjects claim legacy accounts. Fix or delete the failing identity before repointing the provider.
+- Browser sign-in depends on the provider daemon reporting `issuer` in its session state. A providers image that omits it refuses every generic OAuth browser sign-in with 401, so the pinned providers image must report it.
+- Generic OAuth has no SCIM adapter, so no generic OAuth identity is SCIM-pending and the backfill needs no SCIM exception.
 
 Account linking rules:
 
 - Obot does not link accounts by email (upstream obot#8415). A login binds only on auth provider plus provider user ID.
-- Reconfiguring the generic provider to a different issuer must not allow the new issuer to claim identities or sessions created by the previous issuer.
+- Reconfiguring the generic provider to a different issuer does not let the new issuer claim identities created by the previous issuer: its subjects hash to different keys.
 
 The provider daemon should return stable identity fields:
 
@@ -193,7 +210,7 @@ The provider daemon should return stable identity fields:
 
 Changing the issuer URL for `generic-oauth-auth-provider` is a trust-boundary change, not a routine credential edit.
 
-None of the rules in this section are implemented: Obot validates the new issuer but keeps existing identities and sessions. VD-7860 tracks issuer binding.
+As built (VD-7860), the new issuer is a distinct identity namespace, so its `sub` values never resolve to identities from the previous issuer. Existing sessions are not invalidated: a session keeps the issuer it was created under and resolves to that issuer's identity. The remaining rules below are not implemented.
 
 When the configured issuer changes, Obot should:
 
@@ -274,7 +291,9 @@ Dedicated providers may still be preferable when Obot needs vendor-specific grou
 | `apiclient/types/authprovider.go` | Defines API-facing auth provider types. |
 | `pkg/api/handlers/authprovider.go` | Implements list, configure, reveal, and deconfigure auth provider APIs. |
 | `pkg/gateway/server/dispatcher/dispatcher.go` | Launches provider commands with stored credential environment variables. |
-| `pkg/gateway/types/identity.go` | Defines identity storage and needs issuer binding for generic OAuth. |
+| `pkg/gateway/types/identity.go` | Defines identity storage. |
+| `pkg/gateway/types/identity_issuer_binding.go` | Encodes the issuer into the generic OAuth provider user ID. |
+| `pkg/gateway/client/identity_issuer_rekey.go` | Re-keys pre-binding identities: the upgrade backfill and the pre-backfill sign-in claim. |
 | `pkg/gateway/client/identity.go` | Defines verified-provider identity linking behavior. |
 | `pkg/gateway/client/user.go` | Maps provider profile responses into user display name and icon fields. |
 | `pkg/proxy/proxy.go` | Consumes auth-provider state and provider username/email fields during login. |
@@ -319,6 +338,6 @@ Documentation verification should use the repo's existing docs build or lint com
 
 ## Open Questions
 
-1. `[implementation]` Should issuer binding be stored as a new identity field or encoded into the generic provider user ID before hashing?
+1. `[implementation]` Should issuer binding be stored as a new identity field or encoded into the generic provider user ID before hashing? Answered (VD-7860): encoded into the provider user ID.
 2. `[implementation]` If the current provider image lacks a generic OIDC command, which repository owns adding and releasing that command?
 3. `[implementation]` Should configure perform synchronous validation, or should the UI add an explicit test-connection action that gates the configured status?

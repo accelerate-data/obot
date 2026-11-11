@@ -233,7 +233,11 @@ func (c *Client) UserFromProviderUserID(ctx context.Context, providerNamespace, 
 	u := new(types.User)
 	if err := c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		id := new(types.Identity)
-		if err := tx.Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", providerNamespace, providerName, hash.String(providerUserID)).First(id).Error; err != nil {
+		err := tx.Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", providerNamespace, providerName, hash.String(providerUserID)).First(id).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			err = c.legacyIssuerIdentityTx(ctx, tx, providerNamespace, providerName, providerUserID, id)
+		}
+		if err != nil {
 			return err
 		}
 		return tx.Where("id = ? AND deleted_at IS NULL", id.UserID).First(u).Error

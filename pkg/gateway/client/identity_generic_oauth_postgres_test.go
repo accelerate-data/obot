@@ -145,7 +145,7 @@ func newGenericOAuthConcurrentTestIdentity() *gatewaytypes.Identity {
 		AuthProviderName:      genericOAuthTestProviderName,
 		AuthProviderNamespace: system.DefaultNamespace,
 		ProviderUsername:      "alice@example.com",
-		ProviderUserID:        "iss:https://issuer.example.com/|sub:alice",
+		ProviderUserID:        gatewaytypes.QualifyProviderUserID("https://issuer.example.com/", "alice"),
 	}
 }
 
@@ -191,4 +191,79 @@ func waitForPostgresRelationLockWaiters(ctx context.Context, db *gorm.DB, relati
 		case <-ticker.C:
 		}
 	}
+}
+
+// The backfill pages identities by a row-value keyset comparison; this proves that comparison on PostgreSQL, the
+// production database, across a batch boundary.
+func TestBackfillIdentityIssuerBindingAcrossBatchesOnPostgres(t *testing.T) {
+	c := newPostgresIssuerBindingTestClient(t)
+
+	want := make(map[string]uint, identityIssuerBindingBatchSize+1)
+	for i := range identityIssuerBindingBatchSize + 1 {
+		subject := fmt.Sprintf("subject-%d", i)
+		want[gatewaytypes.QualifyProviderUserID(issuerA, subject)] = insertLegacyGenericOAuthIdentity(t, c, subject)
+	}
+	configureGenericOAuthIssuer(t, c, issuerA)
+
+	if err := c.BackfillIdentityIssuerBinding(t.Context()); err != nil {
+		t.Fatalf("backfilling the issuer binding: %v", err)
+	}
+
+	got := storedProviderUserIDs(t, c)
+	if len(got) != len(want) {
+		t.Fatalf("identities after the backfill = %d, want %d", len(got), len(want))
+	}
+	for providerUserID, userID := range want {
+		if got[providerUserID] != userID {
+			t.Fatalf("identity %q belongs to user %d, want %d", providerUserID, got[providerUserID], userID)
+		}
+	}
+	done, err := c.identityIssuerBindingDone(c.db.WithContext(t.Context()))
+	if err != nil || !done {
+		t.Fatalf("issuer binding recorded = %v, %v; want true, nil", done, err)
+	}
+}
+
+// Before the backfill, a sign-in under the configured issuer claims the identity keyed on its bare subject; the same
+// subject under another issuer is a different person.
+func TestLegacyIdentityClaimOnlyUnderTheConfiguredIssuerOnPostgres(t *testing.T) {
+	c := newPostgresIssuerBindingTestClient(t)
+
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "subject")
+	configureGenericOAuthIssuer(t, c, issuerA)
+
+	other := signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerB, "subject"))
+	if other.ID == legacyUserID {
+		t.Fatalf("a sign-in under another issuer resolved the legacy user %d", legacyUserID)
+	}
+	claimed := signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerA, "subject"))
+	if claimed.ID != legacyUserID {
+		t.Fatalf("a sign-in under the configured issuer resolved user %d, want the legacy user %d", claimed.ID, legacyUserID)
+	}
+	got := storedProviderUserIDs(t, c)
+	if _, ok := got["subject"]; ok {
+		t.Fatalf("the legacy identity is still keyed on its bare subject after the claim: %v", got)
+	}
+}
+
+func newPostgresIssuerBindingTestClient(t *testing.T) *Client {
+	t.Helper()
+
+	scopedDSN, _ := newCredentialLockPostgresTest(t)
+	database := newPostgresUserLimitTestDB(t, scopedDSN)
+	if err := database.WithContext(t.Context()).AutoMigrate(
+		&gatewaytypes.Migration{},
+		&gatewaytypes.User{},
+		&gatewaytypes.Identity{},
+		&gatewaytypes.SCIMConnection{},
+		&gatewaytypes.SCIMUserBinding{},
+		&gatewaytypes.ClaudeEnvironment{},
+		&gatewaytypes.Credential{},
+		&gatewaytypes.Group{},
+		&gatewaytypes.GroupMemberships{},
+		&gatewaytypes.GroupRoleAssignment{},
+	); err != nil {
+		t.Fatalf("migrating PostgreSQL gateway tables for issuer binding: %v", err)
+	}
+	return newPostgresGenericOAuthTestClient(database)
 }
