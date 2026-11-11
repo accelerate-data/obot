@@ -115,3 +115,38 @@ func TestGatewayTokenSignInOfAnIssuerBoundTokenUsesItsIssuer(t *testing.T) {
 	require.Equal(t, "alice", sub)
 	require.Equal(t, gatewaytypes.NormalizeIssuer(issuerA), issuer)
 }
+
+func TestGatewayTokenOfAnIdentityTheBackfillLeftBareIsRefused(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	bound := signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerA, "alice"))
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+	require.NoError(t, c.BackfillIdentityIssuerBinding(t.Context()))
+
+	u, err := signInWithGatewayToken(t, c, legacyUserID, "alice")
+
+	requireRefused(t, err)
+	require.Nil(t, u, "the token must never resolve to the user who holds the issuer-bound key: %d", bound.ID)
+}
+
+func TestGatewayTokenBeforeTheBackfillWhoseIssuerBoundKeyIsTakenIsRefused(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	signInGenericOAuth(t, c, gatewaytypes.QualifyProviderUserID(issuerA, "alice"))
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+
+	_, err := signInWithGatewayToken(t, c, legacyUserID, "alice")
+
+	requireRefused(t, err)
+}
+
+func TestGatewayTokenOfABareIdentityAfterTheBackfillIsRefused(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+	recordIssuerBinding(t, c)
+
+	_, err := signInWithGatewayToken(t, c, legacyUserID, "alice")
+
+	requireRefused(t, err)
+}
