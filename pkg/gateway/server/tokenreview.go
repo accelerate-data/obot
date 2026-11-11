@@ -45,16 +45,25 @@ func (g *gatewayTokenReview) AuthenticateRequest(req *http.Request) (*authentica
 		return nil, false, err
 	}
 
+	subject, issuer, err := g.gatewayClient.GatewayTokenSignIn(req.Context(), u.ID, namespace, name, providerUserID)
+	if err != nil {
+		return nil, false, err
+	}
+	extra := map[string][]string{
+		"email":                   {u.Email},
+		"auth_provider_namespace": {namespace},
+		"auth_provider_name":      {name},
+		"auth_provider_groups":    groupIDs,
+	}
+	if issuer != "" {
+		extra["auth_provider_issuer"] = []string{issuer}
+	}
+
 	return &authenticator.Response{
 		User: &user.DefaultInfo{
-			Name: u.Username,
-			UID:  providerUserID,
-			Extra: map[string][]string{
-				"email":                   {u.Email},
-				"auth_provider_namespace": {namespace},
-				"auth_provider_name":      {name},
-				"auth_provider_groups":    groupIDs,
-			},
+			Name:  u.Username,
+			UID:   subject,
+			Extra: extra,
 		},
 	}, true, nil
 }
