@@ -1,13 +1,15 @@
 package types
 
-import "strings"
-
-// GenericOAuthAuthProviderName is the auth provider whose identities bind the issuer into their provider user ID.
-// Its issuer is admin-configurable, so a subject alone does not identify a user: the same subject from a different
-// issuer is a different person.
-const GenericOAuthAuthProviderName = "generic-oauth-auth-provider"
+import (
+	"strings"
+)
 
 const (
+	// GenericOAuthAuthProviderName is the auth provider whose identities bind the issuer into their provider user ID.
+	// Its issuer is admin-configurable, so a subject alone does not identify a user: the same subject from a different
+	// issuer is a different person.
+	GenericOAuthAuthProviderName = "generic-oauth-auth-provider"
+
 	qualifiedIssuerPrefix  = "iss:"
 	qualifiedSubjectPrefix = "\nsub:"
 )
