@@ -59,7 +59,7 @@ func (u UserDecorator) AuthenticateRequest(req *http.Request) (*authenticator.Re
 			AuthProviderName:      authProviderName,
 			AuthProviderNamespace: authProviderNamespace,
 			ProviderUsername:      resp.User.GetName(),
-			ProviderUserID:        resp.User.GetUID(),
+			ProviderUserID:        signInProviderUserID(authProviderName, resp.User),
 		}
 
 		userLimit, err := u.resolveUserLimit(req.Context())
@@ -126,4 +126,15 @@ func (u UserDecorator) resolveUserLimit(ctx context.Context) (UserLimit, error) 
 	}
 
 	return userLimit, nil
+}
+
+// signInProviderUserID returns the provider user ID that a sign-in's identity is keyed on. A generic OAuth sign-in
+// binds its subject to the issuer that vouched for it, because the issuer is admin-configurable and a subject is only
+// unique within one issuer: without the binding, repointing the provider at another identity provider would let a
+// colliding subject sign in as an existing user.
+func signInProviderUserID(authProviderName string, u user.Info) string {
+	if authProviderName != types.GenericOAuthAuthProviderName {
+		return u.GetUID()
+	}
+	return types.QualifyProviderUserID(cmp.Or(u.GetExtra()["auth_provider_issuer"]...), u.GetUID())
 }

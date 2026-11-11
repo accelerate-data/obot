@@ -20,6 +20,7 @@ import (
 	"github.com/obot-platform/obot/pkg/accesscontrolrule"
 	"github.com/obot-platform/obot/pkg/api"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
+	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 	"github.com/obot-platform/obot/pkg/mcptrigger"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -1354,6 +1355,11 @@ func (m *MCPHandler) RevokeVMCPUserOAuthCredentials(req api.Context) error {
 	providerName, providerNamespace := req.AuthProviderNameAndNamespace()
 	if providerName == "" || providerNamespace == "" {
 		return types.NewErrForbidden("administrator identity provider is required for user offboarding")
+	}
+	if providerName == gatewaytypes.GenericOAuthAuthProviderName {
+		// A generic OAuth identity is keyed on the issuer and the subject, and the path names only the subject, so the
+		// subject is resolved under the issuer that authenticated the administrator.
+		userID = gatewaytypes.QualifyProviderUserID(cmp.Or(req.User.GetExtra()["auth_provider_issuer"]...), userID)
 	}
 	target, err := req.GatewayClient.UserFromProviderUserID(req.Context(), providerNamespace, providerName, userID)
 	if errors.Is(err, gorm.ErrRecordNotFound) {

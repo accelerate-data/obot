@@ -145,7 +145,7 @@ func newGenericOAuthConcurrentTestIdentity() *gatewaytypes.Identity {
 		AuthProviderName:      genericOAuthTestProviderName,
 		AuthProviderNamespace: system.DefaultNamespace,
 		ProviderUsername:      "alice@example.com",
-		ProviderUserID:        "iss:https://issuer.example.com/|sub:alice",
+		ProviderUserID:        gatewaytypes.QualifyProviderUserID("https://issuer.example.com/", "alice"),
 	}
 }
 

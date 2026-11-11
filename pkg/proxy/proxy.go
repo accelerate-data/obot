@@ -418,8 +418,9 @@ func (p *Proxy) authenticateRequest(req *http.Request) (*authenticator.Response,
 		// This is set if the auth provider needed to refresh the token.
 		u.Extra["set-cookies"] = ss.SetCookies
 	}
-	// The gateway links a generic OAuth identity by email only for a trusted issuer
-	// that verified the address, so both must reach it from the provider state.
+	// The gateway keys a generic OAuth identity on the issuer and the subject, and links
+	// it by email only for a trusted issuer that verified the address, so both must
+	// reach it from the provider state.
 	if ss.Issuer != "" {
 		u.Extra["auth_provider_issuer"] = []string{ss.Issuer}
 	}

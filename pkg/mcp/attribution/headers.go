@@ -139,7 +139,8 @@ func selectedIDPUserID(ctx context.Context, reader IdentityReader, selected []ty
 	if len(identities) != 1 {
 		return "", nil
 	}
-	return identities[0].ProviderUserID, nil
+	// The destination expects the subject its IdP issued, not Obot's issuer-bound key.
+	return gatewaytypes.ProviderSubject(identities[0].ProviderUserID), nil
 }
 
 // Selected copies only the destination's selected attribution from trusted internal

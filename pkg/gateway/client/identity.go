@@ -438,9 +438,15 @@ func (c *Client) ensureIdentityUser(ctx context.Context, tx *gorm.DB, mode *scim
 		if err := mode.lock(tx); err != nil {
 			return nil, false, false, err
 		}
-		claimed, err := c.claimSCIMIdentityTx(ctx, tx, mode, id)
+		claimed, err := c.claimLegacyIssuerIdentityTx(ctx, tx, id)
 		if err != nil {
 			return nil, false, false, err
+		}
+		if !claimed {
+			claimed, err = c.claimSCIMIdentityTx(ctx, tx, mode, id)
+			if err != nil {
+				return nil, false, false, err
+			}
 		}
 		if !claimed {
 			if err := c.createSignInIdentityTx(ctx, tx, mode, id); err != nil {

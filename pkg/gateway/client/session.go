@@ -73,7 +73,8 @@ func (c *Client) deleteSessionsForUser(ctx context.Context, db *gorm.DB, storage
 			continue
 		}
 
-		user := identity.ProviderUserID
+		// The sessions table holds the provider's subject, not Obot's issuer-bound key.
+		user := types.ProviderSubject(identity.ProviderUserID)
 		if identity.AuthProviderName == "github-auth-provider" && identity.AuthProviderNamespace == system.DefaultNamespace {
 			// The GitHub auth provider stores the username as the user ID in the sessions table.
 			// This is because of an annoying quirk of the oauth2-proxy code for GitHub,

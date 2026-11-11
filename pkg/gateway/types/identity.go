@@ -39,7 +39,8 @@ func (i Identity) GroupLookupID() string {
 	if i.ProviderGroupLookupID != "" {
 		return i.ProviderGroupLookupID
 	}
-	return i.ProviderUserID
+	// An issuer-bound ID is Obot's key, not something the provider can resolve.
+	return ProviderSubject(i.ProviderUserID)
 }
 
 func (i Identity) GetAuthProviderGroupIDs() []string {
