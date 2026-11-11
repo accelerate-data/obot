@@ -68,13 +68,11 @@ func (c *Client) bareIdentityIssuer(ctx context.Context, providerNamespace, prov
 	if err != nil || issuer == "" {
 		return "", err
 	}
-	var taken int64
-	if err := db.Model(new(types.Identity)).
-		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", providerNamespace, providerName, hash.String(types.QualifyProviderUserID(issuer, subject))).
-		Count(&taken).Error; err != nil {
+	taken, err := identityKeyExists(db, providerNamespace, providerName, hash.String(types.QualifyProviderUserID(issuer, subject)))
+	if err != nil {
 		return "", fmt.Errorf("failed to check for an identity with the issuer-bound key: %w", err)
 	}
-	if taken > 0 {
+	if taken {
 		return "", nil
 	}
 	return issuer, nil

@@ -192,7 +192,7 @@ func TestClaimAfterAConcurrentRekeyResolvesTheRekeyedIdentity(t *testing.T) {
 		if err := tx.Where("auth_provider_name = ? AND hashed_provider_user_id = ?", genericOAuthTestProviderName, hash.String("alice")).First(&legacy).Error; err != nil {
 			return err
 		}
-		if ok, err := c.rekeyIdentityTx(t.Context(), tx, legacy, qualified); err != nil || !ok {
+		if moved, _, err := c.rekeyIdentityTx(t.Context(), tx, legacy, qualified); err != nil || !moved {
 			return errors.Join(err, errors.New("the concurrent re-key did not apply"))
 		}
 		var err error
@@ -284,6 +284,54 @@ func TestBackfillLeavesAnIdentityWhoseIssuerBoundKeyIsTaken(t *testing.T) {
 		gatewaytypes.QualifyProviderUserID(issuerA, "alice"): bound.ID,
 		"alice": legacyUserID,
 	}, storedProviderUserIDs(t, c))
+}
+
+func TestRekeyOfAnIdentityAlreadyMovedIsNotATakenKey(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+	configureGenericOAuthIssuer(t, c, issuerA)
+	qualified := gatewaytypes.QualifyProviderUserID(issuerA, "alice")
+
+	// The backfill read this row, then a sign-in claimed and re-keyed it before the backfill's re-key ran.
+	var stale gatewaytypes.Identity
+	require.NoError(t, c.db.WithContext(t.Context()).
+		Where("auth_provider_name = ? AND hashed_provider_user_id = ?", genericOAuthTestProviderName, hash.String("alice")).
+		First(&stale).Error)
+	signInGenericOAuth(t, c, qualified)
+
+	var moved, keyTaken bool
+	require.NoError(t, c.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		var err error
+		moved, keyTaken, err = c.rekeyIdentityTx(t.Context(), tx, stale, qualified)
+		return err
+	}))
+
+	require.False(t, moved)
+	require.False(t, keyTaken, "the identity was moved by the claim, so no other identity owns its issuer-bound key")
+	require.Equal(t, map[string]uint{qualified: legacyUserID}, storedProviderUserIDs(t, c))
+}
+
+func TestRekeyOntoAnotherIdentitysKeyIsATakenKey(t *testing.T) {
+	c := newIssuerBindingTestClient(t)
+	qualified := gatewaytypes.QualifyProviderUserID(issuerA, "alice")
+	bound := signInGenericOAuth(t, c, qualified)
+	legacyUserID := insertLegacyGenericOAuthIdentity(t, c, "alice")
+
+	var legacy gatewaytypes.Identity
+	require.NoError(t, c.db.WithContext(t.Context()).
+		Where("auth_provider_name = ? AND hashed_provider_user_id = ?", genericOAuthTestProviderName, hash.String("alice")).
+		First(&legacy).Error)
+
+	var moved, keyTaken bool
+	require.NoError(t, c.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		var err error
+		moved, keyTaken, err = c.rekeyIdentityTx(t.Context(), tx, legacy, qualified)
+		return err
+	}))
+
+	require.False(t, moved)
+	require.True(t, keyTaken, "another identity owns the issuer-bound key while this one still has its old key")
+	require.Equal(t, map[string]uint{qualified: bound.ID, "alice": legacyUserID}, storedProviderUserIDs(t, c))
 }
 
 func TestBackfillRunsOnce(t *testing.T) {

@@ -30,28 +30,32 @@ var (
 )
 
 // rekeyIdentityTx moves the stored identity to the provider user ID newProviderUserID. The encryption context includes
-// the key, so the identity is decrypted with the old key and encrypted again with the new one. It reports false, and
-// writes nothing, when the identity no longer has its old key or an identity already has the new one.
-func (c *Client) rekeyIdentityTx(ctx context.Context, tx *gorm.DB, stored types.Identity, newProviderUserID string) (bool, error) {
+// the key, so the identity is decrypted with the old key and encrypted again with the new one. It writes nothing, and
+// reports moved false, when the identity no longer has its old key or an identity already has the new one. keyTaken
+// reports only the second case while the identity still has its old key: another identity owns the new key, so this
+// one stays where it is. An identity already moved by a concurrent re-key, whose old key is gone, is not keyTaken.
+func (c *Client) rekeyIdentityTx(ctx context.Context, tx *gorm.DB, stored types.Identity, newProviderUserID string) (moved, keyTaken bool, err error) {
 	newHash := hash.String(newProviderUserID)
-	var taken int64
-	if err := tx.Model(new(types.Identity)).
-		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", stored.AuthProviderNamespace, stored.AuthProviderName, newHash).
-		Count(&taken).Error; err != nil {
-		return false, fmt.Errorf("failed to check for an identity with the issuer-bound key: %w", err)
+	taken, err := identityKeyExists(tx, stored.AuthProviderNamespace, stored.AuthProviderName, newHash)
+	if err != nil {
+		return false, false, fmt.Errorf("failed to check for an identity with the issuer-bound key: %w", err)
 	}
-	if taken > 0 {
-		return false, nil
+	if taken {
+		stillStored, err := identityKeyExists(tx, stored.AuthProviderNamespace, stored.AuthProviderName, stored.HashedProviderUserID)
+		if err != nil {
+			return false, false, fmt.Errorf("failed to check for the identity with its old key: %w", err)
+		}
+		return false, stillStored, nil
 	}
 
 	rekeyed := stored
 	if err := c.decryptStoredIdentity(ctx, &rekeyed); err != nil {
-		return false, err
+		return false, false, err
 	}
 	rekeyed.ProviderUserID = newProviderUserID
 	rekeyed.HashedProviderUserID = newHash
 	if err := c.encryptIdentity(ctx, &rekeyed); err != nil {
-		return false, fmt.Errorf("failed to encrypt identity: %w", err)
+		return false, false, fmt.Errorf("failed to encrypt identity: %w", err)
 	}
 	columns := identityEncryptedColumns(&rekeyed)
 	columns["hashed_provider_user_id"] = newHash
@@ -59,9 +63,20 @@ func (c *Client) rekeyIdentityTx(ctx context.Context, tx *gorm.DB, stored types.
 		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", stored.AuthProviderNamespace, stored.AuthProviderName, stored.HashedProviderUserID).
 		UpdateColumns(columns)
 	if result.Error != nil {
-		return false, fmt.Errorf("failed to re-key the identity: %w", result.Error)
+		return false, false, fmt.Errorf("failed to re-key the identity: %w", result.Error)
 	}
-	return result.RowsAffected > 0, nil
+	return result.RowsAffected > 0, false, nil
+}
+
+// identityKeyExists reports whether an identity of the given auth provider has the hashed provider user ID.
+func identityKeyExists(db *gorm.DB, providerNamespace, providerName, hashedProviderUserID string) (bool, error) {
+	var count int64
+	if err := db.Model(new(types.Identity)).
+		Where("auth_provider_namespace = ? AND auth_provider_name = ? AND hashed_provider_user_id = ?", providerNamespace, providerName, hashedProviderUserID).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 // legacyIssuerSubjectTx reports the subject of the issuer-bound providerUserID when an identity keyed on that bare
@@ -106,7 +121,7 @@ func (c *Client) claimLegacyIssuerIdentityTx(ctx context.Context, tx *gorm.DB, i
 		return false, fmt.Errorf("failed to look up the identity keyed on the subject: %w", err)
 	}
 	if len(legacy) > 0 {
-		if _, err := c.rekeyIdentityTx(ctx, tx, legacy[0], id.ProviderUserID); err != nil {
+		if _, _, err := c.rekeyIdentityTx(ctx, tx, legacy[0], id.ProviderUserID); err != nil {
 			return false, err
 		}
 	}
@@ -207,13 +222,13 @@ func (c *Client) backfillIdentityIssuerBinding(ctx context.Context, tx *gorm.DB,
 			if _, _, qualified := types.ParseQualifiedProviderUserID(decrypted.ProviderUserID); qualified || decrypted.ProviderUserID == "" {
 				continue
 			}
-			ok, err := c.rekeyIdentityTx(ctx, tx, stored, types.QualifyProviderUserID(issuer, decrypted.ProviderUserID))
+			moved, keyTaken, err := c.rekeyIdentityTx(ctx, tx, stored, types.QualifyProviderUserID(issuer, decrypted.ProviderUserID))
 			if err != nil {
 				return err
 			}
-			if ok {
+			if moved {
 				rekeyed++
-			} else {
+			} else if keyTaken {
 				slog.Warn("Left a generic OAuth identity keyed on its bare subject, because another identity already has the issuer-bound key",
 					"namespace", stored.AuthProviderNamespace, "hashedProviderUserID", stored.HashedProviderUserID)
 			}
