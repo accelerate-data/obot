@@ -37,12 +37,46 @@ func TestEmptyProviderProxyUsesGlobalInferenceProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The HTTP dialer may establish a CONNECT tunnel before the inference POST.
-		if r.Method == http.MethodPost {
-			proxyCalls.Add(1)
+		if r.Method != http.MethodConnect {
+			if r.Method == http.MethodPost {
+				proxyCalls.Add(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, configTestChatResponse)
+			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, configTestChatResponse)
+		// The HTTP dialer may open a CONNECT tunnel before the inference POST. net/http
+		// closes a connection after answering CONNECT, so the tunnel is served by hand
+		// rather than relying on the next keep-alive request reaching this handler.
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+			return
+		}
+		for {
+			tunneled, err := http.ReadRequest(rw.Reader)
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, tunneled.Body)
+			if tunneled.Method == http.MethodPost {
+				proxyCalls.Add(1)
+			}
+			response := &http.Response{
+				StatusCode:    http.StatusOK,
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        http.Header{"Content-Type": {"application/json"}},
+				ContentLength: int64(len(configTestChatResponse)),
+				Body:          io.NopCloser(strings.NewReader(configTestChatResponse)),
+			}
+			if err := response.Write(conn); err != nil {
+				return
+			}
+		}
 	}))
 	defer proxy.Close()
 	store := newTestStore(t)
